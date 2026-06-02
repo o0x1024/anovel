@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+dist-ssr/
+release/
+
+# Logs & runtime
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE (local only)
+.idea/
+*.sw?
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+.cursor/
+.gemini/
+.claude/
+.agent/
+.trea/
+
+# Test & coverage
+coverage/
+.nyc_output/
+
+# Electron / Vite cache
+.vite/
+*.local
+
+# Local databases & user data (runtime paths use Electron userData)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Large local reference corpora (not part of the app)
+凡人修仙传.txt
+*.txt.bak
+
+# Nested sentinel-ai project (47GB+ build artifacts; not used by ANovel)
+src/main/utils/sentinel-ai/
+
+# macOS / Windows pack artifacts
+*.dmg
+*.exe
+*.blockmap
+builder-effective-config.yaml

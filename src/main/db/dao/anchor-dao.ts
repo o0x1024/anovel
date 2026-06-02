@@ -1,0 +1,86 @@
+import { BaseDAO } from './base-dao'
+
+export interface AnchorRow {
+  id: number
+  work_id: number
+  type: string
+  title: string
+  content: string
+  is_active: number
+  created_step: string | null
+  create_time: string
+}
+
+export interface AnchorCreateInput {
+  work_id: number
+  type: string
+  title: string
+  content: string
+  created_step?: string
+}
+
+/** 锚点类型常量 */
+export const ANCHOR_TYPES = ['scene', 'character', 'plot', 'emotion', 'structure', 'memory', 'contrast'] as const
+
+export class AnchorDAO extends BaseDAO {
+  /** 获取作品的所有锚点（按类型分组） */
+  listByWork(workId: number): AnchorRow[] {
+    return this.all<AnchorRow>(
+      'SELECT * FROM anchors WHERE work_id = ? ORDER BY type, create_time',
+      [workId]
+    )
+  }
+
+  /** 获取作品的有效锚点 */
+  listActiveByWork(workId: number): AnchorRow[] {
+    return this.all<AnchorRow>(
+      'SELECT * FROM anchors WHERE work_id = ? AND is_active = 1 ORDER BY type, create_time',
+      [workId]
+    )
+  }
+
+  /** 按类型获取锚点 */
+  listByType(workId: number, type: string): AnchorRow[] {
+    return this.all<AnchorRow>(
+      'SELECT * FROM anchors WHERE work_id = ? AND type = ? AND is_active = 1',
+      [workId, type]
+    )
+  }
+
+  getById(id: number): AnchorRow | undefined {
+    return this.get<AnchorRow>('SELECT * FROM anchors WHERE id = ?', [id])
+  }
+
+  create(input: AnchorCreateInput): number {
+    return this.insert(
+      'INSERT INTO anchors (work_id, type, title, content, created_step) VALUES (?, ?, ?, ?, ?)',
+      [input.work_id, input.type, input.title, input.content, input.created_step ?? null]
+    )
+  }
+
+  update(id: number, fields: { title?: string; content?: string; type?: string }): boolean {
+    const sets: string[] = []
+    const vals: unknown[] = []
+    if (fields.title !== undefined) { sets.push('title = ?'); vals.push(fields.title) }
+    if (fields.content !== undefined) { sets.push('content = ?'); vals.push(fields.content) }
+    if (fields.type !== undefined) { sets.push('type = ?'); vals.push(fields.type) }
+    if (sets.length === 0) return false
+    vals.push(id)
+    return this.run(`UPDATE anchors SET ${sets.join(', ')} WHERE id = ?`, vals).changes > 0
+  }
+
+  /** 开关锚点 */
+  toggleActive(id: number, active: boolean): boolean {
+    return this.run('UPDATE anchors SET is_active = ? WHERE id = ?', [active ? 1 : 0, id]).changes > 0
+  }
+
+  delete(id: number): boolean {
+    return this.run('DELETE FROM anchors WHERE id = ?', [id]).changes > 0
+  }
+
+  batchCreate(inputs: AnchorCreateInput[]): number[] {
+    return inputs.map(input => this.create(input))
+  }
+}
+
+export const anchorDAO = new AnchorDAO()

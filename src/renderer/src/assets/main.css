@@ -1,0 +1,591 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================
+   ANovel - 全局样式
+   daisyUI 提供组件样式 + 主题切换
+   ============================================ */
+
+@layer base {
+  html {
+    font-size: var(--font-size-base, 14px);
+    --size-field: calc(0.25rem * var(--ui-scale, 1));
+    --size-selector: calc(0.25rem * var(--ui-scale, 1));
+    --size-tick: calc(0.25rem * var(--ui-scale, 1));
+  }
+
+  :root {
+    --font-size-base: 14px;
+    --ui-scale: 1;
+    --spacing-scale: 1.15;
+  }
+
+  body {
+    @apply antialiased min-h-screen bg-base-100 text-base-content;
+    font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  #app {
+    @apply h-screen flex flex-col;
+  }
+
+  /* 全局滚动条样式 */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--fallback-b3, oklch(var(--b3)/1));
+    border-radius: 8px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--fallback-b2, oklch(var(--b2)/1));
+    border-radius: 8px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--fallback-n, oklch(var(--n)/1));
+  }
+
+  /* 选中文本颜色 */
+  ::selection {
+    @apply bg-primary text-primary-content;
+  }
+
+  /* 布局间隔缩放：作用于常用间距类 */
+  #app {
+    --gap-scale: var(--spacing-scale, 1);
+  }
+
+  #app .gap-1 { gap: calc(0.25rem * var(--gap-scale)); }
+  #app .gap-2 { gap: calc(0.5rem * var(--gap-scale)); }
+  #app .gap-3 { gap: calc(0.75rem * var(--gap-scale)); }
+  #app .gap-4 { gap: calc(1rem * var(--gap-scale)); }
+  #app .gap-6 { gap: calc(1.5rem * var(--gap-scale)); }
+  #app .gap-8 { gap: calc(2rem * var(--gap-scale)); }
+  #app .p-4 { padding: calc(1rem * var(--gap-scale)); }
+  #app .p-5 { padding: calc(1.25rem * var(--gap-scale)); }
+  #app .p-6 { padding: calc(1.5rem * var(--gap-scale)); }
+  #app .p-8 { padding: calc(2rem * var(--gap-scale)); }
+  #app .px-3 { padding-left: calc(0.75rem * var(--gap-scale)); padding-right: calc(0.75rem * var(--gap-scale)); }
+  #app .px-4 { padding-left: calc(1rem * var(--gap-scale)); padding-right: calc(1rem * var(--gap-scale)); }
+  #app .px-5 { padding-left: calc(1.25rem * var(--gap-scale)); padding-right: calc(1.25rem * var(--gap-scale)); }
+  #app .px-6 { padding-left: calc(1.5rem * var(--gap-scale)); padding-right: calc(1.5rem * var(--gap-scale)); }
+  #app .px-8 { padding-left: calc(2rem * var(--gap-scale)); padding-right: calc(2rem * var(--gap-scale)); }
+  #app .py-3 { padding-top: calc(0.75rem * var(--gap-scale)); padding-bottom: calc(0.75rem * var(--gap-scale)); }
+  #app .py-4 { padding-top: calc(1rem * var(--gap-scale)); padding-bottom: calc(1rem * var(--gap-scale)); }
+  #app .py-5 { padding-top: calc(1.25rem * var(--gap-scale)); padding-bottom: calc(1.25rem * var(--gap-scale)); }
+  #app .py-6 { padding-top: calc(1.5rem * var(--gap-scale)); padding-bottom: calc(1.5rem * var(--gap-scale)); }
+  #app .mb-2 { margin-bottom: calc(0.5rem * var(--gap-scale)); }
+  #app .mb-3 { margin-bottom: calc(0.75rem * var(--gap-scale)); }
+  #app .mb-4 { margin-bottom: calc(1rem * var(--gap-scale)); }
+  #app .mb-6 { margin-bottom: calc(1.5rem * var(--gap-scale)); }
+  #app .mb-8 { margin-bottom: calc(2rem * var(--gap-scale)); }
+  #app .space-y-1 > :not([hidden]) ~ :not([hidden]) { margin-top: calc(0.25rem * var(--gap-scale)); }
+  #app .space-y-2 > :not([hidden]) ~ :not([hidden]) { margin-top: calc(0.5rem * var(--gap-scale)); }
+  #app .space-y-3 > :not([hidden]) ~ :not([hidden]) { margin-top: calc(0.75rem * var(--gap-scale)); }
+  #app .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: calc(1rem * var(--gap-scale)); }
+  #app .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: calc(1.5rem * var(--gap-scale)); }
+}
+
+/* ============================================
+   补充组件样式（daisyUI 未覆盖的）
+   ============================================ */
+
+@layer components {
+  /* Tiptap 编辑器样式 */
+  .tiptap-editor .ProseMirror {
+    @apply outline-none min-h-[300px] p-4;
+  }
+  .tiptap-editor .ProseMirror p {
+    @apply my-1;
+  }
+  .tiptap-editor .ProseMirror h1 {
+    @apply text-2xl font-bold my-3;
+  }
+  .tiptap-editor .ProseMirror h2 {
+    @apply text-xl font-bold my-2;
+  }
+  .tiptap-editor .ProseMirror h3 {
+    @apply text-lg font-semibold my-2;
+  }
+  .tiptap-editor .ProseMirror blockquote {
+    @apply border-l-4 border-primary pl-4 italic my-3;
+    color: oklch(var(--bc) / 0.7);
+  }
+  .tiptap-editor .ProseMirror code {
+    @apply bg-base-300 px-1.5 py-0.5 rounded text-sm font-mono;
+  }
+  .tiptap-editor .ProseMirror pre {
+    @apply bg-base-300 rounded-lg p-4 my-3 overflow-x-auto;
+  }
+  .tiptap-editor .ProseMirror pre code {
+    @apply bg-transparent p-0;
+  }
+  .tiptap-editor .ProseMirror ul {
+    @apply list-disc pl-6 my-2;
+  }
+  .tiptap-editor .ProseMirror ol {
+    @apply list-decimal pl-6 my-2;
+  }
+
+  /* 行数限制 */
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+@layer utilities {
+  /* 滚动条样式 */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-base-200;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-base-300 rounded-full;
+  }
+  
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    @apply bg-base-content/20;
+  }
+  
+  /* 动画 */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-in-out;
+  }
+  
+  .animate-slide-up {
+    animation: slideUp 0.3s ease-out;
+  }
+  
+  .animate-bounce-in {
+    animation: bounceIn 0.5s ease-out;
+  }
+
+  /* 间距辅助类 */
+  .gap-xs {
+    gap: 0.25rem;
+  }
+
+  .gap-sm {
+    gap: 0.5rem;
+  }
+
+  .gap-md {
+    gap: 1rem;
+  }
+
+  .gap-lg {
+    gap: 1.5rem;
+  }
+
+  /* 文本截断 */
+  .text-truncate {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* 过渡效果 */
+  .transition-all-300 {
+    transition: all 0.3s ease;
+  }
+}
+
+/* 动画定义 */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes bounceIn {
+  0% {
+    transform: scale(0.3);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.05);
+  }
+  70% {
+    transform: scale(0.9);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ============================================
+   DaisyUI v5 + Tailwind v3 兼容
+   preflight 的 button 重置不在 @layer 内，会盖掉 layered 的 .btn 样式
+   ============================================ */
+
+.btn {
+  --btn-bg: var(--btn-color, var(--color-base-200));
+  --btn-fg: var(--color-base-content);
+  --btn-border: color-mix(in oklab, var(--btn-bg), #000 5%);
+  --size: calc(var(--size-field, 0.25rem) * 10);
+  height: var(--size);
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: var(--btn-bg);
+  background-image: none, var(--btn-noise);
+  background-size: auto, calc(var(--noise) * 100%);
+  padding-inline: var(--btn-p, 1rem);
+  color: var(--btn-fg);
+  border-width: var(--border, 1px);
+  border-style: solid;
+  border-color: var(--btn-border);
+}
+
+.btn-primary {
+  --btn-color: var(--color-primary);
+  --btn-bg: var(--color-primary);
+  --btn-fg: var(--color-primary-content);
+  color: var(--color-primary-content);
+  background-color: var(--color-primary);
+  border-color: color-mix(in oklab, var(--color-primary), #000 5%);
+}
+
+.btn-secondary {
+  --btn-color: var(--color-secondary);
+  --btn-bg: var(--color-secondary);
+  --btn-fg: var(--color-secondary-content);
+  color: var(--color-secondary-content);
+  background-color: var(--color-secondary);
+}
+
+.btn-accent {
+  --btn-color: var(--color-accent);
+  --btn-bg: var(--color-accent);
+  --btn-fg: var(--color-accent-content);
+  color: var(--color-accent-content);
+  background-color: var(--color-accent);
+}
+
+.btn-neutral {
+  --btn-color: var(--color-neutral);
+  --btn-bg: var(--color-neutral);
+  --btn-fg: var(--color-neutral-content);
+  color: var(--color-neutral-content);
+  background-color: var(--color-neutral);
+}
+
+.btn-error {
+  --btn-color: var(--color-error);
+  --btn-bg: var(--color-error);
+  --btn-fg: var(--color-error-content);
+  color: var(--color-error-content);
+  background-color: var(--color-error);
+}
+
+.btn-ghost {
+  --btn-bg: transparent;
+  --btn-border: transparent;
+  background-color: transparent;
+  border-color: transparent;
+  color: var(--color-base-content);
+}
+
+.btn-ghost:hover:not(:disabled, [disabled], .btn-disabled) {
+  background-color: color-mix(in oklab, var(--color-base-content) 10%, transparent);
+}
+
+.btn-ghost.btn-primary {
+  --btn-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.btn-ghost.text-error,
+.btn-ghost.btn-error {
+  --btn-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.btn-outline {
+  --btn-bg: transparent;
+  background-color: transparent;
+  border-color: var(--btn-color, var(--color-base-content));
+  color: var(--btn-color, var(--color-base-content));
+}
+
+.btn-outline.btn-primary {
+  --btn-color: var(--color-primary);
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.btn-outline.btn-neutral {
+  --btn-color: var(--color-neutral);
+  color: var(--color-neutral);
+  border-color: var(--color-neutral);
+}
+
+.btn:disabled:not(.btn-link, .btn-ghost),
+.btn[disabled]:not(.btn-link, .btn-ghost),
+.btn-disabled:not(.btn-link, .btn-ghost) {
+  color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+  background-color: color-mix(in oklab, var(--color-base-content) 10%, transparent);
+  border-color: transparent;
+}
+
+.btn svg,
+.btn .svg-inline--fa {
+  color: currentColor;
+}
+
+.btn-sm {
+  --size: calc(var(--size-field, 0.25rem) * 8);
+  --btn-p: calc(0.75rem * var(--ui-scale, 1));
+  height: var(--size);
+  font-size: 0.875rem;
+}
+
+.btn-xs {
+  --size: calc(var(--size-field, 0.25rem) * 6);
+  --btn-p: calc(0.5rem * var(--ui-scale, 1));
+  height: var(--size);
+  font-size: 0.75rem;
+}
+
+/* menu 内 button 同样被 preflight 重置，layered 的 .menu 规则无法生效 */
+.menu {
+  width: 100%;
+  gap: calc(0.375rem * var(--gap-scale, 1));
+  --menu-active-fg: var(--color-primary);
+  --menu-active-bg: color-mix(in oklab, var(--color-primary) 14%, transparent);
+}
+
+.menu :where(li:not(.menu-title) > *:not(ul, details, .menu-title, .btn)),
+.menu :where(li:not(.menu-title) > details > summary:not(.menu-title)) {
+  display: grid;
+  grid-auto-flow: column;
+  align-content: flex-start;
+  align-items: center;
+  gap: calc(0.5rem * var(--gap-scale, 1));
+  width: 100%;
+  border-radius: var(--radius-field);
+  padding-inline: calc(0.875rem * var(--gap-scale, 1));
+  padding-block: calc(0.5rem * var(--gap-scale, 1));
+  text-align: start;
+  cursor: pointer;
+  border: none;
+  font: inherit;
+  line-height: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: transparent;
+  color: inherit;
+  transition: color 0.2s ease, background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.menu-sm :where(li:not(.menu-title) > *:not(ul, details, .menu-title, .btn)),
+.menu-sm :where(li:not(.menu-title) > details > summary:not(.menu-title)) {
+  padding-inline: calc(0.875rem * var(--gap-scale, 1));
+  padding-block: calc(0.4375rem * var(--gap-scale, 1));
+  font-size: 0.875rem;
+}
+
+.menu :where(li:not(.menu-title, .disabled) > *:not(ul, details, .menu-title, .btn):not(.menu-active):hover),
+.menu :where(li:not(.menu-title, .disabled) > details > summary:not(.menu-title):not(.menu-active):hover) {
+  background-color: color-mix(in oklab, var(--color-base-content) 8%, transparent);
+}
+
+.menu :where(li:not(.menu-title) > *:not(ul, details, .menu-title, .btn).menu-active),
+.menu :where(li:not(.menu-title) > details > summary:not(.menu-title).menu-active),
+:where(:not(ul, details, .menu-title, .btn)).menu-active {
+  color: var(--menu-active-fg);
+  background-color: var(--menu-active-bg);
+  font-weight: 600;
+}
+
+/* tab 内 button 同样被 preflight 重置，layered 的 .tab 规则无法生效 */
+.tabs .tab {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: transparent;
+  border: none;
+  text-decoration: none;
+  font: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.tabs.tabs-box > :is(.tab-active, [aria-selected='true']):not(.tab-disabled, [disabled]) {
+  background-color: var(--tab-bg, var(--color-base-100));
+  color: var(--color-base-content);
+  box-shadow:
+    0 1px oklch(100% 0 0 / calc(var(--depth, 1) * 0.1)) inset,
+    0 1px 1px -1px color-mix(in oklab, var(--color-neutral) calc(var(--depth, 1) * 50%), transparent),
+    0 1px 6px -4px color-mix(in oklab, var(--color-neutral) calc(var(--depth, 1) * 100%), transparent);
+}
+
+/* input / select / textarea 被 preflight 重置，layered 的 daisyUI 规则无法生效 */
+:root {
+  --field-border-color: color-mix(in oklab, var(--color-base-content) 18%, var(--color-base-300));
+  --field-border-color-focus: color-mix(in oklab, var(--color-primary) 55%, var(--color-base-300));
+}
+
+input.input,
+textarea.textarea,
+select.select {
+  --field-size: calc(var(--size-field, 0.25rem) * 10);
+  width: 100%;
+  max-width: 100%;
+  appearance: none;
+  background-color: var(--color-base-100);
+  color: var(--color-base-content);
+  border: 1px solid var(--field-border-color);
+  border-radius: var(--radius-field, 0.5rem);
+  box-shadow: 0 1px color-mix(in oklab, var(--color-base-content) 6%, transparent) inset;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, outline-color 0.15s ease;
+}
+
+input.input,
+select.select {
+  height: var(--field-size);
+  min-height: var(--field-size);
+  padding-inline: 0.75rem;
+  font-size: max(0.875rem, var(--font-size, 0.875rem));
+}
+
+textarea.textarea {
+  min-height: calc(var(--field-size) * 2);
+  padding: 0.75rem;
+  font-size: max(0.875rem, var(--font-size, 0.875rem));
+  line-height: 1.5;
+  resize: vertical;
+}
+
+select.select {
+  padding-inline-end: 2rem;
+  cursor: pointer;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) calc(50% + 1px),
+    calc(100% - 14px) calc(50% + 1px);
+  background-repeat: no-repeat;
+  background-size: 5px 5px, 5px 5px;
+}
+
+input.input:focus,
+textarea.textarea:focus,
+select.select:focus {
+  outline: 2px solid var(--field-border-color-focus);
+  outline-offset: 1px;
+  border-color: var(--field-border-color-focus);
+}
+
+input.input:disabled,
+textarea.textarea:disabled,
+select.select:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+  background-color: var(--color-base-200);
+  border-color: var(--color-base-300);
+}
+
+input.input::placeholder,
+textarea.textarea::placeholder {
+  color: color-mix(in oklab, var(--color-base-content) 42%, transparent);
+}
+
+input.input-xs,
+select.select-xs {
+  --field-size: calc(var(--size-field, 0.25rem) * 6);
+  font-size: 0.75rem;
+  padding-inline: 0.5rem;
+}
+
+textarea.textarea-xs {
+  --field-size: calc(var(--size-field, 0.25rem) * 6);
+  font-size: 0.75rem;
+  padding: 0.5rem;
+}
+
+input.input-sm,
+select.select-sm {
+  --field-size: calc(var(--size-field, 0.25rem) * 8);
+  font-size: 0.8125rem;
+  padding-inline: 0.625rem;
+}
+
+textarea.textarea-sm {
+  --field-size: calc(var(--size-field, 0.25rem) * 8);
+  font-size: 0.8125rem;
+  padding: 0.625rem;
+}
+
+input.input-lg,
+select.select-lg {
+  --field-size: calc(var(--size-field, 0.25rem) * 12);
+  font-size: 1rem;
+  padding-inline: 0.875rem;
+}
+
+textarea.textarea-lg {
+  --field-size: calc(var(--size-field, 0.25rem) * 12);
+  font-size: 1rem;
+  padding: 0.875rem;
+}
+
+input.input-ghost,
+textarea.textarea-ghost,
+select.select-ghost {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+input.input-ghost:focus,
+textarea.textarea-ghost:focus,
+select.select-ghost:focus {
+  background-color: var(--color-base-100);
+  border-color: var(--field-border-color);
+}
+
+/* daisyUI v4 的 *-bordered 类在 v5 中已移除，保留兼容 */
+.input-bordered,
+.select-bordered,
+.textarea-bordered {
+  border: 1px solid var(--field-border-color);
+}

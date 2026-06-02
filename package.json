@@ -1,0 +1,72 @@
+{
+  "name": "anovel",
+  "version": "2.5.0",
+  "type": "module",
+  "description": "AI主导的小说创作辅助系统",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "postinstall": "electron-builder install-app-deps",
+    "pack:mac": "electron-vite build && electron-builder --mac",
+    "pack:win": "electron-vite build && electron-builder --win"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "better-sqlite3": "^11.7.0",
+    "dompurify": "^3.4.7",
+    "mammoth": "^1.12.0",
+    "marked": "^18.0.4"
+  },
+  "devDependencies": {
+    "@fortawesome/fontawesome-svg-core": "^7.2.0",
+    "@fortawesome/free-solid-svg-icons": "^7.2.0",
+    "@fortawesome/vue-fontawesome": "^3.2.0",
+    "@tiptap/starter-kit": "^2.11.2",
+    "@tiptap/vue-3": "^2.11.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/dompurify": "^3.0.5",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "autoprefixer": "^10.4.20",
+    "daisyui": "^5.5.20",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^4.0.0",
+    "pinia": "^2.3.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "build": {
+    "appId": "com.anovel.app",
+    "productName": "ANovel",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
