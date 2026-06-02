@@ -3,6 +3,7 @@ import { modelService } from '../model'
 import { modelConfigDAO } from '../db'
 import type { ModelType } from '../model/types'
 import { aiSessionManager } from '../ai/ai-session-manager'
+import { resolvePrompt } from './prompt-registry'
 
 export interface DebateVariant {
   modelType: string
@@ -98,7 +99,7 @@ export async function runModelDebate(
           '【版本A】\n' + successVariants[0].content.slice(0, 1500),
           '【版本B】\n' + successVariants[1].content.slice(0, 1500)
         ].join('\n\n'),
-        systemPrompt: '对比两个版本，简述差异点，并给出融合建议（各取所长）。200字以内。',
+        systemPrompt: resolvePrompt('debate_fusion.system') || '对比两个版本，简述差异点，并给出融合建议（各取所长）。200字以内。',
         workId,
         step: 'model_debate_fusion',
         enrichWorkContext: false,

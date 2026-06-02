@@ -4,6 +4,7 @@ import { initSchema, workDAO } from './db'
 import { seedBuiltinStyles } from './db/seed'
 import { seedBuiltinMaterials } from './db/seed-materials'
 import { seedAssistantRoles } from './db/assistant-seed'
+import { registerBuiltinPrompts } from './context/prompt-registry'
 import { registerIpcHandlers } from './ipc'
 import { appLogger } from './logger/app-logger'
 import { cleanupDuplicateNarrativeMemoryForAllWorks } from './context/memory-cleanup'
@@ -55,6 +56,7 @@ app.whenReady().then(() => {
   seedBuiltinStyles()
   seedBuiltinMaterials()
   seedAssistantRoles()
+  registerBuiltinPrompts()
 
   registerIpcHandlers()
 

@@ -7,6 +7,7 @@ import {
   extractStyleFingerprint, compareFingerprint, fingerprintToPrompt
 } from './context/style-fingerprint'
 import { detectAiTraces, AI_TRACE_POLISH_PROMPT } from './context/ai-trace-detect'
+import { resolvePrompt } from './context/prompt-registry'
 import {
   suggestRulesFromAiTrace,
   buildStyleRewriteSystemPrompt,
@@ -81,7 +82,7 @@ export function registerV20IpcHandlers(): void {
   ipcMain.handle('aitrace:polish', async (e, workId: number, content: string) => {
     const res = await modelService.chat({
       prompt: content,
-      systemPrompt: AI_TRACE_POLISH_PROMPT,
+      systemPrompt: resolvePrompt('ai_trace_polish.system') || AI_TRACE_POLISH_PROMPT,
       workId,
       step: 'ai_trace_polish',
       enrichWorkContext: false,

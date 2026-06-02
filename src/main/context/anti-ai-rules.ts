@@ -1,5 +1,6 @@
 import { coreSettingDAO, aiFavoriteDAO, writingStyleDAO } from '../db'
 import type { AiTraceIssue } from './ai-trace-detect'
+import { resolvePrompt } from './prompt-registry'
 
 const ANTI_AI_RULES_TYPE = 'anti_ai_rules'
 const REFERENCE_TEXT_TYPE = 'reference_text'
@@ -281,7 +282,7 @@ export function formatAntiAiRulesFromList(rules: string[]): string {
   )
   if (hasDeepRules) {
     lines.push('')
-    lines.push(HUMAN_WRITING_META)
+    lines.push(resolvePrompt('body_generation.human_writing_meta') || HUMAN_WRITING_META)
   }
 
   lines.push('')
@@ -622,7 +623,7 @@ export function buildStyleRewriteUserPrompt(content: string, wordTarget?: number
  * 不含任何情节/人设/世界观/伏笔等上下文。
  */
 export function buildStyleRewriteSystemPrompt(workId: number): string {
-  const parts: string[] = [STYLE_REWRITE_INSTRUCTION]
+  const parts: string[] = [resolvePrompt('body_style_rewrite.system') || STYLE_REWRITE_INSTRUCTION]
 
   const styleId = writingStyleDAO.getWorkStyleId(workId)
   const style = styleId ? writingStyleDAO.getById(styleId) : undefined

@@ -27,6 +27,7 @@ import {
   CHAPTER_OUTLINE_LENGTH_RULES,
   VOLUME_OUTLINE_LENGTH_RULES
 } from './writing-techniques'
+import { resolvePrompt } from './prompt-registry'
 import {
   estimateTokens,
   DEFAULT_MAX_CONTEXT_TOKENS,
@@ -266,7 +267,7 @@ export function collectPromptSections(
       label: '正文连贯性约束',
       priority: 12,
       renderOrder: 15,
-      text: BODY_CONTINUITY_RULE,
+      text: resolvePrompt('body_generation.continuity_rule') || BODY_CONTINUITY_RULE,
       trimStrategy: 'none'
     }))
   }

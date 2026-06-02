@@ -162,4 +162,20 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
   if (hasTable(db, 'writing_styles') && !hasColumn(db, 'writing_styles', 'reference_text')) {
     db.exec(`ALTER TABLE writing_styles ADD COLUMN reference_text TEXT`)
   }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS prompt_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key VARCHAR(100) NOT NULL UNIQUE,
+      category VARCHAR(30) NOT NULL DEFAULT 'internal',
+      label VARCHAR(100) NOT NULL DEFAULT '',
+      builtin_version INTEGER NOT NULL DEFAULT 1,
+      builtin_text TEXT NOT NULL DEFAULT '',
+      user_text TEXT,
+      description TEXT,
+      variables_json TEXT,
+      risk_level VARCHAR(10) NOT NULL DEFAULT 'safe',
+      update_time DATETIME
+    );
+  `)
 }

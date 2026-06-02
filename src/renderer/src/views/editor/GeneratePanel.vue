@@ -178,16 +178,11 @@ function selectChapter(ch: Chapter) {
   selectedChapterId.value = ch.id
 }
 
-const bodySystemPrompt = [
-  '你是一个注重细节的严肃的网文作者。根据大纲和上下文写小说正文。',
-  '从上一章结尾自然延续，注意回收伏笔。',
-  '',
-  '【字数与内容密度约束】',
-  '- 字数目标是参考范围，不是必须凑满的硬性指标。大纲情节写完即可自然收尾。',
-  '- 禁止为凑字数而：重复角色已表达过的心理活动、堆砌无叙事功能的环境描写、添加大纲之外的新情节线、用不同措辞复述同一信息。',
-  '- 每个场景/情节点只展开一次，写透即过，不要反复渲染。',
-  '- 如果大纲内容在目标范围下限附近已自然写完，直接结束本章，不要硬撑。'
-].join('\n')
+const bodySystemPrompt = ref('')
+
+async function loadBodySystemPrompt() {
+  bodySystemPrompt.value = await window.anovel.invoke('prompt:resolve', 'body_generation.system') as string
+}
 
 watch(wordTarget, async (value) => {
   if (selectedChapterId.value) await refreshBudgetPreview(selectedChapterId.value)
@@ -195,6 +190,7 @@ watch(wordTarget, async (value) => {
 })
 
 onMounted(async () => {
+  await loadBodySystemPrompt()
   const plan = await window.anovel.invoke('writingPlan:get', props.workId) as { wordsPerChapter: number }
   if (plan.wordsPerChapter) wordTarget.value = plan.wordsPerChapter
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
@@ -325,7 +321,7 @@ async function refreshBudgetPreview(chapterId: number) {
 
   const report = await window.anovel.invoke('context:estimateBudget', {
     prompt,
-    systemPrompt: bodySystemPrompt,
+    systemPrompt: bodySystemPrompt.value,
     workId: props.workId,
     step: 'body_generation',
     maxTokens: Math.ceil(wordTarget.value * 1.5),
@@ -379,7 +375,7 @@ async function generateBody() {
 
   await refreshBudgetPreview(ch.id)
 
-  await chat(prompt, bodySystemPrompt, 'body_generation', {
+  await chat(prompt, bodySystemPrompt.value, 'body_generation', {
     maxTokens: Math.ceil(wordTarget.value * 1.5),
     workContextOptions: {
       includeVolumes: true,

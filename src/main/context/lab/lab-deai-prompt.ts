@@ -6,6 +6,7 @@ import {
 import { formatStepRulesForLayers } from '../style-step-rules'
 import { parseStyleStepRules } from '../../../shared/style-step-rules'
 import { BODY_PARAGRAPH_SPACING_RULE } from '../../../shared/normalize-body-text'
+import { resolvePrompt } from '../prompt-registry'
 
 const LAB_DEAI_INSTRUCTION = [
   '你是一个极其厌恶AI的网文作家。',
@@ -22,7 +23,11 @@ export function buildLabDeaiSystemPrompt(styleId: number): string {
   const style = writingStyleDAO.getById(styleId)
   if (!style) throw new Error('所选文风不存在')
 
-  const parts: string[] = [LAB_DEAI_INSTRUCTION]
+  const labBase = resolvePrompt('lab_deai.system')
+  const instruction = labBase
+    ? [labBase, '', '排版：' + BODY_PARAGRAPH_SPACING_RULE, ''].join('\n')
+    : LAB_DEAI_INSTRUCTION
+  const parts: string[] = [instruction]
 
   if (style.description?.trim()) {
     parts.push(`【文风说明 · ${style.name}】\n${style.description.trim()}`)

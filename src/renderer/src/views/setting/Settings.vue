@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import GeneralSettingsPanel from './GeneralSettingsPanel.vue'
 import BackupSettingsPanel from './BackupSettingsPanel.vue'
+import PromptTemplatesPanel from './PromptTemplatesPanel.vue'
 
 interface ModelConfig {
   model_type: string
@@ -32,6 +33,7 @@ interface ProviderMeta {
 
 const categories = [
   { id: 'ai', label: 'AI 服务', icon: 'robot' },
+  { id: 'prompts', label: 'Prompt 模板', icon: 'file-lines' },
   { id: 'general', label: '常规设置', icon: 'desktop' },
   { id: 'backup', label: '数据备份', icon: 'database' }
 ] as const
@@ -422,6 +424,9 @@ function providerLabel(type: string) {
         <GeneralSettingsPanel v-if="activeCategory === 'general'" />
 
         <BackupSettingsPanel v-else-if="activeCategory === 'backup'" />
+
+        <!-- Prompt 模板 -->
+        <PromptTemplatesPanel v-else-if="activeCategory === 'prompts'" />
 
         <!-- AI 服务 -->
         <div v-else-if="activeCategory === 'ai'">
