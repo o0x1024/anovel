@@ -1,5 +1,6 @@
-import { anchorDAO, anchorAlignmentDAO } from '../db'
+import { anchorDAO, anchorAlignmentDAO, volumeChapterDAO } from '../db'
 import type { AnchorRow } from '../db'
+import { filterAnchorsForChapter } from './anchor-scope'
 
 export type AlignmentLevel = 0 | 1 | 2
 
@@ -8,17 +9,21 @@ export interface AnchorAlignmentReportItem {
   title: string
   content: string
   type: string
-  aligned: AlignmentLevel
+  aligned: AlignmentLevel | null
   detail: string
+  skipped: boolean
+  skipReason?: string
 }
 
 export interface AnchorAlignmentReport {
   items: AnchorAlignmentReportItem[]
   summary: {
     total: number
+    applicable: number
     aligned: number
     partial: number
     missing: number
+    skipped: number
   }
 }
 
@@ -79,7 +84,19 @@ export function checkAnchorAlignment(
   const body = content.trim()
   const items: AnchorAlignmentReportItem[] = []
 
-  for (const anchor of anchors) {
+  let toCheck = anchors
+  let skippedEntries: { anchor: AnchorRow; reason: string }[] = []
+
+  if (options?.chapterId) {
+    const chapter = volumeChapterDAO.getChapter(options.chapterId)
+    if (chapter) {
+      const filtered = filterAnchorsForChapter(anchors, chapter)
+      toCheck = filtered.applicable
+      skippedEntries = filtered.skipped
+    }
+  }
+
+  for (const anchor of toCheck) {
     const { aligned, detail } = scoreAnchor(anchor, body)
     if (options?.persist !== false) {
       anchorAlignmentDAO.log({
@@ -96,17 +113,35 @@ export function checkAnchorAlignment(
       content: anchor.content,
       type: anchor.type,
       aligned,
-      detail
+      detail,
+      skipped: false
     })
   }
+
+  for (const { anchor, reason } of skippedEntries) {
+    items.push({
+      anchorId: anchor.id,
+      title: anchor.title,
+      content: anchor.content,
+      type: anchor.type,
+      aligned: null,
+      detail: reason,
+      skipped: true,
+      skipReason: reason
+    })
+  }
+
+  const checked = items.filter(i => !i.skipped)
 
   return {
     items,
     summary: {
       total: items.length,
-      aligned: items.filter(i => i.aligned === 2).length,
-      partial: items.filter(i => i.aligned === 1).length,
-      missing: items.filter(i => i.aligned === 0).length
+      applicable: checked.length,
+      aligned: checked.filter(i => i.aligned === 2).length,
+      partial: checked.filter(i => i.aligned === 1).length,
+      missing: checked.filter(i => i.aligned === 0).length,
+      skipped: items.filter(i => i.skipped).length
     }
   }
 }

@@ -1,9 +1,14 @@
 import type { ModelRequest } from '../model/types'
-import { modelConfigDAO, writingStyleDAO, anchorDAO } from '../db'
+import { modelConfigDAO, writingStyleDAO, anchorDAO, appPreferenceDAO } from '../db'
 import type { AnchorRow } from '../db'
 import { buildWorkContext } from './work-context'
 import { formatConditionRulesForPrompt } from './condition-rules'
-import { formatAntiAiRulesForPrompt, buildStyleFewShot, buildAntiAiPersonaForWork } from './anti-ai-rules'
+import {
+  formatAntiAiRulesForPrompt,
+  buildStyleFewShot,
+  buildAntiAiPersonaForWork,
+  hasStyleReferenceText
+} from './anti-ai-rules'
 import {
   buildNarrativeMemorySections,
   type NarrativeMemoryResult
@@ -34,8 +39,13 @@ import {
   MESSAGE_OVERHEAD_TOKENS
 } from './token-estimate'
 import { volumeChapterDAO } from '../db'
-import { shouldInjectWritingStyle } from './step-prompt-policy'
+import {
+  shouldInjectAnchors,
+  shouldInjectTasteAndConditionRules,
+  shouldInjectWritingStyle
+} from './step-prompt-policy'
 import { resolveChapterCharacterNames, buildFocusCharacterHint } from './character-cards'
+import { filterAnchorsForChapter, filterAnchorsForVolume } from './anchor-scope'
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
 
@@ -198,12 +208,19 @@ export function collectPromptSections(
 
   // ── System Zone 1: prompt 开头（高注意力）── 写作规则 / 人设 / 关键约束
   if (request.systemPrompt?.trim()) {
+    let baseSystemText = request.systemPrompt.trim()
+    if (workId && isBodyStep && hasStyleReferenceText(workId)) {
+      const styleDirective = resolvePrompt('body_generation.style_core_directive')?.trim()
+      if (styleDirective && !baseSystemText.includes('【目标范文】')) {
+        baseSystemText = `${baseSystemText}\n${styleDirective}`
+      }
+    }
     sections.push(systemRuleSection({
       key: 'base_system',
       label: '基础系统提示',
       priority: 0,
       renderOrder: 0,
-      text: request.systemPrompt.trim(),
+      text: baseSystemText,
       trimStrategy: 'none'
     }))
   }
@@ -407,12 +424,30 @@ export function collectPromptSections(
   }
 
   // ── System Zone 3: prompt 末尾（高注意力）── 锚点 / 偏好 / 示范 / 自检
-  if (workId) {
-    const anchors = anchorDAO.listActiveByWork(workId)
+  if (workId && shouldInjectAnchors(request.step)) {
+    const allActive = anchorDAO.listActiveByWork(workId)
+    let anchors = allActive
+
     if (anchors.length > 0) {
+      const chId = request.chapterId
+      const volId = request.volumeId
+      if (chId) {
+        const ch = volumeChapterDAO.getChapter(chId)
+        if (ch) {
+          anchors = filterAnchorsForChapter(anchors, ch).applicable
+        }
+      } else if (volId) {
+        anchors = filterAnchorsForVolume(anchors, volId).applicable
+      }
+    }
+
+    if (anchors.length > 0) {
+      const scopeNote = anchors.length < allActive.length
+        ? `创作锚点（${anchors.length}/${allActive.length}）`
+        : '创作锚点'
       sections.push(systemRuleSection({
         key: 'anchors',
-        label: '创作锚点',
+        label: scopeNote,
         priority: 5,
         renderOrder: 75,
         text: formatAnchorsForPrompt(anchors),
@@ -421,7 +456,7 @@ export function collectPromptSections(
     }
   }
 
-  if (workId) {
+  if (workId && shouldInjectTasteAndConditionRules(request.step)) {
     const tasteText = formatTasteForPrompt(workId)
     if (tasteText) {
       sections.push(systemRuleSection({
@@ -482,12 +517,26 @@ export function collectPromptSections(
     if (fewShotText) {
       sections.push(systemRuleSection({
         key: 'style_fewshot',
-        label: '文风佳句示范',
-        priority: 14,
-        renderOrder: 92,
+        label: '目标范文',
+        priority: 8,
+        renderOrder: 4,
         text: fewShotText,
-        trimStrategy: 'drop'
+        trimStrategy: 'tail'
       }))
+
+      if (hasStyleReferenceText(workId)) {
+        const anchorTemplate = resolvePrompt('body_generation.style_anchor')
+        if (anchorTemplate) {
+          sections.push(userContextSection({
+            key: 'style_anchor',
+            label: '文风尾注锚定',
+            priority: 0,
+            renderOrder: 9999,
+            text: anchorTemplate,
+            trimStrategy: 'drop'
+          }))
+        }
+      }
     }
   }
 
@@ -614,7 +663,26 @@ export function assembleBudgetedPrompt(
       }
     }
 
-    // Phase 2: if still over budget, drop system sections marked as droppable
+    // Phase 2a: trim system sections with 'tail' strategy (head-truncate for reference text)
+    flexibleTokens = totalDroppableSystemTokens() + totalUserContextTokens()
+    if (flexibleTokens > contextBudget) {
+      const tailSystemItems = droppableSystemWorking.filter(w => w.included && w.trimStrategy === 'tail')
+      for (const item of tailSystemItems) {
+        flexibleTokens = totalDroppableSystemTokens() + totalUserContextTokens()
+        if (flexibleTokens <= contextBudget) break
+        const overflow = flexibleTokens - contextBudget
+        const currentTokens = estimateTokens(item.workingText)
+        const targetTokens = Math.max(400, currentTokens - overflow - 200)
+        const targetChars = Math.max(600, Math.floor(targetTokens * 1.5))
+        if (targetChars < item.workingText.length) {
+          item.workingText = item.workingText.slice(0, targetChars) + '\n……（范文已截断以适配上下文）'
+          item.trimmed = true
+          warnings.push(`「${item.label}」已截断为约 ${targetChars} 字以控制上下文体积`)
+        }
+      }
+    }
+
+    // Phase 2b: if still over budget, drop system sections marked as droppable
     flexibleTokens = totalDroppableSystemTokens() + totalUserContextTokens()
     if (flexibleTokens > contextBudget) {
       const sortedDroppableSystem = [...droppableSystemWorking]
@@ -708,7 +776,8 @@ export function getMaxContextTokens(modelType?: string): number {
 
 export function estimateContextBudget(request: ModelRequest): ContextBudgetReport {
   const maxContext = getMaxContextTokens(request.modelType)
-  const reservedOutput = request.maxTokens ?? 4096
+  const saved = appPreferenceDAO.getGenerationParams()
+  const reservedOutput = request.maxTokens ?? saved.maxTokens ?? 4096
   const sections = collectPromptSections(request)
   const { report } = assembleBudgetedPrompt(request.prompt, sections, maxContext, reservedOutput)
   return report

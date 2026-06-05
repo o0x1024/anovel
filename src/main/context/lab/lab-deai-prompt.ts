@@ -1,6 +1,6 @@
 import { writingStyleDAO } from '../../db'
 import {
-  formatBuiltinAntiAiRulesForPrompt,
+  formatAntiAiRulesFromList,
   buildStyleFewShotForStyle
 } from '../anti-ai-rules'
 import { formatStepRulesForLayers } from '../style-step-rules'
@@ -8,25 +8,24 @@ import { parseStyleStepRules } from '../../../shared/style-step-rules'
 import { BODY_PARAGRAPH_SPACING_RULE } from '../../../shared/normalize-body-text'
 import { resolvePrompt } from '../prompt-registry'
 
-const LAB_DEAI_INSTRUCTION = [
-  '你是一个极其厌恶AI的网文作家。',
-  '',
-  '排版：' + BODY_PARAGRAPH_SPACING_RULE,
-  ''
-].join('\n')
+function buildLabDeaiInstruction(labBase?: string): string {
+  const lines: string[] = labBase ? [labBase] : ['你是一个极其厌恶AI的网文作家。']
+  const spacingRule = BODY_PARAGRAPH_SPACING_RULE.trim()
+  if (spacingRule) lines.push('', '排版：' + spacingRule)
+  lines.push('')
+  return lines.join('\n')
+}
 
 /**
  * AI 实验室去 AI：按文风 ID 组装完整 system prompt（不依赖作品 workId）。
  * 对齐稿件优化 buildStyleRewriteSystemPrompt 的文风覆盖范围。
  */
-export function buildLabDeaiSystemPrompt(styleId: number): string {
+export function buildLabDeaiSystemPrompt(styleId: number, antiAiRules: string[] = []): string {
   const style = writingStyleDAO.getById(styleId)
   if (!style) throw new Error('所选文风不存在')
 
   const labBase = resolvePrompt('lab_deai.system')
-  const instruction = labBase
-    ? [labBase, '', '排版：' + BODY_PARAGRAPH_SPACING_RULE, ''].join('\n')
-    : LAB_DEAI_INSTRUCTION
+  const instruction = buildLabDeaiInstruction(labBase || undefined)
   const parts: string[] = [instruction]
 
   if (style.description?.trim()) {
@@ -46,7 +45,7 @@ export function buildLabDeaiSystemPrompt(styleId: number): string {
   const fewShot = buildStyleFewShotForStyle(styleId)
   if (fewShot) parts.push(fewShot)
 
-  const antiAi = formatBuiltinAntiAiRulesForPrompt()
+  const antiAi = formatAntiAiRulesFromList(antiAiRules)
   if (antiAi) parts.push(antiAi)
 
   return parts.join('\n\n')

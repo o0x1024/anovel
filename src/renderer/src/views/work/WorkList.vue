@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onActivated, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   DEFAULT_NOVEL_LENGTH,
@@ -184,11 +184,20 @@ async function importWorkFromFile(event: Event) {
 
 onMounted(async () => {
   try {
-    works.value = await window.anovel.invoke('work:list') as Work[]
+    await reloadWorks()
   } catch (e) {
     console.error('加载作品列表失败:', e)
   } finally {
     loading.value = false
+  }
+})
+
+/** 侧栏「作品管理」在编辑页时仍高亮本路由；从文风/实验室返回时刷新列表 */
+onActivated(async () => {
+  try {
+    await reloadWorks()
+  } catch (e) {
+    console.error('刷新作品列表失败:', e)
   }
 })
 

@@ -17,6 +17,7 @@ import { computeWorkChapterProgress, formatEvolutionPrompt } from '../style-evol
 import { extractWorkSummaryFromReply } from './work-summary-parser'
 import type { ModelType } from '../../model/types'
 import type { StyleAnalysisResult, AssistantWorkReference } from './types'
+import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../../shared/style-reference-limits'
 
 const activeChats = new Map<number, AbortController>()
 
@@ -201,7 +202,6 @@ export async function runAssistantChat(
         prompt: userPrompt,
         systemPrompt,
         step: 'assistant_chat',
-        temperature: 0.7,
         enrichWorkContext: false,
         enrichNarrativeMemory: false,
         modelType: conv.model_type ? conv.model_type as ModelType : undefined,
@@ -377,7 +377,7 @@ export function exportStyleFromAnalysis(
   const sample_text = analysis.sampleExcerpts.join('\n\n').slice(0, 3000)
   if (!sample_text.trim()) throw new Error('样例段落为空，无法保存文风')
 
-  const reference_text = analysis.referenceText?.trim().slice(0, 5000) || undefined
+  const reference_text = analysis.referenceText?.trim().slice(0, MAX_STYLE_REFERENCE_TEXT_CHARS) || undefined
   const stepRulesJson = analysis.stepRules ? JSON.stringify(analysis.stepRules) : undefined
 
   if (options?.overwriteStyleId) {

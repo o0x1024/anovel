@@ -42,7 +42,7 @@ defineProps<{
         <span><strong>{{ item.label }}</strong>：{{ item.detail }}</span>
       </div>
     </div>
-    <div v-if="aiReport" class="mt-2 p-2 bg-base-100 rounded border border-base-300 text-xs whitespace-pre-wrap max-h-40 overflow-auto">
+    <div v-if="aiReport" class="mt-2 p-3 bg-base-100 rounded border border-base-300 text-xs whitespace-pre-wrap max-h-64 overflow-auto leading-relaxed">
       {{ aiReport }}
     </div>
     <div v-if="result.writerBlockHint && blockHints?.[result.writerBlockHint]" class="mt-2 alert alert-warning py-2 text-xs">

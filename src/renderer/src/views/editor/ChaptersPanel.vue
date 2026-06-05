@@ -147,9 +147,6 @@ watch(batchResult, async (content) => {
       : '生成结果中未识别到章节结构，请重新生成或检查 AI 是否输出了 JSON 代码块'
     return
   }
-  if (chapters.value.length === 0) {
-    await applyParsedChapters('append')
-  }
 })
 
 async function reparseBatchResult() {
@@ -336,6 +333,7 @@ async function aiBatchChapters() {
       systemPrompt: batchSystemPrompt,
       workId: props.workId,
       step: 'volume_chapters_batch',
+      volumeId: selectedVolume.value.id,
       workContextOptions: { includeVolumes: true }
     }) as { success: boolean; content: string; error?: string }
 
@@ -397,7 +395,10 @@ async function aiChapterOutline(ch: Chapter) {
     '标注 beat_role(A/B/C/transition)、foreshadow_target、next_hook、characters（本章出场角色名数组），放在末尾 JSON 代码块。',
     '末尾附 JSON：{"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}'
   ].join('\n')
-  const res = await chat(context, outlineSystem, 'chapter_outline')
+  const res = await chat(context, outlineSystem, 'chapter_outline', {
+    chapterId: ch.id,
+    volumeId: ch.volume_id
+  })
   if (res.success) {
     const cleanedOutline = await window.anovel.invoke('chapter:stripOutline', res.content) as string
     editingChapterId.value = ch.id

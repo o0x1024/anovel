@@ -45,7 +45,8 @@ export const TARGET_WORD_PRESETS = [
   2_000_000
 ] as const
 
-export const WORDS_PER_CHAPTER_PRESETS = [3500, 4000, 4500, 5000] as const
+/** 每章目标字数选项 — 章节规划与正文生成共用 */
+export const WORDS_PER_CHAPTER_PRESETS = [2000, 2500, 3000, 3500, 4000, 4500, 5000] as const
 
 export function novelLengthSummary(length: NovelLength): string {
   const p = NOVEL_LENGTH_PRESETS[length]

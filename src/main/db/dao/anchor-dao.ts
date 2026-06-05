@@ -8,6 +8,8 @@ export interface AnchorRow {
   content: string
   is_active: number
   created_step: string | null
+  target_chapter_id: number | null
+  target_volume_id: number | null
   create_time: string
 }
 
@@ -17,6 +19,8 @@ export interface AnchorCreateInput {
   title: string
   content: string
   created_step?: string
+  target_chapter_id?: number | null
+  target_volume_id?: number | null
 }
 
 /** 锚点类型常量 */
@@ -53,17 +57,33 @@ export class AnchorDAO extends BaseDAO {
 
   create(input: AnchorCreateInput): number {
     return this.insert(
-      'INSERT INTO anchors (work_id, type, title, content, created_step) VALUES (?, ?, ?, ?, ?)',
-      [input.work_id, input.type, input.title, input.content, input.created_step ?? null]
+      'INSERT INTO anchors (work_id, type, title, content, created_step, target_chapter_id, target_volume_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        input.work_id,
+        input.type,
+        input.title,
+        input.content,
+        input.created_step ?? null,
+        input.target_chapter_id ?? null,
+        input.target_volume_id ?? null
+      ]
     )
   }
 
-  update(id: number, fields: { title?: string; content?: string; type?: string }): boolean {
+  update(id: number, fields: {
+    title?: string
+    content?: string
+    type?: string
+    target_chapter_id?: number | null
+    target_volume_id?: number | null
+  }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
     if (fields.title !== undefined) { sets.push('title = ?'); vals.push(fields.title) }
     if (fields.content !== undefined) { sets.push('content = ?'); vals.push(fields.content) }
     if (fields.type !== undefined) { sets.push('type = ?'); vals.push(fields.type) }
+    if (fields.target_chapter_id !== undefined) { sets.push('target_chapter_id = ?'); vals.push(fields.target_chapter_id) }
+    if (fields.target_volume_id !== undefined) { sets.push('target_volume_id = ?'); vals.push(fields.target_volume_id) }
     if (sets.length === 0) return false
     vals.push(id)
     return this.run(`UPDATE anchors SET ${sets.join(', ')} WHERE id = ?`, vals).changes > 0

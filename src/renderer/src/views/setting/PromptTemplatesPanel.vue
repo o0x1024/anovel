@@ -23,6 +23,27 @@ const CATEGORY_META: Record<string, { label: string; icon: string; color: string
   internal: { label: '内部', icon: 'lock', color: 'text-base-content/50' }
 }
 
+/** 各模板 key 对应图标（未列出的回退到分类图标） */
+const TEMPLATE_ICONS: Record<string, string> = {
+  'body_generation.system': 'pen-nib',
+  'body_generation.continuity_rule': 'link',
+  'body_generation.human_writing_meta': 'feather-alt',
+  'body_style_rewrite.system': 'rotate',
+  'ai_trace_polish.system': 'eraser',
+  'quality_diagnosis_ai.system': 'stethoscope',
+  'quality_apply_fixes.system': 'wand-magic-sparkles',
+  'lab_deai.system': 'flask',
+  'debate_fusion.system': 'code'
+}
+
+function templateIcon(tpl: PromptTemplateInfo): string {
+  return TEMPLATE_ICONS[tpl.key] ?? CATEGORY_META[tpl.category]?.icon ?? 'file-lines'
+}
+
+function templateIconColor(tpl: PromptTemplateInfo): string {
+  return CATEGORY_META[tpl.category]?.color ?? 'text-base-content/50'
+}
+
 const templates = ref<PromptTemplateInfo[]>([])
 const loading = ref(true)
 const editing = ref<string | null>(null)
@@ -32,6 +53,12 @@ const searchQuery = ref('')
 const filterCategory = ref<string | null>(null)
 const confirmResetKey = ref<string | null>(null)
 const confirmResetAll = ref(false)
+const resettingKey = ref<string | null>(null)
+const resettingAll = ref(false)
+
+const confirmResetTemplate = computed(() =>
+  templates.value.find(t => t.key === confirmResetKey.value) ?? null
+)
 
 const categories = computed(() => {
   const cats = new Set(templates.value.map(t => t.category))
@@ -97,16 +124,36 @@ async function saveEdit(key: string) {
   }
 }
 
+function requestResetOne(key: string) {
+  confirmResetKey.value = key
+}
+
 async function resetOne(key: string) {
-  await window.anovel.invoke('prompt:resetToDefault', key)
-  confirmResetKey.value = null
-  await load()
+  resettingKey.value = key
+  try {
+    await window.anovel.invoke('prompt:resetToDefault', key)
+    if (editing.value === key) {
+      editing.value = null
+      editText.value = ''
+    }
+    confirmResetKey.value = null
+    await load()
+  } finally {
+    resettingKey.value = null
+  }
 }
 
 async function resetAll() {
-  await window.anovel.invoke('prompt:resetAll')
-  confirmResetAll.value = false
-  await load()
+  resettingAll.value = true
+  try {
+    await window.anovel.invoke('prompt:resetAll')
+    editing.value = null
+    editText.value = ''
+    confirmResetAll.value = false
+    await load()
+  } finally {
+    resettingAll.value = false
+  }
 }
 
 function effectiveText(t: PromptTemplateInfo): string {
@@ -185,14 +232,17 @@ onMounted(load)
             </button>
           </div>
 
-          <!-- 全部重置 -->
+          <!-- 一键恢复默认 -->
           <button
-            v-if="customizedCount > 0"
-            class="btn btn-xs btn-ghost text-error"
+            v-if="templates.length > 0"
+            class="btn btn-xs btn-outline btn-error"
+            :class="{ loading: resettingAll }"
+            :disabled="resettingAll || loading"
             @click="confirmResetAll = true"
           >
-            <font-awesome-icon icon="rotate-left" class="mr-1" />
-            全部重置
+            <font-awesome-icon v-if="!resettingAll" icon="rotate-left" class="mr-1" />
+            一键恢复默认
+            <span v-if="customizedCount > 0" class="badge badge-error badge-xs ml-1">{{ customizedCount }}</span>
           </button>
         </div>
       </div>
@@ -228,8 +278,15 @@ onMounted(load)
           <div class="card-body p-4">
             <!-- 标题行 -->
             <div class="flex items-start justify-between gap-2">
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2">
+              <div class="flex-1 min-w-0 flex items-start gap-3">
+                <div
+                  class="w-9 h-9 rounded-lg bg-base-200 flex items-center justify-center shrink-0"
+                  :class="templateIconColor(tpl)"
+                >
+                  <font-awesome-icon :icon="templateIcon(tpl)" class="text-base" />
+                </div>
+                <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2 flex-wrap">
                   <span class="font-medium">{{ tpl.label }}</span>
                   <span
                     v-if="tpl.isCustomized"
@@ -240,6 +297,7 @@ onMounted(load)
                 <p v-if="tpl.description" class="text-xs text-base-content/50 mt-1">
                   {{ tpl.description }}
                 </p>
+                </div>
               </div>
               <div class="flex items-center gap-1 shrink-0">
                 <button
@@ -251,11 +309,19 @@ onMounted(load)
                   编辑
                 </button>
                 <button
-                  v-if="tpl.isCustomized && editing !== tpl.key"
-                  class="btn btn-xs btn-ghost text-error"
-                  @click="confirmResetKey = tpl.key"
+                  v-if="editing !== tpl.key"
+                  class="btn btn-xs btn-outline"
+                  :class="tpl.isCustomized ? 'btn-error' : 'btn-ghost'"
+                  :disabled="resettingKey === tpl.key"
+                  :title="tpl.isCustomized ? '清除自定义内容，恢复为内置默认' : '当前已是内置默认，点击可确认恢复'"
+                  @click="requestResetOne(tpl.key)"
                 >
-                  <font-awesome-icon icon="rotate-left" />
+                  <font-awesome-icon
+                    icon="rotate-left"
+                    class="mr-0.5"
+                    :spin="resettingKey === tpl.key"
+                  />
+                  恢复默认
                 </button>
               </div>
             </div>
@@ -281,17 +347,28 @@ onMounted(load)
                   ></textarea>
                 </div>
               </div>
-              <div class="flex items-center justify-end gap-2">
-                <button class="btn btn-xs btn-ghost" @click="cancelEdit">取消</button>
+              <div class="flex items-center justify-between gap-2">
                 <button
-                  class="btn btn-xs btn-primary"
-                  :class="{ loading: saving }"
-                  :disabled="saving"
-                  @click="saveEdit(tpl.key)"
+                  class="btn btn-xs btn-outline btn-error"
+                  :class="{ loading: resettingKey === tpl.key }"
+                  :disabled="saving || resettingKey === tpl.key"
+                  @click="requestResetOne(tpl.key)"
                 >
-                  <font-awesome-icon icon="check" class="mr-1" />
-                  保存
+                  <font-awesome-icon v-if="resettingKey !== tpl.key" icon="rotate-left" class="mr-1" />
+                  恢复默认
                 </button>
+                <div class="flex items-center gap-2">
+                  <button class="btn btn-xs btn-ghost" :disabled="saving" @click="cancelEdit">取消</button>
+                  <button
+                    class="btn btn-xs btn-primary"
+                    :class="{ loading: saving }"
+                    :disabled="saving || resettingKey === tpl.key"
+                    @click="saveEdit(tpl.key)"
+                  >
+                    <font-awesome-icon icon="check" class="mr-1" />
+                    保存
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -299,37 +376,63 @@ onMounted(load)
       </div>
     </template>
 
-    <!-- 重置确认弹窗（单条） -->
+    <!-- 恢复默认确认弹窗（单条） -->
     <dialog :open="confirmResetKey !== null" class="modal modal-bottom sm:modal-middle">
       <div class="modal-box">
-        <h3 class="text-lg font-bold">确认重置</h3>
+        <h3 class="text-lg font-bold">恢复默认</h3>
         <p class="py-4 text-sm text-base-content/70">
-          将 <span class="font-mono text-primary">{{ confirmResetKey }}</span> 恢复为内置默认值？自定义内容将被清除。
+          <template v-if="confirmResetTemplate?.isCustomized">
+            将「<strong>{{ confirmResetTemplate.label }}</strong>」恢复为内置默认值？当前自定义内容将被清除。
+          </template>
+          <template v-else>
+            「<strong>{{ confirmResetTemplate?.label ?? confirmResetKey }}</strong>」当前已是内置默认。确认执行恢复操作（无变更）。
+          </template>
         </p>
+        <p class="text-xs font-mono text-base-content/40 -mt-2 pb-2">{{ confirmResetKey }}</p>
         <div class="modal-action">
-          <button class="btn btn-sm btn-ghost" @click="confirmResetKey = null">取消</button>
-          <button class="btn btn-sm btn-error" @click="resetOne(confirmResetKey!)">确认重置</button>
+          <button class="btn btn-sm btn-ghost" :disabled="!!resettingKey" @click="confirmResetKey = null">取消</button>
+          <button
+            class="btn btn-sm btn-error"
+            :class="{ loading: !!resettingKey }"
+            :disabled="!!resettingKey"
+            @click="resetOne(confirmResetKey!)"
+          >
+            确认恢复
+          </button>
         </div>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button @click="confirmResetKey = null">close</button>
+        <button type="button" :disabled="!!resettingKey" @click="confirmResetKey = null">close</button>
       </form>
     </dialog>
 
-    <!-- 重置确认弹窗（全部） -->
+    <!-- 一键恢复默认确认弹窗 -->
     <dialog :open="confirmResetAll" class="modal modal-bottom sm:modal-middle">
       <div class="modal-box">
-        <h3 class="text-lg font-bold text-error">确认全部重置</h3>
+        <h3 class="text-lg font-bold text-error">一键恢复默认</h3>
         <p class="py-4 text-sm text-base-content/70">
-          将所有 <strong>{{ customizedCount }}</strong> 个已自定义的模板恢复为内置默认值？此操作不可撤销。
+          <template v-if="customizedCount > 0">
+            将全部 <strong>{{ templates.length }}</strong> 个模板恢复为内置默认值？
+            其中 <strong>{{ customizedCount }}</strong> 个含自定义内容，恢复后将被清除。
+          </template>
+          <template v-else>
+            将全部 <strong>{{ templates.length }}</strong> 个模板恢复为内置默认值。当前均无自定义内容，执行后无变更。
+          </template>
         </p>
         <div class="modal-action">
-          <button class="btn btn-sm btn-ghost" @click="confirmResetAll = false">取消</button>
-          <button class="btn btn-sm btn-error" @click="resetAll">确认全部重置</button>
+          <button class="btn btn-sm btn-ghost" :disabled="resettingAll" @click="confirmResetAll = false">取消</button>
+          <button
+            class="btn btn-sm btn-error"
+            :class="{ loading: resettingAll }"
+            :disabled="resettingAll"
+            @click="resetAll"
+          >
+            确认全部恢复
+          </button>
         </div>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button @click="confirmResetAll = false">close</button>
+        <button type="button" :disabled="resettingAll" @click="confirmResetAll = false">close</button>
       </form>
     </dialog>
   </div>

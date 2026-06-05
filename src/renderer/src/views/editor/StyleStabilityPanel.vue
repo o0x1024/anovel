@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { useStyleChangeSync } from '../../composables/useStyleChangeSync'
 import PanelTitle from '../../components/PanelTitle.vue'
 
 const props = defineProps<{ workId: number }>()
@@ -23,6 +24,7 @@ interface Report {
 const report = ref<Report | null>(null)
 const loading = ref(true)
 
+useStyleChangeSync(load)
 onMounted(load)
 
 async function load() {

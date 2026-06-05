@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { useRouter, useRoute } from 'vue-router'
 import { computed, watch } from 'vue'
+import { useSidebarWidth } from '../composables/useSidebarWidth'
 import { getNavRestorePath, saveNavPath } from '../services/navSession'
 
 const router = useRouter()
 const route = useRoute()
+const { width: sidebarWidth, isResizing, startResize } = useSidebarWidth()
 
 const navItems = [
   { path: '/', icon: 'book-open', label: '作品管理', section: 'workspace' },
@@ -39,7 +41,10 @@ function navigateNav(navPath: string) {
 
 <template>
   <div class="flex h-screen bg-base-100 text-base-content font-sans">
-    <aside class="w-64 bg-base-200 border-r border-base-300 flex flex-col shrink-0 select-none">
+    <aside
+      class="bg-base-200 border-r border-base-300 flex flex-col shrink-0 select-none relative"
+      :style="{ width: `${sidebarWidth}px` }"
+    >
       <div class="px-6 py-5 border-b border-base-300 flex flex-col gap-1">
         <h1 class="text-xl font-extrabold text-primary flex items-center gap-2.5 tracking-tight">
           <div class="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
@@ -110,6 +115,16 @@ function navigateNav(navPath: string) {
         <span>ANovel Desktop</span>
         <span>v1.0.0</span>
       </div>
+
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整侧栏宽度"
+        title="拖动调整侧栏宽度"
+        class="absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-10 translate-x-1/2 touch-none"
+        :class="isResizing ? 'bg-primary/40' : 'hover:bg-primary/25'"
+        @mousedown="startResize"
+      />
     </aside>
 
     <main class="flex-1 min-h-0 overflow-auto bg-base-100 relative">

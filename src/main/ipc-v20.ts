@@ -8,11 +8,13 @@ import {
 } from './context/style-fingerprint'
 import { detectAiTraces, AI_TRACE_POLISH_PROMPT } from './context/ai-trace-detect'
 import { resolvePrompt } from './context/prompt-registry'
+import { broadcastStyleChanged } from './style-events'
 import {
   suggestRulesFromAiTrace,
   buildStyleRewriteSystemPrompt,
   buildStyleRewriteUserPrompt
 } from './context/anti-ai-rules'
+import { diagnoseChapterQuality, formatQualityFixHints } from './context/chapter-quality'
 import { runModelDebate } from './context/model-debate'
 import { buildExportQualityReport } from './context/export-quality-report'
 import { exportWorkContent } from './context/export-content'
@@ -52,7 +54,9 @@ export function registerV20IpcHandlers(): void {
   })
   ipcMain.handle('fingerprint:saveToStyle', (_e, styleId: number, text: string) => {
     const fp = extractStyleFingerprint(text)
-    return writingStyleDAO.update(styleId, { fingerprint_json: JSON.stringify(fp) })
+    const ok = writingStyleDAO.update(styleId, { fingerprint_json: JSON.stringify(fp) })
+    if (ok) broadcastStyleChanged(styleId)
+    return ok
   })
   ipcMain.handle('fingerprint:checkDeviation', (_e, workId: number, chapterId: number, content: string) => {
     const styleId = writingStyleDAO.getWorkStyleId(workId)
@@ -91,14 +95,16 @@ export function registerV20IpcHandlers(): void {
     return res
   })
 
-  ipcMain.handle('body:styleRewrite', async (e, workId: number, content: string, wordTarget?: number) => {
+  ipcMain.handle('body:styleRewrite', async (e, workId: number, content: string, wordTarget?: number, chapterId?: number) => {
     const systemPrompt = buildStyleRewriteSystemPrompt(workId)
     const target = typeof wordTarget === 'number' && wordTarget > 0 ? wordTarget : undefined
+    const qualityHints = typeof chapterId === 'number' && chapterId > 0
+      ? formatQualityFixHints(diagnoseChapterQuality(workId, chapterId, content))
+      : undefined
     return modelService.chat({
-      prompt: buildStyleRewriteUserPrompt(content, target),
+      prompt: buildStyleRewriteUserPrompt(content, target, qualityHints),
       systemPrompt,
       step: 'body_style_rewrite',
-      maxTokens: target ? Math.ceil(target * 1.5) : undefined,
       enrichWorkContext: false,
       enrichNarrativeMemory: false
     }, { webContents: e.sender })

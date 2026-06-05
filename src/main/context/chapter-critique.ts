@@ -72,6 +72,38 @@ export function parseCritiqueResponse(content: string): CritiqueResult {
   }
 }
 
+/** 将六维批判结果格式化为供修复模型使用的报告 */
+export function formatCritiqueFixReport(result: CritiqueResult): string {
+  const lines = [
+    '## 总体评价',
+    result.summary,
+    `综合得分：${result.overallScore}`,
+    '',
+    '## 未达标维度及问题'
+  ]
+  const failed = result.dimensions.filter(d => !d.passed)
+  if (failed.length === 0) {
+    lines.push('（无未达标维度，可按总体评价做微调）')
+  } else {
+    for (const dim of failed) {
+      lines.push(`### ${dim.label}（${dim.score} 分）`)
+      if (dim.issues.length) {
+        for (const issue of dim.issues) {
+          lines.push(`- ${issue}`)
+        }
+      } else {
+        lines.push('- 评分未达标，需整体改善该维度')
+      }
+    }
+  }
+  lines.push('', '## 全部维度评分')
+  for (const dim of result.dimensions) {
+    const status = dim.passed ? '通过' : '未达标'
+    lines.push(`- ${dim.label}：${dim.score} 分（${status}）`)
+  }
+  return lines.join('\n')
+}
+
 export const CRITIQUE_SYSTEM_PROMPT = [
   '你是资深小说编辑，对刚生成的章节正文进行六维批判性自评。',
   '评分 1-10，6 分及以上为通过。',

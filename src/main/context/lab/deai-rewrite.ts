@@ -3,13 +3,12 @@ import { labTaskDAO, writingStyleDAO } from '../../db'
 import { modelService } from '../../model'
 import { extractTextFromDocx, isDocxFileName } from '../assistant/docx-extract'
 import { BODY_PARAGRAPH_SPACING_RULE, normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
-import { buildLabDeaiSystemPrompt } from './lab-deai-prompt'
 
 const activeRuns = new Map<number, AbortController>()
 
 function buildDeaiUserPrompt(originalText: string): string {
   return [
-    '请对以下文本进行调整，只输出改写后的正文，不要解释过程。',
+    '请参考目标范文对如下内容进行重新生成和改写，只输出改写后的正文，不要解释过程。',
     BODY_PARAGRAPH_SPACING_RULE,
     '',
     originalText
@@ -28,7 +27,8 @@ export async function runDeaiRewrite(sender: WebContents, taskId: number): Promi
 
   if (!writingStyleDAO.getById(task.style_id)) throw new Error('所选文风不存在')
 
-  const systemPrompt = buildLabDeaiSystemPrompt(task.style_id)
+  const systemPrompt = task.system_prompt?.trim()
+  if (!systemPrompt) throw new Error('System Prompt 不能为空')
 
   let fullContent = ''
   try {
@@ -37,7 +37,6 @@ export async function runDeaiRewrite(sender: WebContents, taskId: number): Promi
         prompt: buildDeaiUserPrompt(task.original_text),
         systemPrompt,
         step: 'lab_deai',
-        temperature: 0.7,
         enrichWorkContext: false,
         enrichNarrativeMemory: false
       },

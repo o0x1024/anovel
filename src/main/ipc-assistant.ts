@@ -7,6 +7,7 @@ import {
   assistantRoleDAO
 } from './db'
 import type { StyleAnalysisResult, AssistantWorkReference } from './context/assistant/types'
+import { broadcastStyleChanged } from './style-events'
 import {
   cancelAssistantChat,
   clearAssistantConversationMessages,
@@ -166,7 +167,7 @@ export function registerAssistantIpcHandlers(): void {
     rename?: string
   }) => {
     const id = exportStyleFromAnalysis(analysis, options)
-    e.sender.send('style:changed', id)
+    broadcastStyleChanged(id)
     return id
   })
 }

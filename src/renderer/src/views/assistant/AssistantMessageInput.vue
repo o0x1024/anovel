@@ -37,16 +37,21 @@ const attachedWorkKeys = computed(() => props.attachedWorks.map(workRefKey))
 const groupedModelOptions = computed(() => {
   const order: string[] = []
   const groups = new Map<string, AssistantModelOption[]>()
+  const labelByType = new Map<string, string>()
   for (const option of props.modelOptions) {
     if (!groups.has(option.model_type)) {
       order.push(option.model_type)
       groups.set(option.model_type, [])
+      labelByType.set(
+        option.model_type,
+        option.provider_label ?? ASSISTANT_MODEL_LABELS[option.model_type] ?? option.model_type
+      )
     }
     groups.get(option.model_type)!.push(option)
   }
   return order.map(modelType => ({
     modelType,
-    providerLabel: ASSISTANT_MODEL_LABELS[modelType] ?? modelType,
+    providerLabel: labelByType.get(modelType)!,
     options: groups.get(modelType)!
   }))
 })

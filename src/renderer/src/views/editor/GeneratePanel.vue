@@ -3,7 +3,8 @@ const unsavedContentCache = new Map<number, string>()
 </script>
 
 <script setup lang="ts">
-import { ref, onMounted, watch, computed, inject } from 'vue'
+import { ref, onMounted, watch, computed, inject, nextTick } from 'vue'
+import { useStyleChangeSync } from '../../composables/useStyleChangeSync'
 import { useModelChat } from './useModelChat'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -19,6 +20,8 @@ import AiTraceReport from './AiTraceReport.vue'
 import AntiAiRulesPanel from './AntiAiRulesPanel.vue'
 import { editorNavKey } from './editor-nav'
 import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
+import { formatBodyWordTargetLine } from '../../../../shared/body-word-target'
+import { WORDS_PER_CHAPTER_PRESETS } from '../../../../shared/writing-plan-presets'
 
 const props = defineProps<{ workId: number }>()
 const nav = inject(editorNavKey)
@@ -38,7 +41,7 @@ const chapters = ref<Chapter[]>([])
 const selectedVolume = ref<number | null>(null)
 const selectedChapterId = ref<number | null>(null)
 const wordTarget = ref(4000)
-const wordOptions = [2000, 2500, 3000, 3500, 4000, 4500, 5000]
+const wordOptions = WORDS_PER_CHAPTER_PRESETS
 
 function estimateWordRange(outline: string | null | undefined, target: number): { min: number; max: number; recommended: number } {
   if (!outline?.trim()) return { min: Math.round(target * 0.7), max: target, recommended: target }
@@ -83,8 +86,24 @@ const maxActiveAnchors = ref(12)
 const boundStyleName = ref<string | null>(null)
 
 interface AlignmentReport {
-  items: { anchorId: number; title: string; content: string; type: string; aligned: 0 | 1 | 2; detail: string }[]
-  summary: { total: number; aligned: number; partial: number; missing: number }
+  items: {
+    anchorId: number
+    title: string
+    content: string
+    type: string
+    aligned: 0 | 1 | 2 | null
+    detail: string
+    skipped?: boolean
+    skipReason?: string
+  }[]
+  summary: {
+    total: number
+    applicable?: number
+    aligned: number
+    partial: number
+    missing: number
+    skipped?: number
+  }
 }
 
 interface CritiqueResult {
@@ -142,12 +161,23 @@ const runningV15Checks = ref(false)
 const savingChapter = ref(false)
 const extractingMemory = ref(false)
 const copyHint = ref('')
+const humanizeHint = ref('')
+const humanizeMsg = ref('')
+const humanizeMsgTone = ref<'success' | 'warning' | 'error'>('success')
+let humanizeHintTimer: ReturnType<typeof setTimeout> | null = null
+let humanizeMsgTimer: ReturnType<typeof setTimeout> | null = null
 const memoryExtractMsg = ref('')
 const fingerprintMsg = ref('')
 const blockHints = ref<Record<string, { label: string; hint: string }>>({})
 const budgetPreview = ref<BudgetPreview | null>(null)
 const crossChapterIssues = ref<CrossChapterIssue[]>([])
 const scanningCrossChapter = ref(false)
+const crossChapterScanHint = ref('')
+const crossChapterScanMsg = ref('')
+const crossChapterScanTone = ref<'success' | 'warning' | 'error' | 'info'>('info')
+const crossChapterReportRef = ref<HTMLElement | null>(null)
+let crossChapterScanHintTimer: ReturnType<typeof setTimeout> | null = null
+let crossChapterScanMsgTimer: ReturnType<typeof setTimeout> | null = null
 const gateResult = ref<ConsistencyGateResult | null>(null)
 const antiAiRulesPanelRef = ref<{ reload: () => Promise<void>; appendRules: (rules: string[]) => Promise<void> } | null>(null)
 const antiAiViolations = ref<AntiAiViolation[]>([])
@@ -189,6 +219,18 @@ watch(wordTarget, async (value) => {
   await window.anovel.invoke('writingPlan:update', props.workId, { wordsPerChapter: value })
 })
 
+async function refreshBoundStyleName() {
+  const styleId = await window.anovel.invoke('style:getWorkStyleId', props.workId) as number | null
+  if (!styleId) {
+    boundStyleName.value = null
+    return
+  }
+  const style = await window.anovel.invoke('style:get', styleId) as { name: string } | null
+  boundStyleName.value = style?.name ?? null
+}
+
+useStyleChangeSync(refreshBoundStyleName)
+
 onMounted(async () => {
   await loadBodySystemPrompt()
   const plan = await window.anovel.invoke('writingPlan:get', props.workId) as { wordsPerChapter: number }
@@ -205,11 +247,7 @@ onMounted(async () => {
   maxActiveAnchors.value = limit.maxActive
   const ctx = await window.anovel.invoke('context:buildWork', props.workId, { includeVolumes: true }) as { text: string }
   workContextText.value = ctx.text
-  const styleId = await window.anovel.invoke('style:getWorkStyleId', props.workId) as number | null
-  if (styleId) {
-    const style = await window.anovel.invoke('style:get', styleId) as { name: string }
-    boundStyleName.value = style?.name ?? null
-  }
+  await refreshBoundStyleName()
   if (volumes.value.length) selectedVolume.value = volumes.value[0].id
   blockHints.value = await window.anovel.invoke('writerBlock:types') as typeof blockHints.value
   workReferenceText.value = await window.anovel.invoke('setting:getWorkReferenceText', props.workId) as string
@@ -299,9 +337,8 @@ async function loadNarrativeMemory(chapterId: number) {
   await refreshBudgetPreview(chapterId)
 }
 
-function buildWordTargetLine(outline: string | null | undefined): string {
-  const range = estimateWordRange(outline, wordTarget.value)
-  return `目标字数：${range.min}-${range.max}字（以情节自然结束为准，不必凑满上限）`
+function buildWordTargetLine(): string {
+  return formatBodyWordTargetLine(wordTarget.value)
 }
 
 async function refreshBudgetPreview(chapterId: number) {
@@ -315,7 +352,7 @@ async function refreshBudgetPreview(chapterId: number) {
     `分卷：${vol?.name || ''}`,
     vol?.description ? `分卷说明：${vol.description}` : '',
     `章节：${ch.title}`,
-    buildWordTargetLine(ch.outline),
+    buildWordTargetLine(),
     ch.outline ? `章节大纲：\n${ch.outline}` : '（暂无章节大纲，请尽量根据作品上下文创作）'
   ].filter(Boolean).join('\n\n')
 
@@ -324,23 +361,86 @@ async function refreshBudgetPreview(chapterId: number) {
     systemPrompt: bodySystemPrompt.value,
     workId: props.workId,
     step: 'body_generation',
-    maxTokens: Math.ceil(wordTarget.value * 1.5),
     workContextOptions: {
       includeVolumes: true,
       includeIncubator: false,
       excludeCoreTypes: ['worldview']
     },
     chapterId: ch.id,
+    volumeId: ch.volume_id,
     enrichNarrativeMemory: true
   }) as BudgetPreview
 
   budgetPreview.value = report
 }
 
+function summarizeCrossChapterIssues(issues: CrossChapterIssue[]): {
+  msg: string
+  tone: 'success' | 'warning' | 'error' | 'info'
+} {
+  if (issues.length === 0) {
+    return { msg: '跨章扫描完成，无返回结果', tone: 'warning' }
+  }
+  const sole = issues.length === 1 ? issues[0] : null
+  if (sole?.message.includes('章节不足 2 章')) {
+    return { msg: sole.message, tone: 'info' }
+  }
+  if (sole?.message.includes('未发现明显跨章逻辑问题')) {
+    return { msg: '跨章扫描完成：未发现明显跨章逻辑问题', tone: 'success' }
+  }
+  const errors = issues.filter(i => i.severity === 'error').length
+  const warnings = issues.filter(i => i.severity === 'warning').length
+  const infos = issues.filter(i => i.severity === 'info').length
+  const parts: string[] = []
+  if (errors) parts.push(`${errors} 条错误`)
+  if (warnings) parts.push(`${warnings} 条警告`)
+  if (infos) parts.push(`${infos} 条提示`)
+  const tone: 'success' | 'warning' | 'error' | 'info' =
+    errors > 0 ? 'error' : warnings > 0 ? 'warning' : 'info'
+  return {
+    msg: `跨章扫描完成：发现 ${parts.join('、')}（详情见下方列表）`,
+    tone
+  }
+}
+
+function showCrossChapterScanFeedback(
+  hint: string,
+  msg: string,
+  tone: 'success' | 'warning' | 'error' | 'info'
+) {
+  crossChapterScanHint.value = hint
+  crossChapterScanMsg.value = msg
+  crossChapterScanTone.value = tone
+  if (crossChapterScanHintTimer) clearTimeout(crossChapterScanHintTimer)
+  crossChapterScanHintTimer = setTimeout(() => {
+    crossChapterScanHint.value = ''
+    crossChapterScanHintTimer = null
+  }, 4000)
+  if (crossChapterScanMsgTimer) clearTimeout(crossChapterScanMsgTimer)
+  crossChapterScanMsgTimer = setTimeout(() => {
+    crossChapterScanMsg.value = ''
+    crossChapterScanMsgTimer = null
+  }, 12000)
+}
+
 async function runCrossChapterScan() {
+  if (scanningCrossChapter.value) return
   scanningCrossChapter.value = true
+  crossChapterScanMsg.value = ''
   try {
-    crossChapterIssues.value = await window.anovel.invoke('narrative:crossChapterScan', props.workId) as CrossChapterIssue[]
+    crossChapterIssues.value = await window.anovel.invoke(
+      'narrative:crossChapterScan',
+      props.workId
+    ) as CrossChapterIssue[]
+    const { msg, tone } = summarizeCrossChapterIssues(crossChapterIssues.value)
+    const hint =
+      tone === 'success' ? '无问题' : tone === 'error' ? '有问题' : tone === 'warning' ? '有警告' : '已扫描'
+    showCrossChapterScanFeedback(hint, msg, tone)
+    await nextTick()
+    crossChapterReportRef.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : '跨章扫描失败'
+    showCrossChapterScanFeedback('失败', message, 'error')
   } finally {
     scanningCrossChapter.value = false
   }
@@ -362,7 +462,7 @@ async function generateBody() {
     `分卷：${vol?.name || ''}`,
     vol?.description ? `分卷说明：${vol.description}` : '',
     `章节：${ch.title}`,
-    buildWordTargetLine(ch.outline),
+    buildWordTargetLine(),
     ch.outline ? `章节大纲：\n${ch.outline}` : '（暂无章节大纲，请尽量根据作品上下文创作）'
   ].filter(Boolean).join('\n\n')
 
@@ -372,17 +472,19 @@ async function generateBody() {
   qualityAiReport.value = ''
   worldviewViolations.value = []
   gateResult.value = null
+  humanizeMsg.value = ''
+  humanizeHint.value = ''
 
   await refreshBudgetPreview(ch.id)
 
   await chat(prompt, bodySystemPrompt.value, 'body_generation', {
-    maxTokens: Math.ceil(wordTarget.value * 1.5),
     workContextOptions: {
       includeVolumes: true,
       includeIncubator: false,
       excludeCoreTypes: ['worldview']
     },
     chapterId: ch.id,
+    volumeId: ch.volume_id,
     enrichNarrativeMemory: true
   })
   if (result.value) {
@@ -393,12 +495,59 @@ async function generateBody() {
   }
 }
 
+function showHumanizeFeedback(
+  hint: string,
+  msg: string,
+  tone: 'success' | 'warning' | 'error'
+) {
+  humanizeHint.value = hint
+  humanizeMsg.value = msg
+  humanizeMsgTone.value = tone
+  if (humanizeHintTimer) clearTimeout(humanizeHintTimer)
+  humanizeHintTimer = setTimeout(() => {
+    humanizeHint.value = ''
+    humanizeHintTimer = null
+  }, 4000)
+  if (humanizeMsgTimer) clearTimeout(humanizeMsgTimer)
+  humanizeMsgTimer = setTimeout(() => {
+    humanizeMsg.value = ''
+    humanizeMsgTimer = null
+  }, 10000)
+}
+
 async function applyHumanize(content: string): Promise<string> {
   humanizing.value = true
+  const before = content
   try {
-    const humanized = await window.anovel.invoke('antiai:humanize', content) as string
+    const refText = workReferenceText.value.trim()
+    const humanized = await window.anovel.invoke(
+      'antiai:humanize',
+      content,
+      refText ? { referenceText: refText } : {}
+    ) as string
     humanizeStats.value = await window.anovel.invoke('antiai:measureAiSignature', humanized) as typeof humanizeStats.value
+    const stats = humanizeStats.value
+    const statsLine = stats
+      ? `剩余 AI 高频词 ${stats.wordSubstitutionHits} 处 · 均匀句群 ${stats.uniformSentenceRuns} 组 · 可预测性 ${stats.avgTokenPredictability}`
+      : ''
+    if (humanized === before) {
+      showHumanizeFeedback(
+        '无变化',
+        `本地去AI已完成，正文未改动（无匹配词或未触发扰动）。${statsLine}`,
+        'warning'
+      )
+    } else {
+      showHumanizeFeedback(
+        '已处理',
+        `正文已更新。${statsLine}`,
+        'success'
+      )
+    }
     return humanized
+  } catch (e) {
+    const message = e instanceof Error ? e.message : '去AI处理失败'
+    showHumanizeFeedback('失败', message, 'error')
+    return before
   } finally {
     humanizing.value = false
   }
@@ -429,7 +578,7 @@ function handleWorkRefFile(event: Event) {
 }
 
 async function manualHumanize() {
-  if (!result.value.trim()) return
+  if (!result.value.trim() || humanizing.value) return
   const humanized = await applyHumanize(result.value)
   result.value = humanized
   await recheckAntiAiViolations(humanized)
@@ -443,7 +592,8 @@ async function styleRewrite() {
       'body:styleRewrite',
       props.workId,
       result.value,
-      wordTarget.value
+      wordTarget.value,
+      selectedChapterId.value ?? undefined
     ) as {
       success: boolean
       content?: string
@@ -492,6 +642,9 @@ async function runPostGenerateChecks(content: string, persistAlignment: boolean)
   }
 }
 
+const applyingFixes = ref(false)
+const applyingCritiqueFixes = ref(false)
+
 async function runQualityAI() {
   if (!result.value || !selectedChapterId.value) return
   const res = await window.anovel.invoke('quality:diagnoseAI', props.workId, selectedChapterId.value, result.value) as {
@@ -501,6 +654,45 @@ async function runQualityAI() {
   }
   if (res.success) qualityAiReport.value = res.report || ''
   else alert(res.error || 'AI 诊断失败')
+}
+
+async function applyDiagnosisFixes() {
+  if (!result.value || !qualityAiReport.value || applyingFixes.value) return
+  applyingFixes.value = true
+  try {
+    const res = await window.anovel.invoke('quality:applyFixes', props.workId, result.value, qualityAiReport.value) as {
+      success: boolean
+      content?: string
+      error?: string
+    }
+    if (res.success && res.content) {
+      updateGeneratedContent(res.content)
+      qualityAiReport.value = ''
+    } else {
+      alert(res.error || '修改失败')
+    }
+  } finally {
+    applyingFixes.value = false
+  }
+}
+
+async function applyCritiqueFixes() {
+  if (!result.value || !critiqueResult.value || applyingCritiqueFixes.value) return
+  applyingCritiqueFixes.value = true
+  try {
+    const res = await window.anovel.invoke('critique:applyFixes', props.workId, result.value, critiqueResult.value) as {
+      success: boolean
+      content?: string
+      error?: string
+    }
+    if (res.success && res.content) {
+      updateGeneratedContent(res.content)
+    } else {
+      alert(res.error || '修改失败')
+    }
+  } finally {
+    applyingCritiqueFixes.value = false
+  }
 }
 
 async function runAlignmentCheck(content: string, persist = true) {
@@ -832,7 +1024,7 @@ async function copyBodyContent() {
                 @click="manualHumanize"
               >
                 <font-awesome-icon :icon="humanizing ? 'spinner' : 'eraser'" :spin="humanizing" class="w-3 h-3" />
-                {{ humanizing ? '处理中...' : '手动去AI' }}
+                {{ humanizing ? '处理中...' : (humanizeHint || '手动去AI') }}
               </button>
               <button
                 v-if="result.trim()"
@@ -846,6 +1038,15 @@ async function copyBodyContent() {
                 {{ styleRewriting ? '优化中...' : '稿件优化' }}
               </button>
               <button class="btn btn-ghost btn-xs" @click="runQualityAI">AI 诊断</button>
+              <button
+                v-if="qualityAiReport"
+                class="btn btn-warning btn-xs gap-1"
+                :disabled="applyingFixes || loading"
+                @click="applyDiagnosisFixes"
+              >
+                <font-awesome-icon :icon="applyingFixes ? 'spinner' : 'wrench'" :spin="applyingFixes" class="w-3 h-3" />
+                {{ applyingFixes ? '修改中...' : '按建议修改' }}
+              </button>
               <FavoriteButton
                 v-if="result.trim()"
                 :work-id="workId"
@@ -885,25 +1086,59 @@ async function copyBodyContent() {
                 type="button"
                 class="btn btn-ghost btn-xs gap-1 ml-auto"
                 :disabled="scanningCrossChapter"
+                title="基于已保存章节正文、伏笔与角色快照，检查全书衔接与一致性（不调用 AI）"
                 @click="runCrossChapterScan"
               >
                 <font-awesome-icon :icon="scanningCrossChapter ? 'spinner' : 'search'" :spin="scanningCrossChapter" class="w-3 h-3" />
-                跨章扫描
+                {{ scanningCrossChapter ? '扫描中...' : (crossChapterScanHint || '跨章扫描') }}
               </button>
             </div>
 
             <div v-if="error" class="alert alert-error text-xs py-2 mb-2 shrink-0">{{ error }}</div>
             <p v-if="memoryExtractMsg" class="text-xs text-success mb-2 shrink-0">{{ memoryExtractMsg }}</p>
             <p v-if="fingerprintMsg" class="text-xs text-base-content/50 mb-2 shrink-0">{{ fingerprintMsg }}</p>
+            <p
+              v-if="humanizeMsg"
+              class="text-xs mb-2 shrink-0 rounded-lg border px-3 py-2"
+              :class="humanizeMsgTone === 'success'
+                ? 'text-success border-success/30 bg-success/5'
+                : humanizeMsgTone === 'warning'
+                  ? 'text-warning border-warning/30 bg-warning/5'
+                  : 'text-error border-error/30 bg-error/5'"
+            >
+              {{ humanizeMsg }}
+            </p>
+            <div
+              v-if="crossChapterScanMsg"
+              class="text-xs mb-2 shrink-0 rounded-lg border px-3 py-2 space-y-1"
+              :class="crossChapterScanTone === 'success'
+                ? 'text-success border-success/30 bg-success/5'
+                : crossChapterScanTone === 'warning'
+                  ? 'text-warning border-warning/30 bg-warning/5'
+                  : crossChapterScanTone === 'error'
+                    ? 'text-error border-error/30 bg-error/5'
+                    : 'text-base-content/70 border-base-300 bg-base-100'"
+            >
+              <p class="font-medium">{{ crossChapterScanMsg }}</p>
+              <ul
+                v-if="crossChapterIssues.length && !crossChapterScanMsg.includes('章节不足')"
+                class="space-y-0.5 max-h-24 overflow-auto"
+              >
+                <li
+                  v-for="(issue, i) in crossChapterIssues"
+                  :key="i"
+                  :class="issue.severity === 'warning'
+                    ? 'text-warning'
+                    : issue.severity === 'error'
+                      ? 'text-error'
+                      : 'text-base-content/60'"
+                >
+                  {{ issue.chapterTitle ? `「${issue.chapterTitle}」` : '' }}{{ issue.message }}
+                </li>
+              </ul>
+            </div>
             <div v-if="gateResult && !gateResult.passed" class="text-xs text-error mb-2 shrink-0">
               门禁拦截：{{ gateResult.blockers.join('；') }}
-            </div>
-            <div v-if="humanizeStats" class="text-xs text-base-content/50 mb-2 shrink-0 flex flex-wrap gap-3">
-              <span>词级替换命中 {{ humanizeStats.wordSubstitutionHits }} 处</span>
-              <span>均匀句群 {{ humanizeStats.uniformSentenceRuns }} 组</span>
-              <span :class="humanizeStats.avgTokenPredictability === '高' ? 'text-warning' : 'text-success'">
-                AI可预测性：{{ humanizeStats.avgTokenPredictability }}
-              </span>
             </div>
             <div v-if="antiAiViolations.length" class="alert alert-warning text-xs py-2 mb-2 shrink-0">
               <p class="font-medium mb-1">去AI规则违规（模型未完全遵守 system prompt）</p>
@@ -952,7 +1187,6 @@ async function copyBodyContent() {
                 :content="result"
                 :regenerate-prompt="lastPrompt"
                 :regenerate-system-prompt="bodySystemPrompt"
-                :max-tokens="Math.ceil(wordTarget * 1.5)"
                 @update:content="updateGeneratedContent"
               />
               <AntiMeanPanel :work-id="workId" :content="result" @apply-content="updateGeneratedContent" />
@@ -972,10 +1206,16 @@ async function copyBodyContent() {
 
             <details
               v-if="result.trim() || critiqueResult || qualityResult || alignmentReport || crossChapterIssues.length"
+              ref="crossChapterReportRef"
               class="collapse collapse-arrow bg-base-100 border border-base-300/60 rounded-lg mt-3 shrink-0"
               open
             >
-              <summary class="collapse-title min-h-0 py-2 text-xs font-medium">质量报告与对齐检测</summary>
+              <summary class="collapse-title min-h-0 py-2 text-xs font-medium">
+                质量报告与对齐检测
+                <span v-if="crossChapterIssues.length" class="text-base-content/40 font-normal ml-1">
+                  · 跨章 {{ crossChapterIssues.length }} 条
+                </span>
+              </summary>
               <div class="collapse-content space-y-2 pb-3">
                 <div v-if="contextBudget" class="rounded-lg border border-base-300 p-2 text-xs">
                   <p class="font-medium mb-1">本次生成上下文</p>
@@ -994,7 +1234,11 @@ async function copyBodyContent() {
                   </p>
                 </div>
                 <p v-if="runningV15Checks" class="text-xs text-base-content/40">批判通道与质量诊断运行中...</p>
-                <ChapterCritiqueReport :result="critiqueResult" />
+                <ChapterCritiqueReport
+                  :result="critiqueResult"
+                  :applying="applyingCritiqueFixes"
+                  @apply-fixes="applyCritiqueFixes"
+                />
                 <ChapterQualityReport :result="qualityResult" :ai-report="qualityAiReport" :block-hints="blockHints" />
                 <div v-if="worldviewViolations.length" class="space-y-1">
                   <p class="text-xs font-medium text-warning">世界观校验</p>

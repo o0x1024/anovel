@@ -16,7 +16,12 @@ interface CritiqueResult {
   summary: string
 }
 
-const props = defineProps<{ result: CritiqueResult | null }>()
+const props = defineProps<{
+  result: CritiqueResult | null
+  applying?: boolean
+}>()
+
+defineEmits<{ applyFixes: [] }>()
 
 const failedDimensions = computed(() =>
   props.result?.dimensions.filter(d => !d.passed) ?? []
@@ -51,5 +56,15 @@ const failedDimensions = computed(() =>
         {{ dim.label }}：{{ dim.issues.join('；') || '评分未达标' }}
       </li>
     </ul>
+    <button
+      v-if="result.needsReview"
+      type="button"
+      class="btn btn-warning btn-xs gap-1 mt-2"
+      :disabled="applying"
+      @click="$emit('applyFixes')"
+    >
+      <font-awesome-icon :icon="applying ? 'spinner' : 'wrench'" :spin="applying" class="w-3 h-3" />
+      {{ applying ? '修改中...' : '按批判修复' }}
+    </button>
   </div>
 </template>

@@ -9,8 +9,11 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "postinstall": "electron-builder install-app-deps",
-    "pack:mac": "electron-vite build && electron-builder --mac",
-    "pack:win": "electron-vite build && electron-builder --win"
+    "icons": "node scripts/generate-app-icon.mjs",
+    "pack:mac": "electron-vite build && electron-builder --mac --arm64",
+    "pack:win": "electron-vite build && electron-builder --win --x64",
+    "release:mac": "electron-vite build && electron-builder --mac --arm64 --publish never",
+    "release:win": "electron-vite build && electron-builder --win --x64 --publish never"
   },
   "dependencies": {
     "axios": "^1.7.9",
@@ -35,6 +38,7 @@
     "electron-vite": "^4.0.0",
     "pinia": "^2.3.0",
     "postcss": "^8.4.49",
+    "sharp": "^0.33.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vue": "^3.5.13",
@@ -43,6 +47,7 @@
   "build": {
     "appId": "com.anovel.app",
     "productName": "ANovel",
+    "icon": "build/icon.png",
     "directories": {
       "output": "release"
     },
@@ -67,6 +72,11 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "o0x1024",
+      "repo": "anovel"
     }
   }
 }

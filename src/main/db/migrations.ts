@@ -151,8 +151,28 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE model_configs ADD COLUMN available_models_json TEXT`)
   }
 
+  if (hasTable(db, 'model_configs') && !hasColumn(db, 'model_configs', 'display_name')) {
+    db.exec(`ALTER TABLE model_configs ADD COLUMN display_name VARCHAR(100)`)
+  }
+
+  if (hasTable(db, 'model_configs') && !hasColumn(db, 'model_configs', 'provider_protocol')) {
+    db.exec(`ALTER TABLE model_configs ADD COLUMN provider_protocol VARCHAR(20)`)
+  }
+
+  if (hasTable(db, 'model_configs') && !hasColumn(db, 'model_configs', 'provider_options_json')) {
+    db.exec(`ALTER TABLE model_configs ADD COLUMN provider_options_json TEXT`)
+  }
+
   if (hasTable(db, 'lab_task') && !hasColumn(db, 'lab_task', 'style_id')) {
     db.exec(`ALTER TABLE lab_task ADD COLUMN style_id INTEGER`)
+  }
+
+  if (hasTable(db, 'lab_task') && !hasColumn(db, 'lab_task', 'anti_ai_rules_json')) {
+    db.exec(`ALTER TABLE lab_task ADD COLUMN anti_ai_rules_json TEXT`)
+  }
+
+  if (hasTable(db, 'lab_task') && !hasColumn(db, 'lab_task', 'system_prompt')) {
+    db.exec(`ALTER TABLE lab_task ADD COLUMN system_prompt TEXT`)
   }
 
   if (hasTable(db, 'writing_styles') && !hasColumn(db, 'writing_styles', 'step_rules_json')) {
@@ -161,6 +181,17 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
 
   if (hasTable(db, 'writing_styles') && !hasColumn(db, 'writing_styles', 'reference_text')) {
     db.exec(`ALTER TABLE writing_styles ADD COLUMN reference_text TEXT`)
+  }
+
+  if (hasTable(db, 'anchors') && !hasColumn(db, 'anchors', 'target_chapter_id')) {
+    db.exec(`ALTER TABLE anchors ADD COLUMN target_chapter_id INTEGER`)
+  }
+  if (hasTable(db, 'anchors') && !hasColumn(db, 'anchors', 'target_volume_id')) {
+    db.exec(`ALTER TABLE anchors ADD COLUMN target_volume_id INTEGER`)
+  }
+
+  if (hasTable(db, 'works') && !hasColumn(db, 'works', 'step_temperature_json')) {
+    db.exec(`ALTER TABLE works ADD COLUMN step_temperature_json TEXT`)
   }
 
   db.exec(`
@@ -178,4 +209,99 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       update_time DATETIME
     );
   `)
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS incubator_seeds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL UNIQUE,
+      content TEXT NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS incubator_candidates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      source_step VARCHAR(30) NOT NULL,
+      title VARCHAR(200) NOT NULL,
+      summary TEXT NOT NULL,
+      dimension VARCHAR(100),
+      highlights TEXT,
+      audience TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'new',
+      raw_json TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_incubator_candidates_work
+      ON incubator_candidates(work_id, status, create_time);
+
+    CREATE TABLE IF NOT EXISTS incubator_candidate_scores (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      candidate_id INTEGER NOT NULL,
+      attraction_score INTEGER NOT NULL DEFAULT 0,
+      serializability_score INTEGER NOT NULL DEFAULT 0,
+      differentiation_score INTEGER NOT NULL DEFAULT 0,
+      conflict_closure_score INTEGER NOT NULL DEFAULT 0,
+      executability_score INTEGER NOT NULL DEFAULT 0,
+      system_total INTEGER NOT NULL DEFAULT 0,
+      user_adjustment INTEGER NOT NULL DEFAULT 0,
+      final_total INTEGER NOT NULL DEFAULT 0,
+      rationale TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (candidate_id) REFERENCES incubator_candidates(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_incubator_scores_candidate
+      ON incubator_candidate_scores(candidate_id, create_time);
+
+    CREATE TABLE IF NOT EXISTS incubator_storyline_draft_slots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      slot_key VARCHAR(30) NOT NULL,
+      content TEXT NOT NULL,
+      source_candidate_id INTEGER,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      version_tag VARCHAR(30) NOT NULL DEFAULT 'draft-current',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_candidate_id) REFERENCES incubator_candidates(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_incubator_slots_work
+      ON incubator_storyline_draft_slots(work_id, slot_key, status);
+
+    CREATE TABLE IF NOT EXISTS incubator_storyline_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      version_no INTEGER NOT NULL,
+      label VARCHAR(100) NOT NULL DEFAULT '',
+      snapshot_json TEXT NOT NULL,
+      base_version_id INTEGER,
+      is_frozen INTEGER NOT NULL DEFAULT 0,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (base_version_id) REFERENCES incubator_storyline_versions(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_incubator_versions_work
+      ON incubator_storyline_versions(work_id, version_no);
+
+    CREATE TABLE IF NOT EXISTS incubator_workflow_states (
+      work_id INTEGER PRIMARY KEY,
+      state VARCHAR(30) NOT NULL DEFAULT 'SeedReady',
+      last_gate_report_json TEXT,
+      last_adopt_json TEXT,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+  `)
+
+  if (hasTable(db, 'incubator_workflow_states') && !hasColumn(db, 'incubator_workflow_states', 'branch_base_version_id')) {
+    db.exec(`ALTER TABLE incubator_workflow_states ADD COLUMN branch_base_version_id INTEGER`)
+  }
 }

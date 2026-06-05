@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, inject } from 'vue'
+import { ref, computed, onMounted, inject, watch, nextTick } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -25,6 +25,7 @@ type SettingType = (typeof settingTypes)[number]['type']
 const aiSystemPrompts: Record<SettingType, string> = {
   character: [
     '基于以下故事方向，生成主要角色设定。',
+    '若上下文含「用户补充要求」，须严格遵守（含角色姓名、关系、禁忌等），并在 ## 标题中使用指定姓名。',
     '输出要求：',
     '- 用 Markdown 结构化输出，每个角色一个 ## 标题',
     '- 主角 800-1200 字，重要配角每人 300-500 字',
@@ -66,6 +67,10 @@ const draftByType = ref<Partial<Record<SettingType, string>>>({})
 const aiLoadingByType = ref<Partial<Record<SettingType, boolean>>>({})
 const aiErrorByType = ref<Partial<Record<SettingType, string>>>({})
 const lastAiContext = ref('')
+/** 人设 AI 生成弹窗中的用户补充（按作品持久化，不写入人设正文） */
+const characterGenHints = ref('')
+const characterHintsDialogOpen = ref(false)
+const characterHintsInputRef = ref<HTMLTextAreaElement | null>(null)
 const expandedTypes = ref<Set<SettingType>>(new Set())
 const versionHistoryRefs = ref<Partial<Record<SettingType, { load: () => Promise<void> }>>>({})
 const characterCardsRef = ref<{ expandPanel?: () => void; load?: () => Promise<void> } | null>(null)
@@ -79,10 +84,26 @@ const hasAnyCoreSetting = computed(() =>
   settingTypes.some(st => getSetting(st.type).trim())
 )
 
-onMounted(loadCoreSettings)
+onMounted(() => {
+  void loadCoreSettings()
+})
+
+watch(
+  () => props.workId,
+  () => {
+    characterGenHints.value = ''
+  }
+)
 
 async function loadCoreSettings() {
   coreSettings.value = await window.anovel.invoke('setting:listByWork', props.workId) as never[]
+}
+
+async function loadCharacterGenHints() {
+  characterGenHints.value = (await window.anovel.invoke(
+    'setting:getCharacterGenHints',
+    props.workId
+  )) as string
 }
 
 function bindVersionRef(type: SettingType, el: Element | ComponentPublicInstance | null) {
@@ -137,13 +158,17 @@ function setDraft(type: SettingType, value: string) {
   draftByType.value = { ...draftByType.value, [type]: value }
 }
 
-async function getStoryContext(type: SettingType): Promise<string> {
+async function getStoryContext(type: SettingType, userHints?: string): Promise<string> {
   const draft = getDraft(type).trim() || getSetting(type).trim()
+  const hints = userHints?.trim() ?? ''
+  const options: { selfDraft?: string; userHints?: string } = {}
+  if (draft) options.selfDraft = draft
+  if (hints) options.userHints = hints
   const ctx = await window.anovel.invoke(
     'context:buildSettingsGeneration',
     props.workId,
     type,
-    draft ? { selfDraft: draft } : undefined
+    Object.keys(options).length ? options : undefined
   ) as { text: string }
   if (ctx.text) return ctx.text
   return ideaInputFallback()
@@ -166,7 +191,6 @@ async function saveSetting() {
   const type = editingType.value
   if (!type) return
   const content = getDraft(type).trim()
-  if (!content) return
   await window.anovel.invoke('setting:upsert', props.workId, type, content)
   cancelEdit()
   await loadCoreSettings()
@@ -181,14 +205,41 @@ interface ModelChatIpcResult {
   error?: string
 }
 
-async function aiSuggest(type: SettingType) {
+function onAiSuggestClick(type: SettingType) {
+  if (aiLoadingByType.value[type]) return
+  if (type === 'character') {
+    void openCharacterHintsDialog()
+    return
+  }
+  void runAiSuggest(type)
+}
+
+async function openCharacterHintsDialog() {
+  await loadCharacterGenHints()
+  characterHintsDialogOpen.value = true
+  await nextTick()
+  characterHintsInputRef.value?.focus()
+}
+
+function closeCharacterHintsDialog() {
+  characterHintsDialogOpen.value = false
+}
+
+async function confirmCharacterAiSuggest() {
+  const hints = characterGenHints.value.trim()
+  await window.anovel.invoke('setting:setCharacterGenHints', props.workId, hints)
+  closeCharacterHintsDialog()
+  await runAiSuggest('character', hints)
+}
+
+async function runAiSuggest(type: SettingType, userHints?: string) {
   if (aiLoadingByType.value[type]) return
 
   aiLoadingByType.value = { ...aiLoadingByType.value, [type]: true }
   aiErrorByType.value = { ...aiErrorByType.value, [type]: '' }
 
   try {
-    const context = await getStoryContext(type)
+    const context = await getStoryContext(type, userHints)
     lastAiContext.value = context
 
     const res = await window.anovel.invoke('model:chat', {
@@ -250,7 +301,7 @@ async function onQualityRefreshed() {
             <button
               class="btn btn-primary btn-xs gap-1"
               :disabled="!!aiLoadingByType[st.type]"
-              @click="aiSuggest(st.type)"
+              @click="onAiSuggestClick(st.type)"
             >
               <font-awesome-icon
                 :icon="aiLoadingByType[st.type] ? 'spinner' : 'robot'"
@@ -312,6 +363,47 @@ async function onQualityRefreshed() {
 
     <StepNavFooter step="settings" :work-id="workId" />
 
+    <dialog :class="['modal', { 'modal-open': characterHintsDialogOpen }]">
+      <div class="modal-box max-w-lg">
+        <h3 class="font-bold text-lg mb-1">人设 · AI 生成</h3>
+        <p class="text-sm text-base-content/50 mb-4">
+          可填写本次生成的补充要求（如角色姓名、关系、禁忌）。留空则仅依据故事方向生成。
+        </p>
+        <textarea
+          ref="characterHintsInputRef"
+          v-model="characterGenHints"
+          rows="4"
+          class="textarea textarea-bordered w-full text-sm leading-relaxed"
+          placeholder="例如：男主名沈辙，女主名温荞；男二为发小未婚夫；不要用真实明星姓名…"
+          @keydown.ctrl.enter.prevent="confirmCharacterAiSuggest"
+          @keydown.meta.enter.prevent="confirmCharacterAiSuggest"
+        />
+        <p class="text-xs text-base-content/40 mt-2">
+          补充说明会注入 prompt，并记住以便下次生成；不会直接写入人设正文。⌘/Ctrl + Enter 开始生成。
+        </p>
+        <div class="modal-action">
+          <button type="button" class="btn btn-ghost" @click="closeCharacterHintsDialog">取消</button>
+          <button
+            type="button"
+            class="btn btn-primary gap-1"
+            :disabled="!!aiLoadingByType.character"
+            @click="confirmCharacterAiSuggest"
+          >
+            <font-awesome-icon
+              v-if="aiLoadingByType.character"
+              icon="spinner"
+              spin
+              class="w-3.5 h-3.5"
+            />
+            {{ aiLoadingByType.character ? '生成中...' : '开始生成' }}
+          </button>
+        </div>
+      </div>
+      <form method="dialog" class="modal-backdrop bg-black/40" @click="closeCharacterHintsDialog">
+        <button type="button">close</button>
+      </form>
+    </dialog>
+
     <dialog :class="['modal', { 'modal-open': editingType !== null }]">
       <div v-if="editingMeta && editingType" class="modal-box w-[92vw] max-w-6xl h-[88vh] p-0 flex flex-col">
         <div class="flex items-center justify-between gap-4 px-6 py-4 border-b border-base-300 shrink-0">
@@ -323,11 +415,10 @@ async function onQualityRefreshed() {
             <button
               type="button"
               class="btn btn-primary btn-sm gap-1"
-              :disabled="!getDraft(editingType).trim()"
               @click="saveSetting"
             >
               <font-awesome-icon icon="save" class="w-3 h-3" />
-              保存
+              {{ getDraft(editingType).trim() ? '保存' : '清空并保存' }}
             </button>
             <FavoriteButton
               v-if="getDraft(editingType).trim()"

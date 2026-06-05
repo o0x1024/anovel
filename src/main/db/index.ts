@@ -44,3 +44,11 @@ export { assistantMessageDAO } from './dao/assistant-message-dao'
 export { labTaskDAO } from './dao/lab-task-dao'
 export { promptTemplateDAO } from './dao/prompt-template-dao'
 export type { PromptTemplateInfo, PromptCategory, PromptRiskLevel } from './dao/prompt-template-dao'
+export {
+  incubatorSeedDAO,
+  incubatorCandidateDAO,
+  incubatorScoreDAO,
+  incubatorDraftSlotDAO,
+  incubatorVersionDAO,
+  incubatorStateDAO
+} from './dao/incubator'

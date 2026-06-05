@@ -1,4 +1,5 @@
 import { coreSettingDAO, volumeChapterDAO } from '../db'
+import { incubatorDraftSlotDAO, incubatorVersionDAO } from '../db/dao/incubator'
 import { getSettingsQualityStatus, type SettingsQualityStatus } from './settings-quality'
 
 export type WorkflowStepKey = 'incubator' | 'settings' | 'volumes' | 'chapters' | 'generate'
@@ -26,6 +27,8 @@ export function getWorkStepProgress(workId: number): WorkStepProgress {
   const byType = new Map(settings.map(s => [s.type, s.content]))
 
   const hasIdea = hasContent(byType, 'idea')
+  const frozenStoryline = !!incubatorVersionDAO.getLatestFrozen(workId)
+  const filledStorylineSlots = incubatorDraftSlotDAO.countFilledSlots(workId)
   const coreDone = CORE_TYPES.every(t => hasContent(byType, t))
 
   const volumes = volumeChapterDAO.listVolumes(workId)
@@ -41,7 +44,13 @@ export function getWorkStepProgress(workId: number): WorkStepProgress {
   const qualityStatus = getSettingsQualityStatus(workId)
 
   const steps: Record<WorkflowStepKey, StepStatus> = {
-    incubator: hasIdea ? 'done' : 'ready',
+    incubator: frozenStoryline
+      ? 'done'
+      : filledStorylineSlots >= 2
+        ? 'review'
+        : hasIdea
+          ? 'ready'
+          : 'pending',
     settings: !coreDone
       ? (hasIdea ? 'ready' : 'pending')
       : qualityStatus.canProceed
@@ -53,8 +62,12 @@ export function getWorkStepProgress(workId: number): WorkStepProgress {
   }
 
   const hints: Partial<Record<WorkflowStepKey, string>> = {}
-  if (!hasIdea) hints.incubator = '请先输入并保存故事方向'
-  else if (!coreDone) hints.settings = '请补全人设、世界观、核心冲突'
+  if (!hasIdea) hints.incubator = '请先输入并保存创作种子'
+  else if (!frozenStoryline && filledStorylineSlots < 2) {
+    hints.incubator = '建议从变体/扩写采纳到主线槽位，拼装故事线后冻结版本'
+  } else if (!frozenStoryline) {
+    hints.incubator = '主线槽位已部分填充，可继续采纳或运行门禁后冻结版本'
+  } else if (!coreDone) hints.settings = '请补全人设、世界观、核心冲突'
   else if (qualityStatus.needsReview) {
     if (qualityStatus.isStale) {
       hints.settings = '设定已变更，请重新运行设定质量自检'

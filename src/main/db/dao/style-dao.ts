@@ -40,11 +40,12 @@ export class WritingStyleDAO extends BaseDAO {
 
   create(input: StyleCreateInput): number {
     return this.insert(
-      `INSERT INTO writing_styles (name, description, sample_text, reference_text, prompt_template, fingerprint_json, step_rules_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO writing_styles (name, description, sample_text, reference_text, prompt_template, fingerprint_json, step_rules_json, is_builtin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [input.name, input.description ?? null, input.sample_text ?? null,
        input.reference_text ?? null, input.prompt_template,
-       input.fingerprint_json ?? null, input.step_rules_json ?? null]
+       input.fingerprint_json ?? null, input.step_rules_json ?? null,
+       input.is_builtin ?? 0]
     )
   }
 
@@ -58,6 +59,7 @@ export class WritingStyleDAO extends BaseDAO {
     if (input.prompt_template !== undefined) { fields.push('prompt_template = ?'); values.push(input.prompt_template) }
     if (input.fingerprint_json !== undefined) { fields.push('fingerprint_json = ?'); values.push(input.fingerprint_json) }
     if (input.step_rules_json !== undefined) { fields.push('step_rules_json = ?'); values.push(input.step_rules_json) }
+    if (input.is_builtin !== undefined) { fields.push('is_builtin = ?'); values.push(input.is_builtin) }
     if (fields.length === 0) return false
     fields.push("update_time = datetime('now')")
     values.push(id)
@@ -65,7 +67,7 @@ export class WritingStyleDAO extends BaseDAO {
   }
 
   delete(id: number): boolean {
-    return this.run('DELETE FROM writing_styles WHERE id = ? AND is_builtin = 0', [id]).changes > 0
+    return this.run('DELETE FROM writing_styles WHERE id = ?', [id]).changes > 0
   }
 
   // ==================== 作品-文风关联 ====================

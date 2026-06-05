@@ -154,6 +154,7 @@ export function useAiActivity() {
       stopTick()
       elapsedMs.value = p.durationMs
       pushHistory(active.value)
+      minimized.value = true
     })
 
     window.anovel.on('ai:session-cancelled', (payload: unknown) => {
@@ -163,6 +164,7 @@ export function useAiActivity() {
       active.value.error = '已取消'
       stopTick()
       pushHistory(active.value)
+      minimized.value = true
     })
   }
 

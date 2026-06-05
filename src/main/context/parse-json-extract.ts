@@ -1,10 +1,10 @@
 /** 从 AI 回复中提取 JSON 对象或数组文本（支持 ```json 围栏或裸 JSON） */
 export function extractJsonText(content: string): string | null {
   const fencedBlocks = collectFencedJsonBlocks(content)
-  const bestFenced = pickBestChaptersJson(fencedBlocks)
+  const bestFenced = pickBestJson(fencedBlocks)
   if (bestFenced) return bestFenced
 
-  const bare = extractBareChaptersJson(content)
+  const bare = extractBareArrayJson(content)
   if (bare) return bare
 
   return extractLegacyJsonTail(content)
@@ -21,10 +21,10 @@ function collectFencedJsonBlocks(content: string): string[] {
   return blocks
 }
 
-function pickBestChaptersJson(candidates: string[]): string | null {
+function pickBestJson(candidates: string[]): string | null {
   let best: { text: string; count: number } | null = null
   for (const text of candidates) {
-    const count = countChaptersInJson(text)
+    const count = countJsonArrayItems(text)
     if (count <= 0) continue
     if (!best || count > best.count) {
       best = { text, count }
@@ -33,20 +33,25 @@ function pickBestChaptersJson(candidates: string[]): string | null {
   return best?.text ?? null
 }
 
-function countChaptersInJson(jsonText: string): number {
+/** 统计 JSON 中首个顶层数组的元素数量（兼容 root array 和 {key:[...]} 形式） */
+function countJsonArrayItems(jsonText: string): number {
   try {
     const parsed = JSON.parse(jsonText) as unknown
     if (Array.isArray(parsed)) return parsed.length
-    const chapters = (parsed as Record<string, unknown>)?.chapters
-    return Array.isArray(chapters) ? chapters.length : 0
+    if (parsed && typeof parsed === 'object') {
+      for (const val of Object.values(parsed as Record<string, unknown>)) {
+        if (Array.isArray(val)) return val.length
+      }
+    }
+    return 0
   } catch {
     return 0
   }
 }
 
-/** 优先匹配含 chapters 键的裸 JSON 对象 */
-function extractBareChaptersJson(content: string): string | null {
-  const pattern = /\{\s*"chapters"\s*:\s*\[/gi
+/** 匹配含顶层数组键的裸 JSON 对象（"key": [...]） */
+function extractBareArrayJson(content: string): string | null {
+  const pattern = /\{\s*"\w+"\s*:\s*\[/gi
   const candidates: string[] = []
   let match: RegExpExecArray | null
   while ((match = pattern.exec(content)) !== null) {
@@ -54,7 +59,7 @@ function extractBareChaptersJson(content: string): string | null {
     const slice = extractBalancedJson(content.slice(match.index))
     if (slice) candidates.push(slice)
   }
-  return pickBestChaptersJson(candidates)
+  return pickBestJson(candidates)
 }
 
 function extractBalancedJson(text: string): string | null {
@@ -95,12 +100,12 @@ function extractBalancedJson(text: string): string | null {
   return null
 }
 
-/** 兼容旧逻辑：从首个 { 或 [ 截到末尾括号（可能误匹配，仅作最后回退） */
+/** 兼容旧逻辑：从首个 { 或 [ 截到末尾括号 */
 function extractLegacyJsonTail(content: string): string | null {
   const trimmed = content.trim()
   const objStart = trimmed.indexOf('{')
   if (objStart < 0) return null
   const balanced = extractBalancedJson(trimmed.slice(objStart))
-  if (balanced && countChaptersInJson(balanced) > 0) return balanced
+  if (balanced && countJsonArrayItems(balanced) > 0) return balanced
   return null
 }

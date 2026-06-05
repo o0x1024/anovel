@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { INCUBATOR_SELF_CHECK_SYSTEM } from '../../../../shared/incubator-analysis-prompts'
 import MarkdownContent from '../../components/MarkdownContent.vue'
 
 const props = defineProps<{
@@ -7,6 +8,7 @@ const props = defineProps<{
   step: string
   content: string
   label?: string
+  enrichWorkContext?: boolean
 }>()
 
 const DEFAULT_PROMPTS: Record<string, string> = {
@@ -14,7 +16,7 @@ const DEFAULT_PROMPTS: Record<string, string> = {
   volumes: '检查分卷结构是否合理、节奏是否均衡、各卷主题是否递进，给出改进建议。',
   chapters: '检查章节大纲是否连贯、冲突是否升级、钩子是否有效，给出改进建议。',
   body_generation: '检查正文是否符合大纲、锚点是否体现、文风是否一致，列出问题与修改建议。',
-  incubator: '检查故事方向是否有吸引力、差异化是否足够、潜在风险有哪些。'
+  incubator: INCUBATOR_SELF_CHECK_SYSTEM
 }
 
 const loading = ref(false)
@@ -27,11 +29,15 @@ async function runSelfCheck() {
   report.value = ''
   error.value = ''
   try {
-    const systemPrompt = [
-      '你是资深小说编辑，对作者内容进行自检评审。',
-      DEFAULT_PROMPTS[props.step] || '检查内容质量、逻辑自洽性和可改进之处。',
-      '输出格式：## 总体评价 / ## 优点 / ## 问题 / ## 修改建议'
-    ].join('\n')
+    const base =
+      props.step === 'incubator'
+        ? INCUBATOR_SELF_CHECK_SYSTEM
+        : [
+            '你是苛刻的责任编辑，对作者内容进行自检评审。',
+            DEFAULT_PROMPTS[props.step] || '检查内容质量、逻辑自洽性和可改进之处。',
+            '输出格式：## 总体评价 / ## 优点 / ## 问题 / ## 修改建议'
+          ].join('\n')
+    const systemPrompt = base
     const res = await window.anovel.invoke('model:chat', {
       prompt: props.content,
       systemPrompt: [
@@ -40,7 +46,7 @@ async function runSelfCheck() {
       ].join('\n'),
       workId: props.workId,
       step: `${props.step}_self_check`,
-      enrichWorkContext: true
+      enrichWorkContext: props.enrichWorkContext !== false
     }) as { success: boolean; content: string; error?: string }
     if (res.success) {
       report.value = res.content

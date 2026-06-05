@@ -11,6 +11,9 @@ export interface ModelConfigRow {
   priority: number
   max_context_tokens: number | null
   available_models_json: string | null
+  display_name: string | null
+  provider_protocol: string | null
+  provider_options_json: string | null
 }
 
 export class ModelConfigDAO extends BaseDAO {
@@ -29,14 +32,40 @@ export class ModelConfigDAO extends BaseDAO {
     return this.get<ModelConfigRow>('SELECT * FROM model_configs WHERE model_type = ?', [modelType])
   }
 
-  upsert(modelType: string, apiKey: string, apiBase?: string, modelName?: string): void {
+  upsert(
+    modelType: string,
+    apiKey: string,
+    apiBase?: string,
+    modelName?: string,
+    displayName?: string | null,
+    providerProtocol?: string | null
+  ): void {
     this.run(
-      `INSERT INTO model_configs (model_type, api_key, api_base, model_name) VALUES (?, ?, ?, ?)
+      `INSERT INTO model_configs (model_type, api_key, api_base, model_name, display_name, provider_protocol)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(model_type) DO UPDATE SET
          api_key = excluded.api_key,
          api_base = excluded.api_base,
-         model_name = excluded.model_name`,
-      [modelType, apiKey, apiBase ?? null, modelName ?? null]
+         model_name = excluded.model_name,
+         display_name = COALESCE(excluded.display_name, model_configs.display_name),
+         provider_protocol = COALESCE(excluded.provider_protocol, model_configs.provider_protocol)`,
+      [modelType, apiKey, apiBase ?? null, modelName ?? null, displayName ?? null, providerProtocol ?? null]
+    )
+  }
+
+  createCustom(
+    modelType: string,
+    displayName: string,
+    providerProtocol: string,
+    apiKey: string,
+    apiBase: string,
+    modelName: string
+  ): void {
+    const maxPriority = this.get<{ max_p: number }>('SELECT COALESCE(MAX(priority), 0) AS max_p FROM model_configs')
+    this.run(
+      `INSERT INTO model_configs (model_type, display_name, provider_protocol, api_key, api_base, model_name, is_enabled, priority)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+      [modelType, displayName, providerProtocol, apiKey, apiBase, modelName, (maxPriority?.max_p ?? 0) + 1]
     )
   }
 
@@ -71,6 +100,13 @@ export class ModelConfigDAO extends BaseDAO {
     return this.run(
       'UPDATE model_configs SET available_models_json = ? WHERE model_type = ?',
       [JSON.stringify(unique), modelType]
+    ).changes > 0
+  }
+
+  setProviderOptions(modelType: string, optionsJson: string | null): boolean {
+    return this.run(
+      'UPDATE model_configs SET provider_options_json = ? WHERE model_type = ?',
+      [optionsJson, modelType]
     ).changes > 0
   }
 }

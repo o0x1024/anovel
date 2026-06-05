@@ -5,8 +5,10 @@
 import type { WebContents } from 'electron'
 import type { AiSessionHandle } from '../ai/ai-session-manager'
 
-/** 支持的模型类型 */
-export type ModelType = 'deepseek' | 'gemini' | 'openai'
+import type { ProviderProtocol } from '../../shared/model-providers'
+
+/** 内置模型类型标识（兼容旧代码） */
+export type ModelType = 'deepseek' | 'kimi' | 'mimo' | 'bailian' | 'gemini' | 'openai' | 'anthropic' | (string & {})
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
 
@@ -47,6 +49,8 @@ export interface ModelRequest {
   presencePenalty?: number
   /** 核采样参数：只从累积概率前 topP 的 token 中采样 (0~1) */
   topP?: number
+  /** DeepSeek 思考模式（由 model-service 从提供商配置注入） */
+  deepseekOptions?: import('../../shared/deepseek-api-params').DeepSeekProviderOptions
   workId?: number                 // 用于自动注入锚点和文风
   step?: string                   // 创作步骤标识
   styleId?: number                // 文风ID（未指定时从作品绑定文风自动取第一个）
@@ -66,6 +70,7 @@ export interface ModelRequest {
   /** 是否注入叙事记忆体（伏笔/快照/时间线），正文生成默认 true */
   enrichNarrativeMemory?: boolean
   chapterId?: number
+  volumeId?: number
 }
 
 /** 模型调用响应 */
@@ -88,11 +93,13 @@ export interface AdapterChatOptions {
   onThinkingDelta?: (delta: string) => void
   signal?: AbortSignal
   stream?: boolean
+  /** 内置提供商类型，用于 MiMo 等需特殊鉴权头的 OpenAI 兼容接口 */
+  modelType?: string
 }
 
 /** 模型调用器接口 */
 export interface ModelAdapter {
-  readonly type: ModelType
+  readonly protocol: ProviderProtocol
   chat(
     request: ModelRequest,
     apiKey: string,

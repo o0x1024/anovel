@@ -5,6 +5,8 @@ import {
   emptyStyleStepRules,
   type StyleStepRules
 } from '../../../../shared/style-step-rules'
+import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../../../shared/style-reference-limits'
+import type { StyleAnalysisResult } from '../../../../shared/assistant-types'
 
 interface Style {
   id: number
@@ -33,8 +35,15 @@ interface StepRulesForm {
 const styles = ref<Style[]>([])
 const loading = ref(true)
 const selectedId = ref<number | null>(null)
-const panelMode = ref<'detail' | 'create' | 'edit' | 'edit_step_rules'>('detail')
+const panelMode = ref<'detail' | 'create' | 'edit' | 'edit_step_rules' | 'ai_generate'>('detail')
 const saving = ref(false)
+
+const aiDescription = ref('')
+const aiGenerating = ref(false)
+const aiError = ref('')
+const aiPreviewMarkdown = ref('')
+const aiAnalysis = ref<StyleAnalysisResult | null>(null)
+const aiSaving = ref(false)
 
 const form = ref({
   name: '',
@@ -173,6 +182,78 @@ function openCreate() {
   stepRulesExpanded.value = false
 }
 
+function openAiGenerate() {
+  selectedId.value = null
+  panelMode.value = 'ai_generate'
+  aiDescription.value = ''
+  aiError.value = ''
+  aiPreviewMarkdown.value = ''
+  aiAnalysis.value = null
+}
+
+function applyAnalysisToForm(analysis: StyleAnalysisResult) {
+  form.value = {
+    name: analysis.styleName,
+    description: analysis.description,
+    prompt_template: analysis.promptTemplate,
+    sample_text: analysis.sampleExcerpts.filter(s => s.trim()).join('\n\n').slice(0, 3000),
+    reference_text: analysis.referenceText?.slice(0, MAX_STYLE_REFERENCE_TEXT_CHARS) ?? ''
+  }
+  if (analysis.stepRules) {
+    stepRulesForm.value = stepRulesToForm(analysis.stepRules)
+    stepRulesExpanded.value = true
+  } else {
+    stepRulesForm.value = emptyStepRulesForm()
+    stepRulesExpanded.value = false
+  }
+  panelMode.value = 'create'
+}
+
+async function generateStyleFromAi() {
+  const desc = aiDescription.value.trim()
+  if (!desc || aiGenerating.value) return
+
+  aiGenerating.value = true
+  aiError.value = ''
+  aiPreviewMarkdown.value = ''
+  aiAnalysis.value = null
+
+  try {
+    const res = await window.anovel.invoke('style:generateFromDescription', desc) as {
+      success: boolean
+      analysis?: StyleAnalysisResult
+      previewMarkdown?: string
+      error?: string
+    }
+    if (res.success && res.analysis) {
+      aiAnalysis.value = res.analysis
+      aiPreviewMarkdown.value = res.previewMarkdown ?? ''
+    } else {
+      aiError.value = res.error || '生成失败'
+    }
+  } catch (e) {
+    aiError.value = String(e)
+  } finally {
+    aiGenerating.value = false
+  }
+}
+
+async function saveAiAnalysis() {
+  if (!aiAnalysis.value || aiSaving.value) return
+  aiSaving.value = true
+  aiError.value = ''
+  try {
+    const id = await window.anovel.invoke('assistant:exportStyle', aiAnalysis.value) as number
+    selectedId.value = id
+    panelMode.value = 'detail'
+    await loadStyles()
+  } catch (e) {
+    aiError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    aiSaving.value = false
+  }
+}
+
 function openEdit(style?: Style) {
   const target = style ?? selectedStyle.value
   if (!target) return
@@ -227,7 +308,7 @@ function cancelForm() {
 }
 
 async function saveStyle() {
-  if (!form.value.name.trim() || !form.value.prompt_template.trim() || saving.value) return
+  if (!form.value.name.trim() || saving.value) return
   saving.value = true
   try {
     const stepRulesJson = formToStepRulesJson(stepRulesForm.value)
@@ -236,6 +317,7 @@ async function saveStyle() {
       description: form.value.description.trim() || null,
       sample_text: form.value.sample_text.trim() || null,
       reference_text: form.value.reference_text.trim() || null,
+      prompt_template: form.value.prompt_template.trim(),
       step_rules_json: stepRulesJson ?? null
     }
     if (panelMode.value === 'edit' && selectedId.value) {
@@ -280,7 +362,7 @@ function handleRefTextFile(event: Event) {
   if (!file) return
   const reader = new FileReader()
   reader.onload = () => {
-    const text = (reader.result as string).slice(0, 5000)
+    const text = (reader.result as string).slice(0, MAX_STYLE_REFERENCE_TEXT_CHARS)
     form.value.reference_text = text
   }
   reader.readAsText(file)
@@ -297,21 +379,27 @@ function formatDate(dateStr: string): string {
     <!-- 左侧文风列表 -->
     <aside class="w-72 shrink-0 border-r border-base-300 flex flex-col min-h-0 bg-base-200/30">
       <div class="p-4 border-b border-base-300 shrink-0">
-        <h2 class="font-bold text-sm">文风列表</h2>
-        <p class="text-xs text-base-content/40 mt-0.5">点击文风查看详情</p>
-        <div class="flex gap-2 mt-3">
-          <button type="button" class="btn btn-primary btn-sm flex-1 gap-1" @click="openCreate">
-            <font-awesome-icon icon="plus" class="w-3 h-3" />
-            新建文风
-          </button>
+        <div class="flex items-center justify-between gap-2">
+          <h2 class="font-bold text-sm">文风列表</h2>
           <button
             type="button"
-            class="btn btn-ghost btn-sm btn-square"
+            class="btn btn-ghost btn-xs btn-square shrink-0"
             title="刷新列表"
             :disabled="loading"
             @click="loadStyles"
           >
             <font-awesome-icon icon="rotate" class="w-3 h-3" :spin="loading" />
+          </button>
+        </div>
+        <p class="text-xs text-base-content/40 mt-0.5">点击文风查看详情</p>
+        <div class="flex gap-2 mt-3">
+          <button type="button" class="btn btn-primary btn-sm flex-1 gap-1" @click="openCreate">
+            <font-awesome-icon icon="plus" class="w-3 h-3" />
+            新建
+          </button>
+          <button type="button" class="btn btn-outline btn-primary btn-sm flex-1 gap-1" @click="openAiGenerate">
+            <font-awesome-icon icon="robot" class="w-3 h-3" />
+            AI 生成
           </button>
         </div>
       </div>
@@ -392,6 +480,127 @@ function formatDate(dateStr: string): string {
         </div>
       </div>
 
+      <!-- AI 文风生成功能 -->
+      <div v-else-if="panelMode === 'ai_generate'" class="p-6 lg:p-8 max-w-3xl">
+        <h2 class="text-xl font-bold mb-1">AI 生成文风</h2>
+        <p class="text-xs text-base-content/40 mb-4">
+          用自然语言描述想要的写作风格，AI 将自动生成 Prompt 模板、分步规则与样例段落
+        </p>
+
+        <div class="space-y-4">
+          <div>
+            <label class="text-xs text-base-content/50">文风描述 <span class="text-error">*</span></label>
+            <textarea
+              v-model="aiDescription"
+              placeholder="例如：快节奏都市爽文，主角碾压反派，对话 witty，每章末尾留悬念，句子短促，对话占比高，禁止 AI 痕迹连接词…"
+              rows="5"
+              class="textarea textarea-bordered w-full mt-1 resize-none text-sm"
+              :disabled="aiGenerating"
+            />
+          </div>
+
+          <div class="flex gap-2">
+            <button
+              type="button"
+              class="btn btn-primary btn-sm gap-1"
+              :disabled="!aiDescription.trim() || aiGenerating"
+              @click="generateStyleFromAi"
+            >
+              <font-awesome-icon :icon="aiGenerating ? 'spinner' : 'robot'" class="w-3.5 h-3.5" :spin="aiGenerating" />
+              {{ aiGenerating ? '生成中…' : '开始生成' }}
+            </button>
+            <button type="button" class="btn btn-ghost btn-sm" :disabled="aiGenerating" @click="cancelForm">
+              取消
+            </button>
+          </div>
+
+          <div v-if="aiError" class="alert alert-error text-xs py-2">{{ aiError }}</div>
+
+          <div v-if="aiAnalysis" class="card bg-base-200 border border-primary/20">
+            <div class="card-body p-4 gap-3">
+              <div class="flex items-start justify-between gap-2">
+                <div>
+                  <h3 class="font-bold">{{ aiAnalysis.styleName }}</h3>
+                  <p class="text-xs text-base-content/50 mt-1">{{ aiAnalysis.description }}</p>
+                </div>
+                <span
+                  class="badge badge-sm"
+                  :class="{
+                    'badge-success': aiAnalysis.confidence === 'high',
+                    'badge-warning': aiAnalysis.confidence === 'medium',
+                    'badge-ghost': aiAnalysis.confidence === 'low'
+                  }"
+                >
+                  {{ aiAnalysis.confidence }}
+                </span>
+              </div>
+
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                <div><span class="text-base-content/40">句长节奏</span> {{ aiAnalysis.dimensions.sentenceRhythm }}</div>
+                <div><span class="text-base-content/40">对话风格</span> {{ aiAnalysis.dimensions.dialogueStyle }}</div>
+                <div><span class="text-base-content/40">叙述距离</span> {{ aiAnalysis.dimensions.narrativeDistance }}</div>
+                <div><span class="text-base-content/40">节奏</span> {{ aiAnalysis.dimensions.pacing }}</div>
+              </div>
+
+              <div v-if="aiAnalysis.warnings?.length" class="text-xs text-warning">
+                {{ aiAnalysis.warnings.join('；') }}
+              </div>
+
+              <div
+                v-if="aiAnalysis.stepRules?.decision_rules?.length || aiAnalysis.stepRules?.quality_checklist?.length"
+                class="text-xs bg-base-300/40 rounded-lg p-2 space-y-1"
+              >
+                <p class="font-medium text-base-content/60">分步规则</p>
+                <p v-if="aiAnalysis.stepRules.identity?.emotional_core?.length">
+                  情绪：{{ aiAnalysis.stepRules.identity.emotional_core.join('、') }}
+                </p>
+                <p v-if="aiAnalysis.stepRules.decision_rules?.length">
+                  决策规则 {{ aiAnalysis.stepRules.decision_rules.length }} 条
+                </p>
+                <p v-if="aiAnalysis.stepRules.quality_checklist?.length">
+                  检查清单 {{ aiAnalysis.stepRules.quality_checklist.length }} 条
+                </p>
+              </div>
+
+              <div>
+                <label class="text-xs text-base-content/50">Prompt 模板预览</label>
+                <pre class="bg-base-300/40 rounded-lg p-3 text-xs whitespace-pre-wrap font-mono mt-1 max-h-40 overflow-y-auto scrollbar-thin">{{ aiAnalysis.promptTemplate }}</pre>
+              </div>
+
+              <div v-if="aiAnalysis.sampleExcerpts?.length">
+                <label class="text-xs text-base-content/50">样例段落预览</label>
+                <p class="bg-base-300/40 rounded-lg p-3 text-sm italic text-base-content/70 whitespace-pre-wrap mt-1 max-h-32 overflow-y-auto scrollbar-thin">
+                  {{ aiAnalysis.sampleExcerpts.join('\n\n') }}
+                </p>
+              </div>
+
+              <div v-if="aiPreviewMarkdown" class="collapse collapse-arrow bg-base-300/30 border border-base-300 rounded-lg">
+                <input type="checkbox" />
+                <div class="collapse-title text-xs font-medium py-2 min-h-0">查看完整分析报告</div>
+                <div class="collapse-content">
+                  <pre class="text-xs whitespace-pre-wrap text-base-content/70 pb-2">{{ aiPreviewMarkdown }}</pre>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  class="btn btn-primary btn-sm gap-1"
+                  :disabled="aiSaving"
+                  @click="saveAiAnalysis"
+                >
+                  <font-awesome-icon icon="save" class="w-3.5 h-3.5" />
+                  {{ aiSaving ? '保存中…' : '直接保存' }}
+                </button>
+                <button type="button" class="btn btn-outline btn-sm" @click="applyAnalysisToForm(aiAnalysis)">
+                  填入表单编辑
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div v-else-if="panelMode === 'create' || panelMode === 'edit'" class="p-6 lg:p-8 max-w-3xl">
         <h2 class="text-xl font-bold mb-1">
           {{ panelMode === 'edit' ? '编辑文风' : '新建文风' }}
@@ -416,10 +625,10 @@ function formatDate(dateStr: string): string {
             />
           </div>
           <div>
-            <label class="text-xs text-base-content/50">Prompt 模板 <span class="text-error">*</span></label>
+            <label class="text-xs text-base-content/50">Prompt 模板（可选）</label>
             <textarea
               v-model="form.prompt_template"
-              placeholder="编写 AI 遵循的风格指令..."
+              placeholder="编写 AI 遵循的风格指令；可留空，仅依赖参考范文或分步规则"
               rows="8"
               class="textarea textarea-bordered w-full mt-1 resize-none font-mono text-xs"
             />
@@ -436,14 +645,14 @@ function formatDate(dateStr: string): string {
 
           <div>
             <div class="flex items-center justify-between">
-              <label class="text-xs text-base-content/50">参考范文（可选，≤5000字，用于 few-shot 风格注入，是降低 AI 检测率的核心手段）</label>
-              <span class="text-xs text-base-content/30">{{ refTextCharCount }} / 5000</span>
+              <label class="text-xs text-base-content/50">参考范文（可选，≤{{ MAX_STYLE_REFERENCE_TEXT_CHARS }}字，用于 few-shot 风格注入，是降低 AI 检测率的核心手段）</label>
+              <span class="text-xs text-base-content/30">{{ refTextCharCount }} / {{ MAX_STYLE_REFERENCE_TEXT_CHARS }}</span>
             </div>
             <textarea
               v-model="form.reference_text"
               placeholder="粘贴一段目标风格的长范文（如某小说的精彩片段），AI 将模仿此文本的用词、句式和节奏"
               rows="8"
-              maxlength="5000"
+              :maxlength="MAX_STYLE_REFERENCE_TEXT_CHARS"
               class="textarea textarea-bordered w-full mt-1 resize-none text-sm"
             />
             <div class="mt-1">
@@ -462,7 +671,7 @@ function formatDate(dateStr: string): string {
             </div>
             <div class="collapse-content space-y-3 pb-4">
               <p class="text-xs text-base-content/50">
-                正文阶段仍使用上方 Prompt 模板；大纲与情节阶段使用决策规则与节奏约束。
+                正文阶段使用上方 Prompt 模板（可留空）；大纲与情节阶段使用决策规则与节奏约束。
               </p>
               <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -523,7 +732,7 @@ function formatDate(dateStr: string): string {
             <button
               type="button"
               class="btn btn-primary btn-sm gap-1"
-              :disabled="!form.name.trim() || !form.prompt_template.trim() || saving"
+              :disabled="!form.name.trim() || saving"
               @click="saveStyle"
             >
               <font-awesome-icon icon="save" class="w-3.5 h-3.5" />
@@ -580,7 +789,6 @@ function formatDate(dateStr: string): string {
               编辑
             </button>
             <button
-              v-if="!selectedStyle.is_builtin"
               type="button"
               class="btn btn-ghost btn-sm text-error"
               @click="deleteStyle(selectedStyle)"
@@ -591,7 +799,7 @@ function formatDate(dateStr: string): string {
         </div>
 
         <div class="space-y-5">
-          <section>
+          <section v-if="selectedStyle.prompt_template?.trim()">
             <h3 class="text-xs font-bold text-base-content/40 uppercase tracking-wider mb-2">Prompt 模板</h3>
             <pre class="bg-base-200 border border-base-300 rounded-lg p-4 text-xs whitespace-pre-wrap font-mono text-base-content/80">{{ selectedStyle.prompt_template }}</pre>
           </section>

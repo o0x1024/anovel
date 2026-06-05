@@ -52,6 +52,11 @@ export function loadCharacterCards(workId: number): CharacterCard[] {
 }
 
 export function saveCharacterCards(workId: number, cards: CharacterCard[]): void {
+  if (cards.length === 0) {
+    const row = coreSettingDAO.getByType(workId, STORAGE_TYPE)
+    if (row) coreSettingDAO.delete(row.id)
+    return
+  }
   coreSettingDAO.upsert(workId, STORAGE_TYPE, JSON.stringify({ cards }, null, 2))
 }
 

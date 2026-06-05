@@ -1,8 +1,6 @@
 import { ModelRequest, ModelResponse, ModelType, ChatOptions } from './types'
-import {
-  createDeepSeekAdapter, createOpenAIAdapter, createGeminiAdapter,
-  OpenAICompatibleAdapter, GeminiAdapter
-} from './adapters'
+import { getAdapterForProtocol } from './adapters'
+import { resolveProviderProtocol } from '../../shared/model-providers'
 import { modelConfigDAO, writingStyleDAO, generationLogDAO, appPreferenceDAO } from '../db'
 import {
   collectPromptSections,
@@ -13,21 +11,20 @@ import { appLogger } from '../logger/app-logger'
 import { aiSessionManager, type AiSessionHandle } from '../ai/ai-session-manager'
 import { resolveSessionTitle } from '../ai/step-titles'
 import { normalizeModelBodyOutput } from '../../shared/normalize-body-text'
+import {
+  isDeepSeekProvider,
+  parseDeepSeekProviderOptions
+} from '../../shared/deepseek-api-params'
+import {
+  isWorkScopedModelRequest,
+  resolveWorkRequestTemperature
+} from '../context/work-step-temperature'
 
 /**
  * 模型服务 - 统一调用入口
- * 职责：模型选择、上下文预算组装、自动重试、调用日志、AI 活动会话
+ * 职责：模型选择、上下文预算组装、调用日志、AI 活动会话
  */
 export class ModelService {
-  private adapters: Map<ModelType, OpenAICompatibleAdapter | GeminiAdapter>
-
-  constructor() {
-    this.adapters = new Map()
-    this.adapters.set('deepseek', createDeepSeekAdapter())
-    this.adapters.set('openai', createOpenAIAdapter())
-    this.adapters.set('gemini', createGeminiAdapter())
-  }
-
   /**
    * 发送聊天请求
    * 自动选择优先级最高的已启用模型，按 Token 预算分层注入上下文
@@ -63,15 +60,16 @@ export class ModelService {
         return this.failResponse(error, startTime, session, ownsSession)
       }
 
-      const adapter = this.adapters.get(config.model_type as ModelType)
-      if (!adapter) {
-        return this.failResponse(`不支持的模型类型: ${config.model_type}`, startTime, session, ownsSession)
-      }
+      const protocol = resolveProviderProtocol(config.model_type, config.provider_protocol)
+      const adapter = getAdapterForProtocol(protocol)
 
       const maxContext = config.max_context_tokens && config.max_context_tokens > 0
         ? config.max_context_tokens
         : getMaxContextTokens(config.model_type)
-      const reservedOutput = request.maxTokens ?? 4096
+
+      const stepDefaults = getStepGenerationDefaults(request.step, request.workId)
+      const resolvedMaxTokens = request.maxTokens ?? stepDefaults.maxTokens ?? 4096
+      const reservedOutput = resolvedMaxTokens
 
       const enrichMemory = request.workId && request.enrichNarrativeMemory !== false && (
         request.enrichNarrativeMemory === true ||
@@ -109,17 +107,30 @@ export class ModelService {
         if (workStyles.length > 0) styleId = workStyles[0].id
       }
 
-      const stepDefaults = getStepGenerationDefaults(request.step)
+      const resolvedTemperature = request.temperature ?? stepDefaults.temperature
+
       const enrichedRequest: ModelRequest = {
         ...stepDefaults,
         ...request,
         systemPrompt,
         prompt: userPrompt,
-        maxTokens: request.maxTokens ?? stepDefaults.maxTokens,
-        temperature: request.temperature ?? stepDefaults.temperature,
+        maxTokens: resolvedMaxTokens,
+        temperature: resolvedTemperature,
         frequencyPenalty: request.frequencyPenalty ?? stepDefaults.frequencyPenalty,
         presencePenalty: request.presencePenalty ?? stepDefaults.presencePenalty,
         topP: request.topP ?? stepDefaults.topP
+      }
+
+      if (isDeepSeekProvider(config.model_type)) {
+        enrichedRequest.deepseekOptions = parseDeepSeekProviderOptions(config.provider_options_json)
+      }
+
+      const tempLog: Record<string, unknown> = {
+        temperature: enrichedRequest.temperature ?? 0.7
+      }
+      if (stepDefaults.temperatureGroup) {
+        tempLog.temperatureGroup = stepDefaults.temperatureGroup
+        tempLog.temperatureRange = stepDefaults.temperatureRange
       }
 
       appLogger.info('llm', 'LLM 请求已发送', {
@@ -129,7 +140,7 @@ export class ModelService {
         step: request.step,
         workId: request.workId,
         maxTokens: enrichedRequest.maxTokens ?? 4096,
-        temperature: enrichedRequest.temperature ?? 0.7,
+        ...tempLog,
         systemPrompt: enrichedRequest.systemPrompt ?? '',
         userPrompt: enrichedRequest.prompt,
         contextBudget: report
@@ -142,157 +153,75 @@ export class ModelService {
         session.setModelInfo(config.model_type, config.model_name || undefined)
       }
 
-      const MAX_RETRIES = 3
-      let lastError: string | undefined
-      let lastResponse: ModelResponse | null = null
+      if (session?.isCancelled()) {
+        return this.cancelledResponse(startTime, report)
+      }
 
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        if (session?.isCancelled()) {
-          return this.cancelledResponse(startTime, report)
+      const response = await adapter.chat(
+        enrichedRequest,
+        config.api_key || '',
+        config.api_base || '',
+        config.model_name || undefined,
+        {
+          onDelta: streamEnabled
+            ? (delta) => {
+                options?.onDelta?.(delta)
+                session?.emitDelta(delta)
+              }
+            : undefined,
+          onThinkingDelta: streamEnabled
+            ? (delta) => {
+                options?.onThinkingDelta?.(delta)
+                session?.emitThinkingDelta(delta)
+              }
+            : undefined,
+          signal,
+          stream: streamEnabled,
+          modelType: config.model_type
         }
+      )
 
-        if (attempt > 1 && session && !options?.suppressPhases) {
-          session.emitPhase(`重试 (${attempt}/${MAX_RETRIES})`, 'running')
-          session.clearStream()
-        }
+      if (response.cancelled) {
+        return { ...response, contextBudget: report }
+      }
 
-        const response = await adapter.chat(
-          enrichedRequest,
-          config.api_key || '',
-          config.api_base || '',
-          config.model_name || undefined,
-          {
-            onDelta: streamEnabled
-              ? (delta) => {
-                  options?.onDelta?.(delta)
-                  session?.emitDelta(delta)
-                }
-              : undefined,
-            onThinkingDelta: streamEnabled
-              ? (delta) => {
-                  options?.onThinkingDelta?.(delta)
-                  session?.emitThinkingDelta(delta)
-                }
-              : undefined,
-            signal,
-            stream: streamEnabled
-          }
-        )
-
-        lastResponse = response
-
-        if (response.cancelled) {
-          return { ...response, contextBudget: report }
-        }
-
-        if (response.success) {
-          appLogger.info('llm', 'LLM 请求成功', {
-            requestId,
-            modelType: config.model_type,
-            modelName: config.model_name || undefined,
-            step: request.step,
-            workId: request.workId,
-            durationMs: response.durationMs ?? 0,
-            usage: response.usage
-          })
-
-          if (request.workId && request.workId > 0) {
-            generationLogDAO.log({
-              work_id: request.workId,
-              step: request.step || 'unknown',
-              model_type: config.model_type,
-              style_id: styleId,
-              prompt_tokens: response.usage?.promptTokens ?? 0,
-              completion_tokens: response.usage?.completionTokens ?? 0,
-              duration_ms: response.durationMs ?? 0
-            })
-          }
-
-          if (ownsSession && session) {
-            session.complete(true)
-          }
-
-          return this.withNormalizedBody(response, request.step, report)
-        }
-
-        lastError = response.error
-        appLogger.warn('model', `模型调用失败，第 ${attempt}/${MAX_RETRIES} 次`, {
+      if (response.success) {
+        appLogger.info('llm', 'LLM 请求成功', {
           requestId,
           modelType: config.model_type,
+          modelName: config.model_name || undefined,
           step: request.step,
           workId: request.workId,
-          error: lastError
+          durationMs: response.durationMs ?? 0,
+          usage: response.usage
         })
 
-        if (attempt < MAX_RETRIES) {
-          await new Promise(resolve => setTimeout(resolve, 1000 * attempt))
+        if (request.workId && request.workId > 0) {
+          generationLogDAO.log({
+            work_id: request.workId,
+            step: request.step || 'unknown',
+            model_type: config.model_type,
+            style_id: styleId,
+            prompt_tokens: response.usage?.promptTokens ?? 0,
+            completion_tokens: response.usage?.completionTokens ?? 0,
+            duration_ms: response.durationMs ?? 0
+          })
         }
+
+        if (ownsSession && session) {
+          session.complete(true)
+        }
+
+        return this.withNormalizedBody(response, request.step, report)
       }
 
-      const fallbackConfig = this.getFallbackModel(config.model_type as ModelType)
-      if (fallbackConfig) {
-        appLogger.warn('llm', '主模型失败，尝试降级模型', {
-          requestId,
-          failedModelType: config.model_type,
-          fallbackModelType: fallbackConfig.model_type,
-          step: request.step,
-          workId: request.workId
-        })
-        console.warn(`[ModelService] 降级到 ${fallbackConfig.model_type}`)
-        if (session) {
-          session.emitPhase(`降级到 ${fallbackConfig.model_type}`, 'running')
-          session.clearStream()
-        }
-        const fallbackAdapter = this.adapters.get(fallbackConfig.model_type as ModelType)
-        if (fallbackAdapter) {
-          const fallbackResponse = await fallbackAdapter.chat(
-            enrichedRequest,
-            fallbackConfig.api_key || '',
-            fallbackConfig.api_base || '',
-            fallbackConfig.model_name || undefined,
-            {
-              onDelta: streamEnabled
-                ? (delta) => {
-                    options?.onDelta?.(delta)
-                    session?.emitDelta(delta)
-                  }
-                : undefined,
-              onThinkingDelta: streamEnabled
-                ? (delta) => {
-                    options?.onThinkingDelta?.(delta)
-                    session?.emitThinkingDelta(delta)
-                  }
-                : undefined,
-              signal,
-              stream: streamEnabled
-            }
-          )
-          if (fallbackResponse.success) {
-            appLogger.info('llm', '降级模型请求成功', {
-              requestId,
-              modelType: fallbackConfig.model_type,
-              modelName: fallbackConfig.model_name || undefined,
-              step: request.step,
-              workId: request.workId,
-              durationMs: fallbackResponse.durationMs ?? 0,
-              usage: fallbackResponse.usage
-            })
-            if (ownsSession && session) {
-              session.complete(true)
-            }
-            return this.withNormalizedBody(fallbackResponse, request.step, report)
-          }
-          lastError = fallbackResponse.error
-          lastResponse = fallbackResponse
-        }
-      }
-
-      const finalError = `调用失败(已重试${MAX_RETRIES}次): ${lastError}`
+      const finalError = response.error || '模型调用失败'
       appLogger.error('model', finalError, {
         requestId,
         modelType: config.model_type,
         step: request.step,
-        workId: request.workId
+        workId: request.workId,
+        error: finalError
       })
 
       if (ownsSession && session) {
@@ -301,7 +230,7 @@ export class ModelService {
 
       return {
         success: false,
-        content: lastResponse?.content ?? '',
+        content: response.content ?? '',
         error: finalError,
         contextBudget: report,
         durationMs: Date.now() - startTime
@@ -397,50 +326,58 @@ export class ModelService {
     return { ...response, content, contextBudget }
   }
 
-  private getFallbackModel(failedType: ModelType) {
-    const allConfigs = modelConfigDAO.list()
-    return allConfigs.find(
-      c => c.model_type !== failedType && c.is_enabled && c.api_key
-    ) ?? null
-  }
+}
+
+type StepGenerationDefaults = Partial<ModelRequest> & {
+  temperatureGroup?: string
+  temperatureRange?: { min: number; max: number }
 }
 
 /**
- * 按创作步骤返回生成参数。
- * 以用户在「设置 > AI 服务 > 生成参数」中持久化的值为基准，
- * body_style_rewrite / ai_trace_polish 在此基础上微调 temperature。
+ * 生成参数默认值。
+ * - 带 workId 的作品创作：temperature 由作品 8 组区间随机采样，忽略全局温度
+ * - 其它场景：使用「设置 > AI 服务 > 高级配置」；润色类 step 仅微调 penalty/topP
  */
-function getStepGenerationDefaults(step?: string): Partial<ModelRequest> {
+function getStepGenerationDefaults(step?: string, workId?: number): StepGenerationDefaults {
   const saved = appPreferenceDAO.getGenerationParams()
+  const base: StepGenerationDefaults = {
+    maxTokens: saved.maxTokens,
+    frequencyPenalty: saved.frequencyPenalty,
+    presencePenalty: saved.presencePenalty,
+    topP: saved.topP
+  }
+
+  if (isWorkScopedModelRequest(workId)) {
+    const sampled = resolveWorkRequestTemperature(workId!, step)
+    return {
+      ...base,
+      temperature: sampled.temperature,
+      temperatureGroup: sampled.group,
+      temperatureRange: sampled.range
+    }
+  }
+
+  base.temperature = saved.temperature
 
   if (step === 'body_style_rewrite') {
     return {
+      ...base,
       temperature: Math.min(saved.temperature + 0.03, 2),
-      maxTokens: saved.maxTokens,
       frequencyPenalty: Math.min(saved.frequencyPenalty + 0.1, 2),
       presencePenalty: Math.min(saved.presencePenalty + 0.05, 2),
       topP: Math.max(saved.topP - 0.02, 0)
     }
   }
-  if (step === 'body_generation' || step?.startsWith('body_')) {
-    return {
-      temperature: saved.temperature,
-      maxTokens: saved.maxTokens,
-      frequencyPenalty: saved.frequencyPenalty,
-      presencePenalty: saved.presencePenalty,
-      topP: saved.topP
-    }
-  }
   if (step === 'ai_trace_polish') {
     return {
+      ...base,
       temperature: Math.min(saved.temperature + 0.03, 2),
-      maxTokens: saved.maxTokens,
       frequencyPenalty: Math.min(saved.frequencyPenalty + 0.05, 2),
       presencePenalty: Math.min(saved.presencePenalty + 0.05, 2),
       topP: Math.max(saved.topP - 0.05, 0)
     }
   }
-  return {}
+  return base
 }
 
 export const modelService = new ModelService()

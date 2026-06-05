@@ -6,11 +6,14 @@ import DeaiDiffText from './DeaiDiffText.vue'
 const props = defineProps<{
   originalText: string
   resultText: string
+  viewMode: 'diff' | 'plain'
   status: 'idle' | 'running' | 'done' | 'error'
   errorMessage: string
 }>()
 
-const viewMode = ref<'diff' | 'plain'>('diff')
+const emit = defineEmits<{
+  'update:viewMode': [value: 'diff' | 'plain']
+}>()
 const hasResult = computed(() => props.resultText.trim().length > 0)
 const showContent = computed(() => props.status !== 'idle' || hasResult.value)
 const diffView = computed(() => buildTextDiff(props.originalText, props.resultText))
@@ -112,16 +115,16 @@ function exportResult() {
         <button
           type="button"
           class="btn btn-xs join-item"
-          :class="viewMode === 'diff' ? 'btn-primary' : 'btn-ghost'"
-          @click="viewMode = 'diff'"
+          :class="props.viewMode === 'diff' ? 'btn-primary' : 'btn-ghost'"
+          @click="emit('update:viewMode', 'diff')"
         >
           对比
         </button>
         <button
           type="button"
           class="btn btn-xs join-item"
-          :class="viewMode === 'plain' ? 'btn-primary' : 'btn-ghost'"
-          @click="viewMode = 'plain'"
+          :class="props.viewMode === 'plain' ? 'btn-primary' : 'btn-ghost'"
+          @click="emit('update:viewMode', 'plain')"
         >
           纯结果
         </button>
@@ -135,7 +138,7 @@ function exportResult() {
         <span v-if="hasResult">→ {{ props.resultText.length.toLocaleString() }} 字</span>
       </span>
       <span
-        v-if="showDiffHighlight && viewMode === 'diff'"
+        v-if="showDiffHighlight && props.viewMode === 'diff'"
         class="text-[10px] text-base-content/40 inline-flex items-center gap-1"
       >
         <span class="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-200/90 dark:bg-yellow-400/30" />
@@ -175,7 +178,7 @@ function exportResult() {
 
     <div v-else-if="showContent" class="flex-1 min-h-0 flex flex-col p-2 gap-2">
       <div
-        v-if="viewMode === 'diff'"
+        v-if="props.viewMode === 'diff'"
         class="grid grid-cols-1 md:grid-cols-2 gap-2 flex-1 min-h-0"
       >
         <article class="border border-base-300/80 rounded-md bg-base-200/20 flex flex-col min-h-0 min-h-[200px] md:min-h-0">

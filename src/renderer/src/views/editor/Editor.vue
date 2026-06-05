@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
+import { useStyleChangeSync } from '../../composables/useStyleChangeSync'
 import { useRoute, useRouter } from 'vue-router'
 import IncubatorPanel from './IncubatorPanel.vue'
 import SettingsPanel from './SettingsPanel.vue'
@@ -9,6 +10,7 @@ import GeneratePanel from './GeneratePanel.vue'
 import AnchorsPanel from './AnchorsPanel.vue'
 import IdeasPanel from './IdeasPanel.vue'
 import FavoritesPanel from './FavoritesPanel.vue'
+import WorkTemperaturePanel from './WorkTemperaturePanel.vue'
 import NarrativeMemoryPanel from './NarrativeMemoryPanel.vue'
 import TasteProfilePanel from './TasteProfilePanel.vue'
 import ImageGeneratePanel from './ImageGeneratePanel.vue'
@@ -74,6 +76,7 @@ const workflowSteps = [
 ]
 
 const utilitySteps = [
+  { key: 'temperature' as const, label: '创作温度', icon: 'thermometer-half' },
   { key: 'memory' as const, label: '叙事记忆体', icon: 'project-diagram' },
   { key: 'stats' as const, label: '写作统计', icon: 'chart-bar' },
   { key: 'block' as const, label: '写作障碍', icon: 'bolt' },
@@ -98,6 +101,7 @@ const panelComponents = {
   generate: GeneratePanel,
   anchors: AnchorsPanel,
   ideas: IdeasPanel,
+  temperature: WorkTemperaturePanel,
   memory: NarrativeMemoryPanel,
   stats: WritingStatsPanel,
   block: WriterBlockPanel,
@@ -143,26 +147,41 @@ function triggerWriterBlock() {
   currentStep.value = 'block'
 }
 
-function onStyleChangedInEditor() {
-  void (async () => {
-    allStyles.value = await window.anovel.invoke('style:list') as StyleOption[]
-  })()
+async function reloadStyleOptions() {
+  allStyles.value = await window.anovel.invoke('style:list') as StyleOption[]
+  const currentId = await window.anovel.invoke('style:getWorkStyleId', workId.value) as number | null
+  if (currentId && !allStyles.value.some(s => s.id === currentId)) {
+    boundStyleId.value = null
+    await window.anovel.invoke('style:setWorkStyle', workId.value, null)
+  } else {
+    boundStyleId.value = currentId
+  }
+}
+
+useStyleChangeSync(reloadStyleOptions)
+
+function onOpenExport() {
+  void openExportModal()
 }
 
 onMounted(async () => {
   window.anovel.on('app:quickIdea', triggerQuickIdea)
-  window.anovel.on('app:openExport', () => { void openExportModal() })
+  window.anovel.on('app:openExport', onOpenExport)
   window.anovel.on('app:writerBlock', triggerWriterBlock)
-  window.anovel.on('style:changed', onStyleChangedInEditor)
   try {
     work.value = await window.anovel.invoke('work:get', workId.value) as WorkInfo
-    allStyles.value = await window.anovel.invoke('style:list') as StyleOption[]
-    boundStyleId.value = await window.anovel.invoke('style:getWorkStyleId', workId.value) as number | null
+    await reloadStyleOptions()
     await refreshProgress()
   } catch (e) {
     console.error('加载失败:', e)
     router.push('/')
   }
+})
+
+onUnmounted(() => {
+  window.anovel.off('app:quickIdea', triggerQuickIdea)
+  window.anovel.off('app:openExport', onOpenExport)
+  window.anovel.off('app:writerBlock', triggerWriterBlock)
 })
 
 watch(currentStep, () => {
@@ -380,7 +399,6 @@ async function doExport() {
         </span>
 
         <div class="ml-auto flex items-center gap-2">
-          <label class="text-xs text-base-content/50 hidden sm:inline">文风</label>
           <select
             v-model="boundStyleId"
             class="select select-bordered select-xs max-w-[140px]"
@@ -399,9 +417,7 @@ async function doExport() {
           >
             进化
           </button>
-          <span class="text-xs text-base-content/40 hidden md:inline" :title="boundStyleName">
-            {{ boundStyleId ? boundStyleName : '生成时不注入文风' }}
-          </span>
+
         </div>
       </header>
 

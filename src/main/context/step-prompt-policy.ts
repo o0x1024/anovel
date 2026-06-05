@@ -1,4 +1,5 @@
 import type { WorkContextOptions } from './work-context'
+import { isCoreSettingsCharacterGenerateStep } from './style-step-rules'
 
 /** 正文生成 */
 export function isBodyGenerationStep(step: string | undefined): boolean {
@@ -55,6 +56,7 @@ export function shouldInjectAnchors(step: string | undefined): boolean {
   if (!step) return false
   if (isIncubatorStep(step)) return false
   if (isFocusedAnalysisStep(step)) return false
+  if (isCoreSettingsCharacterGenerateStep(step)) return false
   return true
 }
 
@@ -63,14 +65,17 @@ export function shouldInjectTasteAndConditionRules(step: string | undefined): bo
   if (isOutlinePlanningStep(step)) return false
   if (isIncubatorStep(step)) return false
   if (isFocusedAnalysisStep(step)) return false
+  if (isCoreSettingsCharacterGenerateStep(step)) return false
   return true
 }
 
-/** 文风模板 / 分步规则 / 进化曲线（提取叙事记忆、大纲规划等分析任务不需要） */
+/** 文风模板 / 分步规则 / 进化曲线（提取叙事记忆、大纲规划、孵化器探索等不需要） */
 export function shouldInjectWritingStyle(step: string | undefined): boolean {
   if (!step) return false
   if (isFocusedAnalysisStep(step)) return false
   if (isOutlinePlanningStep(step)) return false
+  if (isIncubatorStep(step)) return false
+  if (isCoreSettingsCharacterGenerateStep(step)) return false
   return true
 }
 

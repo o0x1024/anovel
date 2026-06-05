@@ -8,6 +8,7 @@ import { registerLogIpcHandlers } from './ipc-log'
 import { registerAiIpcHandlers } from './ai/register-ai-ipc'
 import { registerAssistantIpcHandlers } from './ipc-assistant'
 import { registerLabIpcHandlers } from './ipc-lab'
+import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
@@ -17,10 +18,16 @@ import type { PromptCategory } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
 import { fetchProviderModelCatalog, buildAssistantModelOptions } from './context/model-catalog'
+import { appLogger } from './logger/app-logger'
+import { generateCustomProviderId, defaultBaseForProtocol, defaultModelForProtocol } from '../shared/model-providers'
+import { broadcastStyleChanged } from './style-events'
+import { generateStyleFromDescription } from './context/style-generate'
 import { buildWorkContext } from './context/work-context'
 import {
   buildSettingsGenerationContext,
-  type CoreSettingGenerateType
+  characterGenHintsPreferenceKey,
+  type CoreSettingGenerateType,
+  type SettingsGenerationContextOptions
 } from './context/settings-generation-context'
 import { parseVolumeSuggestions } from './context/parse-volumes'
 import { parseAnchorSuggestions } from './context/parse-anchors'
@@ -30,8 +37,10 @@ import { checkAnchorAlignment } from './context/anchor-alignment'
 import { mergeIdeaToTarget } from './context/idea-merge'
 import { parseExpansionVersions } from './context/parse-expansion'
 import { parseIncubatorVariants } from './context/parse-variants'
+import { registerIncubatorIpcHandlers } from './ipc/incubator-ipc'
 import { getConditionRules, setConditionRules } from './context/condition-rules'
 import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTrace, checkAntiAiRuleViolations, stripEmDashes, getWorkReferenceText, setWorkReferenceText, getAllAntiAiPresets, getCustomAntiAiPresets, setCustomAntiAiPresets, type AntiAiPreset } from './context/anti-ai-rules'
+import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { detectAnchorConflicts } from './context/anchor-conflict'
 import { exportWorkContent } from './context/export-content'
 import {
@@ -73,7 +82,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('work:setCoverFromBase64', (_e, workId: number, base64: string, fileName: string) =>
     setWorkCoverFromBase64(workId, base64, fileName))
   ipcMain.handle('work:removeCover', (_e, workId: number) => removeWorkCover(workId))
-  ipcMain.handle('work:getStepProgress', (_e, workId: number) => getWorkStepProgress(workId))
+  safeIpcHandle('work:getStepProgress', (_e, workId) => getWorkStepProgress(workId as number))
+  ipcMain.handle('work:getStepTemperature', (_e, workId: number) => workDAO.getStepTemperature(workId))
+  ipcMain.handle('work:setStepTemperature', (_e, workId: number, partial: Record<string, unknown>) =>
+    workDAO.setStepTemperature(workId, partial as Parameters<typeof workDAO.setStepTemperature>[1]))
+  ipcMain.handle('work:resetStepTemperature', (_e, workId: number) =>
+    workDAO.resetStepTemperature(workId))
   ipcMain.handle('work:getBodyText', (_e, workId: number, chapterId?: number | null) =>
     getWorkBodyText(workId, chapterId ?? null))
 
@@ -123,9 +137,21 @@ export function registerIpcHandlers(): void {
   // ==================== 文风 ====================
   ipcMain.handle('style:list', () => writingStyleDAO.list())
   ipcMain.handle('style:get', (_e, id: number) => writingStyleDAO.getById(id))
-  ipcMain.handle('style:create', (_e, input: Record<string, unknown>) => writingStyleDAO.create(input as unknown as StyleCreateInput))
-  ipcMain.handle('style:update', (_e, id: number, input: Record<string, unknown>) => writingStyleDAO.update(id, input))
-  ipcMain.handle('style:delete', (_e, id: number) => writingStyleDAO.delete(id))
+  ipcMain.handle('style:create', (_e, input: Record<string, unknown>) => {
+    const id = writingStyleDAO.create(input as unknown as StyleCreateInput)
+    broadcastStyleChanged(id)
+    return id
+  })
+  ipcMain.handle('style:update', (_e, id: number, input: Record<string, unknown>) => {
+    const ok = writingStyleDAO.update(id, input)
+    if (ok) broadcastStyleChanged(id)
+    return ok
+  })
+  ipcMain.handle('style:delete', (_e, id: number) => {
+    const ok = writingStyleDAO.delete(id)
+    if (ok) broadcastStyleChanged(null)
+    return ok
+  })
   ipcMain.handle('style:bindToWork', (_e, workId: number, styleId: number, curve?: string) =>
     writingStyleDAO.bindToWork(workId, styleId, curve))
   ipcMain.handle('style:unbindFromWork', (_e, workId: number, styleId: number) =>
@@ -138,19 +164,34 @@ export function registerIpcHandlers(): void {
     writingStyleDAO.getWorkStyleBinding(workId))
   ipcMain.handle('style:setWorkEvolutionCurve', (_e, workId: number, curveJson: string | null) =>
     writingStyleDAO.setWorkEvolutionCurve(workId, curveJson))
+  ipcMain.handle('style:generateFromDescription', (e, description: string) =>
+    generateStyleFromDescription(description, { webContents: e.sender }))
 
   // ==================== 模型配置 ====================
   ipcMain.handle('model:list', () => modelConfigDAO.list())
   ipcMain.handle('model:listAssistantOptions', () =>
     buildAssistantModelOptions(modelConfigDAO.list()))
-  ipcMain.handle('model:upsert', (_e, type: string, apiKey: string, apiBase?: string, modelName?: string) => {
+  ipcMain.handle('model:upsert', (_e, type: string, apiKey: string, apiBase?: string, modelName?: string, displayName?: string, providerProtocol?: string) => {
     try {
-      console.log('[IPC] model:upsert called with:', { type, apiKey: apiKey ? '***' : '', apiBase, modelName })
-      return modelConfigDAO.upsert(type, apiKey, apiBase, modelName)
+      console.log('[IPC] model:upsert called with:', { type, apiKey: apiKey ? '***' : '', apiBase, modelName, displayName, providerProtocol })
+      return modelConfigDAO.upsert(type, apiKey, apiBase, modelName, displayName ?? null, providerProtocol ?? null)
     } catch (err) {
       console.error('[IPC Error] model:upsert failed:', err)
       throw err
     }
+  })
+  ipcMain.handle('model:createCustom', (_e, displayName: string, providerProtocol: string, apiKey?: string, apiBase?: string, modelName?: string) => {
+    const modelType = generateCustomProviderId()
+    const protocol = providerProtocol as 'openai' | 'gemini' | 'anthropic'
+    modelConfigDAO.createCustom(
+      modelType,
+      displayName.trim(),
+      protocol,
+      apiKey?.trim() ?? '',
+      apiBase?.trim() || defaultBaseForProtocol(protocol),
+      modelName?.trim() || defaultModelForProtocol(protocol)
+    )
+    return modelType
   })
   ipcMain.handle('model:setEnabled', (_e, type: string, enabled: boolean) => {
     try {
@@ -166,6 +207,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('model:delete', (_e, type: string) => modelConfigDAO.delete(type))
   ipcMain.handle('model:setMaxContextTokens', (_e, type: string, tokens: number) =>
     modelConfigDAO.setMaxContextTokens(type, tokens))
+  ipcMain.handle('model:setProviderOptions', (_e, type: string, optionsJson: string | null) =>
+    modelConfigDAO.setProviderOptions(type, optionsJson))
   ipcMain.handle('model:getGlobalDefault', () => appPreferenceDAO.getGlobalLlmDefault())
   ipcMain.handle('model:setGlobalDefault', (_e, provider: string | null, modelName: string | null) =>
     appPreferenceDAO.setGlobalLlmDefault(provider, modelName))
@@ -176,15 +219,35 @@ export function registerIpcHandlers(): void {
     if (!config?.api_key) {
       throw new Error('请先配置 API Key')
     }
-    const models = await fetchProviderModelCatalog(modelType, config.api_key, config.api_base)
-    if (!models.length) {
-      throw new Error('未获取到任何模型')
+    try {
+      const models = await fetchProviderModelCatalog(
+        modelType,
+        config.api_key,
+        config.api_base,
+        config.provider_protocol
+      )
+      if (!models.length) {
+        throw new Error('未获取到任何模型')
+      }
+      modelConfigDAO.setAvailableModels(modelType, models)
+      if (config.model_name && !models.includes(config.model_name)) {
+        modelConfigDAO.upsert(modelType, config.api_key, config.api_base ?? undefined, models[0])
+      }
+      appLogger.info('settings', '刷新模型列表成功', {
+        modelType,
+        apiBase: config.api_base,
+        modelCount: models.length
+      })
+      return models
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err)
+      appLogger.error('settings', '刷新模型列表失败', {
+        modelType,
+        apiBase: config.api_base,
+        error: message
+      })
+      throw err
     }
-    modelConfigDAO.setAvailableModels(modelType, models)
-    if (config.model_name && !models.includes(config.model_name)) {
-      modelConfigDAO.upsert(modelType, config.api_key, config.api_base ?? undefined, models[0])
-    }
-    return models
   })
 
   // ==================== 锚点 ====================
@@ -251,8 +314,16 @@ export function registerIpcHandlers(): void {
     coreSettingDAO.listVersions(workId, type))
   ipcMain.handle('setting:restoreVersion', (_e, workId: number, type: string, versionId: number) =>
     coreSettingDAO.restoreVersion(workId, type, versionId))
-  ipcMain.handle('setting:upsert', (_e, workId: number, type: string, content: string) =>
-    coreSettingDAO.upsert(workId, type, content))
+  ipcMain.handle('setting:upsert', (_e, workId: number, type: string, content: string) => {
+    const trimmed = (content as string).trim()
+    const clearable = type === 'character' || type === 'worldview' || type === 'conflict'
+    if (!trimmed && clearable) {
+      const row = coreSettingDAO.getByType(workId, type)
+      if (row) coreSettingDAO.delete(row.id)
+      return
+    }
+    coreSettingDAO.upsert(workId, type, trimmed)
+  })
   ipcMain.handle('setting:getConditionRules', (_e, workId: number) => getConditionRules(workId))
   ipcMain.handle('setting:setConditionRules', (_e, workId: number, rules: string[]) => {
     setConditionRules(workId, rules)
@@ -272,15 +343,17 @@ export function registerIpcHandlers(): void {
     getWorkReferenceText(workId))
   ipcMain.handle('setting:setWorkReferenceText', (_e, workId: number, text: string) =>
     setWorkReferenceText(workId, text))
+  ipcMain.handle('setting:getCharacterGenHints', (_e, workId: number) =>
+    appPreferenceDAO.getPreference(characterGenHintsPreferenceKey(workId)) ?? '')
+  ipcMain.handle('setting:setCharacterGenHints', (_e, workId: number, text: string) => {
+    appPreferenceDAO.setPreference(characterGenHintsPreferenceKey(workId), (text as string).trim())
+    return true
+  })
 
-  ipcMain.handle('antiai:humanize', (_e, content: string, opts?: Record<string, unknown>) => {
-    const { humanizeText } = require('./context/humanize-text')
-    return humanizeText(content, opts ?? {})
-  })
-  ipcMain.handle('antiai:measureAiSignature', (_e, content: string) => {
-    const { measureAiSignature } = require('./context/humanize-text')
-    return measureAiSignature(content)
-  })
+  ipcMain.handle('antiai:humanize', (_e, content: string, opts?: HumanizeOptions) =>
+    humanizeText(content, opts ?? {}))
+  ipcMain.handle('antiai:measureAiSignature', (_e, content: string) =>
+    measureAiSignature(content))
 
   ipcMain.handle('context:buildWork', (_e, workId: number, options?: Record<string, boolean>) =>
     buildWorkContext(workId, options ?? {}))
@@ -291,7 +364,7 @@ export function registerIpcHandlers(): void {
       _e,
       workId: number,
       targetType: CoreSettingGenerateType,
-      options?: { selfDraft?: string }
+      options?: SettingsGenerationContextOptions
     ) => buildSettingsGenerationContext(workId, targetType, options ?? {})
   )
 
@@ -301,12 +374,16 @@ export function registerIpcHandlers(): void {
     persist?: boolean
   }) => checkAnchorAlignment(workId, content, options))
 
-  ipcMain.handle('incubator:parseExpansion', (_e, content: string) => parseExpansionVersions(content))
-  ipcMain.handle('incubator:parseVariants', (_e, content: string) => parseIncubatorVariants(content))
+  safeIpcHandle('incubator:parseExpansion', (_e, content) =>
+    parseExpansionVersions(content as string))
+  safeIpcHandle('incubator:parseVariants', (_e, content, legacyFallback) =>
+    parseIncubatorVariants(content as string, (legacyFallback as boolean | undefined) ?? false))
+
+  registerIncubatorIpcHandlers()
 
   // ==================== 模型调用 ====================
-  ipcMain.handle('model:chat', (e, request: ModelRequest) =>
-    modelService.chat(request, { webContents: e.sender }))
+  safeIpcHandle('model:chat', (e, request) =>
+    modelService.chat(request as ModelRequest, { webContents: e.sender }))
 
   // ==================== 应用信息 ====================
   ipcMain.handle('app:getInfo', () => ({

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { toPlainForIpc } from '../../../../shared/ipc-plain'
 import SettingVersionHistory from '../../components/SettingVersionHistory.vue'
 
 const props = defineProps<{ workId: number }>()
@@ -30,7 +31,6 @@ const saving = ref(false)
 const aiLoading = ref(false)
 const lastError = ref('')
 const logHint = ref('')
-const expanded = ref(false)
 const versionHistoryRef = ref<{ load: () => Promise<void> } | null>(null)
 
 onMounted(load)
@@ -53,7 +53,7 @@ defineExpose({
     await refreshVersionHistory()
   },
   expandPanel: () => {
-    expanded.value = true
+    document.getElementById('character-cards-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 })
 
@@ -79,14 +79,6 @@ function startAdd() {
   editingIndex.value = -1
 }
 
-function startHeaderAction() {
-  if (cards.value.length > 0) {
-    expanded.value = true
-  } else {
-    startAdd()
-  }
-}
-
 function startEdit(idx: number) {
   draft.value = JSON.parse(JSON.stringify(cards.value[idx]))
   editingIndex.value = idx
@@ -109,23 +101,35 @@ async function saveDraft() {
     const next = [...cards.value]
     if (editingIndex.value === -1) next.push(card)
     else if (editingIndex.value != null) next[editingIndex.value] = card
-    await window.anovel.invoke('characterCards:save', props.workId, next)
-    cards.value = next
+    await persistCards(next)
     cancelEdit()
-    await refreshVersionHistory()
-    await notifyContentChanged()
   } finally {
     saving.value = false
   }
 }
 
-async function removeCard(idx: number) {
-  if (!confirm(`删除人设卡片「${cards.value[idx].name}」？`)) return
-  const next = cards.value.filter((_, i) => i !== idx)
-  await window.anovel.invoke('characterCards:save', props.workId, next)
+async function persistCards(next: CharacterCard[]) {
+  await window.anovel.invoke('characterCards:save', props.workId, toPlainForIpc(next))
   cards.value = next
+  if (editingIndex.value != null && editingIndex.value >= next.length) {
+    cancelEdit()
+  }
   await refreshVersionHistory()
   await notifyContentChanged()
+}
+
+async function removeCard(idx: number) {
+  const name = cards.value[idx]?.name
+  if (!name || !confirm(`删除人设卡片「${name}」？`)) return
+  const next = cards.value.filter((_, i) => i !== idx)
+  await persistCards(next)
+}
+
+async function clearAllCards() {
+  if (!cards.value.length) return
+  if (!confirm(`确定删除全部 ${cards.value.length} 张人设卡片？`)) return
+  cancelEdit()
+  await persistCards([])
 }
 
 async function aiGenerate() {
@@ -142,9 +146,8 @@ async function aiGenerate() {
       parseError?: boolean
     }
     if (res.success && res.cards?.length) {
-      await window.anovel.invoke('characterCards:save', props.workId, res.cards)
+      await window.anovel.invoke('characterCards:save', props.workId, toPlainForIpc(res.cards))
       await load()
-      expanded.value = true
       await refreshVersionHistory()
       await notifyContentChanged()
     } else {
@@ -201,9 +204,17 @@ function cardsSummary(): string {
           />
           {{ aiLoading ? '生成中...' : 'AI 生成卡片' }}
         </button>
-        <button type="button" class="btn btn-outline btn-primary btn-xs gap-1" @click="startHeaderAction">
-          <font-awesome-icon :icon="cards.length ? 'edit' : 'plus'" class="w-3 h-3" />
-          {{ cards.length ? '编辑' : '添加' }}
+        <button type="button" class="btn btn-outline btn-primary btn-xs gap-1" @click="startAdd">
+          <font-awesome-icon icon="plus" class="w-3 h-3" />
+          添加
+        </button>
+        <button
+          v-if="cards.length"
+          type="button"
+          class="btn btn-ghost btn-xs text-error"
+          @click="clearAllCards"
+        >
+          清空全部
         </button>
       </div>
     </div>
@@ -225,35 +236,23 @@ function cardsSummary(): string {
       @restored="onVersionRestored"
     />
 
-    <div v-if="cards.length > 0" class="mt-1">
-      <button
-        type="button"
-        class="w-full flex items-center justify-between gap-2 rounded-lg px-2 py-2 text-left hover:bg-base-100/80 transition-colors"
-        @click="expanded = !expanded"
+    <div v-if="cards.length > 0" class="mt-2 space-y-2">
+      <p class="text-xs text-base-content/50">{{ cardsSummary() }}</p>
+      <div
+        v-for="(card, idx) in cards"
+        :key="`${card.name}-${idx}`"
+        class="border border-base-300/60 rounded-lg p-3 bg-base-100 text-sm"
       >
-        <span class="text-xs text-base-content/60 truncate">{{ cardsSummary() }}</span>
-        <font-awesome-icon
-          :icon="expanded ? 'chevron-up' : 'chevron-down'"
-          class="w-3 h-3 shrink-0 text-base-content/40"
-        />
-      </button>
-      <div v-show="expanded" class="mt-2 pt-2 border-t border-base-300/50 space-y-2">
-        <div
-          v-for="(card, idx) in cards"
-          :key="idx"
-          class="border border-base-300/60 rounded-lg p-3 bg-base-100 text-sm"
-        >
-          <div class="flex justify-between items-start gap-2">
-            <div>
-              <span class="font-semibold">{{ card.name }}</span>
-              <span class="badge badge-outline badge-xs ml-2">{{ roleLabel(card.role) }}</span>
-              <p v-if="card.memoryTag" class="text-xs text-base-content/60 mt-1">记忆：{{ card.memoryTag }}</p>
-              <p v-if="card.coreConflict" class="text-xs text-base-content/60">矛盾：{{ card.coreConflict }}</p>
-            </div>
-            <div class="flex gap-1 shrink-0">
-              <button type="button" class="btn btn-ghost btn-xs" @click="startEdit(idx)">编辑</button>
-              <button type="button" class="btn btn-ghost btn-xs text-error" @click="removeCard(idx)">删除</button>
-            </div>
+        <div class="flex justify-between items-start gap-2">
+          <div class="min-w-0">
+            <span class="font-semibold">{{ card.name }}</span>
+            <span class="badge badge-outline badge-xs ml-2">{{ roleLabel(card.role) }}</span>
+            <p v-if="card.memoryTag" class="text-xs text-base-content/60 mt-1">记忆：{{ card.memoryTag }}</p>
+            <p v-if="card.coreConflict" class="text-xs text-base-content/60">矛盾：{{ card.coreConflict }}</p>
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button type="button" class="btn btn-ghost btn-xs" @click.stop="startEdit(idx)">编辑</button>
+            <button type="button" class="btn btn-ghost btn-xs text-error" @click.stop="removeCard(idx)">删除</button>
           </div>
         </div>
       </div>

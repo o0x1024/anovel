@@ -6,6 +6,7 @@ import {
   workDAO, coreSettingDAO, volumeChapterDAO, anchorDAO, ideaFragmentDAO,
   foreshadowingDAO, timelineDAO, aiFavoriteDAO
 } from '../db'
+import type { WorkStepTemperatureConfig } from '../../shared/work-step-temperature'
 
 export interface WorkBackupBundle {
   version: 1
@@ -22,6 +23,7 @@ export interface WorkBackupBundle {
   snapshots: { character_name: string; chapter_sort: number; volume_sort: number; location?: string | null; mental_state?: string | null; known_info?: string | null }[]
   timeline: { event_name: string; event_description?: string | null; absolute_time?: string | null; relative_time?: string | null }[]
   favorites: { source_step: string; source_label: string; title?: string | null; content: string }[]
+  stepTemperature?: WorkStepTemperatureConfig
 }
 
 export function exportWorkBundle(workId: number): WorkBackupBundle {
@@ -77,7 +79,8 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
       source_label: f.source_label,
       title: f.title,
       content: f.content
-    }))
+    })),
+    stepTemperature: workDAO.getStepTemperature(workId)
   }
 }
 
@@ -140,6 +143,10 @@ export function importWorkBundle(bundle: WorkBackupBundle): number {
       content: fav.content,
       title: fav.title ?? undefined
     })
+  }
+
+  if (bundle.stepTemperature) {
+    workDAO.setStepTemperature(workId, bundle.stepTemperature)
   }
 
   return workId

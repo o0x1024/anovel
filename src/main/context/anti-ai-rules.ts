@@ -1,4 +1,5 @@
 import { coreSettingDAO, aiFavoriteDAO, writingStyleDAO } from '../db'
+import { bodyWordCountBounds } from '../../shared/body-word-target'
 import type { AiTraceIssue } from './ai-trace-detect'
 import { resolvePrompt } from './prompt-registry'
 
@@ -262,7 +263,7 @@ export function formatAntiAiRulesFromList(rules: string[]): string {
   if (rules.length === 0) return ''
 
   const lines: string[] = [
-    '【去AI味强制规则 - 正文写作必须严格遵守，优先级高于流畅、文采与上方所有示范】',
+    '【去AI味强制规则】',
     '以下规则用于消除机器写作痕迹，违反任一条视为不合格输出：',
     ''
   ]
@@ -319,7 +320,7 @@ export function buildStyleFewShotForStyle(styleId: number): string {
   if (style.reference_text?.trim()) {
     const ref = style.reference_text.trim().slice(0, 3000)
     parts.push(
-      '【参考文风范文】\n' + ref
+      '【目标范文】\n' + ref
     )
     budget -= ref.length
   }
@@ -450,11 +451,11 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
 //  收藏佳句 / 文风样例 / 参考范文 → few-shot 示范
 // ---------------------------------------------------------------------------
 
-const MAX_FEWSHOT_CHARS = 5000
+const MAX_FEWSHOT_CHARS = 17000
 
 /**
  * 收集 few-shot 示范文本，按优先级注入：
- *  1. style.reference_text (≤3000字) — 目标文风范文，最核心的风格信号
+ *  1. style.reference_text (≤15000字) — 目标文风范文，最核心的风格信号
  *  2. work_reference_text  (≤1500字) — 作品专属参考
  *  3. style.sample_text + favorites (≤500字) — 补充示范
  */
@@ -466,9 +467,9 @@ export function buildStyleFewShot(workId: number): string {
   const style = styleId ? writingStyleDAO.getById(styleId) : undefined
 
   if (style?.reference_text?.trim()) {
-    const ref = style.reference_text.trim().slice(0, 3000)
+    const ref = style.reference_text.trim().slice(0, 15000)
     parts.push(
-      '【参考文风范文】\n' + ref
+      '【目标范文 - 正文的用词、句式、节奏、对话密度必须与此范文保持一致】\n' + ref
     )
     budget -= ref.length
   }
@@ -507,6 +508,13 @@ export function buildStyleFewShot(workId: number): string {
 
   if (parts.length === 0) return ''
   return parts.join('\n\n')
+}
+
+/** 作品绑定的文风是否配置了参考范文（目标范文） */
+export function hasStyleReferenceText(workId: number): boolean {
+  const styleId = writingStyleDAO.getWorkStyleId(workId)
+  const style = styleId ? writingStyleDAO.getById(styleId) : undefined
+  return !!style?.reference_text?.trim()
 }
 
 // ---------------------------------------------------------------------------
@@ -593,43 +601,116 @@ export function buildAntiAiPersonaForWork(workId: number): string {
 // ---------------------------------------------------------------------------
 
 const STYLE_REWRITE_INSTRUCTION = [
-  '你是文字风格转换专家。将以下初稿按目标文风重写，消除 AI 生成痕迹。',
+  '你是一个注重细节的严肃的网文作者。你的任务是将初稿重写为与【目标范文】文笔高度一致的版本。',
   '',
-  '重写规则：',
-  '1. 保持原文的情节走向、人物对话内容、事件顺序完全不变',
-  '2. 用词、句式节奏、信息密度必须与下方「目标文风范文」保持一致',
-  '3. 不得添加原文没有的情节，不得删除原文的关键事件和对话',
-  '4. 允许且鼓励调整段落划分、句子长短、叙述节奏',
-  '5. 像一个赶稿的人类作者，不是力求完美的 AI',
-  '6. 若用户指定了目标字数，重写后正文须控制在该字数范围内（允许±10%浮动）',
+  '**核心目标：重写后的文字读起来必须像目标范文作者亲笔写的，而非 AI 修改的。**',
+  '',
+  '重写规则（按优先级排列）：',
+  '1. 用词、句式长短、叙述节奏、对话密度、信息分布必须与【目标范文】保持一致',
+  '2. 若指定了目标字数，重写后正文必须控制在该字数范围内（允许±10%浮动），可适当精简冗余描写以达到字数要求',
+  '3. 保持原文的核心情节走向和关键事件不变，但允许删减重复、冗余的细节描写',
+  '4. 不得添加原文没有的新情节线',
+  '5. 鼓励大幅调整段落划分、句子长短、叙述节奏以贴近范文风格',
+  '6. 像一个赶稿的人类作者，不是力求完美的 AI',
   '',
   '只输出重写后的正文，不要解释。'
 ].join('\n')
 
-/** 稿件优化 user prompt：初稿 + 目标字数约束 */
-export function buildStyleRewriteUserPrompt(content: string, wordTarget?: number): string {
+/** 稿件优化 user prompt：质量待改项 + 初稿 + 目标字数约束（字数放末尾利用近因效应） */
+export function buildStyleRewriteUserPrompt(
+  content: string,
+  wordTarget?: number,
+  qualityHints?: string
+): string {
   const trimmed = content.trim()
-  if (!wordTarget || wordTarget <= 0) return trimmed
-  return [
-    `目标字数：约${wordTarget}字（重写后正文应控制在此字数范围内，允许±10%浮动）`,
-    '',
-    trimmed
-  ].join('\n')
+  const parts: string[] = []
+  if (qualityHints?.trim()) {
+    parts.push(qualityHints.trim())
+  }
+  parts.push('【以下是需要重写的初稿】', trimmed)
+  if (wordTarget && wordTarget > 0) {
+    const { min, max } = bodyWordCountBounds(wordTarget)
+    parts.push(
+      `【字数硬性约束】重写后正文必须控制在约 ${wordTarget} 字（±10%，即 ${min}–${max} 字）。可删减冗余描写以达到字数要求。`
+    )
+  }
+  return parts.join('\n\n')
 }
 
 /**
- * 为稿件优化（Step 2）构建纯文风 system prompt。
- * 仅包含：重写指令 + 文风模板 + 参考范文 + 去 AI 味规则。
- * 不含任何情节/人设/世界观/伏笔等上下文。
+ * 为稿件优化（Step 2）构建完整 system prompt。
+ * 注入顺序（与正文生成对齐）：
+ *  1. 范文核心指令（有范文时）
+ *  2. 重写指令
+ *  3. 写作人设（从范文推断的统计特征）
+ *  4. 文风模板
+ *  5. 参考范文（few-shot）
+ *  6. 去 AI 味规则
+ *  7. 文风锚定提醒
  */
 export function buildStyleRewriteSystemPrompt(workId: number): string {
-  const parts: string[] = [resolvePrompt('body_style_rewrite.system') || STYLE_REWRITE_INSTRUCTION]
+  const parts: string[] = []
+
+  const hasRef = hasStyleReferenceText(workId)
+  if (hasRef) {
+    const coreDirective = resolvePrompt('body_generation.style_core_directive')?.trim()
+    if (coreDirective) parts.push(coreDirective)
+  }
+
+  parts.push(resolvePrompt('body_style_rewrite.system') || STYLE_REWRITE_INSTRUCTION)
+
+  if (hasRef) {
+    const persona = buildAntiAiPersonaForWork(workId)
+    if (persona) parts.push(persona)
+  }
 
   const styleId = writingStyleDAO.getWorkStyleId(workId)
   const style = styleId ? writingStyleDAO.getById(styleId) : undefined
 
   if (style?.prompt_template?.trim()) {
     parts.push(style.prompt_template.trim())
+  }
+
+  const fewShot = buildStyleFewShot(workId)
+  if (fewShot) parts.push(fewShot)
+
+  const antiAiRules = formatAntiAiRulesForPrompt(workId)
+  if (antiAiRules) parts.push(antiAiRules)
+
+  if (hasRef) {
+    const anchor = resolvePrompt('body_generation.style_anchor')?.trim()
+    if (anchor) parts.push(anchor)
+  }
+
+  return parts.join('\n\n')
+}
+
+// ---------------------------------------------------------------------------
+//  AI 诊断：文风 + 去 AI 规则上下文（不含重写/生成指令）
+// ---------------------------------------------------------------------------
+
+/**
+ * 为 AI 质量诊断构建文风上下文。
+ * 包含：文风 prompt 模板、参考范文（截断）、去 AI 规则。
+ * 不含生成/重写指令——诊断只需要知道"目标是什么"，不需要"怎么写"。
+ */
+export function buildStyleDiagnosisContext(workId: number): string {
+  const parts: string[] = []
+  const hasRef = hasStyleReferenceText(workId)
+
+  if (hasRef) {
+    parts.push([
+      '【诊断文风基准 - 去 AI 痕迹的修改建议必须遵循此标准】',
+      '下方【目标范文】是唯一的文笔参照。所有「→ 建议改为」的改写示例，必须严格模仿范文的用词习惯、句式长短、叙述节奏、对话密度和信息分布。',
+      '禁止给出「更文学」「更优美」「更流畅」但仍是 AI 腔的通用替代句；改完后的句子应像范文作者亲笔写的。'
+    ].join('\n'))
+  }
+
+  const styleId = writingStyleDAO.getWorkStyleId(workId)
+  const style = styleId ? writingStyleDAO.getById(styleId) : undefined
+
+  if (style?.prompt_template?.trim()) {
+    parts.push('【目标文风要求】\n' + style.prompt_template.trim())
   }
 
   const fewShot = buildStyleFewShot(workId)

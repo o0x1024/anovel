@@ -49,24 +49,28 @@ export function setLastAssistantRoleId(id: number | null): void {
 
 export const ASSISTANT_MODEL_LABELS: Record<string, string> = {
   deepseek: 'DeepSeek',
+  kimi: 'Kimi',
+  mimo: 'MiMo AI',
+  bailian: 'Bailian',
   gemini: 'Gemini',
-  openai: 'OpenAI'
+  openai: 'OpenAI',
+  anthropic: 'Anthropic'
 }
 
 export function assistantModelLabel(
   modelType: string,
   modelName?: string | null,
-  options?: { showProvider?: boolean }
+  options?: { showProvider?: boolean; providerLabel?: string }
 ): string {
   const name = modelName?.trim()
+  const provider = options?.providerLabel ?? ASSISTANT_MODEL_LABELS[modelType] ?? modelType
   if (name) {
     if (options?.showProvider) {
-      const provider = ASSISTANT_MODEL_LABELS[modelType] ?? modelType
       return `${provider} · ${name}`
     }
     return name
   }
-  return ASSISTANT_MODEL_LABELS[modelType] ?? modelType
+  return provider
 }
 
 export function isSameAssistantModel(

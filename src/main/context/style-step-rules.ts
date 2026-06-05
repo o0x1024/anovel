@@ -22,6 +22,11 @@ export function isCoreSettingsAiGenerateStep(step: string | undefined): boolean 
   return /^settings_(character|worldview|conflict|idea)$/.test(step)
 }
 
+/** 核心设定 · 人设「AI 生成建议」：仅需故事方向，不注入文风/品味/锚点等 */
+export function isCoreSettingsCharacterGenerateStep(step: string | undefined): boolean {
+  return step === 'settings_character'
+}
+
 export function resolveLayersForStep(step: string | undefined): StyleStepLayer[] {
   if (!step) return ['language']
 
@@ -46,6 +51,9 @@ export function resolveLayersForStep(step: string | undefined): StyleStepLayer[]
   }
   if (matchStepPrefix(step, ['incubator'])) {
     return ['identity']
+  }
+  if (isCoreSettingsCharacterGenerateStep(step)) {
+    return []
   }
   if (isCoreSettingsAiGenerateStep(step)) {
     return ['identity']
@@ -164,6 +172,10 @@ export function resolveStepStyleInjection(
   promptTemplate: string,
   stepRulesJson: string | null | undefined
 ): StepStyleInjection {
+  if (isCoreSettingsCharacterGenerateStep(step)) {
+    return { languageText: null, stepRulesText: null, layers: [] }
+  }
+
   const layers = resolveLayersForStep(step)
   const rules = parseStyleStepRules(stepRulesJson)
   const isBody = layers.includes('language')

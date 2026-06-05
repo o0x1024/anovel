@@ -1,7 +1,16 @@
 import { ipcMain, shell } from 'electron'
-import { appLogger } from './logger/app-logger'
+import { appLogger, type LogLevel } from './logger/app-logger'
 
 export function registerLogIpcHandlers(): void {
+  ipcMain.handle(
+    'log:write',
+    (_e, level: LogLevel, category: string, message: string, meta?: Record<string, unknown>) => {
+      if (level === 'ERROR') appLogger.error(category, message, meta)
+      else if (level === 'WARN') appLogger.warn(category, message, meta)
+      else if (level === 'DEBUG') appLogger.debug(category, message, meta)
+      else appLogger.info(category, message, meta)
+    }
+  )
   ipcMain.handle('log:getInfo', () => ({
     logDir: appLogger.getLogDir(),
     todayFile: appLogger.getTodayLogPath(),

@@ -87,9 +87,14 @@ export const appLogger = {
   },
 
   readRecentLines(limit = 120): string[] {
-    const filePath = this.getTodayLogPath()
-    if (!fs.existsSync(filePath)) return []
-    const lines = fs.readFileSync(filePath, 'utf8').trim().split('\n').filter(Boolean)
+    const mainPath = this.getTodayLogPath()
+    const llmPath = this.getTodayLlmLogPath()
+    const lines: string[] = []
+    for (const filePath of [mainPath, llmPath]) {
+      if (!fs.existsSync(filePath)) continue
+      lines.push(...fs.readFileSync(filePath, 'utf8').trim().split('\n').filter(Boolean))
+    }
+    lines.sort()
     return lines.slice(-Math.max(1, limit))
   },
 

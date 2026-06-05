@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import MarkdownContent from './MarkdownContent.vue'
 import { useAiActivityLifecycle } from '../composables/useAiActivity'
 import { useAiPanelResize, maxPanelWidth, maxPanelHeight } from '../composables/useAiPanelResize'
+import { useAiPanelPosition } from '../composables/useAiPanelPosition'
 import { useStickToBottomScroll } from '../composables/useStickToBottomScroll'
 
 const {
@@ -22,15 +23,32 @@ const {
   formatDuration
 } = useAiActivityLifecycle()
 
-const { panelWidth, panelHeight, isResizing, startResize, clampToViewport } = useAiPanelResize()
+const { panelWidth, panelHeight, isResizing, startResize, clampToViewport: clampPanelSize } = useAiPanelResize()
+const {
+  position,
+  isDragging,
+  didDrag,
+  ensurePosition,
+  clampToViewport: clampPanelPosition,
+  startDrag,
+  alignToPanelBottomRight
+} = useAiPanelPosition(panelWidth, panelHeight)
 
 const streamRef = ref<HTMLElement | null>(null)
+const pillRef = ref<HTMLElement | null>(null)
 const hasThinking = computed(() => !!(active.value?.thinkingContent?.trim()))
 const hasContent = computed(() => !!(active.value?.content?.trim()))
 
 const panelStyle = computed(() => ({
   width: `${Math.min(panelWidth.value, maxPanelWidth())}px`,
-  height: `${Math.min(panelHeight.value, maxPanelHeight())}px`
+  height: `${Math.min(panelHeight.value, maxPanelHeight())}px`,
+  left: `${position.value.left}px`,
+  top: `${position.value.top}px`
+}))
+
+const pillStyle = computed(() => ({
+  left: `${position.value.left}px`,
+  top: `${position.value.top}px`
 }))
 
 const { stickToBottom, onScroll, jumpToBottom, resetStickToBottom } = useStickToBottomScroll(
@@ -38,10 +56,18 @@ const { stickToBottom, onScroll, jumpToBottom, resetStickToBottom } = useStickTo
   () => [active.value?.content, active.value?.thinkingContent]
 )
 
+function clampToViewport() {
+  clampPanelSize()
+  clampPanelPosition()
+}
+
 watch(
   () => active.value?.sessionId,
-  () => {
+  (sessionId) => {
     resetStickToBottom()
+    if (sessionId) {
+      ensurePosition(panelWidth.value, panelHeight.value)
+    }
     clampToViewport()
   }
 )
@@ -49,6 +75,36 @@ watch(
 watch(isVisible, (visible) => {
   if (visible) clampToViewport()
 })
+
+watch(isMinimized, (minimized) => {
+  if (minimized) {
+    nextTick(() => {
+      const pill = pillRef.value
+      alignToPanelBottomRight(
+        panelWidth.value,
+        panelHeight.value,
+        pill?.offsetWidth ?? 220,
+        pill?.offsetHeight ?? 36
+      )
+    })
+  } else {
+    clampToViewport()
+  }
+})
+
+function onHeaderDragStart(e: MouseEvent) {
+  startDrag(e, panelWidth.value, panelHeight.value)
+}
+
+function onPillPointerDown(e: MouseEvent) {
+  const pill = pillRef.value
+  startDrag(e, pill?.offsetWidth ?? 220, pill?.offsetHeight ?? 36)
+}
+
+function onPillClick() {
+  if (didDrag.value) return
+  restore()
+}
 
 function stepIcon(status: string) {
   if (status === 'done') return 'check-circle'
@@ -77,23 +133,38 @@ function toggleThinking() {
 </script>
 
 <template>
-  <!-- 最小化 pill -->
+  <!-- 折叠 pill（可拖动） -->
   <button
     v-if="isMinimized && active"
+    ref="pillRef"
     type="button"
-    class="fixed bottom-4 right-4 z-50 btn btn-primary btn-sm shadow-lg gap-2"
-    @click="restore"
+    class="ai-activity-pill fixed z-50 btn btn-primary btn-sm shadow-lg gap-2 max-w-[min(90vw,320px)]"
+    :class="{ 'cursor-grabbing select-none': isDragging, 'cursor-grab': !isDragging }"
+    :style="pillStyle"
+    title="拖动调整位置，点击展开"
+    @mousedown="onPillPointerDown"
+    @click="onPillClick"
   >
-    <font-awesome-icon :icon="isRunning ? 'spinner' : 'robot'" :spin="isRunning" class="w-3.5 h-3.5" />
-    {{ active.title }}
-    <span v-if="isRunning" class="opacity-80">{{ formatDuration(elapsedMs) }}</span>
+    <font-awesome-icon icon="grip-vertical" class="w-3 h-3 opacity-60 shrink-0" />
+    <font-awesome-icon :icon="isRunning ? 'spinner' : 'robot'" :spin="isRunning" class="w-3.5 h-3.5 shrink-0" />
+    <span class="truncate">{{ active.title }}</span>
+    <span
+      v-if="!isRunning && active.status === 'success'"
+      class="badge badge-success badge-xs shrink-0"
+    >完成</span>
+    <span
+      v-else-if="!isRunning && active.status === 'error'"
+      class="badge badge-error badge-xs shrink-0"
+    >失败</span>
+    <span v-if="isRunning" class="opacity-80 shrink-0">{{ formatDuration(elapsedMs) }}</span>
+    <span v-else class="opacity-70 shrink-0 text-xs">{{ formatDuration(elapsedMs) }}</span>
   </button>
 
   <!-- 主浮窗 -->
   <div
     v-if="isVisible && active"
-    class="ai-activity-panel fixed bottom-4 right-4 z-50 flex flex-col rounded-xl border border-base-300 bg-base-100 shadow-2xl overflow-hidden"
-    :class="{ 'select-none': isResizing }"
+    class="ai-activity-panel fixed z-50 flex flex-col rounded-xl border border-base-300 bg-base-100 shadow-2xl overflow-hidden"
+    :class="{ 'select-none': isResizing || isDragging }"
     :style="panelStyle"
   >
     <!-- 左上角：同时调整宽度和高度 -->
@@ -115,7 +186,13 @@ function toggleThinking() {
       @mousedown="startResize($event, 'left')"
     />
 
-    <div class="flex items-center gap-2 px-3 py-2 border-b border-base-300 bg-base-200/60 shrink-0">
+    <div
+      class="flex items-center gap-2 px-3 py-2 border-b border-base-300 bg-base-200/60 shrink-0"
+      :class="isDragging ? 'cursor-grabbing' : 'cursor-grab'"
+      title="拖动标题栏移动窗口"
+      @mousedown="onHeaderDragStart"
+    >
+      <font-awesome-icon icon="grip-vertical" class="w-3 h-3 text-base-content/30 shrink-0" />
       <font-awesome-icon
         :icon="isRunning ? 'spinner' : 'robot'"
         :spin="isRunning"
@@ -131,13 +208,13 @@ function toggleThinking() {
       <span class="badge badge-xs" :class="statusBadgeClass(active.status)">
         {{ statusLabel(active.status) }}
       </span>
-      <button type="button" class="btn btn-ghost btn-xs btn-square" title="历史" @click="toggleHistory">
+      <button type="button" class="btn btn-ghost btn-xs btn-square" title="历史" @mousedown.stop @click.stop="toggleHistory">
         <font-awesome-icon icon="clock" class="w-3 h-3" />
       </button>
-      <button type="button" class="btn btn-ghost btn-xs btn-square" title="最小化" @click="minimize">
+      <button type="button" class="btn btn-ghost btn-xs btn-square" title="折叠" @mousedown.stop @click.stop="minimize">
         <font-awesome-icon icon="chevron-down" class="w-3 h-3" />
       </button>
-      <button type="button" class="btn btn-ghost btn-xs btn-square" title="关闭" @click="dismiss">
+      <button type="button" class="btn btn-ghost btn-xs btn-square" title="关闭" @mousedown.stop @click.stop="dismiss">
         <font-awesome-icon icon="times" class="w-3 h-3" />
       </button>
     </div>
@@ -267,8 +344,12 @@ function toggleThinking() {
   color: oklch(var(--bc) / 0.85);
 }
 
+.ai-activity-pill {
+  touch-action: none;
+}
+
 .ai-activity-panel {
-  /* 勿设 position:relative，否则会覆盖 Tailwind 的 fixed，浮窗会落到页面底部不可见区域 */
+  /* 勿设 position:relative，否则会覆盖 Tailwind 的 fixed */
   min-width: 300px;
   min-height: 260px;
   max-width: calc(100vw - 2rem);

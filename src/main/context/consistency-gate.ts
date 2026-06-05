@@ -32,10 +32,10 @@ export function runConsistencyGate(
 
   const alignment = checkAnchorAlignment(workId, content, { chapterId, step: 'body_generation', persist: false })
   if (alignment.summary.missing > 0) {
-    warnings.push(`有 ${alignment.summary.missing} 个活跃锚点可能未对齐`)
+    warnings.push(`本章相关锚点中有 ${alignment.summary.missing} 个可能未对齐`)
   }
   if (alignment.summary.partial > 0) {
-    warnings.push(`有 ${alignment.summary.partial} 个锚点仅部分对齐`)
+    warnings.push(`本章相关锚点中有 ${alignment.summary.partial} 个仅部分对齐`)
   }
 
   const qualityHints = getSettingsQualityGateHints(workId)

@@ -1,10 +1,16 @@
 import { BaseDAO } from './base-dao'
+import {
+  mergeWorkStepTemperature,
+  parseWorkStepTemperatureJson,
+  type WorkStepTemperatureConfig
+} from '../../../shared/work-step-temperature'
 
 export interface WorkRow {
   id: number
   title: string
   description: string | null
   cover_image: string | null
+  step_temperature_json: string | null
   create_time: string
   update_time: string
 }
@@ -56,6 +62,35 @@ export class WorkDAO extends BaseDAO {
   delete(id: number): boolean {
     const result = this.run('DELETE FROM works WHERE id = ?', [id])
     return result.changes > 0
+  }
+
+  getStepTemperature(workId: number): WorkStepTemperatureConfig {
+    const row = this.getById(workId)
+    if (!row) return mergeWorkStepTemperature(null)
+    return parseWorkStepTemperatureJson(row.step_temperature_json)
+  }
+
+  setStepTemperature(
+    workId: number,
+    partial: Partial<WorkStepTemperatureConfig>
+  ): WorkStepTemperatureConfig {
+    const merged = mergeWorkStepTemperature({
+      ...this.getStepTemperature(workId),
+      ...partial
+    })
+    this.run(
+      `UPDATE works SET step_temperature_json = ?, update_time = datetime('now') WHERE id = ?`,
+      [JSON.stringify(merged), workId]
+    )
+    return merged
+  }
+
+  resetStepTemperature(workId: number): WorkStepTemperatureConfig {
+    this.run(
+      `UPDATE works SET step_temperature_json = NULL, update_time = datetime('now') WHERE id = ?`,
+      [workId]
+    )
+    return mergeWorkStepTemperature(null)
   }
 }
 

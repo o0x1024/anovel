@@ -14,7 +14,7 @@ export interface StyleAnalysisResult {
   }
   promptTemplate: string
   sampleExcerpts: string[]
-  /** 参考范文（3000-5000字），用于 few-shot 风格注入 */
+  /** 参考范文（最多 15000 字），用于 few-shot 风格注入 */
   referenceText?: string
   confidence: 'high' | 'medium' | 'low'
   warnings: string[]
@@ -73,6 +73,7 @@ export interface AssistantConversationRow {
 export interface AssistantModelOption {
   model_type: string
   model_name: string
+  provider_label?: string
 }
 
 export interface AssistantMessageRow {

@@ -2,6 +2,7 @@ import { BaseDAO } from './base-dao'
 
 export const GLOBAL_LLM_PROVIDER_KEY = 'global_llm_provider'
 export const GLOBAL_LLM_MODEL_KEY = 'global_llm_model'
+export const BUILTIN_STYLES_SEEDED_KEY = 'builtin_styles_seeded'
 const GENERATION_PARAMS_KEY = 'generation_params'
 
 export interface GlobalLlmDefault {

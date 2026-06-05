@@ -5,6 +5,8 @@ export interface LabTaskRow {
   original_text: string
   result_text: string | null
   style_id: number
+  system_prompt: string | null
+  anti_ai_rules_json: string | null
   status: LabTaskStatus
   error_message: string | null
   source_file: string | null
@@ -16,7 +18,10 @@ export interface LabTaskRow {
 export interface LabTaskCreateInput {
   originalText: string
   styleId: number
+  systemPrompt: string
   sourceFile?: string
+  /** 选中的去 AI 规则文案；默认不传或空数组表示不注入 */
+  antiAiRules?: string[]
 }
 
 export interface LabUploadParseInput {

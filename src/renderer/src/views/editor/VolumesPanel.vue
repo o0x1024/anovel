@@ -25,7 +25,7 @@ const editVolumeName = ref('')
 const editVolumeDesc = ref('')
 const parsedVolumes = ref<ParsedVolume[]>([])
 const applyingVolumes = ref(false)
-const aiSuggestionExpanded = ref(false)
+const aiSuggestionExpanded = ref(true)
 const expandedVolumeIds = ref<Set<number>>(new Set())
 const { loading, result, error, chat, clearResult } = useModelChat(() => props.workId)
 const lastContext = ref('')
@@ -135,6 +135,7 @@ async function applyParsedVolumes(mode: 'append' | 'replace') {
     await window.anovel.invoke('volume:batchUpsert', props.workId, items, mode)
     await loadVolumes()
     await nav?.refreshProgress()
+    aiSuggestionExpanded.value = false
   } finally {
     applyingVolumes.value = false
   }

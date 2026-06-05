@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import {
+  INCUBATOR_AB_VARIANTS_USER_SUFFIX,
+  INCUBATOR_MICRO_INSTRUCT_SYSTEM,
+  INCUBATOR_REJECT_RETRY_SUFFIX
+} from '../../../../shared/incubator-analysis-prompts'
 import type { ModelChatResult } from './useModelChat'
 
 const props = defineProps<{
@@ -11,6 +16,8 @@ const props = defineProps<{
   maxTokens?: number
   /** 批量章节大纲等：当前分卷，用于精简 work_context */
   volumeId?: number
+  /** 设为 false 可跳过核心设定注入（孵化器等探索阶段使用） */
+  enrichWorkContext?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -42,7 +49,8 @@ async function callModel(prompt: string, systemPrompt: string, stepSuffix: strin
     workId: props.workId,
     step: `${props.step}_${stepSuffix}`,
     maxTokens: props.maxTokens,
-    volumeId: props.volumeId
+    volumeId: props.volumeId,
+    enrichWorkContext: props.enrichWorkContext
   }) as ModelChatResult
 }
 
@@ -52,7 +60,7 @@ async function applyMicroInstruction() {
   try {
     const res = await callModel(
       `【原文】\n${props.content}\n\n【修改指令】\n${microInstruction.value.trim()}\n\n请输出修改后的完整内容。`,
-      '你是专业小说编辑，根据作者的微指令修改内容，保持整体风格一致，只输出修改后的正文。',
+      INCUBATOR_MICRO_INSTRUCT_SYSTEM,
       'micro_instruct'
     )
     if (res.success) {
@@ -75,7 +83,7 @@ async function rejectAndRegenerate(reason: string) {
     await window.anovel.invoke('taste:recordReject', props.workId, reason)
     const reasonLabel = rejectReasons.find(r => r.value === reason)?.label ?? reason
     const res = await callModel(
-      `${props.regeneratePrompt}\n\n【上次生成被拒绝】原因：${reasonLabel}。请重新生成，避免相同问题。`,
+      `${props.regeneratePrompt}\n\n【上次生成被拒绝】原因：${reasonLabel}。${INCUBATOR_REJECT_RETRY_SUFFIX}`,
       props.regenerateSystemPrompt,
       'reject_retry'
     )
@@ -95,7 +103,7 @@ async function generateAbVariants() {
   abVariants.value = []
   try {
     const res = await callModel(
-      `${props.regeneratePrompt}\n\n请生成两个不同风格的简短版本（各约300-500字），用 JSON 输出：\n\`\`\`json\n{"variants":[{"label":"版本A","text":"..."},{"label":"版本B","text":"..."}]}\n\`\`\``,
+      `${props.regeneratePrompt}\n\n${INCUBATOR_AB_VARIANTS_USER_SUFFIX}`,
       props.regenerateSystemPrompt,
       'ab_variants'
     )
@@ -103,10 +111,15 @@ async function generateAbVariants() {
       const match = res.content.match(/```json\s*([\s\S]*?)```/)
       const raw = match?.[1] ?? res.content
       try {
-        const parsed = JSON.parse(raw) as { variants?: { label?: string; text?: string }[] }
+        const parsed = JSON.parse(raw) as {
+          variants?: { label?: string; text?: string; summary?: string }[]
+        }
         abVariants.value = (parsed.variants ?? [])
-          .filter(v => v.text?.trim())
-          .map((v, i) => ({ label: v.label || `版本${String.fromCharCode(65 + i)}`, text: v.text!.trim() }))
+          .filter(v => (v.summary ?? v.text)?.trim())
+          .map((v, i) => ({
+            label: v.label || `版本${String.fromCharCode(65 + i)}`,
+            text: (v.summary ?? v.text)!.trim()
+          }))
       } catch {
         alert('未能解析 A/B 版本，请重试')
       }

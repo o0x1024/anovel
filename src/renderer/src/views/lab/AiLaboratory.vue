@@ -10,9 +10,12 @@ const {
   originalText,
   resultText,
   styleId,
+  systemPrompt,
   writingStyles,
   styleNameById,
   sourceFile,
+  selectedAntiAiRules,
+  resultViewMode,
   status,
   errorMessage,
   historyList,
@@ -20,7 +23,8 @@ const {
   run,
   cancel,
   loadFromHistory,
-  deleteHistory
+  deleteHistory,
+  refreshSystemPromptFromStyle
 } = useDeaiTask()
 
 const pageError = ref('')
@@ -47,6 +51,15 @@ async function onDeleteHistory(taskId: number) {
 function onFileLoaded(name: string) {
   sourceFile.value = name
 }
+
+async function onStyleChanged(styleIdValue: number | null) {
+  pageError.value = ''
+  try {
+    await refreshSystemPromptFromStyle(styleIdValue)
+  } catch (error) {
+    pageError.value = error instanceof Error ? error.message : '生成 System Prompt 失败'
+  }
+}
 </script>
 
 <template>
@@ -55,7 +68,7 @@ function onFileLoaded(name: string) {
       <font-awesome-icon icon="flask" class="w-4 h-4 text-primary shrink-0" />
       <h1 class="text-sm font-bold shrink-0">AI 实验室 · 去AI味</h1>
       <span class="text-[11px] text-base-content/45 truncate hidden md:inline">
-        选择文风对比去AI味效果
+        编辑 System Prompt，选择文风自动填入
       </span>
       <button type="button" class="btn btn-ghost btn-xs ml-auto shrink-0" @click="showHistory = true">
         历史记录
@@ -67,15 +80,19 @@ function onFileLoaded(name: string) {
     <DeaiInputPanel
       v-model:original-text="originalText"
       v-model:style-id="styleId"
+      v-model:system-prompt="systemPrompt"
+      v-model:anti-ai-rules="selectedAntiAiRules"
       :writing-styles="writingStyles"
       :status="status"
-      class="shrink-0"
       @run="onRun"
       @cancel="cancel"
       @file-loaded="onFileLoaded"
+      @style-changed="onStyleChanged"
     />
 
+    <!-- 4. 处理结果 -->
     <DeaiResultPanel
+      v-model:view-mode="resultViewMode"
       :original-text="originalText"
       :result-text="resultText"
       :status="status"

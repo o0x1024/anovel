@@ -1,4 +1,5 @@
-import { app, BrowserWindow, globalShortcut } from 'electron'
+import { app, BrowserWindow, globalShortcut, nativeImage } from 'electron'
+import { existsSync } from 'fs'
 import { join } from 'path'
 import { initSchema, workDAO } from './db'
 import { seedBuiltinStyles } from './db/seed'
@@ -14,13 +15,36 @@ registerLocalFileScheme()
 
 let mainWindow: BrowserWindow | null = null
 
+function resolveAppIconPath(): string | undefined {
+  const candidates = [
+    join(app.getAppPath(), 'build/icon.png'),
+    join(process.resourcesPath, 'icon.png')
+  ]
+  return candidates.find(p => existsSync(p))
+}
+
+function createAppIcon(): ReturnType<typeof nativeImage.createFromPath> | undefined {
+  const iconPath = resolveAppIconPath()
+  if (!iconPath) return undefined
+  return nativeImage.createFromPath(iconPath)
+}
+
+function applyDockIcon(): void {
+  const icon = createAppIcon()
+  if (icon && process.platform === 'darwin' && app.dock) {
+    app.dock.setIcon(icon)
+  }
+}
+
 function createWindow(): void {
+  const icon = createAppIcon()
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 1024,
     minHeight: 700,
     title: 'ANovel - AI小说创作助手',
+    ...(icon ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
       contextIsolation: true,
@@ -60,6 +84,7 @@ app.whenReady().then(() => {
 
   registerIpcHandlers()
 
+  applyDockIcon()
   createWindow()
 
   const quickIdea = process.platform === 'darwin' ? 'Command+Shift+I' : 'Control+Shift+I'

@@ -1,9 +1,24 @@
 import { ipcMain } from 'electron'
 import { labTaskDAO } from './db'
+import { buildLabDeaiSystemPrompt } from './context/lab/lab-deai-prompt'
 import { cancelDeaiRewrite, parseLabUploadFile, runDeaiRewrite } from './context/lab/deai-rewrite'
+import { SURFACE_ANTI_AI_PRESETS, DEEP_ANTI_AI_PRESETS } from './context/anti-ai-rules'
 import type { LabTaskCreateInput, LabUploadParseInput } from '../shared/lab-types'
 
 export function registerLabIpcHandlers(): void {
+  ipcMain.handle('lab:getAntiAiPresets', () => ({
+    surface: SURFACE_ANTI_AI_PRESETS,
+    deep: DEEP_ANTI_AI_PRESETS
+  }))
+  ipcMain.handle(
+    'lab:buildSystemPrompt',
+    (_e, styleId: number, antiAiRules?: unknown) => {
+      const rules = Array.isArray(antiAiRules)
+        ? antiAiRules.filter((r): r is string => typeof r === 'string' && r.trim().length > 0)
+        : []
+      return buildLabDeaiSystemPrompt(styleId, rules)
+    }
+  )
   ipcMain.handle('lab:taskList', () => labTaskDAO.list())
   ipcMain.handle('lab:taskGet', (_e, id: number) => labTaskDAO.getById(id))
   ipcMain.handle('lab:taskDelete', (_e, id: number) => labTaskDAO.delete(id))

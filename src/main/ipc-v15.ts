@@ -6,12 +6,13 @@ import { buildConsistencyReport } from './context/consistency-report'
 import { checkWorldviewConsistency } from './context/worldview-check'
 import {
   CRITIQUE_SYSTEM_PROMPT,
-  parseCritiqueResponse
+  formatCritiqueFixReport,
+  parseCritiqueResponse,
+  type CritiqueResult
 } from './context/chapter-critique'
-import {
-  diagnoseChapterQuality,
-  QUALITY_AI_SYSTEM_PROMPT
-} from './context/chapter-quality'
+import { diagnoseChapterQuality } from './context/chapter-quality'
+import { resolvePrompt } from './context/prompt-registry'
+import { buildStyleRewriteSystemPrompt, buildStyleDiagnosisContext } from './context/anti-ai-rules'
 import {
   SURPRISE_SYSTEM_PROMPT,
   DISRUPTOR_SYSTEM_PROMPT,
@@ -136,14 +137,42 @@ export function registerV15IpcHandlers(): void {
     return { success: true, ...parsed }
   })
 
+  ipcMain.handle('critique:applyFixes', async (e, workId: number, content: string, critique: CritiqueResult) => {
+    const report = formatCritiqueFixReport(critique)
+    const styleSystem = buildStyleRewriteSystemPrompt(workId)
+    const systemPrompt = [resolvePrompt('critique_apply_fixes.system'), styleSystem].join('\n\n')
+    const prompt = [
+      '【批判报告】',
+      report,
+      '',
+      '【需要修改的原文】',
+      content
+    ].join('\n')
+    const res = await modelService.chat({
+      prompt,
+      systemPrompt,
+      workId,
+      step: 'critique_apply_fixes',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false
+    }, { webContents: e.sender })
+    return res.success
+      ? { success: true, content: res.content }
+      : { success: false, error: res.error }
+  })
+
   // ==================== 章节质量诊断 ====================
   ipcMain.handle('quality:diagnose', (_e, workId: number, chapterId: number, content: string) =>
     diagnoseChapterQuality(workId, chapterId, content))
 
   ipcMain.handle('quality:diagnoseAI', async (e, workId: number, chapterId: number, content: string) => {
+    const styleCtx = buildStyleDiagnosisContext(workId)
+    const systemPrompt = styleCtx
+      ? [resolvePrompt('quality_diagnosis_ai.system'), styleCtx].join('\n\n')
+      : resolvePrompt('quality_diagnosis_ai.system')
     const res = await modelService.chat({
       prompt: content,
-      systemPrompt: QUALITY_AI_SYSTEM_PROMPT,
+      systemPrompt,
       workId,
       chapterId,
       step: 'quality_diagnosis_ai',
@@ -152,6 +181,29 @@ export function registerV15IpcHandlers(): void {
     }, { webContents: e.sender })
     return res.success
       ? { success: true, report: res.content }
+      : { success: false, error: res.error }
+  })
+
+  ipcMain.handle('quality:applyFixes', async (e, workId: number, content: string, report: string) => {
+    const styleSystem = buildStyleRewriteSystemPrompt(workId)
+    const systemPrompt = [resolvePrompt('quality_apply_fixes.system'), styleSystem].join('\n\n')
+    const prompt = [
+      '【诊断报告】',
+      report,
+      '',
+      '【需要修改的原文】',
+      content
+    ].join('\n')
+    const res = await modelService.chat({
+      prompt,
+      systemPrompt,
+      workId,
+      step: 'body_style_rewrite',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false
+    }, { webContents: e.sender })
+    return res.success
+      ? { success: true, content: res.content }
       : { success: false, error: res.error }
   })
 
