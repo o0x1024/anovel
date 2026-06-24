@@ -1,5 +1,5 @@
 import { createHash } from 'crypto'
-import { anchorDAO, coreSettingDAO } from '../db'
+import { anchorDAO, coreSettingDAO, workDAO } from '../db'
 import type { CharacterCard } from './character-cards'
 import { formatAllCharacterCardsSummary, loadCharacterCards, saveCharacterCards } from './character-cards'
 import { buildWorkContext } from './work-context'
@@ -27,9 +27,9 @@ export {
 } from './settings-quality-conclusion'
 
 const STATE_TYPE = 'settings_quality_state'
-const FINGERPRINT_TYPES = ['character', 'worldview', 'conflict', 'character_cards'] as const
+const FINGERPRINT_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast', 'character_cards'] as const
 
-export type ReviseSettingType = 'character' | 'worldview' | 'conflict'
+export type ReviseSettingType = 'protagonist' | 'golden_finger' | 'pleasure_engine' | 'world_pressure' | 'conflict_engine' | 'supporting_cast'
 
 export interface QualityReportEntry {
   report: string
@@ -67,6 +67,8 @@ export interface SettingsQualityStatus {
   convergenceStalled: boolean
   manuallyAccepted: boolean
   canReviseBlocking: boolean
+  canReviseAdvisory: boolean
+  advisoryOptimizeCount: number
   meetsPassCriteria: boolean
 }
 
@@ -78,6 +80,26 @@ export interface ParsedReportSection {
   reviseType?: ReviseSettingType
   action?: SectionReviseAction
   severity?: QualitySeverity
+}
+
+export interface ConflictCardCoverageItem {
+  name: string
+  role: CharacterCard['role']
+  coreConflict: string
+  covered: boolean
+  matchedTerms: string[]
+  reason: string
+}
+
+export interface ConflictCardCoverageReport {
+  hasConflict: boolean
+  hasCards: boolean
+  totalCards: number
+  coveredCount: number
+  missingCount: number
+  fullyCovered: boolean
+  missingItems: ConflictCardCoverageItem[]
+  items: ConflictCardCoverageItem[]
 }
 
 export {
@@ -97,40 +119,79 @@ export {
 export { extractJsonCandidates } from './settings-quality-json'
 
 const REVISE_SYSTEM_PROMPTS: Record<ReviseSettingType, string> = {
-  character: [
-    '你是资深小说编辑。根据自检报告中的问题与建议，修订「现有人设」。',
+  protagonist: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「主角设计」。',
     '要求：',
-    '1. 保留原人设中合理、有效的部分，只针对报告指出的问题做针对性修改',
-    '2. 明确各角色的功能定位，消除功能重复或缺失',
-    '3. 输出完整修订后的人设 Markdown，结构与原稿一致（## 主角 / ## 重要配角 / ## 反派 等）',
-    '4. 只输出修订后的人设正文，不要复述检查报告或附加解释',
-    '5. 字数约束：主角 800-1200 字，配角每人 300-500 字，全部角色合计不超过 3000 字',
-    '6. 用结构化字段（性格内核/语言模式/行为习惯/核心矛盾/行为逻辑）而非叙事散文，禁止写场景示例'
-  ].join('\n'),
-  worldview: [
-    '你是资深小说编辑。根据自检报告中的问题与建议，修订「现有世界观」。',
-    '要求：',
-    '1. 保留合理部分，只针对报告指出的自洽性问题修改',
-    '2. 输出完整修订后的世界观 Markdown，结构与原稿一致',
+    '1. 保留原有合理设定，只针对报告的硬矛盾或功能缺失做修改',
+    '2. 输出完整修订后的主角设计 Markdown',
     '3. 只输出修订后正文，不要复述报告',
-    '4. 字数约束：总字数 800-2000 字，只写规则和限制，不写百科式描述'
+    '4. 结构化字段：身份标签/核心欲望/性格驱动力/致命缺陷/决策模式/底线/魅力点',
+    '5. 总字数 500-1000 字，禁止写叙事段落或场景示例'
   ].join('\n'),
-  conflict: [
-    '你是资深小说编辑。根据自检报告中的问题与建议，修订「现有核心冲突」。',
+  golden_finger: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「金手指系统」。',
     '要求：',
-    '1. 保留合理部分，强化主线/副线冲突的因果链与升级路径',
-    '2. 输出完整修订后的核心冲突 Markdown，结构与原稿一致',
+    '1. 保留原有合理设定，强化限制条件与反噬机制（限制比能力更重要）',
+    '2. 输出完整修订后的金手指系统 Markdown',
     '3. 只输出修订后正文，不要复述报告',
-    '4. 字数约束：总字数 500-1200 字，禁止写具体场景描写或对话'
+    '4. 结构化字段：名称形态/核心能力/获取方式/限制条件/反噬机制/升级路径/信息差优势',
+    '5. 总字数 400-800 字'
+  ].join('\n'),
+  pleasure_engine: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「爽点机制」。',
+    '要求：',
+    '1. 确保爽点类型与金手指、冲突引擎对齐，避免空洞描述',
+    '2. 输出完整修订后的爽点机制 Markdown',
+    '3. 只输出修订后正文，不要复述报告',
+    '4. 结构化字段：主要爽点类型/触发条件/频率设计/对抗设计/情绪节奏锚点',
+    '5. 总字数 300-600 字'
+  ].join('\n'),
+  world_pressure: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「世界观压力规则」。',
+    '要求：',
+    '1. 保留合理部分，只针对规则自洽性或压力不足做修改',
+    '2. 输出完整修订后的世界观压力规则 Markdown',
+    '3. 只输出修订后正文，不要复述报告',
+    '4. 结构化字段：核心铁律/权力结构/资源稀缺性/规则代价/规则漏洞/压迫升级路径',
+    '5. 总字数 600-1500 字，只写规则和限制，禁止百科式描述'
+  ].join('\n'),
+  conflict_engine: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「冲突升级引擎」。',
+    '要求：',
+    '1. 保留合理部分，强化升级机制的因果链与触发事件',
+    '2. 输出完整修订后的冲突升级引擎 Markdown',
+    '3. 只输出修订后正文，不要复述报告',
+    '4. 结构化字段：对立双方/不可调和点/三层赌注/升级机制/冲突反转点/终局收束',
+    '5. 总字数 500-1200 字'
+  ].join('\n'),
+  supporting_cast: [
+    '你是资深小说编辑。根据自检报告中的问题与建议，修订「配角功能组」。',
+    '要求：',
+    '1. 按六种功能类型组织（催化剂/对照组/阻力/情感锚/信息/喜剧），消除功能重复或缺失',
+    '2. 每个配角注明与主角的关系动力学和关键互动场景',
+    '3. 输出完整修订后的配角功能组 Markdown',
+    '4. 只输出修订后正文，不要复述报告',
+    '5. 每个配角 200-400 字，配角标准：记忆点>完整性'
   ].join('\n')
 }
 
-export const CROSS_REVISE_TYPES: readonly ReviseSettingType[] = ['character', 'worldview', 'conflict']
+/** 跨设定修订依赖顺序：主角 → 金手指 → 世界观压力 → 冲突引擎 → 爽点机制 → 配角功能组 */
+export const CROSS_REVISE_TYPES: readonly ReviseSettingType[] = [
+  'protagonist',
+  'golden_finger',
+  'world_pressure',
+  'conflict_engine',
+  'pleasure_engine',
+  'supporting_cast'
+]
 
 export const CROSS_REVISE_TYPE_LABELS: Record<ReviseSettingType, string> = {
-  character: '人设',
-  worldview: '世界观',
-  conflict: '核心冲突'
+  protagonist: '主角设计',
+  golden_finger: '金手指系统',
+  pleasure_engine: '爽点机制',
+  world_pressure: '世界观压力规则',
+  conflict_engine: '冲突升级引擎',
+  supporting_cast: '配角功能组'
 }
 
 export type ReviseAllWorkItem =
@@ -171,9 +232,20 @@ export function buildReviseAllStepLabels(targets: ParsedReportSection[]): string
 }
 
 const SECTION_REVISE_MAP: Record<string, ReviseSettingType | SectionReviseAction> = {
-  '人设': 'character',
-  '世界观': 'worldview',
-  '核心冲突': 'conflict',
+  '主角与反差设定': 'protagonist',
+  '主角设计': 'protagonist',
+  '设定与微创新': 'golden_finger',
+  '金手指': 'golden_finger',
+  '金手指系统': 'golden_finger',
+  '情绪节奏与爽点': 'pleasure_engine',
+  '爽点机制': 'pleasure_engine',
+  '世界观': 'world_pressure',
+  '世界观压力规则': 'world_pressure',
+  '核心冲突': 'conflict_engine',
+  '冲突升级引擎': 'conflict_engine',
+  '功能性配角': 'supporting_cast',
+  '配角功能组': 'supporting_cast',
+  '人设': 'supporting_cast',        // 向后兼容旧报告
   '卡片与 Markdown 一致性': 'revise-cards',
   '锚点对齐': 'revise-anchors',
   '跨设定矛盾': 'revise-cross'
@@ -255,6 +327,9 @@ export function getSettingsQualityStatus(workId: number): SettingsQualityStatus 
   const targets = state.overall?.report && !isStale
     ? getReviseAllTargets(workId, state.overall.report)
     : []
+  const advisoryTargets = state.overall?.report && !isStale
+    ? getReviseAdvisoryTargets(workId, state.overall.report)
+    : []
 
   return {
     hasOverallCheck,
@@ -276,6 +351,8 @@ export function getSettingsQualityStatus(workId: number): SettingsQualityStatus 
       && blockingCount >= (reviseMeta.lastBlockingCount ?? blockingCount),
     manuallyAccepted,
     canReviseBlocking: targets.length > 0 && reviseMeta.round < MAX_REVISE_ROUNDS,
+    canReviseAdvisory: advisoryTargets.length > 0,
+    advisoryOptimizeCount: advisoryTargets.length,
     meetsPassCriteria: meets
   }
 }
@@ -356,6 +433,86 @@ export function buildSettingsQualityInput(workId: number): string {
   return parts.join('\n')
 }
 
+function extractConflictKeywords(text: string): string[] {
+  const source = text.trim()
+  if (!source) return []
+  const raw = source.match(/[\u4e00-\u9fa5A-Za-z0-9]{2,}/g) ?? []
+  const stopwords = new Set(['核心冲突', '主线冲突', '副线冲突', '冲突升级路径'])
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const token of raw) {
+    const normalized = token.trim()
+    if (!normalized || stopwords.has(normalized)) continue
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    out.push(normalized)
+  }
+  return out
+}
+
+function buildCoverageItem(card: CharacterCard, conflictText: string): ConflictCardCoverageItem {
+  const core = card.coreConflict?.trim() ?? ''
+  const matchedTerms: string[] = []
+
+  if (card.name && conflictText.includes(card.name)) {
+    matchedTerms.push(card.name)
+  }
+  for (const kw of extractConflictKeywords(core)) {
+    if (conflictText.includes(kw)) matchedTerms.push(kw)
+  }
+
+  const covered = matchedTerms.length > 0
+  const reason = !core
+    ? '角色卡未填写核心矛盾'
+    : covered
+      ? `已匹配：${matchedTerms.slice(0, 4).join('、')}`
+      : '核心冲突正文未体现该角色矛盾'
+
+  return {
+    name: card.name,
+    role: card.role,
+    coreConflict: core,
+    covered,
+    matchedTerms,
+    reason
+  }
+}
+
+export function buildConflictCardCoverageReport(workId: number): ConflictCardCoverageReport {
+  const conflictText = (coreSettingDAO.getByType(workId, 'conflict_engine')?.content?.trim() || coreSettingDAO.getByType(workId, 'conflict')?.content?.trim()) ?? ''
+  const cards = loadCharacterCards(workId)
+  const hasConflict = !!conflictText
+  const hasCards = cards.length > 0
+
+  if (!hasCards) {
+    return {
+      hasConflict,
+      hasCards: false,
+      totalCards: 0,
+      coveredCount: 0,
+      missingCount: 0,
+      fullyCovered: true,
+      missingItems: [],
+      items: []
+    }
+  }
+
+  const items = cards.map(card => buildCoverageItem(card, conflictText))
+  const missingItems = items.filter(item => !item.covered)
+  const coveredCount = items.length - missingItems.length
+
+  return {
+    hasConflict,
+    hasCards: true,
+    totalCards: items.length,
+    coveredCount,
+    missingCount: missingItems.length,
+    fullyCovered: missingItems.length === 0,
+    missingItems,
+    items
+  }
+}
+
 export function parseReportSections(report: string): ParsedReportSection[] {
   const lines = report.split('\n')
   const sections: ParsedReportSection[] = []
@@ -392,7 +549,8 @@ export function buildRevisePrompt(
   workId: number,
   type: ReviseSettingType,
   report: string,
-  sectionTitle?: string
+  sectionTitle?: string,
+  mode: 'fix' | 'optimize' = 'fix'
 ): { prompt: string; systemPrompt: string } {
   const current = coreSettingDAO.getByType(workId, type)?.content?.trim() ?? ''
   const sectionBlock = sectionTitle
@@ -403,18 +561,26 @@ export function buildRevisePrompt(
     : report
 
   const typeLabels: Record<ReviseSettingType, string> = {
-    character: '现有人设',
-    worldview: '现有世界观',
-    conflict: '现有核心冲突'
+    protagonist: '现有主角设计',
+    golden_finger: '现有金手指系统',
+    pleasure_engine: '现有爽点机制',
+    world_pressure: '现有世界观压力规则',
+    conflict_engine: '现有冲突升级引擎',
+    supporting_cast: '现有配角功能组'
   }
 
   const ctx = buildWorkContext(workId, { includeCoreSettings: true, includeIdea: true, includeQualityIssues: false })
 
   const isCrossSection = !!sectionBlock?.title.includes('跨设定')
 
+  const optimizeNote = mode === 'optimize'
+    ? '【优化模式】本次为及格线抛光（非结构修复）。重点落实报告中的「建议：」，强化推动力/分场挂靠/表现力，勿改动已自洽的核心结构。'
+    : ''
+
   const prompt = [
     ctx.text,
     '',
+    ...(optimizeNote ? [optimizeNote, ''] : []),
     ...(isCrossSection
       ? ['【修订目标】针对跨设定矛盾，修订当前设定块并与人设/世界观/核心冲突保持一致。', '']
       : []),
@@ -425,7 +591,12 @@ export function buildRevisePrompt(
     reportExcerpt
   ].join('\n')
 
-  return { prompt, systemPrompt: REVISE_SYSTEM_PROMPTS[type] }
+  const workInfo = workDAO.getById(workId)
+  const isStory = workInfo?.work_type === 'story'
+  const sysPrompt = REVISE_SYSTEM_PROMPTS[type]
+  const finalSysPrompt = isStory ? sysPrompt.replace(/小说编辑/g, '短故事编辑') : sysPrompt
+
+  return { prompt, systemPrompt: finalSysPrompt }
 }
 
 export function buildReviseCharacterCardsPrompt(
@@ -434,7 +605,7 @@ export function buildReviseCharacterCardsPrompt(
   sectionTitle?: string
 ): { prompt: string; systemPrompt: string } {
   const cards = loadCharacterCards(workId)
-  const characterMd = coreSettingDAO.getByType(workId, 'character')?.content?.trim() ?? ''
+  const characterMd = (coreSettingDAO.getByType(workId, 'supporting_cast')?.content?.trim() || coreSettingDAO.getByType(workId, 'character')?.content?.trim()) ?? ''
   const sectionBlock = sectionTitle
     ? parseReportSections(report).find(s => s.title.includes(sectionTitle.replace(/^##\s*/, '')))
     : parseReportSections(report).find(s => s.title.includes('卡片'))
@@ -455,7 +626,13 @@ export function buildReviseCharacterCardsPrompt(
     reportExcerpt
   ].join('\n')
 
-  return { prompt, systemPrompt: REVISE_CHARACTER_CARDS_SYSTEM_PROMPT }
+  const workInfo = workDAO.getById(workId)
+  const isStory = workInfo?.work_type === 'story'
+  const finalSysPrompt = isStory 
+    ? REVISE_CHARACTER_CARDS_SYSTEM_PROMPT.replace(/小说编辑/g, '短故事编辑') 
+    : REVISE_CHARACTER_CARDS_SYSTEM_PROMPT
+
+  return { prompt, systemPrompt: finalSysPrompt }
 }
 
 function findReportSectionBlock(report: string, sectionTitle?: string, fallbackKeyword?: string) {
@@ -496,7 +673,13 @@ export function buildReviseAnchorsPrompt(
     reportExcerpt
   ].join('\n')
 
-  return { prompt, systemPrompt: REVISE_ANCHORS_SYSTEM_PROMPT }
+  const workInfo = workDAO.getById(workId)
+  const isStory = workInfo?.work_type === 'story'
+  const finalSysPrompt = isStory 
+    ? REVISE_ANCHORS_SYSTEM_PROMPT.replace(/小说编辑/g, '短故事编辑') 
+    : REVISE_ANCHORS_SYSTEM_PROMPT
+
+  return { prompt, systemPrompt: finalSysPrompt }
 }
 
 export function applyRevisedAnchors(workId: number, revisions: RevisedAnchor[]): number {
@@ -548,30 +731,13 @@ export function applyRevisedAnchorsFromAi(workId: number, content: string): {
   return { success: true, count }
 }
 
-export function sectionNeedsRevise(workId: number, section: ParsedReportSection): boolean {
-  if (section.severity === 'none' || section.severity === 'advisory') return false
-  if (section.severity === 'blocking') {
-    if (section.reviseType) {
-      return !!coreSettingDAO.getByType(workId, section.reviseType)?.content?.trim()
-    }
-    if (section.action === 'revise-cards') {
-      return loadCharacterCards(workId).length > 0
-    }
-    if (section.action === 'revise-anchors') {
-      return anchorDAO.listActiveByWork(workId).length > 0
-    }
-    if (section.action === 'revise-cross') {
-      return FINGERPRINT_TYPES.slice(0, 3).some(t => !!coreSettingDAO.getByType(workId, t)?.content?.trim())
-    }
-    return false
-  }
+function isSkippedQualitySectionTitle(title: string): boolean {
+  return title.includes('总体评价') || title.includes('自检结论')
+}
 
-  // 兼容旧报告（无 severity / JSON）
-  if (!section.content.trim()) return false
-  if (/无问题|暂无问题|无明显问题|良好|基本一致|暂无不|无矛盾|已覆盖/.test(section.content)) return false
-  if (/建议|可优化|强化|可以考虑/.test(section.content) && !/矛盾|冲突|不一致|遗漏|缺失|严重/.test(section.content)) {
-    return false
-  }
+export function sectionHasReviseCapability(workId: number, section: ParsedReportSection): boolean {
+  if (isSkippedQualitySectionTitle(section.title)) return false
+  if (!section.reviseType && !section.action) return false
 
   if (section.reviseType) {
     return !!coreSettingDAO.getByType(workId, section.reviseType)?.content?.trim()
@@ -588,10 +754,47 @@ export function sectionNeedsRevise(workId: number, section: ParsedReportSection)
   return false
 }
 
-export function getReviseAllTargets(workId: number, report: string): ParsedReportSection[] {
+/** 非优秀项且具备可修订/优化能力（blocking + advisory） */
+export function sectionCanOptimize(workId: number, section: ParsedReportSection): boolean {
+  if (section.severity === 'none' || !section.severity) return false
+  return sectionHasReviseCapability(workId, section)
+}
+
+export function sectionNeedsRevise(workId: number, section: ParsedReportSection): boolean {
+  if (section.severity === 'blocking') {
+    return sectionCanOptimize(workId, section)
+  }
+
+  // 兼容旧报告（无 severity / JSON）
+  if (section.severity) return false
+  if (!section.content.trim()) return false
+  if (/无问题|暂无问题|无明显问题|良好|基本一致|暂无不|无矛盾|已覆盖/.test(section.content)) return false
+  if (/建议|可优化|强化|可以考虑/.test(section.content) && !/矛盾|冲突|不一致|遗漏|缺失|严重/.test(section.content)) {
+    return false
+  }
+  return sectionHasReviseCapability(workId, section)
+}
+
+export function getReviseTargets(
+  workId: number,
+  report: string,
+  severities: QualitySeverity[]
+): ParsedReportSection[] {
   const conclusion = parseQualityConclusion(report)
   const sections = enrichSectionsWithConclusion(parseReportSections(report), conclusion)
-  return sections.filter(s => sectionNeedsRevise(workId, s))
+  return sections.filter(s =>
+    !!s.severity
+    && severities.includes(s.severity)
+    && sectionCanOptimize(workId, s)
+  )
+}
+
+export function getReviseAllTargets(workId: number, report: string): ParsedReportSection[] {
+  return getReviseTargets(workId, report, ['blocking'])
+}
+
+export function getReviseAdvisoryTargets(workId: number, report: string): ParsedReportSection[] {
+  return getReviseTargets(workId, report, ['advisory'])
 }
 
 export function parseEnrichedReportSections(workId: number, report: string): ParsedReportSection[] {
@@ -632,6 +835,63 @@ export function acceptSettingsQualityPass(workId: number): SettingsQualityState 
     manuallyAccepted: true,
     acceptedAt: new Date().toISOString()
   })
+}
+
+export function prepareReviseAdvisoryAll(workId: number): {
+  ok: boolean
+  error?: string
+  targets: ParsedReportSection[]
+  prevAdvisory: number
+  prevScore: number | null
+} {
+  const state = loadSettingsQualityState(workId)
+  const report = state.overall?.report?.trim()
+  if (!report) {
+    return { ok: false, error: '请先运行整体自检', targets: [], prevAdvisory: 0, prevScore: null }
+  }
+  if (isSettingsQualityStale(workId)) {
+    return {
+      ok: false,
+      error: '设定内容已变更，请先重新运行整体自检',
+      targets: [],
+      prevAdvisory: 0,
+      prevScore: null
+    }
+  }
+
+  const targets = getReviseAdvisoryTargets(workId, report)
+  if (targets.length === 0) {
+    return {
+      ok: false,
+      error: '当前没有可优化的及格项',
+      targets: [],
+      prevAdvisory: 0,
+      prevScore: null
+    }
+  }
+
+  const conclusion = getEffectiveConclusion(state)
+  return {
+    ok: true,
+    targets,
+    prevAdvisory: conclusion?.advisoryCount ?? targets.length,
+    prevScore: conclusion?.overallScore ?? null
+  }
+}
+
+export function finalizeReviseOptimizeAll(
+  workId: number,
+  recheckReport?: string
+): { conclusion: QualityConclusion | null } {
+  if (!recheckReport?.trim()) {
+    return { conclusion: null }
+  }
+  const conclusion = parseQualityConclusion(recheckReport) ?? undefined
+  recordQualityCheck(workId, {
+    overall: { report: recheckReport.trim(), checkedAt: new Date().toISOString() },
+    conclusion
+  })
+  return { conclusion: conclusion ?? null }
 }
 
 export function prepareReviseAll(workId: number): {

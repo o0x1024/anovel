@@ -86,6 +86,7 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
     normalized.startsWith('quality_diagnosis') ||
     normalized === 'settings_overall_check' ||
     normalized === 'settings_character_check' ||
+    normalized === 'settings_conflict_coverage_suggest' ||
     normalized === 'revision_checklist'
   ) {
     return 'analysis'
@@ -112,6 +113,14 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
   }
 
   if (normalized === 'incubator_reverse') return 'outline'
+  if (
+    normalized === 'incubator_gate_check' ||
+    normalized === 'incubator_gate_fix' ||
+    normalized === 'incubator_diagnose_apply' ||
+    normalized === 'incubator_tweak'
+  ) {
+    return 'polish'
+  }
 
   if (
     normalized.startsWith('volumes_outline') ||
@@ -126,6 +135,8 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
   if (normalized.startsWith('writer_block_') || normalized.startsWith('anti_mean_')) {
     return 'creative'
   }
+
+  if (normalized.startsWith('timeline_')) return 'creative'
 
   if (normalized.startsWith('settings_conflict')) return 'creative'
 

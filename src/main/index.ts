@@ -1,11 +1,10 @@
-import { app, BrowserWindow, globalShortcut, nativeImage } from 'electron'
+import { app, BrowserWindow, dialog, globalShortcut, nativeImage } from 'electron'
 import { existsSync } from 'fs'
 import { join } from 'path'
-import { initSchema, workDAO } from './db'
+import { initSchema, workDAO, goalRoutineDAO } from './db'
 import { seedBuiltinStyles } from './db/seed'
 import { seedBuiltinMaterials } from './db/seed-materials'
 import { seedAssistantRoles } from './db/assistant-seed'
-import { registerBuiltinPrompts } from './context/prompt-registry'
 import { registerIpcHandlers } from './ipc'
 import { appLogger } from './logger/app-logger'
 import { cleanupDuplicateNarrativeMemoryForAllWorks } from './context/memory-cleanup'
@@ -43,6 +42,8 @@ function createWindow(): void {
     height: 900,
     minWidth: 1024,
     minHeight: 700,
+    show: false,
+    center: true,
     title: 'ANovel - AI小说创作助手',
     ...(icon ? { icon } : {}),
     webPreferences: {
@@ -53,6 +54,21 @@ function createWindow(): void {
     }
   })
 
+  mainWindow.once('ready-to-show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+
+  mainWindow.webContents.on('did-fail-load', (_event, code, description, url) => {
+    console.error('[window] did-fail-load', code, description, url)
+    dialog.showErrorBox(
+      '页面加载失败',
+      `无法加载应用界面 (${code}): ${description}\n${url}`
+    )
+  })
+
   if (process.env.NODE_ENV === 'development' || process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL']!)
   } else {
@@ -60,33 +76,7 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
-  setupLocalFileProtocol()
-  appLogger.startup()
-
-  // 初始化数据库
-  initSchema()
-
-  // 清理叙事记忆重复数据（同章多次提取遗留）
-  const workIds = workDAO.list().map(w => w.id)
-  if (workIds.length > 0) {
-    const cleaned = cleanupDuplicateNarrativeMemoryForAllWorks(workIds)
-    if (cleaned.snapshotsRemoved > 0 || cleaned.foreshadowingRemoved > 0) {
-      appLogger.info('memory', 'startup cleanup narrative duplicates', cleaned)
-    }
-  }
-
-  // 写入内置文风预设
-  seedBuiltinStyles()
-  seedBuiltinMaterials()
-  seedAssistantRoles()
-  registerBuiltinPrompts()
-
-  registerIpcHandlers()
-
-  applyDockIcon()
-  createWindow()
-
+function registerGlobalShortcuts(): void {
   const quickIdea = process.platform === 'darwin' ? 'Command+Shift+I' : 'Control+Shift+I'
   const openExport = process.platform === 'darwin' ? 'Command+Shift+E' : 'Control+Shift+E'
   const writerBlock = process.platform === 'darwin' ? 'Command+Shift+B' : 'Control+Shift+B'
@@ -111,9 +101,53 @@ app.whenReady().then(() => {
       mainWindow.focus()
     }
   })
+}
+
+function bootstrapApp(): void {
+  setupLocalFileProtocol()
+  appLogger.startup()
+
+  initSchema()
+
+  // 目标循环：启动时将中断的 running 态重置为 paused，避免 LLM 自动续跑失控（需用户手动恢复）
+  try {
+    const reset = goalRoutineDAO.resetRunningToPaused()
+    if (reset > 0) appLogger.info('goal_routine', '启动 reconcile：running→paused', { count: reset })
+  } catch (e) {
+    appLogger.warn('goal_routine', '启动 reconcile 失败', { error: String(e) })
+  }
+
+  const workIds = workDAO.list().map(w => w.id)
+  if (workIds.length > 0) {
+    const cleaned = cleanupDuplicateNarrativeMemoryForAllWorks(workIds)
+    if (cleaned.snapshotsRemoved > 0 || cleaned.foreshadowingRemoved > 0) {
+      appLogger.info('memory', 'startup cleanup narrative duplicates', cleaned)
+    }
+  }
+
+  seedBuiltinStyles()
+  seedBuiltinMaterials()
+  seedAssistantRoles()
+  registerIpcHandlers()
+  registerGlobalShortcuts()
+}
+
+app.whenReady().then(() => {
+  applyDockIcon()
+  createWindow()
+
+  try {
+    bootstrapApp()
+  } catch (err) {
+    const message = err instanceof Error ? err.stack ?? err.message : String(err)
+    console.error('[boot] FATAL startup error:', message)
+    appLogger.error('app', 'startup failed', { message })
+    dialog.showErrorBox('ANovel 启动失败', message)
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    else mainWindow?.show()
   })
 })
 

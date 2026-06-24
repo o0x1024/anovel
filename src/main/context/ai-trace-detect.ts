@@ -12,10 +12,58 @@ export interface AiTraceReport {
   summary: string
 }
 
-const CONNECTOR_PATTERNS = ['然而', '因此', '总的来说', '与此同时', '不仅如此', '此外', '综上']
+const CONNECTOR_PATTERNS = ['然而', '因此', '总的来说', '与此同时', '不仅如此', '此外', '综上', '尽管如此', '值得注意的是', '总而言之']
 const TEMPLATE_PATTERNS = [
   '心中涌起一股', '眼中闪过一丝', '嘴角微微上扬', '不禁', '仿佛', '宛如',
   '在这个', '随着', '逐渐'
+]
+
+const FILM_SHOT_PATTERNS: RegExp[] = [
+  /(?:目光|视线|眼神)(?:落在|扫过|越过|移到|停在|掠过).{0,15}上/g,
+  /(?:他|她)(?:转身|回过头|抬起头|低下头|站起身|迈步|停下脚步)[^，。]{0,6}[。，]/g,
+  /嘴角微微(?:上扬|勾起|一弯)/g,
+  /脚步(?:一顿|顿了顿|微微一顿)/g,
+  /缓缓(?:开口|站起身|回过头|转过身|抬起头)/g,
+  /四目相对/g,
+]
+
+// ---------------------------------------------------------------------------
+//  机械对话标注：AI 高频使用 "对话"他说，/ "对话"她问。 这种裸标注
+//  人类网文作者几乎不用，而是用 "说道/问道" 并附带动作、语气、神态描写
+//  例：✗ "走吧。"他说。  ✓ "走吧。"他头也不回的说道。
+// ---------------------------------------------------------------------------
+
+const MECHANICAL_DIALOGUE_TAG_PATTERNS: RegExp[] = [
+  /["""][他她]说[，。！？\n]/g,
+  /["""][他她]问[，。！？\n]/g,
+  /["""][\u4e00-\u9fff]{1,4}说[，。！？\n]/g,
+  /["""][\u4e00-\u9fff]{1,4}问[，。！？\n]/g,
+]
+
+
+function detectMechanicalDialogueTags(text: string): { count: number; examples: string[] } {
+  let totalHits = 0
+  const examples: string[] = []
+
+  for (const pat of MECHANICAL_DIALOGUE_TAG_PATTERNS) {
+    const matches = text.match(pat) ?? []
+    for (const m of matches) {
+      const core = m.replace(/^["""]/, '').replace(/[，。！？\n]$/, '')
+      if (core.endsWith('说道') || core.endsWith('问道') || core.endsWith('道')) continue
+      if (/(?:笑|冷|怒|急|沉声|轻声|低声|大声|淡淡|缓缓|森然|冷冷|温声|厉声)/.test(core)) continue
+      totalHits++
+      if (examples.length < 4) {
+        examples.push(m.slice(0, 20))
+      }
+    }
+  }
+  return { count: totalHits, examples }
+}
+
+const CLOSURE_PATTERNS: RegExp[] = [
+  /这一刻[，,]?(?:他|她)?(?:明白|懂得|知道|意识到)/g,
+  /或许[，,]?这(?:便|就)是/g,
+  /对于.{2,8}而言/g,
 ]
 
 const METAPHOR_PATTERNS = [
@@ -84,6 +132,105 @@ function detectEmotionalSaturation(text: string): { ratio: number; consecutiveHi
   }
 }
 
+/**
+ * 电报式短句连发检测：3句以上连续≤10字的短句（不含对话）。
+ * AI 偏好用"抬起头。看着他。没说话。"这种镜头式碎片句制造伪文学感。
+ */
+function detectTelegraphicStaccato(text: string): { count: number; examples: string[] } {
+  const sentences = text.split(/(?<=[。！？])/g).filter(s => s.trim())
+  let groupCount = 0
+  let runLen = 0
+  let runStart = 0
+  const examples: string[] = []
+
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i].trim()
+    const isDialogue = /[""「『]/.test(s)
+    const pureLen = s.replace(/[^\u4e00-\u9fff\w]/g, '').length
+
+    if (!isDialogue && pureLen <= 10 && pureLen >= 2) {
+      if (runLen === 0) runStart = i
+      runLen++
+    } else {
+      if (runLen >= 3) {
+        groupCount++
+        if (examples.length < 3) {
+          examples.push(sentences.slice(runStart, runStart + Math.min(runLen, 4)).map(s => s.trim()).join(''))
+        }
+      }
+      runLen = 0
+    }
+  }
+  if (runLen >= 3) {
+    groupCount++
+    if (examples.length < 3) {
+      examples.push(sentences.slice(runStart, runStart + Math.min(runLen, 4)).map(s => s.trim()).join(''))
+    }
+  }
+
+  return { count: groupCount, examples }
+}
+
+/**
+ * 平行否定/肯定结构检测："没X，也没Y" / "不X，也不Y" / "没X，没Y"
+ * 以及 "X着Y，Z着W" 式对称动作。
+ */
+function detectParallelNegation(text: string): { count: number; examples: string[] } {
+  const patterns: RegExp[] = [
+    /没[^，。！？]{1,8}[，,](?:也|又|更)?没[^。！？]{1,10}[。！？]/g,
+    /不[^，。！？]{1,8}[，,](?:也|又|更)?不[^。！？]{1,10}[。！？]/g,
+    /没有[^，。！？]{1,8}[，,](?:也|又)?没有[^。！？]{1,10}[。！？]/g,
+    /既没[^，。！？]{1,10}[，,]也没[^。！？]{1,10}[。！？]/g,
+    /既不[^，。！？]{1,10}[，,]也不[^。！？]{1,10}[。！？]/g,
+  ]
+
+  let total = 0
+  const examples: string[] = []
+  for (const pat of patterns) {
+    const matches = text.match(pat) ?? []
+    total += matches.length
+    for (const m of matches) {
+      if (examples.length < 3) examples.push(m.slice(0, 25))
+    }
+  }
+  return { count: total, examples }
+}
+
+/**
+ * 动词回声检测：同一双字动词在相邻句/分句中出现两次。
+ * "盯着系统面板，已经盯了一刻钟" — 同一动词的不同时态/体重复。
+ */
+function detectVerbEcho(text: string): { count: number; examples: string[] } {
+  const sentences = text.split(/[。！？]+/).filter(s => s.trim().length > 4)
+  let total = 0
+  const examples: string[] = []
+
+  for (const sent of sentences) {
+    const clauses = sent.split(/[，,；]/).filter(c => c.trim().length > 2)
+    if (clauses.length < 2) continue
+
+    const verbRe = /[\u4e00-\u9fff]{2}(?=[着了过得])/g
+    for (let i = 0; i < clauses.length - 1; i++) {
+      const verbs1 = new Set((clauses[i].match(verbRe) ?? []))
+      if (verbs1.size === 0) continue
+      for (let j = i + 1; j < Math.min(i + 3, clauses.length); j++) {
+        const verbs2 = clauses[j].match(verbRe) ?? []
+        for (const v of verbs2) {
+          if (verbs1.has(v)) {
+            total++
+            if (examples.length < 3) {
+              examples.push(`${v}...${v}`)
+            }
+            break
+          }
+        }
+      }
+    }
+  }
+
+  return { count: total, examples }
+}
+
 export function detectAiTraces(content: string): AiTraceReport {
   const issues: AiTraceIssue[] = []
   const text = content.trim()
@@ -117,6 +264,52 @@ export function detectAiTraces(content: string): AiTraceReport {
     }
   }
 
+  let filmShotTotal = 0
+  const filmShotExamples: string[] = []
+  for (const pat of FILM_SHOT_PATTERNS) {
+    const matches = text.match(pat) ?? []
+    filmShotTotal += matches.length
+    if (matches.length > 0 && filmShotExamples.length < 3 && matches[0]) {
+      filmShotExamples.push(matches[0].slice(0, 20))
+    }
+  }
+  if (filmShotTotal >= 2) {
+    issues.push({
+      type: 'film_shot_chain',
+      label: `电影镜头链描写（${filmShotTotal}处）— 外部检测器最敏感特征`,
+      severity: 'warning',
+      count: filmShotTotal,
+      examples: filmShotExamples.length > 0 ? filmShotExamples : ['目光落在…上', '嘴角微微上扬', '缓缓开口']
+    })
+  }
+
+  let closureTotal = 0
+  for (const pat of CLOSURE_PATTERNS) {
+    closureTotal += (text.match(pat) ?? []).length
+  }
+  if (closureTotal >= 1) {
+    issues.push({
+      type: 'closure_summary',
+      label: `总结收束句（${closureTotal}处）— "这一刻他明白了…""或许这便是…"`,
+      severity: 'warning',
+      count: closureTotal,
+      examples: ['这一刻他明白了…', '或许这便是…']
+    })
+  }
+
+  const mechDialogue = detectMechanicalDialogueTags(text)
+  if (mechDialogue.count >= 2) {
+    issues.push({
+      type: 'mechanical_dialogue_tag',
+      label: `机械对话标注（${mechDialogue.count}处）— "他说，""她问。"式裸标注`,
+      severity: 'warning',
+      count: mechDialogue.count,
+      examples: mechDialogue.examples.length > 0
+        ? mechDialogue.examples
+        : ['"走吧。"他说，', '"真的？"她问。']
+    })
+  }
+
   const paragraphs = text.split(/\n\n+/).filter(p => p.trim())
   const paraLengths = paragraphs.map(p => p.replace(/\s/g, '').length)
   if (paraLengths.length >= 3) {
@@ -131,6 +324,57 @@ export function detectAiTraces(content: string): AiTraceReport {
         examples: ['各段长度接近，缺乏节奏变化']
       })
     }
+  }
+
+  // -----------------------------------------------------------------------
+  //  电报式短句连发：3句以上连续≤10字短句（"抬起头。看着他。没说话。"）
+  //  AI 高频使用此节奏模拟"文学感"，人类网文极少出现
+  // -----------------------------------------------------------------------
+  const staccatoResult = detectTelegraphicStaccato(text)
+  if (staccatoResult.count >= 1) {
+    issues.push({
+      type: 'telegraphic_staccato',
+      label: `电报式短句连发（${staccatoResult.count}组）— 连续≤10字断句堆砌`,
+      severity: 'warning',
+      count: staccatoResult.count,
+      examples: staccatoResult.examples.length > 0
+        ? staccatoResult.examples
+        : ['抬起头。看着他。没说话。']
+    })
+  }
+
+  // -----------------------------------------------------------------------
+  //  平行否定/肯定结构："没X，也没Y" / "不X，也不Y" / "没X，没Y"
+  //  AI 极高频使用对称否定，人类作者偏好不对称表达
+  // -----------------------------------------------------------------------
+  const parallelNeg = detectParallelNegation(text)
+  if (parallelNeg.count >= 2) {
+    issues.push({
+      type: 'parallel_negation',
+      label: `平行否定/肯定结构（${parallelNeg.count}处）— "没X，也没Y"式对称`,
+      severity: 'warning',
+      count: parallelNeg.count,
+      examples: parallelNeg.examples.length > 0
+        ? parallelNeg.examples
+        : ['没喝，也没催她']
+    })
+  }
+
+  // -----------------------------------------------------------------------
+  //  动词回声：同一动词在相邻句/分句中重复使用（"盯着…，已经盯了…"）
+  //  AI 偏好用动词重复制造节奏感，人类作者倾向换词或省略
+  // -----------------------------------------------------------------------
+  const verbEcho = detectVerbEcho(text)
+  if (verbEcho.count >= 2) {
+    issues.push({
+      type: 'verb_echo',
+      label: `动词回声（${verbEcho.count}处）— 相邻句中同一动词重复`,
+      severity: 'info',
+      count: verbEcho.count,
+      examples: verbEcho.examples.length > 0
+        ? verbEcho.examples
+        : ['盯着…已经盯了']
+    })
   }
 
   const metaphor = detectMetaphorDensity(text)
@@ -196,15 +440,26 @@ export function detectAiTraces(content: string): AiTraceReport {
 }
 
 export const AI_TRACE_POLISH_PROMPT = [
-  '你是文字润色专家，消除以下文本中的 AI 生成痕迹。核心原则：像一个赶稿的人类作者而非一个力求完美的AI。',
+  '你是文字编辑，只输出修复指令 JSON，绝不输出全文。',
+  '针对正文中的明显 AI 痕迹，输出对应的替换指令，进行最小必要改写。',
   '',
-  '具体操作：',
-  '1. 减少「然而/因此/总的来说」等连接词堆砌，用具体动作句代替过渡',
-  '2. 替换「心中涌起一股/眼中闪过一丝」等模板化情感表达，改用身体细节',
-  '3. 大幅削减比喻密度——每500字最多保留1处比喻，其余改为白描',
-  '4. 打破句长均匀性——插入碎片短句（3-6字），打断长句连续',
-  '5. 添加 2-3 个"白开水"段落——纯说事/纯写环境，不带任何修辞',
-  '6. 在叙述中掺入意外的具体细节（数字、品牌名、不优美的琐事）',
-  '7. 情感高潮段后加入冷叙述段降温',
-  '8. 保持原意和情节不变，只输出润色后的正文'
+  '【改写原则】',
+  '1. 仅修改命中的问题句：连接词堆叠、模板化情绪句、明显解释腔、机械对话标注。',
+  '2. 修复机械对话标注：“他说，”“她问。”等裸标注，改为附带动作/神态/语气的写法。',
+  '   ✗ “走吧。”他说。→ ✓ “走吧。”他头也不回的说道。',
+  '   ✗ “真的？”她问。→ ✓ “真的？”她皱了下眉。',
+  '   也可省略标注让对话自然衔接，或用动作段代替说话标签。',
+  '3. 修复电报式短句连发：连续3句以上≤10字的断句（“抬起头。看着他。没说话。”），合并或修改打破机械节奏。',
+  '4. 修复平行否定结构：“没X，也没Y”“不X，也不Y”，改为不对称表达或只保留一个否定。',
+  '5. 修复动词回声：相邻句中同一动词重复（“盯着…盯了”），换用近义词或省略重复。',
+  '',
+  '【输出格式 — 严格遵守，只输出 JSON，不要有任何其他文字】',
+  '{"patches": [{"find": "需要修改的原文精确片段", "replace": "修改后的片段"}]}',
+  '',
+  'find 规则：',
+  '1. 必须是原文中精确存在的、唯一的字符串（含标点）。',
+  '2. 长度建议 >= 10 字以确保唯一性；如果较短，请向左右扩展原文直到足够唯一。',
+  '3. 只修改受 AI 痕迹影响的段落/句子，其余未提及的文字保持原封不动。',
+  '',
+  '若无明显 AI 痕迹或无需修改，请输出：{"patches": []}'
 ].join('\n')

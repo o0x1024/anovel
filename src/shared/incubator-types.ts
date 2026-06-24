@@ -22,8 +22,8 @@ export type IncubatorCandidateSourceStep =
   | 'frontstory'
   | 'role_engine_gen'
   | 'world_rules_gen'
-  | 'emotion_curve_gen'
-  | 'ending_image_gen'
+  | 'rhythm_curve_gen'
+  | 'ending_structure_gen'
 
 export type IncubatorCandidateStatus =
   | 'new'
@@ -102,7 +102,10 @@ export interface IncubatorGateReport {
     severity: 'blocking' | 'warning'
     issue: string
     suggestion: string
+    /** LLM 产出的局部替换列表，original→replacement 逐条应用 */
+    replacements?: { original: string; replacement: string }[]
   }[]
+  globalAnalysis?: string
 }
 
 export interface IncubatorLastAdoptAction {
@@ -165,4 +168,5 @@ export interface IncubatorVersionDetail {
   slotPreviews: { slotKey: IncubatorSlotKey; label: string; content: string }[]
   synthesizedSummary?: string | null
   qualitySnapshot?: string | null
+  gate?: IncubatorGateReport | null
 }

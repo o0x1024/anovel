@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import MarkdownContent from '../../components/MarkdownContent.vue'
 import FavoriteButton from '../../components/FavoriteButton.vue'
 import {
@@ -13,6 +14,7 @@ import {
 } from './editor-nav'
 
 const props = defineProps<{ workId: number }>()
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const emit = defineEmits<{
   refreshed: []
@@ -20,7 +22,21 @@ const emit = defineEmits<{
 }>()
 
 type TabKey = 'overall' | 'characterFunction'
-type ReviseType = 'character' | 'worldview' | 'conflict'
+type ReviseType =
+  | 'protagonist'
+  | 'golden_finger'
+  | 'pleasure_engine'
+  | 'world_pressure'
+  | 'conflict_engine'
+  | 'supporting_cast'
+  | 'character'
+  | 'worldview'
+  | 'conflict'
+
+const qualityTabs: { key: TabKey; label: string }[] = [
+  { key: 'overall', label: '整体自检' },
+  { key: 'characterFunction', label: '角色功能矩阵' }
+]
 type ReviseActionKey = ReviseType | 'cards' | 'anchors' | 'cross'
 
 interface QualityReportEntry {
@@ -42,15 +58,40 @@ interface ParsedSection {
   severity?: QualitySeverity
 }
 
+interface ConflictCardCoverageItem {
+  name: string
+  role: 'protagonist' | 'supporting' | 'antagonist'
+  coreConflict: string
+  covered: boolean
+  matchedTerms: string[]
+  reason: string
+}
+
+interface ConflictCardCoverageReport {
+  hasConflict: boolean
+  hasCards: boolean
+  totalCards: number
+  coveredCount: number
+  missingCount: number
+  fullyCovered: boolean
+  missingItems: ConflictCardCoverageItem[]
+  items: ConflictCardCoverageItem[]
+}
+
 const tab = ref<TabKey>('overall')
 const state = ref<QualityState>({})
 const status = ref<SettingsQualityStatus | null>(null)
 const overallSections = ref<ParsedSection[]>([])
+const conflictCoverage = ref<ConflictCardCoverageReport | null>(null)
+const conflictSuggestLoading = ref(false)
+const conflictSuggestContent = ref('')
+const conflictApplyLoading = ref(false)
 const expanded = ref(false)
 const reportExpanded = ref(false)
 const overallLoading = ref(false)
 const characterLoading = ref(false)
 const reviseAllLoading = ref(false)
+const reviseAdvisoryAllLoading = ref(false)
 const acceptLoading = ref(false)
 const reviseLoading = ref<ReviseActionKey | null>(null)
 const reviseSection = ref<string | null>(null)
@@ -63,6 +104,10 @@ const activeReport = computed(() =>
 
 const canReviseBlocking = computed(() =>
   tab.value === 'overall' && !!status.value?.canReviseBlocking
+)
+
+const canReviseAdvisory = computed(() =>
+  tab.value === 'overall' && !!status.value?.canReviseAdvisory
 )
 
 const canAcceptPass = computed(() =>
@@ -115,9 +160,21 @@ const panelSummary = computed(() => {
 
 onMounted(loadState)
 
+const workType = ref<string | null>(null)
+
 async function loadState() {
+  const work = await window.anovel.invoke('work:get', props.workId)
+  workType.value = work?.work_type ?? null
+
   state.value = await window.anovel.invoke('settingsQuality:getState', props.workId) as QualityState
   status.value = await window.anovel.invoke('settingsQuality:getStatus', props.workId) as SettingsQualityStatus
+  conflictCoverage.value = await window.anovel.invoke(
+    'settingsQuality:getConflictCardCoverage',
+    props.workId
+  ) as ConflictCardCoverageReport
+  if (!conflictCoverage.value?.hasConflict || conflictCoverage.value.fullyCovered) {
+    conflictSuggestContent.value = ''
+  }
   if (state.value.overall?.report) {
     overallSections.value = await window.anovel.invoke(
       'settingsQuality:parseSections',
@@ -126,6 +183,65 @@ async function loadState() {
     ) as ParsedSection[]
   } else {
     overallSections.value = []
+  }
+}
+
+function roleLabel(role: ConflictCardCoverageItem['role']): string {
+  if (role === 'protagonist') return '主角'
+  if (role === 'antagonist') return '反派'
+  return '配角'
+}
+
+async function suggestConflictCoverageFix() {
+  if (conflictSuggestLoading.value) return
+  conflictSuggestLoading.value = true
+  error.value = ''
+  successMsg.value = ''
+  try {
+    const res = await window.anovel.invoke(
+      'settingsQuality:suggestConflictCoverageFix',
+      props.workId,
+      bodyModelParams()
+    ) as { success: boolean; content?: string; error?: string }
+    if (res.success && res.content?.trim()) {
+      conflictSuggestContent.value = res.content.trim()
+      successMsg.value = '已生成冲突补齐建议，可按下方内容修订核心冲突'
+    } else {
+      error.value = res.error || '生成补齐建议失败'
+    }
+  } catch (e) {
+    error.value = String(e)
+  } finally {
+    conflictSuggestLoading.value = false
+  }
+}
+
+async function applyConflictCoverageFix() {
+  if (conflictApplyLoading.value) return
+  if (!conflictSuggestContent.value.trim()) {
+    error.value = '暂无可应用的补齐建议，请先生成建议'
+    return
+  }
+  conflictApplyLoading.value = true
+  error.value = ''
+  successMsg.value = ''
+  try {
+    const res = await window.anovel.invoke(
+      'settingsQuality:applyConflictCoverageFix',
+      props.workId,
+      conflictSuggestContent.value
+    ) as { success: boolean; error?: string }
+    if (res.success) {
+      successMsg.value = '已将补齐建议应用到核心冲突，请按需运行整体自检'
+      emit('refreshed')
+      await loadState()
+    } else {
+      error.value = res.error || '应用补齐建议失败'
+    }
+  } catch (e) {
+    error.value = String(e)
+  } finally {
+    conflictApplyLoading.value = false
   }
 }
 
@@ -145,7 +261,7 @@ async function runOverallCheck() {
   error.value = ''
   successMsg.value = ''
   try {
-    const res = await window.anovel.invoke('settingsQuality:runOverallCheck', props.workId) as {
+    const res = await window.anovel.invoke('settingsQuality:runOverallCheck', props.workId, bodyModelParams()) as {
       success: boolean
       error?: string
     }
@@ -171,7 +287,7 @@ async function runCharacterFunctionCheck() {
   error.value = ''
   successMsg.value = ''
   try {
-    const res = await window.anovel.invoke('settingsQuality:runCharacterFunctionCheck', props.workId) as {
+    const res = await window.anovel.invoke('settingsQuality:runCharacterFunctionCheck', props.workId, bodyModelParams()) as {
       success: boolean
       error?: string
     }
@@ -192,11 +308,15 @@ async function runCharacterFunctionCheck() {
   }
 }
 
-async function reviseAndApply(type: ReviseType, sectionTitle?: string) {
+async function reviseAndApply(
+  type: ReviseType,
+  sectionTitle?: string,
+  mode: 'fix' | 'optimize' = 'fix'
+) {
   const report = tab.value === 'overall'
     ? state.value.overall?.report
     : state.value.characterFunction?.report
-  if (!report?.trim() || reviseLoading.value || reviseAllLoading.value) return
+  if (!report?.trim() || reviseLoading.value || reviseAllLoading.value || reviseAdvisoryAllLoading.value) return
 
   reviseLoading.value = type
   reviseSection.value = sectionTitle ?? null
@@ -208,12 +328,26 @@ async function reviseAndApply(type: ReviseType, sectionTitle?: string) {
       props.workId,
       type,
       report,
-      sectionTitle
+      sectionTitle,
+      mode,
+      bodyModelParams()
     ) as { success: boolean; content?: string; error?: string }
 
     if (res.success && res.content?.trim()) {
       await window.anovel.invoke('setting:upsert', props.workId, type, res.content.trim())
-      successMsg.value = `已应用${type === 'character' ? '人设' : type === 'worldview' ? '世界观' : '核心冲突'}修订`
+      const labelMap: Record<string, string> = {
+        character: '人设',
+        worldview: '世界观',
+        conflict: '核心冲突',
+        protagonist: workType.value === 'story' ? '主角与反差设定' : '主角设计',
+        golden_finger: workType.value === 'story' ? '设定与微创新' : '金手指系统',
+        pleasure_engine: workType.value === 'story' ? '情绪节奏与爽点' : '爽点机制',
+        world_pressure: '世界观压力规则',
+        conflict_engine: '冲突升级引擎',
+        supporting_cast: workType.value === 'story' ? '功能性配角' : '配角功能组'
+      }
+      const label = labelMap[type] || type
+      successMsg.value = mode === 'optimize' ? `已应用${label}优化` : `已应用${label}修订`
       emit('refreshed')
       await loadState()
     } else {
@@ -240,7 +374,8 @@ async function reviseCharacterCards(sectionTitle?: string) {
       'settingsQuality:reviseCharacterCards',
       props.workId,
       report,
-      sectionTitle
+      sectionTitle,
+      bodyModelParams()
     ) as { success: boolean; error?: string }
 
     if (res.success) {
@@ -271,7 +406,8 @@ async function reviseAnchors(sectionTitle?: string) {
       'settingsQuality:reviseAnchors',
       props.workId,
       report,
-      sectionTitle
+      sectionTitle,
+      bodyModelParams()
     ) as { success: boolean; count?: number; error?: string }
 
     if (res.success) {
@@ -302,14 +438,21 @@ async function reviseCross(sectionTitle?: string) {
       'settingsQuality:reviseCross',
       props.workId,
       report,
-      sectionTitle
+      sectionTitle,
+      bodyModelParams()
     ) as { success: boolean; revised?: string[]; error?: string }
 
     if (res.success && res.revised?.length) {
       const labels: Record<string, string> = {
         character: '人设',
         worldview: '世界观',
-        conflict: '核心冲突'
+        conflict: '核心冲突',
+        protagonist: workType.value === 'story' ? '主角与反差设定' : '主角设计',
+        golden_finger: workType.value === 'story' ? '设定与微创新' : '金手指系统',
+        pleasure_engine: workType.value === 'story' ? '情绪节奏与爽点' : '爽点机制',
+        world_pressure: '世界观压力规则',
+        conflict_engine: '冲突升级引擎',
+        supporting_cast: workType.value === 'story' ? '功能性配角' : '配角功能组'
       }
       const names = res.revised.map(k => labels[k] ?? k).join('、')
       successMsg.value = `已应用跨设定修订：${names}`
@@ -326,8 +469,70 @@ async function reviseCross(sectionTitle?: string) {
   }
 }
 
+async function reviseAdvisoryAll() {
+  if (reviseAdvisoryAllLoading.value || !status.value?.canReviseAdvisory) return
+  const n = status.value.advisoryOptimizeCount
+  if (!confirm(`将按自检报告依次优化 ${n} 个及格项，完成后自动重新自检。是否继续？`)) return
+
+  reviseAdvisoryAllLoading.value = true
+  error.value = ''
+  successMsg.value = ''
+  try {
+    const res = await window.anovel.invoke('settingsQuality:reviseAdvisoryAll', props.workId, bodyModelParams()) as {
+      success: boolean
+      revised?: string[]
+      errors?: string[]
+      recheckSuccess?: boolean
+      advisoryCount?: number
+      error?: string
+    }
+
+    if (res.revised?.length) {
+      const labels: Record<string, string> = {
+        character: '人设',
+        worldview: '世界观',
+        conflict: '核心冲突',
+        character_cards: '人设卡片',
+        anchors: '锚点',
+        cross_settings: '跨设定',
+        protagonist: workType.value === 'story' ? '主角与反差设定' : '主角设计',
+        golden_finger: workType.value === 'story' ? '设定与微创新' : '金手指系统',
+        pleasure_engine: workType.value === 'story' ? '情绪节奏与爽点' : '爽点机制',
+        world_pressure: '世界观压力规则',
+        conflict_engine: '冲突升级引擎',
+        supporting_cast: workType.value === 'story' ? '功能性配角' : '配角功能组'
+      }
+      const names = res.revised.map(k => labels[k] ?? k).join('、')
+      expanded.value = true
+      reportExpanded.value = true
+      emit('refreshed')
+      await loadState()
+
+      let msg = res.recheckSuccess
+        ? `已优化 ${names}，并已完成重新自检`
+        : `已优化 ${names}，请手动重新运行整体自检`
+      if (res.advisoryCount != null && res.advisoryCount > 0) {
+        msg += `；仍有 ${res.advisoryCount} 个及格·待优化项`
+      } else if (res.recheckSuccess) {
+        msg += '；各维度已达优秀'
+      }
+      successMsg.value = msg
+    }
+
+    if (res.errors?.length) {
+      error.value = res.errors.join('；')
+    } else if (!res.success && !res.revised?.length) {
+      error.value = res.error || '优化及格项失败'
+    }
+  } catch (e) {
+    error.value = String(e)
+  } finally {
+    reviseAdvisoryAllLoading.value = false
+  }
+}
+
 async function reviseBlocking() {
-  if (reviseAllLoading.value || !status.value?.canReviseBlocking) return
+  if (reviseAllLoading.value || reviseAdvisoryAllLoading.value || !status.value?.canReviseBlocking) return
   const n = status.value.blockingCount
   if (!confirm(`将按自检报告依次修订 ${n} 个不合格项，完成后自动重新自检。是否继续？`)) return
 
@@ -335,7 +540,7 @@ async function reviseBlocking() {
   error.value = ''
   successMsg.value = ''
   try {
-    const res = await window.anovel.invoke('settingsQuality:reviseAll', props.workId) as {
+    const res = await window.anovel.invoke('settingsQuality:reviseAll', props.workId, bodyModelParams()) as {
       success: boolean
       revised?: string[]
       errors?: string[]
@@ -352,7 +557,13 @@ async function reviseBlocking() {
         conflict: '核心冲突',
         character_cards: '人设卡片',
         anchors: '锚点',
-        cross_settings: '跨设定'
+        cross_settings: '跨设定',
+        protagonist: workType.value === 'story' ? '主角与反差设定' : '主角设计',
+        golden_finger: workType.value === 'story' ? '设定与微创新' : '金手指系统',
+        pleasure_engine: workType.value === 'story' ? '情绪节奏与爽点' : '爽点机制',
+        world_pressure: '世界观压力规则',
+        conflict_engine: '冲突升级引擎',
+        supporting_cast: workType.value === 'story' ? '功能性配角' : '配角功能组'
       }
       const names = res.revised.map(k => labels[k] ?? k).join('、')
       expanded.value = true
@@ -415,14 +626,18 @@ async function acceptPass() {
   }
 }
 
-function sectionNeedsAction(section: ParsedSection): boolean {
-  if (section.severity !== 'blocking') return false
+function sectionCanOptimize(section: ParsedSection): boolean {
+  if (!section.severity || section.severity === 'none') return false
   return !!(
     section.reviseType
     || section.action === 'revise-cards'
     || section.action === 'revise-anchors'
     || section.action === 'revise-cross'
   )
+}
+
+function sectionReviseMode(section: ParsedSection): 'fix' | 'optimize' {
+  return section.severity === 'advisory' ? 'optimize' : 'fix'
 }
 
 function isAnchorSection(section: ParsedSection): boolean {
@@ -437,9 +652,10 @@ function severityBadgeClass(severity?: QualitySeverity): string {
 }
 
 function handleSectionAction(section: ParsedSection) {
-  if (!sectionNeedsAction(section)) return
+  if (!sectionCanOptimize(section)) return
+  const mode = sectionReviseMode(section)
   if (section.reviseType) {
-    void reviseAndApply(section.reviseType, section.title)
+    void reviseAndApply(section.reviseType, section.title, mode)
   } else if (section.action === 'revise-cards') {
     void reviseCharacterCards(section.title)
   } else if (section.action === 'revise-anchors') {
@@ -450,18 +666,30 @@ function handleSectionAction(section: ParsedSection) {
 }
 
 function sectionActionLabel(section: ParsedSection): string {
+  const verb = section.severity === 'advisory' ? '优化' : '修订'
   if (section.reviseType) {
     const labels: Record<ReviseType, string> = {
-      character: '按建议修订人设',
-      worldview: '按建议修订世界观',
-      conflict: '按建议修订冲突'
+      character: `按建议${verb}人设`,
+      worldview: `按建议${verb}世界观`,
+      conflict: `按建议${verb}冲突`,
+      protagonist: `按建议${verb}${workType.value === 'story' ? '主角与反差设定' : '主角设计'}`,
+      golden_finger: `按建议${verb}${workType.value === 'story' ? '设定与微创新' : '金手指系统'}`,
+      pleasure_engine: `按建议${verb}${workType.value === 'story' ? '情绪节奏与爽点' : '爽点机制'}`,
+      world_pressure: `按建议${verb}世界观压力规则`,
+      conflict_engine: `按建议${verb}冲突升级引擎`,
+      supporting_cast: `按建议${verb}${workType.value === 'story' ? '功能性配角' : '配角功能组'}`
     }
     return labels[section.reviseType]
   }
-  if (section.action === 'revise-cards') return '按建议修订卡片'
-  if (section.action === 'revise-anchors') return '按建议修订锚点'
-  if (section.action === 'revise-cross') return '按建议修订跨设定'
+  if (section.action === 'revise-cards') return `按建议${verb}卡片`
+  if (section.action === 'revise-anchors') return `按建议${verb}锚点`
+  if (section.action === 'revise-cross') return `按建议${verb}跨设定`
   return ''
+}
+
+function sectionActionButtonClass(section: ParsedSection): string {
+  if (section.severity === 'advisory') return 'btn btn-outline btn-warning btn-xs'
+  return 'btn btn-outline btn-primary btn-xs'
 }
 
 function isSectionLoading(section: ParsedSection): boolean {
@@ -473,8 +701,8 @@ function isSectionLoading(section: ParsedSection): boolean {
 }
 
 const isBusy = computed(() =>
-  !!reviseLoading.value || reviseAllLoading.value || acceptLoading.value
-    || overallLoading.value || characterLoading.value
+  !!reviseLoading.value || reviseAllLoading.value || reviseAdvisoryAllLoading.value || acceptLoading.value
+    || overallLoading.value || characterLoading.value || conflictSuggestLoading.value || conflictApplyLoading.value
 )
 
 defineExpose({
@@ -502,7 +730,7 @@ defineExpose({
           <span v-else-if="status?.needsReview" class="badge badge-info badge-xs">待自检</span>
         </h4>
         <p class="text-xs text-base-content/40 mt-0.5">
-          整体自洽 · 角色功能 · 锚点对齐 · 卡片一致性（与生成/门禁/一致性报告联动）
+          整体自检 · 角色功能 · 锚点对齐 · 卡片一致性（与生成/门禁/一致性报告联动）
         </p>
         <p class="text-[11px] text-base-content/35 mt-0.5">{{ QUALITY_SEVERITY_LEGEND }}</p>
       </div>
@@ -520,6 +748,20 @@ defineExpose({
             class="w-3 h-3"
           />
           {{ reviseAllLoading ? '修订中...' : `修订不合格项 (${status?.blockingCount ?? 0})` }}
+        </button>
+        <button
+          v-if="tab === 'overall' && canReviseAdvisory"
+          type="button"
+          class="btn btn-outline btn-warning btn-xs gap-1"
+          :disabled="isBusy"
+          @click="reviseAdvisoryAll"
+        >
+          <font-awesome-icon
+            :icon="reviseAdvisoryAllLoading ? 'spinner' : 'wand-magic-sparkles'"
+            :spin="reviseAdvisoryAllLoading"
+            class="w-3 h-3"
+          />
+          {{ reviseAdvisoryAllLoading ? '优化中...' : `优化及格项 (${status?.advisoryOptimizeCount ?? 0})` }}
         </button>
         <button
           v-if="tab === 'overall' && canAcceptPass"
@@ -561,17 +803,92 @@ defineExpose({
     </button>
 
     <div v-show="expanded" class="mt-2 pt-2 border-t border-base-300/50">
-    <div role="tablist" class="tabs tabs-boxed tabs-xs bg-base-100/80 w-fit mb-3">
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'overall' }" @click="tab = 'overall'">
-        整体自洽
-      </button>
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'characterFunction' }" @click="tab = 'characterFunction'">
-        角色功能矩阵
-      </button>
+    <div role="tablist" class="tabs tabs-box tabs-sm w-fit mb-4 bg-base-300/45" aria-label="质量检查类型">
+      <a
+        v-for="item in qualityTabs"
+        :key="item.key"
+        role="tab"
+        href="#"
+        class="tab"
+        :class="{ 'tab-active': tab === item.key }"
+        :aria-selected="tab === item.key"
+        @click.prevent="tab = item.key"
+      >
+        {{ item.label }}
+      </a>
     </div>
 
     <div v-if="staleBanner" class="alert alert-warning text-xs py-2 mb-2">{{ staleBanner }}</div>
     <div v-if="convergenceHint" class="alert alert-info text-xs py-2 mb-2">{{ convergenceHint }}</div>
+    <div
+      v-if="tab === 'overall' && conflictCoverage && conflictCoverage.hasCards && workType !== 'story'"
+      class="rounded-lg border border-base-300/60 bg-base-100/70 p-3 mb-2"
+    >
+      <div class="flex items-center justify-between gap-2 mb-1 flex-wrap">
+        <p class="text-xs font-medium text-base-content/70">核心冲突 × 人设卡映射</p>
+        <div class="flex items-center gap-2">
+          <span
+            class="badge badge-xs"
+            :class="conflictCoverage.fullyCovered ? 'badge-success' : 'badge-warning'"
+          >
+            {{ conflictCoverage.coveredCount }}/{{ conflictCoverage.totalCards }}
+          </span>
+          <button
+            v-if="conflictCoverage.hasConflict && conflictCoverage.missingCount > 0"
+            type="button"
+            class="btn btn-outline btn-primary btn-xs"
+            :disabled="isBusy"
+            @click="suggestConflictCoverageFix"
+          >
+            {{ conflictSuggestLoading ? '生成中...' : '生成补齐建议' }}
+          </button>
+        </div>
+      </div>
+      <p v-if="!conflictCoverage.hasConflict" class="text-xs text-warning">
+        尚未填写核心冲突，暂无法评估映射情况。
+      </p>
+      <template v-else>
+        <p v-if="conflictCoverage.fullyCovered" class="text-xs text-success">
+          所有角色卡的核心矛盾都已在核心冲突中体现。
+        </p>
+        <div v-else class="space-y-1.5">
+          <p class="text-xs text-warning">
+            {{ conflictCoverage.missingCount }} 个角色矛盾尚未映射到核心冲突：
+          </p>
+          <div
+            v-for="item in conflictCoverage.missingItems.slice(0, 6)"
+            :key="`${item.name}-${item.role}`"
+            class="text-xs bg-base-200/70 rounded px-2 py-1.5"
+          >
+            <span class="font-medium">{{ item.name }}</span>
+            <span class="text-base-content/50">（{{ roleLabel(item.role) }}）</span>
+            <p class="text-base-content/70 mt-0.5">{{ item.reason }}</p>
+            <p v-if="item.coreConflict" class="text-base-content/55 mt-0.5 line-clamp-2">
+              卡片矛盾：{{ item.coreConflict }}
+            </p>
+          </div>
+        </div>
+      </template>
+      <div
+        v-if="conflictSuggestContent && conflictCoverage.hasConflict && conflictCoverage.missingCount > 0"
+        class="mt-2 pt-2 border-t border-base-300/50"
+      >
+        <div class="flex items-center justify-between gap-2 mb-1 flex-wrap">
+          <p class="text-xs font-medium text-base-content/60">AI 补齐建议</p>
+          <button
+            type="button"
+            class="btn btn-primary btn-xs"
+            :disabled="isBusy"
+            @click="applyConflictCoverageFix"
+          >
+            {{ conflictApplyLoading ? '应用中...' : '一键应用到核心冲突' }}
+          </button>
+        </div>
+        <div class="rounded-md border border-base-300/60 p-2 bg-base-100">
+          <MarkdownContent :content="conflictSuggestContent" size="sm" />
+        </div>
+      </div>
+    </div>
 
     <div class="flex items-center justify-between text-xs text-base-content/50 mb-2 flex-wrap gap-2">
       <span>
@@ -585,21 +902,37 @@ defineExpose({
           · {{ status.unresolvedIssues.length }} 条未决问题
         </span>
       </span>
-      <FavoriteButton
-        v-if="activeReport?.report"
-        :work-id="workId"
-        :source-step="tab === 'overall' ? 'settings_overall_check' : 'settings_character_check'"
-        :source-label="tab === 'overall' ? '设定整体自检' : '角色功能检查'"
-        :content="activeReport.report"
-        size="xs"
-      />
+      <div class="flex items-center gap-2 shrink-0">
+        <button
+          v-if="tab === 'characterFunction' && activeReport?.report"
+          type="button"
+          class="btn btn-primary btn-xs gap-1"
+          :disabled="isBusy"
+          @click="reviseAndApply('character')"
+        >
+          <font-awesome-icon
+            :icon="reviseLoading === 'character' ? 'spinner' : 'pen-nib'"
+            :spin="reviseLoading === 'character'"
+            class="w-3 h-3"
+          />
+          {{ reviseLoading === 'character' ? '修订中...' : '按建议修订人设' }}
+        </button>
+        <FavoriteButton
+          v-if="activeReport?.report"
+          :work-id="workId"
+          :source-step="tab === 'overall' ? 'settings_overall_check' : 'settings_character_check'"
+          :source-label="tab === 'overall' ? '设定整体自检' : '角色功能检查'"
+          :content="activeReport.report"
+          size="xs"
+        />
+      </div>
     </div>
 
     <div
       v-if="tab === 'overall' && overallSections.length && activeReport?.report"
       class="mb-3 pt-2 border-t border-base-300/50 space-y-2"
     >
-      <p class="text-xs font-medium text-base-content/50">分块操作（仅不合格项可自动修订）</p>
+      <p class="text-xs font-medium text-base-content/50">分块操作（不及格可修订，及格可优化）</p>
       <div
         v-for="section in overallSections"
         :key="section.title"
@@ -619,9 +952,9 @@ defineExpose({
         </div>
         <div class="flex gap-1 shrink-0 flex-wrap justify-end">
           <button
-            v-if="sectionNeedsAction(section)"
+            v-if="sectionCanOptimize(section)"
             type="button"
-            class="btn btn-outline btn-primary btn-xs"
+            :class="sectionActionButtonClass(section)"
             :disabled="isBusy"
             @click="handleSectionAction(section)"
           >
@@ -652,24 +985,8 @@ defineExpose({
           class="w-3 h-3 shrink-0 text-base-content/40"
         />
       </button>
-      <div v-show="reportExpanded" class="mt-2 rounded-lg border border-base-300/60 p-3 bg-base-100 space-y-3">
+      <div v-show="reportExpanded" class="mt-2 rounded-lg border border-base-300/60 p-3 bg-base-100">
         <MarkdownContent :content="activeReport.report" size="sm" />
-
-        <div v-if="tab === 'characterFunction'" class="pt-2 border-t border-base-300/50">
-          <button
-            type="button"
-            class="btn btn-primary btn-xs gap-1"
-            :disabled="isBusy"
-            @click="reviseAndApply('character')"
-          >
-            <font-awesome-icon
-              :icon="reviseLoading === 'character' ? 'spinner' : 'pen-nib'"
-              :spin="reviseLoading === 'character'"
-              class="w-3 h-3"
-            />
-            {{ reviseLoading === 'character' ? '修订中...' : '按建议修订人设' }}
-          </button>
-        </div>
       </div>
     </div>
     <p v-else class="text-sm text-base-content/40 italic">

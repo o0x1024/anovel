@@ -106,6 +106,16 @@ export class IncubatorCandidateDAO extends BaseDAO {
     return info.changes
   }
 
+  deleteByWorkSourceSteps(workId: number, sourceSteps: string[]): number {
+    if (!sourceSteps.length) return 0
+    const placeholders = sourceSteps.map(() => '?').join(',')
+    return this.run(
+      `DELETE FROM incubator_candidates
+       WHERE work_id = ? AND source_step IN (${placeholders})`,
+      [workId, ...sourceSteps]
+    ).changes
+  }
+
   create(input: IncubatorCandidateCreateInput): number {
     return this.insert(
       `INSERT INTO incubator_candidates (

@@ -1,4 +1,5 @@
 import { ipcMain } from 'electron'
+import { existsSync, unlinkSync } from 'fs'
 import { registerV15IpcHandlers } from './ipc-v15'
 import { registerV20IpcHandlers } from './ipc-v20'
 import { registerV25IpcHandlers } from './ipc-v25'
@@ -8,32 +9,38 @@ import { registerLogIpcHandlers } from './ipc-log'
 import { registerAiIpcHandlers } from './ai/register-ai-ipc'
 import { registerAssistantIpcHandlers } from './ipc-assistant'
 import { registerLabIpcHandlers } from './ipc-lab'
+import { registerNamesIpcHandlers } from './ipc-names'
 import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
-  generationLogDAO, coreSettingDAO, appPreferenceDAO, promptTemplateDAO
+  generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO
 } from './db'
-import type { PromptCategory } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
 import { fetchProviderModelCatalog, buildAssistantModelOptions } from './context/model-catalog'
 import { appLogger } from './logger/app-logger'
 import { generateCustomProviderId, defaultBaseForProtocol, defaultModelForProtocol } from '../shared/model-providers'
 import { broadcastStyleChanged } from './style-events'
+import { broadcastModelConfigChanged } from './model-events'
 import { generateStyleFromDescription } from './context/style-generate'
 import { buildWorkContext } from './context/work-context'
 import {
   buildSettingsGenerationContext,
-  characterGenHintsPreferenceKey,
+  normalizeGenreDetectMode,
   type CoreSettingGenerateType,
+  type GenreDetectMode,
+  type SettingGenHintsKind,
   type SettingsGenerationContextOptions
 } from './context/settings-generation-context'
+import {
+  settingGenHintsPreferenceKey,
+  settingWorldviewGenreDetectModePreferenceKey
+} from '../shared/settings-types'
 import { parseVolumeSuggestions } from './context/parse-volumes'
 import { parseAnchorSuggestions } from './context/parse-anchors'
 import { parseChapterSuggestions, parseChapterAbcFromAi, stripOutlineJsonFooter } from './context/parse-chapters'
 import { getWorkStepProgress } from './context/work-progress'
-import { checkAnchorAlignment } from './context/anchor-alignment'
 import { mergeIdeaToTarget } from './context/idea-merge'
 import { parseExpansionVersions } from './context/parse-expansion'
 import { parseIncubatorVariants } from './context/parse-variants'
@@ -41,8 +48,12 @@ import { registerIncubatorIpcHandlers } from './ipc/incubator-ipc'
 import { getConditionRules, setConditionRules } from './context/condition-rules'
 import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTrace, checkAntiAiRuleViolations, stripEmDashes, getWorkReferenceText, setWorkReferenceText, getAllAntiAiPresets, getCustomAntiAiPresets, setCustomAntiAiPresets, type AntiAiPreset } from './context/anti-ai-rules'
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
+import { autoRewriteBody } from './context/lab/body-auto-rewrite'
+import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning } from './context/goal-routine/story-goal-routine'
+import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
 import { exportWorkContent } from './context/export-content'
+import { exportWorkBundle, importWorkBundle } from './backup/work-backup'
 import {
   getWritingPlanStatus,
   initWritingPlanForWork,
@@ -58,6 +69,7 @@ import {
   removeWorkCover,
   setWorkCoverFromBase64
 } from './context/work-cover'
+import { pickAndImportManuscript } from './context/work-import'
 import { getWorkBodyText } from './context/assistant/work-reference'
 
 /**
@@ -65,18 +77,42 @@ import { getWorkBodyText } from './context/assistant/work-reference'
  */
 export function registerIpcHandlers(): void {
   // ==================== 作品 ====================
-  ipcMain.handle('work:list', () => workDAO.list())
+  ipcMain.handle('work:list', (_e, workType?: string) => workDAO.list(workType))
   ipcMain.handle('work:get', (_e, id: number) => workDAO.getById(id))
-  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength }) => {
+  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; workType?: string }) => {
     const id = workDAO.create(input)
     initWritingPlanForWork(id, input.novelLength ?? 'medium')
+    if (input.workType === 'story') {
+      const volumeId = volumeChapterDAO.createVolume(id, '正文', '短故事主线剧情')
+      volumeChapterDAO.createChapter(volumeId, '正文', '短故事正文内容')
+    }
     return id
   })
   ipcMain.handle('work:update', (_e, id: number, input: Record<string, unknown>) => workDAO.update(id, input))
-  ipcMain.handle('work:delete', (_e, id: number) => {
+  // 删除作品：默认软删除进回收站，可恢复；仅 work:purge 彻底清除
+  ipcMain.handle('work:delete', (_e, id: number) => workDAO.softDelete(id))
+  ipcMain.handle('work:listTrash', (_e, workType?: string) => workDAO.listTrash(workType))
+  ipcMain.handle('work:restore', (_e, id: number) => workDAO.restore(id))
+  ipcMain.handle('work:importManuscript', (_e, workType: 'novel' | 'story') =>
+    pickAndImportManuscript(workType))
+  ipcMain.handle('work:purge', (_e, id: number) => {
     const work = workDAO.getById(id)
     deleteWorkCoverFile(work?.cover_image)
+    // 清理作品关联的生成图片文件
+    const images = imageDAO.listByWork(id)
+    for (const img of images) {
+      try {
+        if (img.local_path && existsSync(img.local_path)) unlinkSync(img.local_path)
+      } catch {
+        // 忽略文件不存在或锁定
+      }
+    }
     return workDAO.delete(id)
+  })
+  ipcMain.handle('work:duplicate', (_e, id: number, newTitle?: string) => {
+    const bundle = exportWorkBundle(id)
+    if (newTitle) bundle.work.title = newTitle
+    return importWorkBundle(bundle)
   })
   ipcMain.handle('work:pickCover', (_e, workId: number) => pickAndSetWorkCover(workId))
   ipcMain.handle('work:setCoverFromBase64', (_e, workId: number, base64: string, fileName: string) =>
@@ -107,14 +143,30 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:get', (_e, id: number) => volumeChapterDAO.getChapter(id))
   ipcMain.handle('chapter:create', (_e, volumeId: number, title: string, outline?: string) =>
     volumeChapterDAO.createChapter(volumeId, title, outline))
-  ipcMain.handle('chapter:update', (_e, id: number, fields: Record<string, unknown>) =>
-    volumeChapterDAO.updateChapter(id, fields))
+  ipcMain.handle('chapter:update', (_e, id: number, fields: Record<string, unknown>) => {
+    // 若修改了正文内容，自动创建历史快照
+    if (fields.content !== undefined) {
+      return volumeChapterDAO.updateChapterWithVersion(id, fields as Parameters<typeof volumeChapterDAO.updateChapterWithVersion>[1])
+    }
+    return volumeChapterDAO.updateChapter(id, fields as Parameters<typeof volumeChapterDAO.updateChapter>[1])
+  })
   ipcMain.handle('chapter:delete', (_e, id: number) => volumeChapterDAO.deleteChapter(id))
+  ipcMain.handle('chapter:listVersions', (_e, chapterId: number) =>
+    volumeChapterDAO.listVersions(chapterId))
+  ipcMain.handle('chapter:getVersion', (_e, versionId: number, chapterId: number) =>
+    volumeChapterDAO.getVersion(versionId, chapterId))
   ipcMain.handle('chapter:batchCreate', (_e, volumeId: number, items: { title: string; outline?: string }[], mode?: 'append' | 'replace') =>
     volumeChapterDAO.batchCreateChapters(volumeId, items, mode ?? 'append'))
   ipcMain.handle('chapter:parseSuggestions', (_e, content: string) => parseChapterSuggestions(content, false))
   ipcMain.handle('chapter:parseAbc', (_e, content: string) => parseChapterAbcFromAi(content))
   ipcMain.handle('chapter:stripOutline', (_e, content: string) => stripOutlineJsonFooter(content))
+  ipcMain.handle('chapter:reorder', (_e, orderedIds: number[]) =>
+    volumeChapterDAO.reorderChapters(orderedIds))
+  ipcMain.handle('chapter:move', (_e, chapterId: number, targetVolumeId: number, targetSort: number) =>
+    volumeChapterDAO.moveChapter(chapterId, targetVolumeId, targetSort))
+
+  ipcMain.handle('volume:reorder', (_e, orderedIds: number[]) =>
+    volumeChapterDAO.reorderVolumes(orderedIds))
 
   ipcMain.handle('writingPlan:get', (_e, workId: number) => loadWritingPlan(workId))
   ipcMain.handle('writingPlan:update', (_e, workId: number, input: { targetTotalWords?: number; wordsPerChapter?: number; novelLength?: NovelLength }) =>
@@ -125,6 +177,10 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('writingPlan:suggestBatchCount', (_e, workId: number, volumeId: number) => {
     const status = getWritingPlanStatus(workId)
     const vol = status.volumes.find(v => v.id === volumeId)
+    if (status.plan.workType === 'story') {
+      const remaining = Math.max(0, vol?.gap ?? 0)
+      return remaining > 0 ? Math.min(10, remaining) : 1
+    }
     return suggestBatchChapterCount(vol)
   })
 
@@ -174,7 +230,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('model:upsert', (_e, type: string, apiKey: string, apiBase?: string, modelName?: string, displayName?: string, providerProtocol?: string) => {
     try {
       console.log('[IPC] model:upsert called with:', { type, apiKey: apiKey ? '***' : '', apiBase, modelName, displayName, providerProtocol })
-      return modelConfigDAO.upsert(type, apiKey, apiBase, modelName, displayName ?? null, providerProtocol ?? null)
+      modelConfigDAO.upsert(type, apiKey, apiBase, modelName, displayName ?? null, providerProtocol ?? null)
+      broadcastModelConfigChanged()
     } catch (err) {
       console.error('[IPC Error] model:upsert failed:', err)
       throw err
@@ -191,12 +248,15 @@ export function registerIpcHandlers(): void {
       apiBase?.trim() || defaultBaseForProtocol(protocol),
       modelName?.trim() || defaultModelForProtocol(protocol)
     )
+    broadcastModelConfigChanged()
     return modelType
   })
   ipcMain.handle('model:setEnabled', (_e, type: string, enabled: boolean) => {
     try {
       console.log('[IPC] model:setEnabled called with:', { type, enabled })
-      return modelConfigDAO.setEnabled(type, enabled)
+      const ok = modelConfigDAO.setEnabled(type, enabled)
+      if (ok) broadcastModelConfigChanged()
+      return ok
     } catch (err) {
       console.error('[IPC Error] model:setEnabled failed:', err)
       throw err
@@ -204,14 +264,21 @@ export function registerIpcHandlers(): void {
   })
   ipcMain.handle('model:setPriority', (_e, type: string, priority: number) =>
     modelConfigDAO.setPriority(type, priority))
-  ipcMain.handle('model:delete', (_e, type: string) => modelConfigDAO.delete(type))
+  ipcMain.handle('model:delete', (_e, type: string) => {
+    const ok = modelConfigDAO.delete(type)
+    if (ok) broadcastModelConfigChanged()
+    return ok
+  })
   ipcMain.handle('model:setMaxContextTokens', (_e, type: string, tokens: number) =>
     modelConfigDAO.setMaxContextTokens(type, tokens))
   ipcMain.handle('model:setProviderOptions', (_e, type: string, optionsJson: string | null) =>
     modelConfigDAO.setProviderOptions(type, optionsJson))
   ipcMain.handle('model:getGlobalDefault', () => appPreferenceDAO.getGlobalLlmDefault())
-  ipcMain.handle('model:setGlobalDefault', (_e, provider: string | null, modelName: string | null) =>
-    appPreferenceDAO.setGlobalLlmDefault(provider, modelName))
+  ipcMain.handle('model:setGlobalDefault', (_e, provider: string | null, modelName: string | null) => {
+    const result = appPreferenceDAO.setGlobalLlmDefault(provider, modelName)
+    broadcastModelConfigChanged()
+    return result
+  })
   ipcMain.handle('model:getGenerationParams', () => appPreferenceDAO.getGenerationParams())
   ipcMain.handle('model:setGenerationParams', (_e, params) => appPreferenceDAO.setGenerationParams(params))
   ipcMain.handle('model:refreshCatalog', async (_e, modelType: string) => {
@@ -238,6 +305,7 @@ export function registerIpcHandlers(): void {
         apiBase: config.api_base,
         modelCount: models.length
       })
+      broadcastModelConfigChanged()
       return models
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
@@ -316,7 +384,7 @@ export function registerIpcHandlers(): void {
     coreSettingDAO.restoreVersion(workId, type, versionId))
   ipcMain.handle('setting:upsert', (_e, workId: number, type: string, content: string) => {
     const trimmed = (content as string).trim()
-    const clearable = type === 'character' || type === 'worldview' || type === 'conflict'
+    const clearable = type === 'protagonist' || type === 'golden_finger' || type === 'pleasure_engine' || type === 'world_pressure' || type === 'conflict_engine' || type === 'supporting_cast'
     if (!trimmed && clearable) {
       const row = coreSettingDAO.getByType(workId, type)
       if (row) coreSettingDAO.delete(row.id)
@@ -343,10 +411,25 @@ export function registerIpcHandlers(): void {
     getWorkReferenceText(workId))
   ipcMain.handle('setting:setWorkReferenceText', (_e, workId: number, text: string) =>
     setWorkReferenceText(workId, text))
+  ipcMain.handle('setting:getGenHints', (_e, workId: number, kind: SettingGenHintsKind) =>
+    appPreferenceDAO.getPreference(settingGenHintsPreferenceKey(workId, kind)) ?? '')
+  ipcMain.handle('setting:setGenHints', (_e, workId: number, kind: SettingGenHintsKind, text: string) => {
+    appPreferenceDAO.setPreference(settingGenHintsPreferenceKey(workId, kind), (text as string).trim())
+    return true
+  })
+  ipcMain.handle('setting:getWorldviewGenreDetectMode', (_e, workId: number) =>
+    normalizeGenreDetectMode(appPreferenceDAO.getPreference(settingWorldviewGenreDetectModePreferenceKey(workId))))
+  ipcMain.handle('setting:setWorldviewGenreDetectMode', (_e, workId: number, mode: GenreDetectMode) => {
+    appPreferenceDAO.setPreference(
+      settingWorldviewGenreDetectModePreferenceKey(workId),
+      normalizeGenreDetectMode(mode)
+    )
+    return true
+  })
   ipcMain.handle('setting:getCharacterGenHints', (_e, workId: number) =>
-    appPreferenceDAO.getPreference(characterGenHintsPreferenceKey(workId)) ?? '')
+    appPreferenceDAO.getPreference(settingGenHintsPreferenceKey(workId, 'supporting_cast')) ?? '')
   ipcMain.handle('setting:setCharacterGenHints', (_e, workId: number, text: string) => {
-    appPreferenceDAO.setPreference(characterGenHintsPreferenceKey(workId), (text as string).trim())
+    appPreferenceDAO.setPreference(settingGenHintsPreferenceKey(workId, 'supporting_cast'), (text as string).trim())
     return true
   })
 
@@ -354,30 +437,59 @@ export function registerIpcHandlers(): void {
     humanizeText(content, opts ?? {}))
   ipcMain.handle('antiai:measureAiSignature', (_e, content: string) =>
     measureAiSignature(content))
+  ipcMain.handle('antiai:autoRewriteBody', (_e, content: string) =>
+    autoRewriteBody(content))
+
+  // ==================== 目标循环（goal routine）====================
+  ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
+    void runStoryGoalLoop(workId, config ?? {}, e.sender).catch((err) => {
+      appLogger.error('goal_routine', '目标循环启动失败', { workId, error: String(err) })
+    })
+    return true
+  })
+  ipcMain.handle('goal:cancel', (_e, workId: number) => cancelGoalLoop(workId))
+  ipcMain.handle('goal:getState', (_e, workId: number) => {
+    const state = goalRoutineDAO.getByWork(workId)
+    const turns = goalRoutineDAO.listTurns(workId, 30)
+    return { state: state ?? null, turns }
+  })
+  ipcMain.handle('goal:isRunning', (_e, workId: number) => isGoalLoopRunning(workId))
 
   ipcMain.handle('context:buildWork', (_e, workId: number, options?: Record<string, boolean>) =>
     buildWorkContext(workId, options ?? {}))
 
   ipcMain.handle(
     'context:buildSettingsGeneration',
-    (
+    async (
       _e,
       workId: number,
       targetType: CoreSettingGenerateType,
       options?: SettingsGenerationContextOptions
-    ) => buildSettingsGenerationContext(workId, targetType, options ?? {})
+    ) => await buildSettingsGenerationContext(workId, targetType, options ?? {})
   )
-
-  ipcMain.handle('alignment:checkContent', (_e, workId: number, content: string, options?: {
-    chapterId?: number
-    step?: string
-    persist?: boolean
-  }) => checkAnchorAlignment(workId, content, options))
 
   safeIpcHandle('incubator:parseExpansion', (_e, content) =>
     parseExpansionVersions(content as string))
   safeIpcHandle('incubator:parseVariants', (_e, content, legacyFallback) =>
     parseIncubatorVariants(content as string, (legacyFallback as boolean | undefined) ?? false))
+  safeIpcHandle('incubator:parseAnchors', (_e, content) => {
+    const text = (content as string).trim()
+    // 提取 JSON 数组
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
+      ?? text.match(/(\[[\s\S]*\])/)
+    if (!fenced) return []
+    try {
+      const arr = JSON.parse(fenced[1] ?? fenced[0])
+      if (!Array.isArray(arr)) return []
+      return arr.map((a: Record<string, unknown>) => ({
+        title: String(a.title ?? ''),
+        summary: String(a.content ?? ''),
+        dimension: [String(a.type ?? 'plot'), a.scope ? `范围:${a.scope}` : ''].filter(Boolean).join(' · ')
+      }))
+    } catch {
+      return []
+    }
+  })
 
   registerIncubatorIpcHandlers()
 
@@ -419,11 +531,7 @@ export function registerIpcHandlers(): void {
   // ==================== AI 实验室 ====================
   registerLabIpcHandlers()
 
-  // ==================== Prompt 模板管理 ====================
-  ipcMain.handle('prompt:list', () => promptTemplateDAO.list())
-  ipcMain.handle('prompt:listByCategory', (_e, cat: PromptCategory) => promptTemplateDAO.listByCategory(cat))
-  ipcMain.handle('prompt:resolve', (_e, key: string) => promptTemplateDAO.resolve(key))
-  ipcMain.handle('prompt:setUserText', (_e, key: string, text: string | null) => promptTemplateDAO.setUserText(key, text))
-  ipcMain.handle('prompt:resetToDefault', (_e, key: string) => promptTemplateDAO.resetToDefault(key))
-  ipcMain.handle('prompt:resetAll', () => { promptTemplateDAO.resetAll(); return true })
+  // ==================== 名称库 ====================
+  registerNamesIpcHandlers()
+
 }

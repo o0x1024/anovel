@@ -55,10 +55,10 @@ export const DEFAULT_WORK_STEP_TEMPERATURE: WorkStepTemperatureConfig = {
   outline: { min: 0.8, max: 1.0 },
   worldview: { min: 0.9, max: 1.2 },
   character: { min: 0.8, max: 1.0 },
-  body: { min: 0.7, max: 0.9 },
+  body: { min: 0.8, max: 1.0 },
   creative: { min: 0.9, max: 1.1 },
-  polish: { min: 0.5, max: 0.7 },
-  deai: { min: 0.4, max: 0.6 },
+  polish: { min: 0.45, max: 0.6 },
+  deai: { min: 0.9, max: 1.2 },
   analysis: { min: 0.5, max: 0.7 }
 }
 

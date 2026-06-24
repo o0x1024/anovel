@@ -1,5 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
+import ListBatchToolbar from '../../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../../composables/useListSelection'
 
 const props = defineProps<{ workId: number }>()
 
@@ -33,6 +40,8 @@ const form = ref({
   ability_changes: ''
 })
 
+const selection = useListSelection(snapshots)
+
 onMounted(async () => {
   await Promise.all([loadSnapshots(), loadChapters()])
 })
@@ -40,6 +49,7 @@ onMounted(async () => {
 async function loadSnapshots() {
   snapshots.value = await window.anovel.invoke('snapshot:listByWork', props.workId) as Snapshot[]
   characters.value = await window.anovel.invoke('snapshot:listCharacters', props.workId) as string[]
+  selection.clearSelection()
 }
 
 async function loadChapters() {
@@ -76,6 +86,18 @@ async function createSnapshot() {
 
 async function deleteSnapshot(id: number) {
   await window.anovel.invoke('snapshot:delete', id)
+}
+
+async function deleteSelectedSnapshots() {
+  const selected = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(selected.length, '角色快照'))) return
+  await runBatchDelete(selected, item => deleteSnapshot(item.id))
+  await loadSnapshots()
+}
+
+async function deleteAllSnapshots() {
+  if (!(await confirmDeleteAll(snapshots.value.length, '角色快照'))) return
+  await runBatchDelete(snapshots.value, item => deleteSnapshot(item.id))
   await loadSnapshots()
 }
 
@@ -96,10 +118,21 @@ const groupedEntries = computed(() => {
 
 <template>
   <div class="space-y-4">
-    <div class="flex items-center justify-between">
+    <div class="flex items-center justify-between gap-3 flex-wrap">
       <p class="text-sm text-base-content/50">记录角色在各章的状态，正文生成时自动注入最新快照。</p>
-      <button class="btn btn-primary btn-sm" @click="showForm = !showForm">{{ showForm ? '取消' : '添加快照' }}</button>
+      <button class="btn btn-primary btn-sm shrink-0" @click="showForm = !showForm">{{ showForm ? '取消' : '添加快照' }}</button>
     </div>
+
+    <ListBatchToolbar
+      v-if="snapshots.length > 0"
+      :total="snapshots.length"
+      :selectable-count="selection.selectableCount"
+      :selected-count="selection.selectedCount"
+      :all-selected="selection.allSelected"
+      @toggle-all="selection.toggleAll()"
+      @delete-selected="deleteSelectedSnapshots"
+      @delete-all="deleteAllSnapshots"
+    />
 
     <div v-if="showForm" class="card bg-base-100 border border-base-300 p-4 space-y-2">
       <div class="flex gap-2 flex-wrap">
@@ -124,10 +157,23 @@ const groupedEntries = computed(() => {
       <div v-for="[name, list] in groupedEntries" :key="name">
         <h4 class="font-semibold text-sm mb-2">{{ name }}</h4>
         <div class="space-y-2">
-          <div v-for="snap in list.slice().reverse().slice(0, 3)" :key="snap.id" class="card bg-base-100 border border-base-300 p-3 text-sm">
-            <div class="flex justify-between mb-1">
-              <span class="text-xs text-base-content/50">{{ chapterTitle(snap.chapter_id) }}</span>
-              <button class="btn btn-ghost btn-xs text-error" @click="deleteSnapshot(snap.id)">删除</button>
+          <div
+            v-for="snap in list.slice().reverse().slice(0, 3)"
+            :key="snap.id"
+            class="card bg-base-100 border border-base-300 p-3 text-sm"
+            :class="{ 'ring-1 ring-primary/40': selection.isSelected(snap, 0) }"
+          >
+            <div class="flex justify-between mb-1 gap-2">
+              <div class="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  class="checkbox checkbox-xs shrink-0"
+                  :checked="selection.isSelected(snap, 0)"
+                  @change="selection.toggle(snap, 0)"
+                />
+                <span class="text-xs text-base-content/50">{{ chapterTitle(snap.chapter_id) }}</span>
+              </div>
+              <button class="btn btn-ghost btn-xs text-error" @click="deleteSnapshot(snap.id).then(loadSnapshots)">删除</button>
             </div>
             <p v-if="snap.location" class="text-base-content/70">📍 {{ snap.location }}</p>
             <p v-if="snap.mental_state" class="text-base-content/70">心理：{{ snap.mental_state }}</p>

@@ -3,14 +3,73 @@ import { normalizeBodyParagraphSpacing } from '../../shared/normalize-body-text'
 /**
  * 后处理人性化模块
  *
- * AI 检测器的核心依据是 token 级概率分布的均匀性，prompt 工程无法改变这一点。
- * 本模块通过 **词级替换** 和 **结构扰动** 在生成后打破这种均匀性：
+ * 基于朱雀 AI 检测实验的结论，按权重优先级处理：
  *
- * 1. 高频AI词 → 低频人类替代词（降低 token 可预测性）
- * 2. 标点变异（逗号拆分、顿号替换等改变分词边界）
- * 3. 随机插入口语化填充词（打破信息密度均匀性）
- * 4. 句式微调（被动↔主动、语序扰动）
+ * 1. 【致命】消除电影镜头链（朱雀 F6: 人工特征↓81%）
+ * 2. 【高危】消除书面连接词（朱雀 F4: 人工特征↓39%）
+ * 3. 【中危】消除模板情感句/总结句（朱雀 F1/F5: ↓26%~27%）
+ * 4. 高频AI词 → 低频人类替代词（降低 token 可预测性）
+ * 5. 标点变异（改变分词边界）
+ * 6. 随机插入口语化填充词（打破信息密度均匀性）
+ * 7. 消除连续同长度句
  */
+
+// ---------------------------------------------------------------------------
+//  朱雀实验驱动的指纹消除（优先级最高的三层）
+// ---------------------------------------------------------------------------
+
+/**
+ * 【致命级】消除电影镜头链——朱雀实验 F6: 注入镜头链使人工特征↓81%
+ */
+function eliminateFilmShotChains(text: string): string {
+  let r = text
+  r = r.replace(/(?:目光|视线|眼神)(?:落在|扫过|越过|移到|停在|掠过)([^，。！？]{1,15})上/g,
+    (_m, t: string) => `看了眼${t}`)
+  r = r.replace(/嘴角微微(?:上扬|勾起|一弯)/g, '咧了咧嘴')
+  r = r.replace(/(?:缓缓|慢慢)(?:回过头|转过身|站起身|抬起头)/g, (m) =>
+    m.replace(/缓缓|慢慢/, ''))
+  r = r.replace(/脚步(?:一顿|顿了顿|微微一顿)/g, '停了一下')
+  r = r.replace(/四目相对[^，。]{0,6}[。，]/g, '互相看了一眼，')
+  return r
+}
+
+/**
+ * 【高危级】消除书面连接词——朱雀实验 F4: 注入连接词使人工特征↓39%
+ */
+function eliminateConnectors(text: string): string {
+  const map: [RegExp, string[]][] = [
+    [/然而[，,]?/g, ['可', '但', '不过，', '']],
+    [/因此[，,]?/g, ['所以', '这才', '']],
+    [/此外[，,]?/g, ['另外', '还有', '']],
+    [/与此同时[，,]?/g, ['这会儿', '这当口', '']],
+    [/不仅如此[，,]?/g, ['', '不光这样']],
+    [/尽管如此[，,]?/g, ['话虽这么说，', '即便这样，', '']],
+    [/值得注意的是[，,]?/g, ['']],
+    [/不难发现[，,]?/g, ['']],
+    [/由此可见[，,]?/g, ['']],
+    [/总而言之[，,]?/g, ['']],
+  ]
+  let r = text
+  for (const [pattern, alts] of map) {
+    r = r.replace(pattern, () => alts[Math.floor(Math.random() * alts.length)])
+  }
+  return r
+}
+
+/**
+ * 【中危级】消除模板情感句和总结收束句
+ * 朱雀实验 F1: 注入模板情感句→人工特征↓26%; F5: 注入总结句→↓27%
+ */
+function eliminateTemplateEmotions(text: string): string {
+  let r = text
+  r = r.replace(/(?:心中|内心|胸口)(?:涌起|泛起|升起|掠过)(?:一股|一阵|一丝)[^，。]{1,15}[，。]/g, '')
+  r = r.replace(/(?:这一刻[，,]?(?:他|她)?(?:明白|懂得|知道|意识到了?))[^。]{0,20}。/g, '')
+  r = r.replace(/(?:或许[，,]?这(?:便|就)是)[^。]{0,20}。/g, '')
+  r = r.replace(/(?:对于[^，。]{2,8}而言)[^。]{0,15}。/g, '')
+  return r
+}
+
+// ---------------------------------------------------------------------------
 
 /** AI 偏好词 → 人类替代词（一对多，随机选取） */
 const WORD_SUBSTITUTIONS: [RegExp, string[]][] = [
@@ -214,7 +273,6 @@ function breakUniformSentences(text: string): string {
       const nextSimilar = next > 0 && Math.abs(curr - next) < Math.max(curr, next) * 0.25
 
       if (prevSimilar && nextSimilar && curr > 15 && Math.random() < 0.4) {
-        // 尝试在逗号处拆分为两句
         const commaIdx = sentences[i].indexOf('，', Math.floor(sentences[i].length * 0.3))
         if (commaIdx > 0 && commaIdx < sentences[i].length - 5) {
           processed.push(sentences[i].slice(0, commaIdx) + '。')
@@ -232,11 +290,174 @@ function breakUniformSentences(text: string): string {
   return result.join('')
 }
 
+/**
+ * 句长节奏制造：主动打破句长均匀性，拉高 sentenceStd 与相邻句长变化率
+ * （启发式检测器 30% 权重的核心指标）。
+ *
+ * 策略：检测连续 ≥3 句长度相近的「均匀段」，在其中随机做两种变换之一——
+ *  ① 把相邻两句用逗号合并成一句长句（拔高峰值，拉高 std 与变化率）；
+ *  ② 把一句长句在逗号处断成两句（制造一个短句）。
+ * 仅对 10–40 字的中等句操作，避免破坏语义或对话。
+ */
+function diversifySentenceRhythm(text: string): string {
+  const parts = text.split(/(\n\n+)/)
+  const result: string[] = []
+
+  for (const part of parts) {
+    if (/^\n+$/.test(part)) {
+      result.push(part)
+      continue
+    }
+
+    const sentences = part.split(/(?<=[。！？])/g).filter(s => s.trim())
+    if (sentences.length < 4) {
+      result.push(part)
+      continue
+    }
+
+    const lens = sentences.map(s => s.replace(/\s/g, '').length)
+    const processed: string[] = []
+    let i = 0
+    while (i < sentences.length) {
+      // 探测从 i 开始的均匀句群
+      let runEnd = i + 1
+      while (runEnd < sentences.length) {
+        const a = lens[runEnd - 1]
+        const b = lens[runEnd]
+        if (a > 0 && Math.abs(a - b) < Math.max(a, b) * 0.22) runEnd++
+        else break
+      }
+      const runLen = runEnd - i
+
+      if (runLen >= 3 && Math.random() < 0.5) {
+        // 在均匀群内做一次合并：把群内相邻两句并成一句
+        const mergeAt = i + 1 + Math.floor(Math.random() * (runLen - 1))
+        for (let j = i; j < runEnd; j++) {
+          if (j === mergeAt && j < sentences.length) {
+            const prev = sentences[j - 1].trim()
+            const curr = sentences[j].trim()
+            // 去掉前句末尾句号，用逗号连接
+            const prevCore = prev.replace(/[。！？]+$/, '')
+            const merged = `${prevCore}，${curr}`
+            processed[processed.length - 1] = merged
+            continue
+          }
+          processed.push(sentences[j])
+        }
+      } else {
+        for (let j = i; j < runEnd; j++) processed.push(sentences[j])
+      }
+      i = runEnd
+    }
+
+    result.push(processed.join(''))
+  }
+
+  return result.join('')
+}
+
+/**
+ * 信息密度均匀检测 + 插闲笔：
+ * AI 文本段落信息密度高度均匀（每段都在「推进情节」），人味文本会有低密度的
+ * 闲笔/感官白描段落。对密度过于均匀的相邻段落，往间隙插一句低信息密度感官句，
+ * 打破均匀性（同时降困惑度——闲笔 token 更不可预测）。
+ *
+ * 密度代理指标：段落字数与其句末标点数的比值（句均字数）越接近，段落越「同质」。
+ * 仅在相邻段落句均字数差异极小（均匀）时触发，且不在对话段附近插。
+ */
+const SENSORY_FILLERS = [
+  '外头风停了，屋里安静得能听见钟走。',
+  '茶凉了，没人顾上续。',
+  '窗纸透进来一道光，落在桌角。',
+  '远处有人喊了一嗓子，没听清喊什么。',
+  '灶上的水咕嘟咕嘟响。',
+  '他换了个姿势，椅子吱呀一声。',
+  '天上云压得很低，像要下雨又没下。',
+  '烟灰掉在膝盖上，他没掸。',
+]
+
+function infoDensityUniform(paragraphs: string[]): boolean {
+  // 句均字数作为密度代理；相邻段落差异都极小 → 整体均匀
+  if (paragraphs.length < 5) return false
+  const densities = paragraphs.map(p => {
+    const pure = p.replace(/\s/g, '').length
+    const ends = (p.match(/[。！？]/g) || []).length
+    return ends > 0 ? pure / ends : pure
+  })
+  let uniformNeighbors = 0
+  for (let i = 1; i < densities.length; i++) {
+    const a = densities[i - 1]
+    const b = densities[i]
+    if (Math.max(a, b) > 0 && Math.abs(a - b) / Math.max(a, b) < 0.12) uniformNeighbors++
+  }
+  return uniformNeighbors / (densities.length - 1) > 0.6
+}
+
+function insertSensoryFillers(text: string, maxInserts = 2): string {
+  const paragraphs = text.split('\n\n')
+  if (paragraphs.length < 5) return text
+  if (!infoDensityUniform(paragraphs)) return text
+
+  let insertCount = 0
+  const result: string[] = []
+  for (let i = 0; i < paragraphs.length; i++) {
+    result.push(paragraphs[i])
+    if (i > 1 && i < paragraphs.length - 2 && insertCount < maxInserts) {
+      const para = paragraphs[i]
+      const isDialogue = para.includes('「') || para.includes('"') || para.includes('"')
+      const nextIsDialogue = paragraphs[i + 1].includes('「') || paragraphs[i + 1].includes('"')
+      if (!isDialogue && !nextIsDialogue && Math.random() < 0.3) {
+        result.push(pick(SENSORY_FILLERS))
+        insertCount++
+      }
+    }
+  }
+  return result.join('\n\n')
+}
+
+/**
+ * 孤立短句向前合并：极短的结论/断言句（≤8字，如"不动了。""没说话。"）
+ * 应该附着到上一段末尾而非独占一段。
+ *
+ * 匹配条件：段落纯文字≤8字、非对话、前一段存在且非对话。
+ */
+function mergeOrphanedShortSentences(text: string): string {
+  const paragraphs = text.split('\n\n')
+  if (paragraphs.length < 2) return text
+
+  const result: string[] = []
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const p = paragraphs[i].trim()
+    if (!p) continue
+
+    const pureLen = p.replace(/[^\u4e00-\u9fff\w]/g, '').length
+    const isDialogue = /^[""「『]/.test(p)
+    const prevIdx = result.length - 1
+
+    if (
+      pureLen <= 8 &&
+      !isDialogue &&
+      prevIdx >= 0 &&
+      !/^[""「『]/.test(result[prevIdx])
+    ) {
+      result[prevIdx] = result[prevIdx] + p
+      continue
+    }
+
+    result.push(p)
+  }
+
+  return result.join('\n\n')
+}
+
 export interface HumanizeOptions {
   wordSubstitution?: boolean
   punctuationPerturb?: boolean
   fillerInsertion?: boolean
   breakUniform?: boolean
+  /** 消除朱雀检测器最敏感的 AI 指纹（镜头链/连接词/模板句） */
+  eliminateFingerprints?: boolean
   skipRate?: number
   referenceText?: string
 }
@@ -255,6 +476,7 @@ export function humanizeText(text: string, options: HumanizeOptions = {}): strin
     punctuationPerturb = true,
     fillerInsertion = true,
     breakUniform = true,
+    eliminateFingerprints = true,
     skipRate = 0.3,
     referenceText
   } = options
@@ -263,12 +485,20 @@ export function humanizeText(text: string, options: HumanizeOptions = {}): strin
 
   let result = text
 
+  if (eliminateFingerprints) {
+    result = eliminateFilmShotChains(result)
+    result = eliminateConnectors(result)
+    result = eliminateTemplateEmotions(result)
+  }
+
   if (wordSubstitution) {
     result = applyWordSubstitutions(result, skipRate, styleWordMap)
   }
 
   if (breakUniform) {
     result = breakUniformSentences(result)
+    result = diversifySentenceRhythm(result)
+    result = mergeOrphanedShortSentences(result)
   }
 
   if (punctuationPerturb) {
@@ -277,6 +507,7 @@ export function humanizeText(text: string, options: HumanizeOptions = {}): strin
 
   if (fillerInsertion) {
     result = insertFillerSentences(result)
+    result = insertSensoryFillers(result)
   }
 
   return normalizeBodyParagraphSpacing(result)

@@ -4,7 +4,7 @@ export interface LabTaskRow {
   id: number
   original_text: string
   result_text: string | null
-  style_id: number
+  style_id: number | null
   system_prompt: string | null
   anti_ai_rules_json: string | null
   status: LabTaskStatus
@@ -17,7 +17,7 @@ export interface LabTaskRow {
 
 export interface LabTaskCreateInput {
   originalText: string
-  styleId: number
+  styleId?: number | null
   systemPrompt: string
   sourceFile?: string
   /** 选中的去 AI 规则文案；默认不传或空数组表示不注入 */

@@ -24,7 +24,7 @@ export class LabTaskDAO extends BaseDAO {
   list(): LabTaskRow[] {
     return this.all<LabTaskRow>(
       `SELECT id, original_text, result_text, style_id, system_prompt, anti_ai_rules_json, status, error_message, source_file, char_count, create_time, update_time
-       FROM lab_task WHERE style_id IS NOT NULL ORDER BY id DESC`
+       FROM lab_task ORDER BY id DESC`
     )
   }
 
@@ -40,7 +40,8 @@ export class LabTaskDAO extends BaseDAO {
     const original = normalizeBodyParagraphSpacing(input.originalText)
     if (!original) throw new Error('原文不能为空')
     if (original.length > MAX_INPUT_CHARS) throw new Error(`文本超过 ${MAX_INPUT_CHARS} 字符上限`)
-    if (!input.styleId || input.styleId <= 0) throw new Error('请选择文风')
+    if (input.styleId != null && input.styleId <= 0) throw new Error('无效文风')
+    const styleId = input.styleId != null && input.styleId > 0 ? input.styleId : null
     const systemPrompt = input.systemPrompt.trim()
     if (!systemPrompt) throw new Error('System Prompt 不能为空')
     return this.insert(
@@ -56,7 +57,7 @@ export class LabTaskDAO extends BaseDAO {
       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', datetime('now'))`,
       [
         original,
-        input.styleId,
+        styleId,
         systemPrompt,
         serializeAntiAiRules(input.antiAiRules),
         input.sourceFile?.trim() || null,

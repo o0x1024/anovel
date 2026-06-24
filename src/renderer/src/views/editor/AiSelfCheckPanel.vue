@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import { INCUBATOR_SELF_CHECK_SYSTEM } from '../../../../shared/incubator-analysis-prompts'
 import MarkdownContent from '../../components/MarkdownContent.vue'
 
@@ -10,6 +11,8 @@ const props = defineProps<{
   label?: string
   enrichWorkContext?: boolean
 }>()
+
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const DEFAULT_PROMPTS: Record<string, string> = {
   settings: '检查人设/世界观/冲突是否自洽、有无矛盾、角色功能是否清晰，给出改进建议。',
@@ -46,7 +49,8 @@ async function runSelfCheck() {
       ].join('\n'),
       workId: props.workId,
       step: `${props.step}_self_check`,
-      enrichWorkContext: props.enrichWorkContext !== false
+      enrichWorkContext: props.enrichWorkContext !== false,
+      ...bodyModelParams()
     }) as { success: boolean; content: string; error?: string }
     if (res.success) {
       report.value = res.content

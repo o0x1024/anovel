@@ -1,7 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
+import ListBatchToolbar from '../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../composables/useListSelection'
 
 const props = defineProps<{ workId: number }>()
 
@@ -15,10 +22,6 @@ interface Favorite {
   source_input: string | null
   create_time: string
 }
-
-const favorites = ref<Favorite[]>([])
-const expandedId = ref<number | null>(null)
-const filterStep = ref('all')
 
 const sourceSteps = [
   { value: 'all', label: '全部' },
@@ -34,25 +37,28 @@ const sourceSteps = [
   { value: 'body_generation', label: '正文生成' }
 ]
 
-const filteredFavorites = ref<Favorite[]>([])
+const favorites = ref<Favorite[]>([])
+const expandedId = ref<number | null>(null)
+const filterStep = ref('all')
+
+const filteredFavorites = computed(() =>
+  filterStep.value === 'all'
+    ? favorites.value
+    : favorites.value.filter(f => f.source_step === filterStep.value)
+)
+
+const selection = useListSelection(filteredFavorites)
 
 onMounted(loadFavorites)
 
 async function loadFavorites() {
   favorites.value = await window.anovel.invoke('favorite:listByWork', props.workId) as Favorite[]
-  applyFilter()
-}
-
-function applyFilter() {
-  filteredFavorites.value =
-    filterStep.value === 'all'
-      ? favorites.value
-      : favorites.value.filter(f => f.source_step === filterStep.value)
+  selection.clearSelection()
 }
 
 function onFilterChange() {
-  applyFilter()
   expandedId.value = null
+  selection.clearSelection()
 }
 
 function toggleExpand(id: number) {
@@ -62,6 +68,19 @@ function toggleExpand(id: number) {
 async function deleteFavorite(id: number) {
   await window.anovel.invoke('favorite:delete', id)
   if (expandedId.value === id) expandedId.value = null
+}
+
+async function deleteSelectedFavorites() {
+  const items = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(items.length, '收藏'))) return
+  await runBatchDelete(items, item => deleteFavorite(item.id))
+  await loadFavorites()
+}
+
+async function deleteAllFavorites() {
+  const items = filteredFavorites.value
+  if (!(await confirmDeleteAll(items.length, '收藏'))) return
+  await runBatchDelete(items, item => deleteFavorite(item.id))
   await loadFavorites()
 }
 
@@ -86,6 +105,17 @@ function formatTime(time: string) {
       <span class="text-xs text-base-content/40 self-center">{{ filteredFavorites.length }} 条收藏</span>
     </div>
 
+    <ListBatchToolbar
+      v-if="filteredFavorites.length > 0"
+      :total="filteredFavorites.length"
+      :selectable-count="selection.selectableCount"
+      :selected-count="selection.selectedCount"
+      :all-selected="selection.allSelected"
+      @toggle-all="selection.toggleAll()"
+      @delete-selected="deleteSelectedFavorites"
+      @delete-all="deleteAllFavorites"
+    />
+
     <div v-if="filteredFavorites.length === 0" class="text-center py-12 text-base-content/40">
       <font-awesome-icon icon="bookmark" class="text-4xl mb-3 opacity-30" />
       <p>{{ favorites.length === 0 ? '还没有收藏内容' : '该分类下暂无收藏' }}</p>
@@ -96,34 +126,43 @@ function formatTime(time: string) {
 
     <div v-else class="space-y-3">
       <div
-        v-for="item in filteredFavorites"
+        v-for="(item, index) in filteredFavorites"
         :key="item.id"
         class="card bg-base-200 border border-base-300 shadow-sm overflow-hidden"
+        :class="{ 'ring-1 ring-primary/40': selection.isSelected(item, index) }"
       >
         <div class="p-4">
           <div class="flex items-start justify-between gap-3 mb-2">
-            <div class="min-w-0 flex-1">
-              <div class="flex flex-wrap items-center gap-2 mb-1">
-                <span class="badge badge-primary badge-sm">{{ item.source_label }}</span>
-                <span class="text-xs text-base-content/40">{{ formatTime(item.create_time) }}</span>
+            <div class="flex items-start gap-2 min-w-0 flex-1">
+              <input
+                type="checkbox"
+                class="checkbox checkbox-xs mt-1 shrink-0"
+                :checked="selection.isSelected(item, index)"
+                @change="selection.toggle(item, index)"
+              />
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2 mb-1">
+                  <span class="badge badge-primary badge-sm">{{ item.source_label }}</span>
+                  <span class="text-xs text-base-content/40">{{ formatTime(item.create_time) }}</span>
+                </div>
+                <h4 class="font-semibold text-sm truncate" :title="item.title || item.source_label">
+                  {{ item.title || item.source_label }}
+                </h4>
               </div>
-              <h4 class="font-semibold text-sm truncate" :title="item.title || item.source_label">
-                {{ item.title || item.source_label }}
-              </h4>
             </div>
             <div class="flex gap-1 shrink-0">
               <button class="btn btn-ghost btn-xs gap-1" @click="toggleExpand(item.id)">
                 <font-awesome-icon :icon="expandedId === item.id ? 'chevron-down' : 'chevron-right'" class="w-3 h-3" />
                 {{ expandedId === item.id ? '收起' : '展开' }}
               </button>
-              <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteFavorite(item.id)">
+              <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteFavorite(item.id).then(loadFavorites)">
                 <font-awesome-icon icon="trash" class="w-3 h-3" />
                 删除
               </button>
             </div>
           </div>
 
-          <div v-if="expandedId !== item.id" class="text-sm text-base-content/60 line-clamp-3">
+          <div v-if="expandedId !== item.id" class="text-sm text-base-content/60 line-clamp-3 ml-6">
             {{ item.content.replace(/^#+\s+/gm, '').slice(0, 200) }}
           </div>
         </div>

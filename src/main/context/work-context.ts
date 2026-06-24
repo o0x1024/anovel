@@ -1,7 +1,12 @@
-import { coreSettingDAO, volumeChapterDAO } from '../db'
+import { coreSettingDAO, volumeChapterDAO, workDAO } from '../db'
 import type { VolumeRow } from '../db'
 import { formatQualityIssuesForContext } from './settings-quality'
 import { VOLUME_OUTLINE_TARGET_CHARS } from './writing-techniques'
+import {
+  CORE_SETTING_TYPES,
+  getCoreSettingLabel,
+  type CoreSettingType
+} from '../../shared/settings-types'
 
 export const INCUBATOR_SETTING_TYPES = [
   'incubator_diagnose',
@@ -31,8 +36,6 @@ const SETTING_LABELS: Record<string, string> = {
   incubator_microinnovation: '微创新分析'
 }
 
-const CORE_SETTING_TYPES = ['character', 'worldview', 'conflict'] as const
-
 export interface WorkContextOptions {
   includeIdea?: boolean
   includeIncubator?: boolean
@@ -49,7 +52,7 @@ export interface WorkContextOptions {
    * - names_only：仅卷名列表
    */
   volumeOutlineMode?: 'full' | 'compact' | 'names_only'
-  /** 正文生成时当前卷 ID，配合 compact 避免与 task prompt 重复 */
+  /** 正文生成时当前卷 ID，配合 compact 避免与 task prompt重复 */
   currentVolumeId?: number
 }
 
@@ -69,6 +72,9 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
     includeVolumes = false,
     includeQualityIssues = true
   } = options
+
+  const work = workDAO.getById(workId)
+  const isStory = work?.work_type === 'story'
 
   const settings = coreSettingDAO.listByWork(workId)
   const byType = new Map(settings.map(s => [s.type, s.content]))
@@ -92,7 +98,7 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
       if (excluded.has(type)) continue
       const content = byType.get(type)?.trim()
       if (!content) continue
-      sections[SETTING_LABELS[type]] = content
+      sections[getCoreSettingLabel(type, isStory)] = content
     }
   }
 

@@ -7,6 +7,7 @@ import {
   faAnchor,
   faArrowDown,
   faArrowLeft,
+  faArrowRight,
   faArrowUp,
   faBolt,
   faBook,
@@ -18,6 +19,7 @@ import {
   faCheck,
   faCheckCircle,
   faChevronDown,
+  faChevronLeft,
   faChevronRight,
   faChevronUp,
   faCircle,
@@ -34,6 +36,8 @@ import {
   faEraser,
   faExclamationCircle,
   faExpand,
+  faCompress,
+  faCompass,
   faEye,
   faEyeSlash,
   faFeatherAlt,
@@ -81,6 +85,7 @@ import {
   faTrash,
   faUpload,
   faUser,
+  faWandMagicSparkles,
   faWifi
 } from '@fortawesome/free-solid-svg-icons'
 
@@ -88,6 +93,7 @@ library.add(
   faAnchor,
   faArrowDown,
   faArrowLeft,
+  faArrowRight,
   faArrowUp,
   faBolt,
   faBook,
@@ -99,6 +105,7 @@ library.add(
   faCheck,
   faCheckCircle,
   faChevronDown,
+  faChevronLeft,
   faChevronRight,
   faChevronUp,
   faCircle,
@@ -115,6 +122,8 @@ library.add(
   faEraser,
   faExclamationCircle,
   faExpand,
+  faCompress,
+  faCompass,
   faEye,
   faEyeSlash,
   faFeatherAlt,
@@ -162,6 +171,7 @@ library.add(
   faTrash,
   faUpload,
   faUser,
+  faWandMagicSparkles,
   faWifi
 )
 

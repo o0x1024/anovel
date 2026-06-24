@@ -43,6 +43,8 @@ export interface ModelRequest {
   modelName?: string              // 指定具体模型 ID（覆盖提供商默认 model_name）
   maxTokens?: number
   temperature?: number
+  thinkingEnabled?: boolean
+
   /** 频率惩罚：惩罚已出现 token 的重复使用，增加词汇多样性 (-2~2) */
   frequencyPenalty?: number
   /** 存在惩罚：惩罚任何已出现过的 token，鼓励引入新话题 (-2~2) */

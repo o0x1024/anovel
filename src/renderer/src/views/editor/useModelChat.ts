@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 
 export interface ContextBudgetReport {
   maxContextTokens: number
@@ -28,6 +29,7 @@ export interface ModelChatResult {
 }
 
 export function useModelChat(workId: () => number) {
+  const { modelParams: bodyModelParams } = useBodyGenerationModel(workId)
   const loading = ref(false)
   const result = ref('')
   const error = ref('')
@@ -39,6 +41,8 @@ export function useModelChat(workId: () => number) {
     step: string,
     extra?: {
       maxTokens?: number
+      modelType?: string
+      modelName?: string
       enrichWorkContext?: boolean
       enrichNarrativeMemory?: boolean
       chapterId?: number
@@ -65,6 +69,7 @@ export function useModelChat(workId: () => number) {
         systemPrompt,
         workId: workId(),
         step,
+        ...bodyModelParams(),
         ...extra
       }) as ModelChatResult
       if (res.contextBudget) {

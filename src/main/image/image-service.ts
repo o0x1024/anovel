@@ -19,12 +19,12 @@ export async function generateImage(input: {
   const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.svg`
   const localPath = join(imagesDir, filename)
 
-  if (config?.is_enabled && config.access_key) {
+  if (config?.is_enabled && config.access_key && config.secret_key) {
     // 火山引擎 API 集成点：当前生成带 Prompt 信息的占位图，避免无密钥时失败
     const svg = buildPlaceholderSvg(input.prompt, '火山引擎配置已保存，完整 API 对接待启用')
     writeFileSync(localPath, svg, 'utf-8')
   } else {
-    const svg = buildPlaceholderSvg(input.prompt, '请在设置中配置火山引擎密钥以启用真实生图')
+    const svg = buildPlaceholderSvg(input.prompt, '请在系统设置 → AI 服务中配置火山引擎密钥')
     writeFileSync(localPath, svg, 'utf-8')
   }
 

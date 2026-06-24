@@ -292,8 +292,8 @@ function toggleThinking() {
         <span v-if="isRunning" class="inline-block w-2 h-3.5 ml-0.5 bg-primary animate-pulse align-middle" />
       </div>
 
-      <p v-if="!hasThinking && !hasContent && isRunning" class="text-xs text-base-content/40">
-        等待模型输出…
+      <p v-if="!hasThinking && !hasContent && isRunning" class="text-xs text-base-content/40 px-1">
+        {{ active.currentPhase || '等待模型输出…' }}
       </p>
       <p v-else-if="!hasThinking && !hasContent && !isRunning" class="text-xs text-base-content/40">
         无输出内容

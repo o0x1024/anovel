@@ -7,11 +7,11 @@ import {
   extractStyleFingerprint, compareFingerprint, fingerprintToPrompt
 } from './context/style-fingerprint'
 import { detectAiTraces, AI_TRACE_POLISH_PROMPT } from './context/ai-trace-detect'
-import { resolvePrompt } from './context/prompt-registry'
+import { STYLE_REWRITE_INSTRUCTION } from './context/anti-ai-rules'
 import { broadcastStyleChanged } from './style-events'
+import { parseQualityAiPatchResponse } from '../shared/quality-ai-score'
 import {
   suggestRulesFromAiTrace,
-  buildStyleRewriteSystemPrompt,
   buildStyleRewriteUserPrompt
 } from './context/anti-ai-rules'
 import { diagnoseChapterQuality, formatQualityFixHints } from './context/chapter-quality'
@@ -83,20 +83,57 @@ export function registerV20IpcHandlers(): void {
     const report = detectAiTraces(content)
     return suggestRulesFromAiTrace(report.issues)
   })
-  ipcMain.handle('aitrace:polish', async (e, workId: number, content: string) => {
+  ipcMain.handle('aitrace:polish', async (e, workId: number, content: string, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }) => {
     const res = await modelService.chat({
       prompt: content,
-      systemPrompt: resolvePrompt('ai_trace_polish.system') || AI_TRACE_POLISH_PROMPT,
+      systemPrompt: AI_TRACE_POLISH_PROMPT,
       workId,
       step: 'ai_trace_polish',
       enrichWorkContext: false,
-      enrichNarrativeMemory: false
+      enrichNarrativeMemory: false,
+      modelType: modelOpts?.modelType as import('./model/types').ModelType | undefined,
+      modelName: modelOpts?.modelName,
+      thinkingEnabled: modelOpts?.thinkingEnabled
     }, { webContents: e.sender })
-    return res
+
+    if (!res.success) return res
+
+    // 解析并应用 patches
+    let patches: import('../shared/quality-ai-score').QualityAiPatch[] = []
+    try {
+      patches = parseQualityAiPatchResponse(res.content)
+    } catch {
+      // 忽略解析错误
+    }
+
+    // 回退：如果 AI 没有返回 patches 而是返回了整篇修改后的文章
+    if (!patches.length && res.content.trim().length > 200) {
+      const rewritten = res.content.trim()
+      const cleaned = rewritten
+        .replace(/^.*?(?:以下是|修改后|修订后|优化后)[^\n]*[:：]?\s*\n+/i, '')
+        .trim()
+      if (cleaned.length > 50 && cleaned !== content.trim()) {
+        patches = [{ find: content.trim(), replace: cleaned }]
+      }
+    }
+
+    if (!patches.length) {
+      return { success: true, content }
+    }
+
+    let patchedText = content
+    for (const patch of patches) {
+      if (!patch.find) continue
+      const idx = patchedText.indexOf(patch.find)
+      if (idx === -1) continue
+      patchedText = patchedText.slice(0, idx) + patch.replace + patchedText.slice(idx + patch.find.length)
+    }
+
+    return { success: true, content: patchedText }
   })
 
-  ipcMain.handle('body:styleRewrite', async (e, workId: number, content: string, wordTarget?: number, chapterId?: number) => {
-    const systemPrompt = buildStyleRewriteSystemPrompt(workId)
+  ipcMain.handle('body:styleRewrite', async (e, workId: number, content: string, wordTarget?: number, chapterId?: number, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }) => {
+    const systemPrompt = STYLE_REWRITE_INSTRUCTION
     const target = typeof wordTarget === 'number' && wordTarget > 0 ? wordTarget : undefined
     const qualityHints = typeof chapterId === 'number' && chapterId > 0
       ? formatQualityFixHints(diagnoseChapterQuality(workId, chapterId, content))
@@ -104,9 +141,13 @@ export function registerV20IpcHandlers(): void {
     return modelService.chat({
       prompt: buildStyleRewriteUserPrompt(content, target, qualityHints),
       systemPrompt,
+      workId,
       step: 'body_style_rewrite',
       enrichWorkContext: false,
-      enrichNarrativeMemory: false
+      enrichNarrativeMemory: false,
+      modelType: modelOpts?.modelType as import('./model/types').ModelType | undefined,
+      modelName: modelOpts?.modelName,
+      thinkingEnabled: modelOpts?.thinkingEnabled
     }, { webContents: e.sender })
   })
 

@@ -1,0 +1,706 @@
+[
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "A1-human.txt",
+    "output": "WS1-full-A1-human.txt",
+    "chars": 871
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "A1-human.txt",
+    "output": "WS2-clause-A1-human.txt",
+    "chars": 871
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "A1-human.txt",
+    "output": "WS3-phrase-A1-human.txt",
+    "chars": 871
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "A1-human.txt",
+    "output": "WS4-swap-A1-human.txt",
+    "chars": 871
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "A2-ai.txt",
+    "output": "WS1-full-A2-ai.txt",
+    "chars": 844
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "A2-ai.txt",
+    "output": "WS2-clause-A2-ai.txt",
+    "chars": 844
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "A2-ai.txt",
+    "output": "WS3-phrase-A2-ai.txt",
+    "chars": 844
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "A2-ai.txt",
+    "output": "WS4-swap-A2-ai.txt",
+    "chars": 844
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "Q4-70human-30ai.txt",
+    "output": "WS1-full-Q4-70human-30ai.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "Q4-70human-30ai.txt",
+    "output": "WS2-clause-Q4-70human-30ai.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "Q4-70human-30ai.txt",
+    "output": "WS3-phrase-Q4-70human-30ai.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "Q4-70human-30ai.txt",
+    "output": "WS4-swap-Q4-70human-30ai.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "Q6-50human-50ai.txt",
+    "output": "WS1-full-Q6-50human-50ai.txt",
+    "chars": 928
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "Q6-50human-50ai.txt",
+    "output": "WS2-clause-Q6-50human-50ai.txt",
+    "chars": 928
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "Q6-50human-50ai.txt",
+    "output": "WS3-phrase-Q6-50human-50ai.txt",
+    "chars": 928
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "Q6-50human-50ai.txt",
+    "output": "WS4-swap-Q6-50human-50ai.txt",
+    "chars": 928
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "Q8-30human-70ai.txt",
+    "output": "WS1-full-Q8-30human-70ai.txt",
+    "chars": 960
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "Q8-30human-70ai.txt",
+    "output": "WS2-clause-Q8-30human-70ai.txt",
+    "chars": 960
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "Q8-30human-70ai.txt",
+    "output": "WS3-phrase-Q8-30human-70ai.txt",
+    "chars": 960
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "Q8-30human-70ai.txt",
+    "output": "WS4-swap-Q8-30human-70ai.txt",
+    "chars": 960
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "Q10-10human-90ai.txt",
+    "output": "WS1-full-Q10-10human-90ai.txt",
+    "chars": 934
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "Q10-10human-90ai.txt",
+    "output": "WS2-clause-Q10-10human-90ai.txt",
+    "chars": 934
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "Q10-10human-90ai.txt",
+    "output": "WS3-phrase-Q10-10human-90ai.txt",
+    "chars": 934
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "Q10-10human-90ai.txt",
+    "output": "WS4-swap-Q10-10human-90ai.txt",
+    "chars": 934
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "K2-50mix-human-tail.txt",
+    "output": "WS1-full-K2-50mix-human-tail.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "K2-50mix-human-tail.txt",
+    "output": "WS2-clause-K2-50mix-human-tail.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "K2-50mix-human-tail.txt",
+    "output": "WS3-phrase-K2-50mix-human-tail.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "K2-50mix-human-tail.txt",
+    "output": "WS4-swap-K2-50mix-human-tail.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "K4-50mix-interleave.txt",
+    "output": "WS1-full-K4-50mix-interleave.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "K4-50mix-interleave.txt",
+    "output": "WS2-clause-K4-50mix-interleave.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "K4-50mix-interleave.txt",
+    "output": "WS3-phrase-K4-50mix-interleave.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "K4-50mix-interleave.txt",
+    "output": "WS4-swap-K4-50mix-interleave.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "K5-50mix-sandwich.txt",
+    "output": "WS1-full-K5-50mix-sandwich.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "K5-50mix-sandwich.txt",
+    "output": "WS2-clause-K5-50mix-sandwich.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "K5-50mix-sandwich.txt",
+    "output": "WS3-phrase-K5-50mix-sandwich.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "K5-50mix-sandwich.txt",
+    "output": "WS4-swap-K5-50mix-sandwich.txt",
+    "chars": 939
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "H1-ai-lowfreq-vocab-only.txt",
+    "output": "WS1-full-H1-ai-lowfreq-vocab-only.txt",
+    "chars": 926
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "H1-ai-lowfreq-vocab-only.txt",
+    "output": "WS2-clause-H1-ai-lowfreq-vocab-only.txt",
+    "chars": 926
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "H1-ai-lowfreq-vocab-only.txt",
+    "output": "WS3-phrase-H1-ai-lowfreq-vocab-only.txt",
+    "chars": 926
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "H1-ai-lowfreq-vocab-only.txt",
+    "output": "WS4-swap-H1-ai-lowfreq-vocab-only.txt",
+    "chars": 926
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "E1-ai-colloquial-rewrite.txt",
+    "output": "WS1-full-E1-ai-colloquial-rewrite.txt",
+    "chars": 829
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "E1-ai-colloquial-rewrite.txt",
+    "output": "WS2-clause-E1-ai-colloquial-rewrite.txt",
+    "chars": 829
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "E1-ai-colloquial-rewrite.txt",
+    "output": "WS3-phrase-E1-ai-colloquial-rewrite.txt",
+    "chars": 829
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "E1-ai-colloquial-rewrite.txt",
+    "output": "WS4-swap-E1-ai-colloquial-rewrite.txt",
+    "chars": 829
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "M1-chatgpt.txt",
+    "output": "WS1-full-M1-chatgpt.txt",
+    "chars": 1049
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "M1-chatgpt.txt",
+    "output": "WS2-clause-M1-chatgpt.txt",
+    "chars": 1049
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "M1-chatgpt.txt",
+    "output": "WS3-phrase-M1-chatgpt.txt",
+    "chars": 1049
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "M1-chatgpt.txt",
+    "output": "WS4-swap-M1-chatgpt.txt",
+    "chars": 1049
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "M2-claude.txt",
+    "output": "WS1-full-M2-claude.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "M2-claude.txt",
+    "output": "WS2-clause-M2-claude.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "M2-claude.txt",
+    "output": "WS3-phrase-M2-claude.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "M2-claude.txt",
+    "output": "WS4-swap-M2-claude.txt",
+    "chars": 848
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "M4-deepseek.txt",
+    "output": "WS1-full-M4-deepseek.txt",
+    "chars": 899
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "M4-deepseek.txt",
+    "output": "WS2-clause-M4-deepseek.txt",
+    "chars": 899
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "M4-deepseek.txt",
+    "output": "WS3-phrase-M4-deepseek.txt",
+    "chars": 899
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "M4-deepseek.txt",
+    "output": "WS4-swap-M4-deepseek.txt",
+    "chars": 899
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "M6-glm.txt",
+    "output": "WS1-full-M6-glm.txt",
+    "chars": 681
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "M6-glm.txt",
+    "output": "WS2-clause-M6-glm.txt",
+    "chars": 681
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "M6-glm.txt",
+    "output": "WS3-phrase-M6-glm.txt",
+    "chars": 681
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "M6-glm.txt",
+    "output": "WS4-swap-M6-glm.txt",
+    "chars": 681
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "F1-ai-novel.txt",
+    "output": "WS1-full-F1-ai-novel.txt",
+    "chars": 1734
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "F1-ai-novel.txt",
+    "output": "WS2-clause-F1-ai-novel.txt",
+    "chars": 1734
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "F1-ai-novel.txt",
+    "output": "WS3-phrase-F1-ai-novel.txt",
+    "chars": 1734
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "F1-ai-novel.txt",
+    "output": "WS4-swap-F1-ai-novel.txt",
+    "chars": 1734
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "D5-double-translate.txt",
+    "output": "WS1-full-D5-double-translate.txt",
+    "chars": 862
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "D5-double-translate.txt",
+    "output": "WS2-clause-D5-double-translate.txt",
+    "chars": 862
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "D5-double-translate.txt",
+    "output": "WS3-phrase-D5-double-translate.txt",
+    "chars": 862
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "D5-double-translate.txt",
+    "output": "WS4-swap-D5-double-translate.txt",
+    "chars": 862
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "D7-cascade-claude-to-deepseek.txt",
+    "output": "WS1-full-D7-cascade-claude-to-deepseek.txt",
+    "chars": 603
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "D7-cascade-claude-to-deepseek.txt",
+    "output": "WS2-clause-D7-cascade-claude-to-deepseek.txt",
+    "chars": 603
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "D7-cascade-claude-to-deepseek.txt",
+    "output": "WS3-phrase-D7-cascade-claude-to-deepseek.txt",
+    "chars": 603
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "D7-cascade-claude-to-deepseek.txt",
+    "output": "WS4-swap-D7-cascade-claude-to-deepseek.txt",
+    "chars": 603
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "G1-genre-xianxia.txt",
+    "output": "WS1-full-G1-genre-xianxia.txt",
+    "chars": 615
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "G1-genre-xianxia.txt",
+    "output": "WS2-clause-G1-genre-xianxia.txt",
+    "chars": 615
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "G1-genre-xianxia.txt",
+    "output": "WS3-phrase-G1-genre-xianxia.txt",
+    "chars": 615
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "G1-genre-xianxia.txt",
+    "output": "WS4-swap-G1-genre-xianxia.txt",
+    "chars": 615
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "G3-genre-mystery.txt",
+    "output": "WS1-full-G3-genre-mystery.txt",
+    "chars": 629
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "G3-genre-mystery.txt",
+    "output": "WS2-clause-G3-genre-mystery.txt",
+    "chars": 629
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "G3-genre-mystery.txt",
+    "output": "WS3-phrase-G3-genre-mystery.txt",
+    "chars": 629
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "G3-genre-mystery.txt",
+    "output": "WS4-swap-G3-genre-mystery.txt",
+    "chars": 629
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "G4-genre-scifi.txt",
+    "output": "WS1-full-G4-genre-scifi.txt",
+    "chars": 602
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "G4-genre-scifi.txt",
+    "output": "WS2-clause-G4-genre-scifi.txt",
+    "chars": 602
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "G4-genre-scifi.txt",
+    "output": "WS3-phrase-G4-genre-scifi.txt",
+    "chars": 602
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "G4-genre-scifi.txt",
+    "output": "WS4-swap-G4-genre-scifi.txt",
+    "chars": 602
+  },
+  {
+    "id": "WS1",
+    "mode": "full",
+    "label": "全token打乱(无语义)",
+    "source": "X1-AI.txt",
+    "output": "WS1-full-X1-AI.txt",
+    "chars": 1767
+  },
+  {
+    "id": "WS2",
+    "mode": "clause",
+    "label": "句内分句打乱",
+    "source": "X1-AI.txt",
+    "output": "WS2-clause-X1-AI.txt",
+    "chars": 1767
+  },
+  {
+    "id": "WS3",
+    "mode": "phrase",
+    "label": "句内短语块打乱",
+    "source": "X1-AI.txt",
+    "output": "WS3-phrase-X1-AI.txt",
+    "chars": 1767
+  },
+  {
+    "id": "WS4",
+    "mode": "swap",
+    "label": "相邻词对交换32%",
+    "source": "X1-AI.txt",
+    "output": "WS4-swap-X1-AI.txt",
+    "chars": 1767
+  }
+]

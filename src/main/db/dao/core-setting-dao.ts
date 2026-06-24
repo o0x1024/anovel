@@ -87,6 +87,21 @@ export class CoreSettingDAO extends BaseDAO {
     return this.run('DELETE FROM core_settings WHERE id = ?', [id]).changes > 0
   }
 
+  /** 删除指定 type 的设定及其版本快照 */
+  deleteByWorkAndTypes(workId: number, types: string[]): number {
+    if (!types.length) return 0
+    let deleted = 0
+    for (const type of types) {
+      const row = this.getByType(workId, type)
+      if (row && this.delete(row.id)) deleted++
+      this.run(
+        'DELETE FROM core_setting_versions WHERE work_id = ? AND type = ?',
+        [workId, type]
+      )
+    }
+    return deleted
+  }
+
   private createVersion(workId: number, type: CoreSettingType, content: string): void {
     const latest = this.get<{ v: number }>(
       'SELECT COALESCE(MAX(version_number), 0) + 1 AS v FROM core_setting_versions WHERE work_id = ? AND type = ?',

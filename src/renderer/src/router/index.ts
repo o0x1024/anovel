@@ -5,13 +5,23 @@ const router = createRouter({
   routes: [
     {
       path: '/',
-      name: 'works',
+      name: 'novels',
       component: () => import('../views/work/WorkList.vue')
     },
     {
-      path: '/work/:id',
-      name: 'editor',
-      component: () => import('../views/editor/Editor.vue')
+      path: '/stories',
+      name: 'stories',
+      component: () => import('../views/work/WorkList.vue')
+    },
+    {
+      path: '/novel/:id',
+      name: 'novel-editor',
+      component: () => import('../views/editor/WorkEditor.vue')
+    },
+    {
+      path: '/story/:id',
+      name: 'story-editor',
+      component: () => import('../views/editor/WorkEditor.vue')
     },
     {
       path: '/style',

@@ -6,7 +6,7 @@ import {
 import { formatStepRulesForLayers } from '../style-step-rules'
 import { parseStyleStepRules } from '../../../shared/style-step-rules'
 import { BODY_PARAGRAPH_SPACING_RULE } from '../../../shared/normalize-body-text'
-import { resolvePrompt } from '../prompt-registry'
+const LAB_DEAI_BASE = '你是一个极其厌恶AI的网文作家。'
 
 function buildLabDeaiInstruction(labBase?: string): string {
   const lines: string[] = labBase ? [labBase] : ['你是一个极其厌恶AI的网文作家。']
@@ -24,8 +24,7 @@ export function buildLabDeaiSystemPrompt(styleId: number, antiAiRules: string[] 
   const style = writingStyleDAO.getById(styleId)
   if (!style) throw new Error('所选文风不存在')
 
-  const labBase = resolvePrompt('lab_deai.system')
-  const instruction = buildLabDeaiInstruction(labBase || undefined)
+  const instruction = buildLabDeaiInstruction(LAB_DEAI_BASE)
   const parts: string[] = [instruction]
 
   if (style.description?.trim()) {

@@ -1,209 +1,171 @@
+import { INCUBATOR_GATE_CHECK_SYSTEM, buildGateCheckUserPrompt } from '../../../shared/incubator-analysis-prompts'
+import { INCUBATOR_SLOT_KEYS, isIncubatorSlotKey } from '../../../shared/incubator-slots'
 import type { IncubatorGateReport } from '../../../shared/incubator-types'
-import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
-import {
-  INCUBATOR_FREEZE_MIN_FILLED_SLOTS,
-  INCUBATOR_GATE_MIN_CONFLICT_CLOSURE,
-  INCUBATOR_GATE_MIN_SERIALIZABILITY
-} from '../../../shared/incubator-gate'
-import { INCUBATOR_SLOT_KEYS } from '../../../shared/incubator-slots'
-import { incubatorDraftSlotDAO, incubatorStateDAO } from '../../db/dao/incubator'
+import { incubatorDraftSlotDAO, incubatorSeedDAO, incubatorStateDAO } from '../../db/dao/incubator'
+import { modelService } from '../../model'
+import type { ChatOptions } from '../../model'
+import { withWorkModelOptions, type WorkModelOptions } from '../../../shared/work-model-options'
+import { extractJsonText } from '../parse-json-extract'
+import { loadCharacterCards } from '../character-cards'
+import { nameEntryDAO } from '../../db'
 
-const STOPWORDS = new Set([
-  '主角', '故事', '冲突', '核心', '推进', '世界', '规则', '角色', '情感', '结局', '终局',
-  '以及', '然后', '但是', '如果', '为了', '需要', '通过', '这个', '那个', '他们', '我们',
-  '并且', '因为', '所以', '就是', '一个', '一种', '进行', '出现', '相关', '设定', '展开',
-  '开局', '中段', '高潮', '结尾', '读者', '方案', '版本', '变化', '阶段', '内容'
-])
-
-function tokenizeKeywords(text: string): Set<string> {
-  const cleaned = text
-    .replace(/[A-Za-z0-9_]+/g, ' ')
-    .replace(/[\r\n\t，。！？；、：,.!?;:()[\]{}"'`~\-_/\\|<>@#$%^&*+=]+/g, ' ')
-  const raw = cleaned
-    .split(/\s+/)
-    .map(t => t.trim())
-    .filter(t => t.length >= 2 && t.length <= 12)
-    .filter(t => !STOPWORDS.has(t))
-  return new Set(raw)
+function loadCharacterNames(workId: number): string[] {
+  const namesSet = new Set<string>()
+  try {
+    const cards = loadCharacterCards(workId)
+    for (const c of cards) {
+      const name = c.name?.trim()
+      if (name) namesSet.add(name)
+    }
+  } catch { /* ignore */ }
+  try {
+    const registryNames = nameEntryDAO.listByWork(workId, 'character')
+    for (const r of registryNames) {
+      const name = r.name?.trim()
+      if (name) namesSet.add(name)
+    }
+  } catch { /* ignore */ }
+  return [...namesSet]
 }
 
-function keywordOverlapCount(a: string, b: string): number {
-  const ka = tokenizeKeywords(a)
-  const kb = tokenizeKeywords(b)
-  let count = 0
-  for (const t of ka) {
-    if (kb.has(t)) count += 1
+function clampScore(value: unknown): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+function toStringArray(value: unknown, max = 20): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .map(v => {
+      if (v == null) return ''
+      if (typeof v === 'string') return v.trim()
+      if (typeof v === 'object') {
+        const obj = v as Record<string, unknown>
+        const text = obj.issue ?? obj.text ?? obj.message ?? obj.description ?? obj.suggestion
+        if (typeof text === 'string') return text.trim()
+        return JSON.stringify(v)
+      }
+      return String(v).trim()
+    })
+    .filter(Boolean)
+    .slice(0, max)
+}
+
+function parseReplacements(value: unknown): { original: string; replacement: string }[] {
+  if (!Array.isArray(value)) return []
+  const out: { original: string; replacement: string }[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const r = item as Record<string, unknown>
+    const original = typeof r.original === 'string' ? r.original : ''
+    const replacement = typeof r.replacement === 'string' ? r.replacement : ''
+    if (!original.trim()) continue
+    out.push({ original, replacement })
   }
-  return count
+  return out
 }
 
-function hasAny(text: string, terms: string[]): boolean {
-  return terms.some(t => text.includes(t))
+function parseGateReportContent(content: string, filledSlotCount: number): IncubatorGateReport | null {
+  const jsonText = extractJsonText(content.trim())
+  if (!jsonText) return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonText)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object') return null
+
+  const row = parsed as Record<string, unknown>
+  const issues = toStringArray(row.issues)
+  const suggestions = toStringArray(row.suggestions)
+  const rawCoherence = Array.isArray(row.coherence) ? row.coherence : []
+  const coherence: IncubatorGateReport['coherence'] = rawCoherence
+    .map(item => {
+      if (!item || typeof item !== 'object') return null
+      const r = item as Record<string, unknown>
+      const slotKey = String(r.slotKey ?? '').trim()
+      const severity = String(r.severity ?? '').trim()
+      const issue = String(r.issue ?? '').trim()
+      const suggestion = String(r.suggestion ?? '').trim()
+      if (!isIncubatorSlotKey(slotKey) || !issue || !suggestion) return null
+      if (severity !== 'blocking' && severity !== 'warning') return null
+      const replacements = parseReplacements(r.replacements)
+      return { slotKey, severity, issue, suggestion, ...(replacements.length ? { replacements } : {}) }
+    })
+    .filter((x): x is IncubatorGateReport['coherence'][number] => x != null)
+
+  const blockingCount = coherence.filter(c => c.severity === 'blocking').length
+  const reportedPassed = typeof row.passed === 'boolean' ? row.passed : null
+  const passed = reportedPassed ?? (blockingCount === 0)
+
+  const rawGlobalAnalysis = row.global_analysis ?? row.globalAnalysis
+  const globalAnalysis = typeof rawGlobalAnalysis === 'string' ? rawGlobalAnalysis.trim() : undefined
+
+  return {
+    passed,
+    filledSlotCount,
+    serializabilityScore: clampScore(row.serializabilityScore),
+    conflictClosureScore: clampScore(row.conflictClosureScore),
+    issues,
+    suggestions,
+    coherence,
+    ...(globalAnalysis ? { globalAnalysis } : {})
+  }
 }
 
-export function runIncubatorGate(workId: number): IncubatorGateReport {
+function fallbackGateReport(filledSlotCount: number, reason: string): IncubatorGateReport {
+  return {
+    passed: false,
+    filledSlotCount,
+    serializabilityScore: 0,
+    conflictClosureScore: 0,
+    issues: [
+      '门禁模型调用异常，无法完成自动判定',
+      '需对六槽进行独立结构审查',
+      ...(filledSlotCount < 6 ? [`仅 ${filledSlotCount}/6 槽已填写，缺少内容`] : [])
+    ],
+    suggestions: [
+      reason || '请稍后重试门禁，或检查模型配置后再试',
+      '请逐一审查六槽内容，重点检查：主冲突是否清晰且可持续推进、角色驱动是否真正支撑主冲突而非平行叙述、世界规则是否构成压力系统并能持续逼迫角色选择、六槽之间是否因果闭环',
+      '若发现薄弱或空置槽位，请基于创作种子补全或强化该槽位（400-800字，必须极其饱满完善，细节丰富）'
+    ],
+    coherence: []
+  }
+}
+
+export async function runIncubatorGate(
+  workId: number,
+  userInstruction?: string,
+  chatOptions?: Pick<ChatOptions, 'webContents' | 'sessionTitle'>,
+  modelOpts?: WorkModelOptions
+): Promise<IncubatorGateReport> {
   const slots = incubatorDraftSlotDAO.listActiveByWork(workId)
   const slotMap: Record<string, string> = {}
   for (const key of INCUBATOR_SLOT_KEYS) {
     slotMap[key] = slots.find(s => s.slot_key === key)?.content?.trim() ?? ''
   }
 
+  const seed = incubatorSeedDAO.getByWork(workId)?.content?.trim() ?? ''
+  const characters = loadCharacterNames(workId)
+
   const filledSlotCount = slots.filter(s => s.content.trim()).length
+  const prompt = buildGateCheckUserPrompt(slotMap, seed, characters, userInstruction)
+  const res = await modelService.chat(withWorkModelOptions({
+    prompt,
+    systemPrompt: INCUBATOR_GATE_CHECK_SYSTEM,
+    workId,
+    step: 'incubator_gate_check',
+    enrichWorkContext: false,
+    enrichNarrativeMemory: false
+  }, modelOpts), chatOptions)
 
-  const conflictText = slotMap.core_conflict
-  const hookText = slotMap.hook
-  const roleText = slotMap.role_engine
-  const worldText = slotMap.world_rules
-  const emotionText = slotMap.emotion_curve
-  const endingText = slotMap.ending_image
-
-  const serializabilityScore = filledSlotCount >= 4 ? 78 : filledSlotCount >= 2 ? 65 : 40
-  const conflictClosureScore = conflictText
-    ? Math.min(90, 60 + Math.floor(conflictText.replace(/\s/g, '').length / 30))
-    : hookText
-      ? 62
-      : 35
-
-  const issues: string[] = []
-  const suggestions: string[] = []
-  const coherence: IncubatorGateReport['coherence'] = []
-  let blockingIssues = 0
-
-  function addIssue(issue: string, suggestion: string, severity: 'blocking' | 'warning' = 'blocking'): void {
-    issues.push(issue)
-    suggestions.push(suggestion)
-    if (severity === 'blocking') blockingIssues += 1
-  }
-
-  function addCoherence(
-    slotKey: IncubatorSlotKey,
-    issue: string,
-    suggestion: string,
-    severity: 'blocking' | 'warning' = 'blocking'
-  ): void {
-    addIssue(issue, suggestion, severity)
-    coherence.push({ slotKey, severity, issue, suggestion })
-  }
-
-  if (filledSlotCount < INCUBATOR_FREEZE_MIN_FILLED_SLOTS) {
-    addIssue(
-      `主线槽位仅填满 ${filledSlotCount}/${INCUBATOR_FREEZE_MIN_FILLED_SLOTS}`,
-      '继续从候选池采纳到「主冲突轴」「角色驱动轴」等槽位'
-    )
-  }
-  if (serializabilityScore < INCUBATOR_GATE_MIN_SERIALIZABILITY) {
-    addIssue('可连载性不足，缺少足够的情节延展线索', '在「世界规则轴」或「终局意象」补充长线伏笔')
-  }
-  if (conflictClosureScore < INCUBATOR_GATE_MIN_CONFLICT_CLOSURE) {
-    addIssue('主冲突闭环不清晰', '在「主冲突轴」写清对立双方、赌注与终局结算方式')
-  }
-
-  // ------- 跨槽位一致性（P0 Gate v1）-------
-  // 1) 主冲突 <-> 角色驱动：关键词至少有 2 个交集
-  if (conflictText && roleText) {
-    const overlap = keywordOverlapCount(conflictText, roleText)
-    if (overlap < 2) {
-      addCoherence(
-        'role_engine',
-        '主冲突轴与角色驱动轴疑似脱节：角色动机未有效支撑主冲突',
-        '在角色驱动轴补充与主冲突一致的欲望/恐惧/选择代价，并复用同一组对立关键词'
-      )
-    }
-  }
-
-  // 2) 世界规则必须可施压：需要“代价/限制”语义，并能映射到冲突
-  if (worldText) {
-    const hasCost = hasAny(worldText, ['代价', '成本', '限制', '惩罚', '风险', '副作用', '寿命', '不可', '禁止', '失去'])
-    if (!hasCost) {
-      addCoherence(
-        'world_rules',
-        '世界规则轴缺少“规则代价”，难以形成持续压力',
-        '在世界规则轴加入明确代价：触发条件 + 代价类型 + 失效后果'
-      )
-    }
-    if (conflictText) {
-      const overlap = keywordOverlapCount(worldText, conflictText)
-      if (overlap < 1) {
-        addCoherence(
-          'world_rules',
-          '世界规则轴与主冲突轴连接弱：规则未成为冲突推进器',
-          '把主冲突中的关键对象或限制词嵌入世界规则轴，说明规则如何逼迫角色做选择'
-        )
-      }
-    }
-  }
-
-  // 3) 情感曲线要有转折，不是平铺标签
-  if (emotionText) {
-    const hasTurns = hasAny(emotionText, ['转折', '反转', '低谷', '爆发', '高潮', '崩溃', '和解', '回升', '递进'])
-    if (!hasTurns) {
-      addCoherence(
-        'emotion_curve',
-        '情感曲线轴缺少关键转折点，曲线可能过平',
-        '用“起点-转折-高潮-余韵”四段写法补齐，并绑定对应事件',
-        'warning'
-      )
-    }
-  }
-
-  // 4) 终局意象应与开局钩子呼应
-  if (hookText && endingText) {
-    const overlap = keywordOverlapCount(hookText, endingText)
-    const hasEchoWord = hasAny(endingText, ['呼应', '回扣', '镜像', '首尾', '开局', '开篇'])
-    if (overlap < 1 && !hasEchoWord) {
-      addCoherence(
-        'ending_image',
-        '终局意象与前台钩子缺少呼应，首尾闭环不足',
-        '在终局意象加入对开局核心物件/动作/命题的回扣词，形成首尾镜像',
-        'warning'
-      )
-    }
-  }
-
-  // 5) 角色弧线与终局收束应可达
-  if (roleText && endingText) {
-    const roleHasArc = hasAny(roleText, ['弧线', '起点', '终点', '成长', '变化', '转变'])
-    const endingHasResolution = hasAny(endingText, ['结局', '终局', '最终', '选择', '代价', '收束', '落点'])
-    if (!roleHasArc || !endingHasResolution) {
-      addCoherence(
-        'role_engine',
-        '角色驱动轴与终局意象的收束关系不明确',
-        '在角色驱动轴写“起点→终点”，在终局意象写“最后选择/代价”，保证角色弧线可闭合'
-      )
-    }
-  }
-
-  // 6) 明显互斥设定检测（轻量）
-  if (worldText) {
-    const worldSaysForbidden = hasAny(worldText, ['禁止', '不可', '不能', '无法'])
-    const plotSaysBreak = hasAny(
-      `${conflictText}\n${endingText}`,
-      ['轻松解决', '毫无代价', '不受限制', '无视规则', '直接成功']
-    )
-    if (worldSaysForbidden && plotSaysBreak) {
-      addCoherence(
-        'world_rules',
-        '世界规则轴与冲突/终局存在疑似互斥：规则约束被剧情直接绕过',
-        '补充“破规则的代价与条件”，避免无代价破局导致可信度下降'
-      )
-    }
-  }
-
-  const passed =
-    filledSlotCount >= INCUBATOR_FREEZE_MIN_FILLED_SLOTS &&
-    serializabilityScore >= INCUBATOR_GATE_MIN_SERIALIZABILITY &&
-    conflictClosureScore >= INCUBATOR_GATE_MIN_CONFLICT_CLOSURE &&
-    blockingIssues === 0
-
-  const report: IncubatorGateReport = {
-    passed,
-    filledSlotCount,
-    serializabilityScore,
-    conflictClosureScore,
-    issues,
-    suggestions,
-    coherence
-  }
+  const report = res.success && res.content.trim()
+    ? (parseGateReportContent(res.content, filledSlotCount) ??
+      fallbackGateReport(filledSlotCount, 'AI 返回内容未通过门禁解析'))
+    : fallbackGateReport(filledSlotCount, res.error || '模型调用失败')
 
   incubatorStateDAO.ensure(workId)
   incubatorStateDAO.setLastGateReport(workId, JSON.stringify(report))

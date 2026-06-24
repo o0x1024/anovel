@@ -1,3 +1,8 @@
+/** 统计正文字数（包含标点，去空白，对齐网文平台口径） */
+export function countWords(text: string): number {
+  return text.replace(/[\s\p{Z}]/gu, '').length
+}
+
 /** 正文生成 / 稿件优化共用的 ±10% 字数容差 */
 export const BODY_WORD_COUNT_TOLERANCE = 0.1
 
@@ -13,6 +18,7 @@ export function formatBodyWordTargetLine(target: number): string {
   const { min, max } = bodyWordCountBounds(target)
   return (
     `目标字数：约 ${target} 字（允许 ±10%，即 ${min}–${max} 字）。` +
-    `须完整覆盖本章大纲；写完后自然收束，禁止为凑字注水，亦勿明显短于 ${min} 字。`
+    `须完整覆盖本章大纲；写完后自然收束，禁止为凑字注水，亦勿明显短于 ${min} 字。` +
+    `超过 ${max} 字视为不合格，必须在 ${max} 字内完成全部情节。`
   )
 }

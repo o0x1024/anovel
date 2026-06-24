@@ -17,6 +17,18 @@ export interface CharacterCardsBundle {
   cards: CharacterCard[]
 }
 
+export interface CharacterCardsSanitizeResult {
+  cards: CharacterCard[]
+  droppedCount: number
+  duplicateNames: string[]
+}
+
+export interface CharacterCardsValidationResult {
+  valid: boolean
+  errors: string[]
+  warnings: string[]
+}
+
 export const CHARACTER_CARD_TEMPLATE: CharacterCard = {
   name: '',
   role: 'supporting',
@@ -39,25 +51,125 @@ export const ROLE_LABELS: Record<CharacterRole, string> = {
 }
 
 const STORAGE_TYPE = 'character_cards'
+const CHARACTER_CARD_REQUIRED_FIELDS = [
+  { key: 'memoryTag', label: '记忆标签' },
+  { key: 'coreConflict', label: '核心矛盾' },
+  { key: 'relationBinding', label: '关系绑定' }
+] as const
+
+function normalizeRole(value: unknown): CharacterRole {
+  if (value === 'protagonist' || value === 'supporting' || value === 'antagonist') {
+    return value
+  }
+  return 'supporting'
+}
+
+function trimOptional(value: unknown): string | undefined {
+  const text = typeof value === 'string' ? value.trim() : ''
+  return text || undefined
+}
+
+function normalizeCard(card: CharacterCard): CharacterCard | null {
+  const name = (card.name ?? '').trim()
+  if (!name) return null
+
+  const reactions = {
+    instinct: trimOptional(card.reactions?.instinct),
+    rational: trimOptional(card.reactions?.rational),
+    hidden: trimOptional(card.reactions?.hidden)
+  }
+  const hasReactions = !!(reactions.instinct || reactions.rational || reactions.hidden)
+  const growthTriggers = (card.growthTriggers ?? [])
+    .map(v => v.trim())
+    .filter(Boolean)
+
+  return {
+    name,
+    role: normalizeRole(card.role),
+    memoryTag: trimOptional(card.memoryTag),
+    coreConflict: trimOptional(card.coreConflict),
+    reactions: hasReactions ? reactions : undefined,
+    speechStyle: trimOptional(card.speechStyle),
+    growthTriggers: growthTriggers.length ? [...new Set(growthTriggers)] : undefined,
+    relationBinding: trimOptional(card.relationBinding)
+  }
+}
+
+export function sanitizeCharacterCards(cards: CharacterCard[]): CharacterCardsSanitizeResult {
+  const normalized: CharacterCard[] = []
+  const seen = new Set<string>()
+  const duplicateNames: string[] = []
+  let droppedCount = 0
+
+  for (const card of cards) {
+    const next = normalizeCard(card)
+    if (!next) {
+      droppedCount += 1
+      continue
+    }
+    const key = next.name.toLowerCase()
+    if (seen.has(key)) {
+      duplicateNames.push(next.name)
+      continue
+    }
+    seen.add(key)
+    normalized.push(next)
+  }
+
+  return { cards: normalized, droppedCount, duplicateNames }
+}
+
+export function validateCharacterCards(cards: CharacterCard[]): CharacterCardsValidationResult {
+  if (cards.length === 0) return { valid: true, errors: [], warnings: [] }
+
+  const errors: string[] = []
+  const warnings: string[] = []
+  const protagonistCount = cards.filter(c => c.role === 'protagonist').length
+  const antagonistCount = cards.filter(c => c.role === 'antagonist').length
+
+  if (protagonistCount === 0) {
+    errors.push('至少需要 1 个主角（protagonist）卡片')
+  }
+  if (antagonistCount === 0) {
+    warnings.push('当前无反派（antagonist）卡片，建议补充主要对手')
+  }
+
+  for (const card of cards) {
+    for (const field of CHARACTER_CARD_REQUIRED_FIELDS) {
+      const value = card[field.key]
+      if (typeof value !== 'string' || !value.trim()) {
+        errors.push(`角色「${card.name}」缺少${field.label}`)
+      }
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings
+  }
+}
 
 export function loadCharacterCards(workId: number): CharacterCard[] {
   const row = coreSettingDAO.getByType(workId, STORAGE_TYPE)
   if (!row?.content) return []
   try {
     const parsed = JSON.parse(row.content) as CharacterCardsBundle
-    return Array.isArray(parsed.cards) ? parsed.cards : []
+    if (!Array.isArray(parsed.cards)) return []
+    return sanitizeCharacterCards(parsed.cards).cards
   } catch {
     return []
   }
 }
 
 export function saveCharacterCards(workId: number, cards: CharacterCard[]): void {
-  if (cards.length === 0) {
+  const sanitized = sanitizeCharacterCards(cards).cards
+  if (sanitized.length === 0) {
     const row = coreSettingDAO.getByType(workId, STORAGE_TYPE)
     if (row) coreSettingDAO.delete(row.id)
     return
   }
-  coreSettingDAO.upsert(workId, STORAGE_TYPE, JSON.stringify({ cards }, null, 2))
+  coreSettingDAO.upsert(workId, STORAGE_TYPE, JSON.stringify({ cards: sanitized }, null, 2))
 }
 
 export { parseCharacterCardsFromAi } from './parse-character-cards'

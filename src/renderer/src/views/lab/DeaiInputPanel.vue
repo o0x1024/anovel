@@ -55,7 +55,6 @@ const canRun = () =>
   props.status !== 'running'
   && props.originalText.trim().length > 0
   && props.systemPrompt.trim().length > 0
-  && props.styleId != null
 
 async function onWorkImport(ref: AssistantWorkReference) {
   uploadError.value = ''
@@ -109,10 +108,11 @@ async function onFileChange(event: Event) {
         <select
           class="select select-bordered select-xs w-44 shrink-0"
           :value="props.styleId ?? ''"
-          :disabled="!props.writingStyles.length || props.status === 'running'"
+          :disabled="props.status === 'running'"
           @change="onStyleChange"
         >
-          <option v-if="!props.writingStyles.length" value="">暂无文风</option>
+          <option value="">不选文风</option>
+          <option v-if="!props.writingStyles.length" disabled value="__empty__">暂无可用文风</option>
           <option v-for="style in props.writingStyles" :key="style.id" :value="style.id">
             {{ style.name }}{{ style.is_builtin ? '（内置）' : '' }}
           </option>
@@ -145,7 +145,7 @@ async function onFileChange(event: Event) {
         class="w-full h-28 max-h-[26vh] resize-y border-0 rounded-b-lg bg-base-100 text-xs leading-5 p-3 font-mono focus:outline-none focus:ring-0 overflow-y-auto scrollbar-thin"
         :maxlength="SYSTEM_PROMPT_MAX"
         :disabled="props.status === 'running'"
-        placeholder="选择文风后自动填入完整 System Prompt，也可直接手动编写"
+        placeholder="可选文风自动填入 System Prompt，也可直接手动编写"
         @input="emit('update:systemPrompt', ($event.target as HTMLTextAreaElement).value)"
       />
     </section>
@@ -226,7 +226,7 @@ async function onFileChange(event: Event) {
     :max-length="SYSTEM_PROMPT_MAX"
     :disabled="props.status === 'running'"
     monospace
-    placeholder="选择文风后自动填入完整 System Prompt，也可直接手动编写"
+    placeholder="可选文风自动填入 System Prompt，也可直接手动编写"
     @update:model-value="emit('update:systemPrompt', $event)"
     @close="closeFullscreen"
   />

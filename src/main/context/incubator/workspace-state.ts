@@ -23,13 +23,29 @@ import type {
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
 import { backfillIncubatorFromLegacy } from './backfill-legacy'
 import { pruneDuplicateCandidates } from './candidate-dedup'
-import { recalibrateLegacyHeuristicScores, rescoreAllCandidates } from './score-candidate'
 import {
   draftDiffersFromLatestFrozen,
   listIncubatorVersions,
   nextStorylineFreezeVersionNo
 } from './version-ops'
 import { assertIncubatorWorkExists, sanitizeIncubatorFkOrphans } from './sanitize-incubator-fk'
+
+function sanitizeStringArray(arr: unknown): string[] {
+  if (!Array.isArray(arr)) return []
+  return arr
+    .map(v => {
+      if (v == null) return ''
+      if (typeof v === 'string') return v === '[object Object]' ? '' : v.trim()
+      if (typeof v === 'object') {
+        const obj = v as Record<string, unknown>
+        const text = obj.issue ?? obj.text ?? obj.message ?? obj.description ?? obj.suggestion
+        if (typeof text === 'string') return text.trim()
+        return JSON.stringify(v)
+      }
+      return String(v).trim()
+    })
+    .filter(Boolean)
+}
 
 function mapCandidate(row: IncubatorCandidateRow): IncubatorCandidate {
   return {
@@ -79,12 +95,7 @@ function mapSlot(row: IncubatorDraftSlotRow): IncubatorDraftSlot {
 export function getIncubatorWorkspaceState(workId: number): IncubatorWorkspaceState {
   assertIncubatorWorkExists(workId)
   sanitizeIncubatorFkOrphans(workId)
-  const pruned = pruneDuplicateCandidates(workId)
-  if (pruned > 0) {
-    rescoreAllCandidates(workId)
-  } else {
-    recalibrateLegacyHeuristicScores(workId)
-  }
+  pruneDuplicateCandidates(workId)
   backfillIncubatorFromLegacy(workId)
 
   const stateRow = incubatorStateDAO.ensure(workId)
@@ -100,8 +111,8 @@ export function getIncubatorWorkspaceState(workId: number): IncubatorWorkspaceSt
         filledSlotCount: parsed.filledSlotCount ?? 0,
         serializabilityScore: parsed.serializabilityScore ?? 0,
         conflictClosureScore: parsed.conflictClosureScore ?? 0,
-        issues: parsed.issues ?? [],
-        suggestions: parsed.suggestions ?? [],
+        issues: sanitizeStringArray(parsed.issues),
+        suggestions: sanitizeStringArray(parsed.suggestions),
         coherence: parsed.coherence ?? []
       }
     } catch {

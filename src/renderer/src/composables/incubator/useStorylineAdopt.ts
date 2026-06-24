@@ -4,7 +4,7 @@ import type { IncubatorAdoptMode } from '../../../../shared/incubator-types'
 import type { IncubatorSlotKey } from '../../../../shared/incubator-slots'
 import { reportRendererError } from '../../utils/reportError'
 
-export type AdoptSourceStep = 'variants' | 'expand' | 'role_engine_gen' | 'world_rules_gen' | 'emotion_curve_gen' | 'ending_image_gen'
+export type AdoptSourceStep = 'variants' | 'expand' | 'role_engine_gen' | 'world_rules_gen' | 'rhythm_curve_gen' | 'ending_structure_gen'
 
 export interface AdoptLegacyPayload {
   sourceStep: AdoptSourceStep

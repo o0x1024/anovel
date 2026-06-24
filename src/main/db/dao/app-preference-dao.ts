@@ -1,9 +1,11 @@
 import { BaseDAO } from './base-dao'
+import type { PerplexityApiConfig } from '../../../shared/aigc-detect-types'
 
 export const GLOBAL_LLM_PROVIDER_KEY = 'global_llm_provider'
 export const GLOBAL_LLM_MODEL_KEY = 'global_llm_model'
 export const BUILTIN_STYLES_SEEDED_KEY = 'builtin_styles_seeded'
 const GENERATION_PARAMS_KEY = 'generation_params'
+const PERPLEXITY_API_CONFIG_KEY = 'perplexity_api_config'
 
 export interface GlobalLlmDefault {
   provider: string | null
@@ -87,6 +89,34 @@ export class AppPreferenceDAO extends BaseDAO {
       topP: params.topP ?? current.topP
     }
     this.setPreference(GENERATION_PARAMS_KEY, JSON.stringify(merged))
+    return merged
+  }
+
+  getPerplexityApiConfig(): PerplexityApiConfig {
+    const raw = this.getPreference(PERPLEXITY_API_CONFIG_KEY)
+    if (!raw) return { mode: 'builtin', apiBase: 'http://localhost:1234/v1', modelName: '' }
+    try {
+      const parsed = JSON.parse(raw) as Partial<PerplexityApiConfig>
+      return {
+        mode: parsed.mode ?? 'builtin',
+        apiBase: parsed.apiBase ?? 'http://localhost:1234/v1',
+        modelName: parsed.modelName ?? '',
+        apiKey: parsed.apiKey ?? ''
+      }
+    } catch {
+      return { mode: 'builtin', apiBase: 'http://localhost:1234/v1', modelName: '' }
+    }
+  }
+
+  setPerplexityApiConfig(config: Partial<PerplexityApiConfig>): PerplexityApiConfig {
+    const current = this.getPerplexityApiConfig()
+    const merged: PerplexityApiConfig = {
+      mode: config.mode ?? current.mode,
+      apiBase: config.apiBase ?? current.apiBase,
+      modelName: config.modelName ?? current.modelName,
+      apiKey: config.apiKey ?? current.apiKey
+    }
+    this.setPreference(PERPLEXITY_API_CONFIG_KEY, JSON.stringify(merged))
     return merged
   }
 }

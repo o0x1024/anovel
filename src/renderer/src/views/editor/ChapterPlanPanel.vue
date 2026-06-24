@@ -3,9 +3,9 @@ import { ref, computed, watch, onMounted } from 'vue'
 import {
   type WritingPlanStatus,
   type NovelLength,
-  TARGET_WORD_PRESETS,
-  WORDS_PER_CHAPTER_PRESETS,
-  NOVEL_LENGTH_PRESETS,
+  getPresetsForType,
+  getTargetWordPresets,
+  getWordsPerChapterPresets,
   formatWordCount,
   volumePlanLabel,
   novelLengthSummary
@@ -21,13 +21,29 @@ const targetTotalWords = ref(800_000)
 const wordsPerChapter = ref(4000)
 const expanded = ref(false)
 
-const novelLengthOptions = computed(() =>
-  (Object.keys(NOVEL_LENGTH_PRESETS) as NovelLength[]).map(key => ({
+const workType = computed(() => status.value?.plan.workType || 'novel')
+const chapterUnit = computed(() => workType.value === 'story' ? '拍' : '章')
+const perChapterLabel = computed(() => workType.value === 'story' ? '每拍字数' : '每章字数')
+const plannedVerb = computed(() => workType.value === 'story' ? '已拆解' : '已规划')
+const planTitle = computed(() => workType.value === 'story' ? '节拍规划' : '章节规划')
+const planDescription = computed(() => {
+  if (workType.value === 'story') {
+    return '按短故事目标字数与每拍字数设定节奏基线，自动推导目标总拍数并引导拆解进度'
+  }
+  return '按篇幅类型设定目标总字数；默认每章约 4000 字，反推全书与各卷章数'
+})
+
+const novelLengthOptions = computed(() => {
+  const presets = getPresetsForType(workType.value)
+  return (Object.keys(presets) as NovelLength[]).map(key => ({
     key,
-    label: NOVEL_LENGTH_PRESETS[key].label,
-    summary: novelLengthSummary(key)
+    label: presets[key].label,
+    summary: novelLengthSummary(key, workType.value)
   }))
-)
+})
+
+const targetWordPresets = computed(() => getTargetWordPresets(workType.value))
+const wordsPerChapterPresets = computed(() => getWordsPerChapterPresets(workType.value))
 
 const selectedVolumeStatus = computed(() =>
   status.value?.volumes.find(v => v.id === props.selectedVolumeId) ?? null
@@ -37,15 +53,15 @@ const summaryLine = computed(() => {
   const s = status.value
   if (!s) return ''
   return [
-    `建议 ${s.suggestedTotalChapters} 章`,
-    `已规划 ${s.actualTotalChapters} 章（${s.outlineProgressPercent}%）`,
+    `建议 ${s.suggestedTotalChapters} ${chapterUnit.value}`,
+    `${plannedVerb.value} ${s.actualTotalChapters} ${chapterUnit.value}（${s.outlineProgressPercent}%）`,
     `正文 ${formatWordCount(s.writtenWords)} / ${formatWordCount(s.plan.targetTotalWords)}（${s.writtenProgressPercent}%）`
   ].join(' · ')
 })
 
 const collapsedSummary = computed(() => {
   if (summaryLine.value) return summaryLine.value
-  return novelLengthSummary(novelLength.value)
+  return novelLengthSummary(novelLength.value, workType.value)
 })
 
 onMounted(loadStatus)
@@ -99,7 +115,7 @@ defineExpose({ reload: loadStatus })
     >
       <div class="min-w-0 flex-1">
         <div class="flex items-center gap-2 flex-wrap">
-          <h4 class="font-semibold text-sm shrink-0">章节规划</h4>
+          <h4 class="font-semibold text-sm shrink-0">{{ planTitle }}</h4>
           <font-awesome-icon
             :icon="expanded ? 'chevron-up' : 'chevron-down'"
             class="w-3 h-3 shrink-0 text-base-content/40"
@@ -107,7 +123,7 @@ defineExpose({ reload: loadStatus })
         </div>
         <p v-if="!expanded" class="text-xs text-base-content/50 mt-1 truncate">{{ collapsedSummary }}</p>
         <p v-else class="text-xs text-base-content/50 mt-0.5">
-          按篇幅类型设定目标总字数；默认每章约 4000 字，反推全书与各卷章数
+          {{ planDescription }}
         </p>
       </div>
       <div v-if="selectedVolumeStatus && !expanded" class="flex items-center gap-2 shrink-0 text-xs">
@@ -115,7 +131,7 @@ defineExpose({ reload: loadStatus })
           class="badge badge-sm"
           :class="selectedVolumeStatus.gap > 0 ? 'badge-warning' : 'badge-success'"
         >
-          {{ volumePlanLabel(selectedVolumeStatus) }}
+          {{ volumePlanLabel(selectedVolumeStatus, workType) }}
         </span>
       </div>
     </button>
@@ -137,7 +153,7 @@ defineExpose({ reload: loadStatus })
         </select>
       </label>
       <p v-if="novelLengthOptions.length" class="text-xs text-base-content/50 pb-2 max-w-md">
-        {{ novelLengthSummary(novelLength) }}
+        {{ novelLengthSummary(novelLength, workType) }}
       </p>
     </div>
 
@@ -149,27 +165,34 @@ defineExpose({ reload: loadStatus })
           class="select select-bordered select-sm w-36"
           @change="savePlan"
         >
-          <option v-for="n in TARGET_WORD_PRESETS" :key="n" :value="n">{{ formatWordCount(n) }}</option>
+          <option v-for="n in targetWordPresets" :key="n" :value="n">{{ formatWordCount(n) }}</option>
         </select>
       </label>
       <label class="form-control">
-        <span class="label-text text-xs text-base-content/50">每章字数</span>
+        <span class="label-text text-xs text-base-content/50">{{ perChapterLabel }}</span>
         <select
           v-model.number="wordsPerChapter"
           class="select select-bordered select-sm w-28"
           @change="savePlan"
         >
-          <option v-for="n in WORDS_PER_CHAPTER_PRESETS" :key="n" :value="n">{{ n }} 字</option>
+          <option v-for="n in wordsPerChapterPresets" :key="n" :value="n">{{ n }} 字</option>
         </select>
       </label>
       <div v-if="status" class="text-xs pb-2 text-base-content/60">
-        ≈ <span class="font-medium text-base-content">{{ status.suggestedTotalChapters }}</span> 章
+        ≈ <span class="font-medium text-base-content">{{ status.suggestedTotalChapters }}</span> {{ chapterUnit }}
         <span v-if="status.volumes.length">
-          · 每卷约
+          · 每{{ workType === 'story' ? '分卷' : '卷' }}约
           <span class="font-medium">{{ Math.ceil(status.suggestedTotalChapters / status.volumes.length) }}</span>
-          章
+          {{ chapterUnit }}
         </span>
       </div>
+    </div>
+
+    <div
+      v-if="workType === 'story' && $slots['story-batch']"
+      class="mt-3 pt-3 border-t border-base-300/50"
+    >
+      <slot name="story-batch" />
     </div>
 
     <div
@@ -182,12 +205,12 @@ defineExpose({ reload: loadStatus })
         class="badge badge-sm"
         :class="selectedVolumeStatus.gap > 0 ? 'badge-warning' : 'badge-success'"
       >
-        {{ volumePlanLabel(selectedVolumeStatus) }}
+        {{ volumePlanLabel(selectedVolumeStatus, workType) }}
       </span>
       <span v-if="selectedVolumeStatus.gap > 0" class="text-warning">
-        建议再规划 {{ selectedVolumeStatus.gap }} 章
+        建议再{{ workType === 'story' ? '拆解' : '规划' }} {{ selectedVolumeStatus.gap }} {{ chapterUnit }}
       </span>
-      <span v-else class="text-success">本章数已达建议量</span>
+      <span v-else class="text-success">当前{{ chapterUnit }}数已达建议量</span>
     </div>
     </div>
   </div>

@@ -3,7 +3,7 @@ import { ModelAdapter, ModelRequest, ModelResponse, AdapterChatOptions } from '.
 import type { ProviderProtocol } from '../../shared/model-providers'
 import { buildOpenAICompatibleBody } from '../../shared/kimi-api-params'
 import { openAICompatibleAuthHeaders } from '../../shared/mimo-api-params'
-import { consumeSseStream, isAbortError } from './stream-utils'
+import { consumeSseStream, isAbortError, parseAxiosErrorMessage } from './stream-utils'
 
 /**
  * OpenAI 兼容适配器
@@ -183,9 +183,73 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
   }
 }
 
+type GeminiContentPart = { text?: string; thought?: boolean }
+
+/** Gemini 2.5+ / 3.x 支持思考摘要；1.5 等旧模型传入 thinkingConfig 可能 400 */
+function geminiSupportsThoughtSummaries(model: string): boolean {
+  const normalized = model.toLowerCase()
+  return (
+    /gemini-2\.5/.test(normalized) ||
+    /gemini-3/.test(normalized) ||
+    normalized.includes('thinking')
+  )
+}
+
+function dispatchGeminiParts(
+  parts: GeminiContentPart[] | undefined,
+  handlers: {
+    onThinkingDelta?: (delta: string) => void
+    onDelta?: (delta: string) => void
+    appendContent?: (text: string) => void
+    appendThinking?: (text: string) => void
+  }
+): void {
+  for (const part of parts ?? []) {
+    if (!part.text) continue
+    if (part.thought) {
+      handlers.appendThinking?.(part.text)
+      handlers.onThinkingDelta?.(part.text)
+    } else {
+      handlers.appendContent?.(part.text)
+      handlers.onDelta?.(part.text)
+    }
+  }
+}
+
 /**
  * Google Gemini 适配器
  */
+function buildGeminiRequestBody(
+  request: ModelRequest,
+  options?: { model?: string; includeThoughts?: boolean }
+): Record<string, unknown> {
+  const genConfig: Record<string, unknown> = {
+    maxOutputTokens: request.maxTokens ?? 4096,
+    temperature: request.temperature ?? 0.7
+  }
+  if (request.topP != null) genConfig.topP = request.topP
+  // Gemini 多数模型不支持 frequencyPenalty / presencePenalty，传入会触发 400
+  const model = options?.model ?? ''
+  if (geminiSupportsThoughtSummaries(model)) {
+    if (request.thinkingEnabled === false) {
+      genConfig.thinkingConfig = { thinkingBudget: 0 }
+    } else if (options?.includeThoughts) {
+      genConfig.thinkingConfig = { thinkingBudget: 2048, includeThoughts: true }
+    }
+  }
+
+  const body: Record<string, unknown> = {
+    contents: [{ role: 'user', parts: [{ text: request.prompt }] }],
+    generationConfig: genConfig
+  }
+
+  if (request.systemPrompt) {
+    body.systemInstruction = { parts: [{ text: request.systemPrompt }] }
+  }
+
+  return body
+}
+
 export class GeminiAdapter implements ModelAdapter {
   public readonly protocol: ProviderProtocol = 'gemini'
   private readonly defaultModel = 'gemini-1.5-pro'
@@ -200,23 +264,10 @@ export class GeminiAdapter implements ModelAdapter {
     const startTime = Date.now()
     const model = modelName || this.defaultModel
     const useStream = options?.stream !== false && !!options?.onDelta
-
-    const genConfig: Record<string, unknown> = {
-      maxOutputTokens: request.maxTokens ?? 4096,
-      temperature: request.temperature ?? 0.7
-    }
-    if (request.topP != null) genConfig.topP = request.topP
-    if (request.frequencyPenalty != null) genConfig.frequencyPenalty = request.frequencyPenalty
-    if (request.presencePenalty != null) genConfig.presencePenalty = request.presencePenalty
-
-    const body: Record<string, unknown> = {
-      contents: [{ role: 'user', parts: [{ text: request.prompt }] }],
-      generationConfig: genConfig
-    }
-
-    if (request.systemPrompt) {
-      body.system_instruction = { parts: [{ text: request.systemPrompt }] }
-    }
+    const body = buildGeminiRequestBody(request, {
+      model,
+      includeThoughts: !!options?.onThinkingDelta
+    })
 
     try {
       if (useStream) {
@@ -231,17 +282,11 @@ export class GeminiAdapter implements ModelAdapter {
       })
 
       const data = response.data
-      const parts = data.candidates?.[0]?.content?.parts as Array<{ text?: string; thought?: boolean }> | undefined
       let content = ''
-      let thinking = ''
-      for (const part of parts ?? []) {
-        if (!part.text) continue
-        if (part.thought) thinking += part.text
-        else content += part.text
-      }
-      if (thinking) {
-        options?.onThinkingDelta?.(thinking)
-      }
+      dispatchGeminiParts(data.candidates?.[0]?.content?.parts as GeminiContentPart[] | undefined, {
+        onThinkingDelta: options?.onThinkingDelta,
+        appendContent: (text) => { content += text }
+      })
 
       return {
         success: true,
@@ -264,10 +309,7 @@ export class GeminiAdapter implements ModelAdapter {
           durationMs: Date.now() - startTime
         }
       }
-      const axiosError = error as { response?: { data?: { error?: { message?: string } } }; message?: string }
-      const errMsg = axiosError.response?.data?.error?.message
-        ?? axiosError.message
-        ?? '未知错误'
+      const errMsg = await parseAxiosErrorMessage(error)
 
       return {
         success: false,
@@ -300,17 +342,14 @@ export class GeminiAdapter implements ModelAdapter {
       await consumeSseStream(response.data, (data) => {
         try {
           const parsed = JSON.parse(data) as {
-            candidates?: Array<{ content?: { parts?: Array<{ text?: string; thought?: boolean }> } }>
+            candidates?: Array<{ content?: { parts?: GeminiContentPart[] } }> | null
           }
-          for (const part of parsed.candidates?.[0]?.content?.parts ?? []) {
-            if (!part.text) continue
-            if (part.thought) {
-              options?.onThinkingDelta?.(part.text)
-            } else {
-              content += part.text
-              options?.onDelta?.(part.text)
-            }
-          }
+          // 思考阶段部分 chunk 的 candidates 为 null，跳过即可
+          dispatchGeminiParts(parsed.candidates?.[0]?.content?.parts, {
+            onThinkingDelta: options?.onThinkingDelta,
+            onDelta: options?.onDelta,
+            appendContent: (text) => { content += text }
+          })
         } catch {
           // ignore malformed chunk
         }
@@ -333,10 +372,7 @@ export class GeminiAdapter implements ModelAdapter {
           durationMs: Date.now() - startTime
         }
       }
-      const axiosError = error as { response?: { data?: { error?: { message?: string } } }; message?: string }
-      const errMsg = axiosError.response?.data?.error?.message
-        ?? axiosError.message
-        ?? '未知错误'
+      const errMsg = await parseAxiosErrorMessage(error)
       return {
         success: false,
         content,

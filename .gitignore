@@ -53,6 +53,7 @@ coverage/
 
 # Large local reference corpora (not part of the app)
 凡人修仙传.txt
+我在精神病院学斩神.txt
 *.txt.bak
 
 # Nested sentinel-ai project (47GB+ build artifacts; not used by ANovel)

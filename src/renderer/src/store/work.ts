@@ -4,8 +4,13 @@ import { ref } from 'vue'
 interface Work {
   id: number
   title: string
-  description: string
+  description: string | null
+  coverImage: string | null
+  novelLength: string | null
+  targetTotalWords: number | null
+  wordsPerChapter: number | null
   updateTime: string
+  createTime: string
 }
 
 export const useWorkStore = defineStore('work', () => {
@@ -27,9 +32,13 @@ export const useWorkStore = defineStore('work', () => {
     currentWork.value = work
   }
 
+  function setWorks(list: Work[]) {
+    works.value = list
+  }
+
   function setStep(step: string) {
     currentStep.value = step
   }
 
-  return { currentWork, works, currentStep, steps, setCurrentWork, setStep }
+  return { currentWork, works, currentStep, steps, setCurrentWork, setWorks, setStep }
 })

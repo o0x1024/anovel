@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import {
   INCUBATOR_AB_VARIANTS_USER_SUFFIX,
   INCUBATOR_MICRO_INSTRUCT_SYSTEM,
@@ -14,11 +15,15 @@ const props = defineProps<{
   regeneratePrompt: string
   regenerateSystemPrompt: string
   maxTokens?: number
+  modelType?: string
+  modelName?: string
   /** 批量章节大纲等：当前分卷，用于精简 work_context */
   volumeId?: number
   /** 设为 false 可跳过核心设定注入（孵化器等探索阶段使用） */
   enrichWorkContext?: boolean
 }>()
+
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const emit = defineEmits<{
   'update:content': [value: string]
@@ -50,7 +55,9 @@ async function callModel(prompt: string, systemPrompt: string, stepSuffix: strin
     step: `${props.step}_${stepSuffix}`,
     maxTokens: props.maxTokens,
     volumeId: props.volumeId,
-    enrichWorkContext: props.enrichWorkContext
+    enrichWorkContext: props.enrichWorkContext,
+    ...bodyModelParams(),
+    ...(props.modelType ? { modelType: props.modelType, modelName: props.modelName } : {})
   }) as ModelChatResult
 }
 

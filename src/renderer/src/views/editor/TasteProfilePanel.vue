@@ -26,6 +26,7 @@ const showCreate = ref(false)
 const newName = ref('')
 const importJson = ref('')
 const exporting = ref(false)
+const confirmDeleteProfile = ref(false)
 
 onMounted(load)
 
@@ -78,6 +79,24 @@ async function exportProfile() {
   }
 }
 
+async function deleteProfile() {
+  if (!boundProfileId.value) return
+  await window.anovel.invoke('taste:delete', boundProfileId.value)
+  boundProfileId.value = null
+  confirmDeleteProfile.value = false
+  await load()
+}
+
+async function removeRejectPattern(reason: string) {
+  const profile = boundProfile()
+  if (!profile) return
+  const patterns = parseRejects(profile.reject_patterns).filter(p => p.reason !== reason)
+  await window.anovel.invoke('taste:update', profile.id, {
+    reject_patterns: JSON.stringify(patterns)
+  })
+  await load()
+}
+
 async function importProfile() {
   if (!importJson.value.trim()) return
   const id = await window.anovel.invoke('taste:import', importJson.value, props.workId) as number
@@ -108,6 +127,18 @@ const boundProfile = () => profiles.value.find(p => p.id === boundProfileId.valu
       <div class="flex flex-wrap gap-2">
         <button class="btn btn-outline btn-primary btn-xs" @click="showCreate = !showCreate">新建档案</button>
         <button class="btn btn-outline btn-xs" :disabled="exporting" @click="exportProfile">导出 JSON</button>
+        <button
+          v-if="profiles.length > 1 && boundProfileId"
+          class="btn btn-outline btn-error btn-xs"
+          @click="confirmDeleteProfile = true"
+        >删除档案</button>
+      </div>
+      <div v-if="confirmDeleteProfile" class="alert alert-warning text-sm py-2 px-3 mt-1">
+        <span>确认删除「{{ boundProfile()?.profile_name }}」？此操作不可撤销。</span>
+        <div class="flex gap-1 ml-auto">
+          <button class="btn btn-error btn-xs" @click="deleteProfile">确认删除</button>
+          <button class="btn btn-ghost btn-xs" @click="confirmDeleteProfile = false">取消</button>
+        </div>
       </div>
       <div v-if="showCreate" class="flex gap-2">
         <input v-model="newName" class="input input-bordered input-sm flex-1" placeholder="档案名称" />
@@ -124,10 +155,17 @@ const boundProfile = () => profiles.value.find(p => p.id === boundProfileId.valu
         <li
           v-for="r in parseRejects(boundProfile()!.reject_patterns)"
           :key="r.reason"
-          class="flex justify-between text-sm"
+          class="flex items-center justify-between text-sm group"
         >
-          <span>{{ r.label || r.reason }}</span>
-          <span class="badge badge-ghost badge-sm">{{ r.count }} 次</span>
+          <span class="truncate mr-2">{{ r.label || r.reason }}</span>
+          <span class="flex items-center gap-1 shrink-0">
+            <span class="badge badge-ghost badge-sm">{{ r.count }} 次</span>
+            <button
+              class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100 transition-opacity text-error px-1"
+              title="删除此条记录"
+              @click="removeRejectPattern(r.reason)"
+            >✕</button>
+          </span>
         </li>
       </ul>
     </div>

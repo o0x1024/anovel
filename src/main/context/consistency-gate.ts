@@ -1,6 +1,5 @@
 import { diagnoseChapterQuality } from './chapter-quality'
 import { checkWorldviewConsistency } from './worldview-check'
-import { checkAnchorAlignment } from './anchor-alignment'
 import { getSettingsQualityGateHints } from './settings-quality'
 
 export interface ConsistencyGateResult {
@@ -28,14 +27,6 @@ export function runConsistencyGate(
   const worldview = checkWorldviewConsistency(workId, content)
   for (const v of worldview) {
     warnings.push(`世界观：${v.detail}`)
-  }
-
-  const alignment = checkAnchorAlignment(workId, content, { chapterId, step: 'body_generation', persist: false })
-  if (alignment.summary.missing > 0) {
-    warnings.push(`本章相关锚点中有 ${alignment.summary.missing} 个可能未对齐`)
-  }
-  if (alignment.summary.partial > 0) {
-    warnings.push(`本章相关锚点中有 ${alignment.summary.partial} 个仅部分对齐`)
   }
 
   const qualityHints = getSettingsQualityGateHints(workId)

@@ -5,6 +5,7 @@ import type {
   IncubatorVersionCompareResult,
   IncubatorVersionDetail
 } from '../../../../../shared/incubator-types'
+import SectionsPreviewDialog, { type PreviewSection } from '../../../components/SectionsPreviewDialog.vue'
 import { incubatorStateKey } from './incubator-context'
 
 const props = defineProps<{ workId: number }>()
@@ -21,6 +22,9 @@ const detailId = ref<number | null>(null)
 const detail = ref<IncubatorVersionDetail | null>(null)
 const loadingDetail = ref(false)
 const actingId = ref<number | null>(null)
+const versionPreviewOpen = ref(false)
+const versionPreviewSections = ref<PreviewSection[]>([])
+const versionPreviewTitle = ref('版本快照预览')
 
 const versionById = computed(() => new Map(versions.value.map(v => [v.id, v])))
 
@@ -54,9 +58,70 @@ async function loadDetail(versionId: number) {
       props.workId,
       versionId
     ) as IncubatorVersionDetail | null
+    openVersionPreviewDialog(versionId)
   } finally {
     loadingDetail.value = false
   }
+}
+
+function openVersionPreviewDialog(versionId: number) {
+  if (!detail.value) return
+  const v = versionById.value.get(versionId)
+  versionPreviewTitle.value = v
+    ? `版本快照 · V${v.versionNo} ${v.label}`
+    : '版本快照预览'
+
+  const sections: PreviewSection[] = []
+
+  // 门禁报告
+  const gate = detail.value.gate
+  if (gate) {
+    const gateLines: string[] = [
+      `门禁状态：${gate.passed ? '✅ 通过' : '❌ 未通过'}`,
+      `已填槽位：${gate.filledSlotCount}/6`,
+      `可连载性评分：${gate.serializabilityScore}`,
+      `冲突闭环评分：${gate.conflictClosureScore}`
+    ]
+    if (gate.issues.length) {
+      gateLines.push('', '## 问题', ...gate.issues.map(i => `- ${i}`))
+    }
+    if (gate.suggestions.length) {
+      gateLines.push('', '## 建议', ...gate.suggestions.map(s => `- ${s}`))
+    }
+    if (gate.coherence.length) {
+      const blocking = gate.coherence.filter(c => c.severity === 'blocking')
+      const warnings = gate.coherence.filter(c => c.severity === 'warning')
+      if (blocking.length) {
+        gateLines.push('', '## 阻断项')
+        blocking.forEach(b => {
+          gateLines.push(`- [${b.slotKey}] ${b.issue}`)
+          gateLines.push(`  修复建议：${b.suggestion}`)
+        })
+      }
+      if (warnings.length) {
+        gateLines.push('', '## 警告项')
+        warnings.forEach(w => {
+          gateLines.push(`- [${w.slotKey}] ${w.issue}`)
+          gateLines.push(`  修复建议：${w.suggestion}`)
+        })
+      }
+    }
+    sections.push({ label: '门禁报告', content: gateLines.join('\n') })
+  }
+
+  if (detail.value.synthesizedSummary?.trim()) {
+    sections.push({ label: '统合摘要', content: detail.value.synthesizedSummary.trim() })
+  }
+  if (detail.value.qualitySnapshot?.trim()) {
+    sections.push({ label: '质量评分卡', content: detail.value.qualitySnapshot.trim() })
+  }
+  for (const slot of detail.value.slotPreviews) {
+    if (slot.content.trim()) {
+      sections.push({ label: slot.label, content: slot.content.trim() })
+    }
+  }
+  versionPreviewSections.value = sections
+  versionPreviewOpen.value = true
 }
 
 async function restore(versionId: number) {
@@ -221,26 +286,16 @@ function formatTime(t: string): string {
       </p>
     </div>
 
-    <div v-if="detailId" class="border border-base-300 rounded-lg p-2 bg-base-100">
-      <p class="text-xs font-medium mb-2">
-        快照预览
-        <span v-if="detail">· {{ detail.filledSlotCount }} 槽位</span>
-      </p>
-      <div v-if="loadingDetail" class="text-xs text-base-content/40">加载中...</div>
-      <div v-else-if="detail" class="space-y-2 max-h-48 overflow-y-auto">
-        <div v-if="detail.synthesizedSummary" class="pb-2 border-b border-base-300/50">
-          <p class="text-xs text-primary font-medium">统合摘要</p>
-          <p class="text-xs text-base-content/60 whitespace-pre-wrap line-clamp-4">{{ detail.synthesizedSummary }}</p>
-        </div>
-        <div v-if="detail.qualitySnapshot" class="pb-2 border-b border-base-300/50">
-          <p class="text-xs text-primary font-medium">质量评分卡</p>
-          <p class="text-xs text-base-content/60 whitespace-pre-wrap line-clamp-4">{{ detail.qualitySnapshot }}</p>
-        </div>
-        <div v-for="s in detail.slotPreviews" :key="s.slotKey">
-          <p class="text-xs text-primary">{{ s.label }}</p>
-          <p class="text-xs text-base-content/60 whitespace-pre-wrap line-clamp-3">{{ s.content }}</p>
-        </div>
-      </div>
+    <div v-if="detailId && loadingDetail" class="border border-base-300 rounded-lg p-2 bg-base-100">
+      <p class="text-xs text-base-content/40">加载版本快照...</p>
     </div>
   </div>
+
+  <SectionsPreviewDialog
+    :open="versionPreviewOpen"
+    :title="versionPreviewTitle"
+    :sections="versionPreviewSections"
+    empty-hint="该版本暂无槽位内容"
+    @close="versionPreviewOpen = false"
+  />
 </template>

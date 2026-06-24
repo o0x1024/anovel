@@ -11,7 +11,8 @@ export interface WorldviewViolation {
  */
 export function checkWorldviewConsistency(workId: number, content: string): WorldviewViolation[] {
   const violations: WorldviewViolation[] = []
-  const worldview = coreSettingDAO.getByType(workId, 'worldview')?.content?.trim()
+  const worldview = coreSettingDAO.getByType(workId, 'world_pressure')?.content?.trim()
+    || coreSettingDAO.getByType(workId, 'worldview')?.content?.trim()
   if (!worldview || !content.trim()) return violations
 
   const rules = extractRules(worldview)

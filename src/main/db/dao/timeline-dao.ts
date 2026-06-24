@@ -71,6 +71,11 @@ export class TimelineDAO extends BaseDAO {
   delete(id: number): boolean {
     return this.run('DELETE FROM story_timeline WHERE id = ?', [id]).changes > 0
   }
+
+  deleteByWork(workId: number): number {
+    const result = this.run('DELETE FROM story_timeline WHERE work_id = ?', [workId])
+    return result.changes
+  }
 }
 
 export const timelineDAO = new TimelineDAO()

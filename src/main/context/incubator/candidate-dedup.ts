@@ -1,7 +1,6 @@
 import { incubatorCandidateDAO, incubatorScoreDAO } from '../../db/dao/incubator'
 import type { IncubatorCandidateSourceStep } from '../../../shared/incubator-types'
 import { normalizeCandidateTitle } from '../../../shared/incubator-candidate'
-import { heuristicScoreCandidate } from './heuristic-score'
 
 export { normalizeCandidateTitle }
 
@@ -31,20 +30,6 @@ export function upsertIncubatorCandidate(
       highlights: input.highlights ?? null,
       audience: input.audience ?? null
     })
-    const row = incubatorCandidateDAO.getById(existing.id)!
-    const previous = incubatorScoreDAO.getLatestByCandidate(existing.id)
-    const scoreInput = heuristicScoreCandidate(row)
-    if (previous?.user_adjustment) {
-      const adj = Math.max(-30, Math.min(30, Math.round(previous.user_adjustment)))
-      incubatorScoreDAO.create({
-        ...scoreInput,
-        userAdjustment: adj,
-        finalTotal: Math.max(0, Math.min(100, scoreInput.systemTotal + adj)),
-        rationale: `${scoreInput.rationale ?? ''}；保留用户修正 ${adj >= 0 ? '+' : ''}${adj}`
-      })
-    } else {
-      incubatorScoreDAO.create(scoreInput)
-    }
     return existing.id
   }
 
@@ -58,8 +43,6 @@ export function upsertIncubatorCandidate(
     audience: input.audience ?? null,
     status: 'new'
   })
-  const row = incubatorCandidateDAO.getById(id)!
-  incubatorScoreDAO.create(heuristicScoreCandidate(row))
   return id
 }
 

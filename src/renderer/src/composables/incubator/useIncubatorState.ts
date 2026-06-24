@@ -1,4 +1,5 @@
 import { ref, type Ref } from 'vue'
+import { useBodyGenerationModel } from '../useBodyGenerationModel'
 import type {
   IncubatorGateReport,
   IncubatorVersionCompareResult,
@@ -24,6 +25,8 @@ export function useIncubatorState(workId: Ref<number> | number) {
     return id
   }
 
+  const { modelParams: bodyModelParams } = useBodyGenerationModel(wid)
+
   async function refresh(): Promise<IncubatorWorkspaceState> {
     loading.value = true
     try {
@@ -47,11 +50,11 @@ export function useIncubatorState(workId: Ref<number> | number) {
     return workspace.value
   }
 
-  async function runGate(): Promise<IncubatorGateReport> {
+  async function runGate(userInstruction?: string): Promise<IncubatorGateReport> {
     gateRunning.value = true
     actionError.value = ''
     try {
-      const res = await window.anovel.invoke('incubator:runGate', wid()) as {
+      const res = await window.anovel.invoke('incubator:runGate', wid(), userInstruction, bodyModelParams()) as {
         report: IncubatorGateReport
         workspace: IncubatorWorkspaceState
       }
@@ -73,14 +76,18 @@ export function useIncubatorState(workId: Ref<number> | number) {
       const res = await window.anovel.invoke(
         'incubator:freezeVersion',
         wid(),
-        label
+        label,
+        bodyModelParams()
       ) as { success: boolean; error?: string; workspace?: IncubatorWorkspaceState }
+      // 无论成功与否都更新 workspace，确保门禁报告等状态同步到前端
+      if (res.workspace) {
+        workspace.value = res.workspace
+        lastGateReport.value = res.workspace.gateSummary
+      }
       if (!res.success) {
         actionError.value = res.error || '冻结失败'
         return false
       }
-      if (res.workspace) workspace.value = res.workspace
-      else await refresh()
       return true
     } finally {
       freezing.value = false

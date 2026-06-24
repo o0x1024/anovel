@@ -29,9 +29,12 @@ export const MIN_SECTION_SCORE = 70
 export const MAX_REVISE_ROUNDS = 2
 
 const SECTION_KEY_HINTS: Record<string, string[]> = {
-  character: ['人设'],
-  worldview: ['世界观'],
-  conflict: ['核心冲突', '冲突'],
+  protagonist: ['主角与反差设定', '主角设计', '主角', '主角设定'],
+  golden_finger: ['设定与微创新', '微创新设定', '微创新', '金手指', '金手指系统'],
+  pleasure_engine: ['情绪节奏与爽点', '情绪与爽点', '爽点', '爽点机制'],
+  world_pressure: ['世界观压力规则', '世界观压力', '世界观'],
+  conflict_engine: ['冲突升级引擎', '冲突升级', '冲突引擎', '核心冲突'],
+  supporting_cast: ['功能性配角', '配角功能', '配角'],
   cards: ['卡片', 'Markdown 一致性'],
   anchors: ['锚点'],
   cross: ['跨设定', '矛盾']
@@ -57,7 +60,7 @@ function normalizeVerdict(value: unknown, conclusion: Omit<QualityConclusion, 'v
   return 'review'
 }
 
-const SCORABLE_SECTION_KEYS = new Set(['character', 'worldview', 'conflict', 'cards', 'anchors', 'cross'])
+const SCORABLE_SECTION_KEYS = new Set(['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast', 'cards', 'anchors', 'cross'])
 
 function isScorableSectionKey(key: string): boolean {
   return SCORABLE_SECTION_KEYS.has(key)
@@ -105,17 +108,42 @@ export function parseQualityConclusion(report: string): QualityConclusion | null
   return inferConclusionFromReport(report)
 }
 
+/**
+ * 检查关键词是否在非否定语境中出现。
+ * 以中文标点为分句边界，在同一分句内若关键词前存在"无/没/没有/并无/并非/不是/不存在"
+ * 等否定词，则视为否定语境（如"无硬逻辑矛盾"）。
+ */
+function hasNonNegatedKeyword(content: string, keywords: string[]): boolean {
+  for (const kw of keywords) {
+    let searchFrom = 0
+    for (;;) {
+      const idx = content.indexOf(kw, searchFrom)
+      if (idx < 0) break
+      let clauseStart = idx
+      while (clauseStart > 0 && !/[，,。.；;！!？?\n]/.test(content[clauseStart - 1])) {
+        clauseStart--
+      }
+      const prefix = content.slice(clauseStart, idx)
+      if (!/无(?!法)|没有?|不存在|并无|并非|不是/.test(prefix)) {
+        return true
+      }
+      searchFrom = idx + kw.length
+    }
+  }
+  return false
+}
+
 function inferSectionSeverity(section: SectionLike): QualitySeverity {
   const content = section.content.trim()
   if (!content) return 'none'
 
   // 写作技巧：正文已说明自洽 / 已有解释 → none
   if (/说明：|已有解释|设定中已有|逻辑完整|弧线.{0,6}清晰|无硬矛盾|已覆盖|覆盖良好|相互一致|暂无问题|无明显问题|已基本自洽|无问题/.test(content)) {
-    if (!/阻塞：|必须修复|硬逻辑|完全未|拖垮|毒点/.test(content)) return 'none'
+    if (!hasNonNegatedKeyword(content, ['阻塞：', '必须修复', '硬逻辑', '完全未', '拖垮', '毒点'])) return 'none'
   }
 
-  // 明确 blocking（硬矛盾 / 毒点 / 完全遗漏）
-  if (/阻塞：|必须修复|硬逻辑矛盾|根本背离|拖垮文章|毒点|完全未体现|完全未覆盖|严重不一致|遗漏主要角色|无法自洽|互相打架/.test(content)) {
+  // 明确 blocking（硬矛盾 / 毒点 / 完全遗漏）— 须排除否定语境
+  if (hasNonNegatedKeyword(content, ['阻塞：', '必须修复', '硬逻辑矛盾', '根本背离', '拖垮文章', '毒点', '完全未体现', '完全未覆盖', '严重不一致', '遗漏主要角色', '无法自洽', '互相打架'])) {
     return 'blocking'
   }
 
@@ -131,7 +159,7 @@ function inferSectionSeverity(section: SectionLike): QualitySeverity {
 
   if (/无问题|良好|基本一致|无需修改/.test(content)) return 'none'
 
-  if (/无法|严重矛盾|不能共存/.test(content)) return 'blocking'
+  if (hasNonNegatedKeyword(content, ['无法', '严重矛盾', '不能共存'])) return 'blocking'
 
   if (/矛盾|不一致|遗漏|缺失|未覆盖|未体现|略弱|偏弱/.test(content)) return 'advisory'
 
@@ -142,18 +170,21 @@ function inferSectionSeverity(section: SectionLike): QualitySeverity {
   return 'none'
 }
 
-/** 正文与 JSON 结论冲突时，以正文为准（避免误标阻塞） */
+/**
+ * 有 JSON 结论时优先信任模型的结构化输出；仅在正文明确说"无问题"而 JSON
+ * 标了更高严重度时，以正文为准降级（防止模型 JSON 误标阻塞）。
+ * 没有 JSON 时完全依赖关键词推断。
+ */
 export function reconcileSectionSeverity(
   section: SectionLike,
   fromConclusion?: QualitySeverity
 ): QualitySeverity {
   const fromContent = inferSectionSeverity(section)
   if (!fromConclusion) return fromContent
+  // 正文明确说无问题但 JSON 标了更高严重度 → 以正文为准降级
   if (fromContent === 'none' && fromConclusion !== 'none') return 'none'
-  if (fromContent === 'blocking') return 'blocking'
   // JSON 标 blocking 但正文仅为建议级 → 以正文为准降级
   if (fromConclusion === 'blocking' && fromContent !== 'blocking') return fromContent
-  if (fromConclusion === 'blocking' && fromContent === 'advisory') return 'advisory'
   return fromConclusion
 }
 
@@ -242,7 +273,7 @@ export function enrichSectionsWithConclusion<T extends SectionLike>(
       return { ...section, severity: 'none' as QualitySeverity }
     }
     const fromConclusion = conclusion ? matchSectionSeverity(section, conclusion) : undefined
-    const severity = reconcileSectionSeverity(section, fromConclusion ?? inferSectionSeverity(section))
+    const severity = reconcileSectionSeverity(section, fromConclusion)
     return { ...section, severity }
   })
 }
@@ -267,7 +298,8 @@ export function meetsPassCriteriaReconciled(
   if (!conclusion) return false
   const { blockingCount } = countSectionSeverities(sections)
   if (blockingCount > 0) return false
-  return meetsPassCriteria(conclusion)
+  if (conclusion.overallScore < PASS_SCORE_THRESHOLD) return false
+  return true
 }
 
 export function meetsPassCriteria(conclusion: QualityConclusion | null | undefined): boolean {
@@ -276,7 +308,7 @@ export function meetsPassCriteria(conclusion: QualityConclusion | null | undefin
   if (blockingCount > 0) return false
   if (conclusion.overallScore < PASS_SCORE_THRESHOLD) return false
   const coreSections = conclusion.sections.filter(s =>
-    ['character', 'worldview', 'conflict'].includes(s.key)
+    ['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast'].includes(s.key)
   )
   if (coreSections.some(s => s.score < MIN_SECTION_SCORE && s.severity === 'blocking')) {
     return false

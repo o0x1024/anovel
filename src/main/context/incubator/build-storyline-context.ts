@@ -7,7 +7,7 @@ export const CHARACTER_SETTING_SLOT_KEYS: IncubatorSlotKey[] = [
   'hook',
   'core_conflict',
   'role_engine',
-  'emotion_curve'
+  'rhythm_curve'
 ]
 
 export interface FrozenStorylineContextOptions {

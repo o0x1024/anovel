@@ -3,11 +3,12 @@ import type { IncubatorCandidateSourceStep } from '../../../shared/incubator-typ
 import { upsertIncubatorCandidate } from './candidate-dedup'
 import { inferStateAfterCandidates } from './state-machine'
 import { incubatorCandidateDAO } from '../../db/dao/incubator'
+import { scoreCandidatesBatchAi } from './score-candidate'
 
-export function persistVariantsAsCandidates(
+export async function persistVariantsAsCandidates(
   workId: number,
   items: { title: string; summary: string; dimension?: string }[]
-): number[] {
+): Promise<number[]> {
   const ids: number[] = []
   for (const item of items) {
     ids.push(
@@ -19,14 +20,17 @@ export function persistVariantsAsCandidates(
       })
     )
   }
+  if (ids.length > 0) {
+    await scoreCandidatesBatchAi(workId, ids)
+  }
   bumpCandidateState(workId)
   return ids
 }
 
-export function persistExpansionAsCandidates(
+export async function persistExpansionAsCandidates(
   workId: number,
   versions: { title: string; summary: string; highlights?: string; audience?: string }[]
-): number[] {
+): Promise<number[]> {
   const ids: number[] = []
   for (const ver of versions) {
     ids.push(
@@ -39,15 +43,18 @@ export function persistExpansionAsCandidates(
       })
     )
   }
+  if (ids.length > 0) {
+    await scoreCandidatesBatchAi(workId, ids)
+  }
   bumpCandidateState(workId)
   return ids
 }
 
-export function persistSlotAnalysisAsCandidates(
+export async function persistSlotAnalysisAsCandidates(
   workId: number,
   sourceStep: IncubatorCandidateSourceStep,
   versions: { title: string; summary: string }[]
-): number[] {
+): Promise<number[]> {
   const ids: number[] = []
   for (const ver of versions) {
     ids.push(
@@ -58,6 +65,9 @@ export function persistSlotAnalysisAsCandidates(
       })
     )
   }
+  if (ids.length > 0) {
+    await scoreCandidatesBatchAi(workId, ids)
+  }
   bumpCandidateState(workId)
   return ids
 }
@@ -67,7 +77,7 @@ function bumpCandidateState(workId: number): void {
   incubatorStateDAO.setState(workId, inferStateAfterCandidates(count))
 }
 
-export function ensureCandidateFromManual(
+export async function ensureCandidateFromManual(
   workId: number,
   sourceStep: IncubatorCandidateSourceStep,
   payload: {
@@ -77,8 +87,8 @@ export function ensureCandidateFromManual(
     highlights?: string | null
     audience?: string | null
   }
-): number {
-  return upsertIncubatorCandidate(workId, {
+): Promise<number> {
+  const id = upsertIncubatorCandidate(workId, {
     sourceStep,
     title: payload.title,
     summary: payload.summary,
@@ -86,4 +96,6 @@ export function ensureCandidateFromManual(
     highlights: payload.highlights ?? null,
     audience: payload.audience ?? null
   })
+  await scoreCandidatesBatchAi(workId, [id])
+  return id
 }

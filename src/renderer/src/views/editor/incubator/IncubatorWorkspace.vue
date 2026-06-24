@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, watch, provide, inject, toRef } from 'vue'
+import { ref, reactive, computed, onMounted, watch, provide, inject, toRef } from 'vue'
 import SeedPanel from './SeedPanel.vue'
 import StorylineComposerPanel from './StorylineComposerPanel.vue'
 import CandidatePoolPanel from './CandidatePoolPanel.vue'
@@ -8,6 +8,11 @@ import IncubatorAnalysisPanel from './IncubatorAnalysisPanel.vue'
 import IncubatorAdoptModal from './IncubatorAdoptModal.vue'
 import VersionGraphPanel from './VersionGraphPanel.vue'
 import IncubatorWorkflowGuide from './IncubatorWorkflowGuide.vue'
+import SectionsPreviewDialog, { type PreviewSection } from '../../../components/SectionsPreviewDialog.vue'
+import {
+  INCUBATOR_SLOT_KEYS,
+  INCUBATOR_SLOT_LABELS
+} from '../../../../../shared/incubator-slots'
 import { useIncubatorState } from '../../../composables/incubator/useIncubatorState'
 import { useStorylineAdopt } from '../../../composables/incubator/useStorylineAdopt'
 import {
@@ -24,6 +29,7 @@ const seedText = ref('')
 const rightTab = ref<'candidates' | 'scores' | 'analysis'>('candidates')
 const analysisRef = ref<InstanceType<typeof IncubatorAnalysisPanel> | null>(null)
 const seedPanelRef = ref<InstanceType<typeof SeedPanel> | null>(null)
+const storylineRef = ref<InstanceType<typeof StorylineComposerPanel> | null>(null)
 
 const incubator = useIncubatorState(toRef(props, 'workId'))
 const adopt = useStorylineAdopt(props.workId, async () => {
@@ -37,6 +43,8 @@ provide(storylineAdoptKey, reactive(adopt))
 provide(incubatorSeedTextKey, seedText)
 
 async function loadWorkData() {
+  const workId = props.workId
+  if (!Number.isFinite(workId) || workId <= 0) return
   const ws = await incubator.refresh()
   const settings = await window.anovel.invoke('setting:listByWork', props.workId) as { type: string; content: string }[]
   const idea = settings.find(s => s.type === 'idea')?.content?.trim() ?? ''
@@ -49,18 +57,6 @@ async function loadWorkData() {
     await incubator.setSeed(idea)
   }
 
-  if (loadedHasVariantsOrExpand(settings)) {
-    const variants = settings.find(s => s.type === 'incubator_variants')?.content
-    const expand = settings.find(s => s.type === 'incubator_expand')?.content
-    if (variants?.trim()) {
-      await window.anovel.invoke('incubator:syncParsedCandidates', props.workId, 'variants', variants, true)
-    }
-    if (expand?.trim()) {
-      await window.anovel.invoke('incubator:syncParsedCandidates', props.workId, 'expand', expand, true)
-    }
-    await incubator.refresh()
-  }
-
   await analysisRef.value?.loadSavedResults()
 }
 
@@ -68,22 +64,94 @@ onMounted(() => void loadWorkData())
 
 watch(() => props.workId, () => void loadWorkData())
 
-function loadedHasVariantsOrExpand(settings: { type: string; content: string }[]) {
-  return settings.some(s => s.type === 'incubator_variants' || s.type === 'incubator_expand')
-}
-
 async function onSaved() {
   await incubator.refresh()
   await nav?.refreshProgress()
 }
+
+const previewOpen = ref(false)
+const previewSections = ref<PreviewSection[]>([])
+const previewLoading = ref(false)
+
+const hasPreviewContent = computed(() => {
+  const ws = incubator.workspace.value
+  const seed = seedText.value.trim() || ws?.seed?.content?.trim() || ''
+  if (seed) return true
+  const slotContents = storylineRef.value?.getSlotContentsForPreview?.()
+  if (slotContents && INCUBATOR_SLOT_KEYS.some(key => slotContents[key]?.trim())) return true
+  const slots = ws?.activeDraftSlots ?? []
+  return INCUBATOR_SLOT_KEYS.some(key =>
+    slots.some(s => s.slotKey === key && s.content.trim())
+  )
+})
+
+async function openFullPreview() {
+  previewLoading.value = true
+  try {
+    await incubator.refresh()
+    const ws = incubator.workspace.value
+    const sections: PreviewSection[] = []
+
+    const seed = seedText.value.trim() || ws?.seed?.content?.trim() || ''
+    if (seed) sections.push({ label: '创作种子', content: seed })
+
+    const slotContents = storylineRef.value?.getSlotContentsForPreview?.() ?? {}
+    const persistedSlots = ws?.activeDraftSlots ?? []
+    for (const key of INCUBATOR_SLOT_KEYS) {
+      const content =
+        slotContents[key]?.trim() ||
+        persistedSlots.find(s => s.slotKey === key)?.content?.trim() ||
+        ''
+      if (content) sections.push({ label: INCUBATOR_SLOT_LABELS[key], content })
+    }
+
+    const frozen = ws?.latestFrozenVersion
+    if (frozen) {
+      try {
+        const detail = await window.anovel.invoke(
+          'incubator:getVersionDetail',
+          props.workId,
+          frozen.id
+        ) as {
+          synthesizedSummary?: string | null
+          qualitySnapshot?: string | null
+        } | null
+        const summary = detail?.synthesizedSummary?.trim()
+        const quality = detail?.qualitySnapshot?.trim()
+        if (summary) sections.push({ label: '统合摘要', content: summary })
+        if (quality) sections.push({ label: '质量评分卡', content: quality })
+      } catch { /* non-critical */ }
+    }
+
+    previewSections.value = sections
+    previewOpen.value = true
+  } finally {
+    previewLoading.value = false
+  }
+}
 </script>
 
 <template>
-  <IncubatorWorkflowGuide class="mb-4" />
+  <IncubatorWorkflowGuide class="mb-4" :work-id="workId" />
+  <div class="flex justify-end mb-3">
+    <button
+      type="button"
+      class="btn btn-outline btn-primary btn-sm gap-1.5"
+      :disabled="!hasPreviewContent || previewLoading"
+      @click="openFullPreview"
+    >
+      <font-awesome-icon
+        :icon="previewLoading ? 'spinner' : 'eye'"
+        :spin="previewLoading"
+        class="w-3.5 h-3.5"
+      />
+      {{ previewLoading ? '加载中...' : '预览全部大岗' }}
+    </button>
+  </div>
   <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
     <div class="space-y-4 min-w-0">
       <SeedPanel ref="seedPanelRef" :work-id="workId" @saved="onSaved" />
-      <StorylineComposerPanel @saved="onSaved" />
+      <StorylineComposerPanel ref="storylineRef" :work-id="workId" @saved="onSaved" />
       <VersionGraphPanel :work-id="workId" @changed="onSaved" />
     </div>
 
@@ -125,5 +193,13 @@ async function onSaved() {
     </div>
   </div>
 
-  <IncubatorAdoptModal />
+  <IncubatorAdoptModal :work-id="workId" />
+
+  <SectionsPreviewDialog
+    :open="previewOpen"
+    title="大岗预览"
+    :sections="previewSections"
+    empty-hint="尚无创作种子或槽位内容"
+    @close="previewOpen = false"
+  />
 </template>

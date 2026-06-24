@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
+import { useToast } from '../../composables/useToast'
 
-const props = defineProps<{ workId: number; content: string }>()
+const props = defineProps<{ workId: number; content: string; modelType?: string; modelName?: string }>()
 const emit = defineEmits<{ polished: [content: string]; 'rules-added': [rules: string[]] }>()
+
+const { showToast } = useToast()
 
 interface TraceIssue {
   type: string
@@ -46,6 +49,9 @@ async function addSuggestedRules() {
       suggestedRules.value
     ) as string[]
     emit('rules-added', merged)
+    showToast('success', `成功加入 ${suggestedRules.value.length} 条去AI规则，下次生成时生效！`)
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : '添加失败')
   } finally {
     addingRules.value = false
   }
@@ -55,7 +61,10 @@ async function polish() {
   if (!props.content.trim() || polishing.value) return
   polishing.value = true
   try {
-    const res = await window.anovel.invoke('aitrace:polish', props.workId, props.content) as {
+    const modelOpts: { modelType?: string; modelName?: string } = {}
+    if (props.modelType) modelOpts.modelType = props.modelType
+    if (props.modelName) modelOpts.modelName = props.modelName
+    const res = await window.anovel.invoke('aitrace:polish', props.workId, props.content, modelOpts) as {
       success: boolean
       content?: string
       error?: string

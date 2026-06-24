@@ -1,8 +1,18 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onActivated } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
+import ListBatchToolbar from '../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../composables/useListSelection'
+
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 
 const props = defineProps<{ workId: number }>()
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 interface Anchor {
   id: number
@@ -69,6 +79,8 @@ const groupedAnchors = computed(() => {
 
 const activeCount = computed(() => anchors.value.filter(a => a.is_active).length)
 
+const selection = useListSelection(anchors)
+
 const chaptersByVolume = computed(() => {
   const map: Record<number, Chapter[]> = {}
   for (const ch of chapters.value) {
@@ -78,17 +90,41 @@ const chaptersByVolume = computed(() => {
   return map
 })
 
-onMounted(async () => {
+onActivated(async () => {
   await Promise.all([loadAnchors(), loadStructure()])
 })
 
 async function loadAnchors() {
   anchors.value = await window.anovel.invoke('anchor:listByWork', props.workId) as never[]
+  selection.clearSelection()
 }
+
+const matching = ref(false)
+const matchMsg = ref('')
 
 async function loadStructure() {
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as Volume[]
   chapters.value = await window.anovel.invoke('chapter:listByWork', props.workId) as Chapter[]
+}
+
+async function autoMatch() {
+  matching.value = true
+  matchMsg.value = ''
+  try {
+    const res = await window.anovel.invoke('anchor:autoMatch', props.workId, bodyModelParams()) as {
+      success: boolean; matched?: number; message?: string; error?: string
+    }
+    if (res.success) {
+      matchMsg.value = res.message || `已自动匹配 ${res.matched ?? 0} 个锚点`
+      await loadAnchors()
+    } else {
+      matchMsg.value = res.error || '匹配失败'
+    }
+  } catch (e) {
+    matchMsg.value = String(e)
+  } finally {
+    matching.value = false
+  }
 }
 
 function chapterLabel(ch: Chapter): string {
@@ -171,9 +207,21 @@ async function toggleAnchor(id: number, active: boolean) {
   await loadAnchors()
 }
 
-async function deleteAnchor(id: number) {
-  if (!confirm('删除此锚点？')) return
+async function deleteAnchor(id: number, skipConfirm = false) {
+  if (!skipConfirm && !confirm('删除此锚点？')) return
   await window.anovel.invoke('anchor:delete', id)
+}
+
+async function deleteSelectedAnchors() {
+  const items = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(items.length, '锚点'))) return
+  await runBatchDelete(items, item => deleteAnchor(item.id, true))
+  await loadAnchors()
+}
+
+async function deleteAllAnchors() {
+  if (!(await confirmDeleteAll(anchors.value.length, '锚点'))) return
+  await runBatchDelete(anchors.value, item => deleteAnchor(item.id, true))
   await loadAnchors()
 }
 </script>
@@ -197,10 +245,22 @@ async function deleteAnchor(id: number) {
       当前活跃锚点 {{ activeCount }} 个，超过建议上限 12。正文生成时仅注入优先级最高的 12 个，请禁用次要锚点。
     </div>
 
-    <button class="btn btn-primary btn-sm mb-4 gap-1" @click="showAnchorForm = !showAnchorForm">
-      <font-awesome-icon :icon="showAnchorForm ? 'times' : 'plus'" class="w-3 h-3" />
-      {{ showAnchorForm ? '取消' : '新建锚点' }}
-    </button>
+    <div class="flex gap-2 mb-4 flex-wrap">
+      <button class="btn btn-primary btn-sm gap-1" @click="showAnchorForm = !showAnchorForm">
+        <font-awesome-icon :icon="showAnchorForm ? 'times' : 'plus'" class="w-3 h-3" />
+        {{ showAnchorForm ? '取消' : '新建锚点' }}
+      </button>
+      <button
+        v-if="chapters.length > 0"
+        class="btn btn-outline btn-sm gap-1"
+        :disabled="matching"
+        @click="autoMatch"
+      >
+        <font-awesome-icon :icon="matching ? 'spinner' : 'link'" :spin="matching" class="w-3 h-3" />
+        {{ matching ? '匹配中…' : '自动匹配' }}
+      </button>
+    </div>
+    <p v-if="matchMsg" class="text-xs mb-3" :class="matchMsg.includes('失败') ? 'text-error' : 'text-success'">{{ matchMsg }}</p>
 
     <div v-if="showAnchorForm" class="card bg-base-200 border border-base-300 shadow-sm p-4 mb-6">
       <select v-model="newAnchor.type" class="select select-bordered w-full mb-3">
@@ -271,6 +331,15 @@ async function deleteAnchor(id: number) {
     </div>
 
     <div v-else class="space-y-6">
+      <ListBatchToolbar
+        :total="anchors.length"
+        :selectable-count="selection.selectableCount"
+        :selected-count="selection.selectedCount"
+        :all-selected="selection.allSelected"
+        @toggle-all="selection.toggleAll()"
+        @delete-selected="deleteSelectedAnchors"
+        @delete-all="deleteAllAnchors"
+      />
       <div v-for="t in anchorTypes" :key="t">
         <template v-if="groupedAnchors[t]?.length">
           <h4 class="text-sm font-semibold mb-2 flex items-center gap-2">
@@ -281,19 +350,27 @@ async function deleteAnchor(id: number) {
             <div
               v-for="anchor in groupedAnchors[t]"
               :key="anchor.id"
-              :class="['card bg-base-200 border border-base-300 shadow-sm p-3', anchor.is_active ? '' : 'opacity-50']"
+              :class="['card bg-base-200 border border-base-300 shadow-sm p-3', anchor.is_active ? '' : 'opacity-50', selection.isSelected(anchor, 0) ? 'ring-1 ring-primary/40' : '']"
             >
               <div class="flex items-start justify-between mb-1 gap-2">
-                <div class="min-w-0">
-                  <h5 class="font-semibold text-sm">{{ anchor.title }}</h5>
-                  <span class="badge badge-ghost badge-xs mt-1">{{ bindingLabel(anchor) }}</span>
+                <div class="flex items-start gap-2 min-w-0">
+                  <input
+                    type="checkbox"
+                    class="checkbox checkbox-xs mt-0.5 shrink-0"
+                    :checked="selection.isSelected(anchor, 0)"
+                    @change="selection.toggle(anchor, 0)"
+                  />
+                  <div class="min-w-0">
+                    <h5 class="font-semibold text-sm">{{ anchor.title }}</h5>
+                    <span class="badge badge-ghost badge-xs mt-1">{{ bindingLabel(anchor) }}</span>
+                  </div>
                 </div>
                 <div class="flex gap-1 shrink-0">
                   <button class="btn btn-ghost btn-xs gap-1" @click="toggleAnchor(anchor.id, !anchor.is_active)">
                     <font-awesome-icon :icon="anchor.is_active ? 'eye-slash' : 'eye'" class="w-3 h-3" />
                     {{ anchor.is_active ? '禁用' : '启用' }}
                   </button>
-                  <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteAnchor(anchor.id)">
+                  <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteAnchor(anchor.id).then(loadAnchors)">
                     <font-awesome-icon icon="trash" class="w-3 h-3" />
                     删除
                   </button>

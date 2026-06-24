@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
+import ListBatchToolbar from '../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../composables/useListSelection'
 
 const props = defineProps<{ workId: number }>()
 
@@ -33,10 +40,15 @@ const filtered = computed(() => {
   return list.filter(m => m.category === filter.value)
 })
 
+const selection = useListSelection(filtered, {
+  canSelect: (item) => item.work_id != null
+})
+
 onMounted(load)
 
 async function load() {
   materials.value = await window.anovel.invoke('material:listByWork', props.workId) as Material[]
+  selection.clearSelection()
 }
 
 async function addMaterial() {
@@ -52,9 +64,22 @@ async function addMaterial() {
   await load()
 }
 
-async function removeMaterial(id: number) {
-  if (!confirm('确定删除此素材？')) return
+async function removeMaterial(id: number, skipConfirm = false) {
+  if (!skipConfirm && !confirm('确定删除此素材？')) return
   await window.anovel.invoke('material:delete', id)
+}
+
+async function deleteSelectedMaterials() {
+  const items = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(items.length, '素材'))) return
+  await runBatchDelete(items, item => removeMaterial(item.id))
+  await load()
+}
+
+async function deleteAllMaterials() {
+  const items = filtered.value.filter(m => m.work_id != null)
+  if (!(await confirmDeleteAll(items.length, '可删除素材'))) return
+  await runBatchDelete(items, item => removeMaterial(item.id))
   await load()
 }
 
@@ -79,22 +104,49 @@ function copyContent(content: string) {
       <button type="button" class="btn btn-primary btn-xs ml-auto" @click="showAdd = true">添加素材</button>
     </div>
 
+    <ListBatchToolbar
+      :total="filtered.length"
+      :selectable-count="selection.selectableCount"
+      :selected-count="selection.selectedCount"
+      :all-selected="selection.allSelected"
+      @toggle-all="selection.toggleAll()"
+      @delete-selected="deleteSelectedMaterials"
+      @delete-all="deleteAllMaterials"
+    />
+
     <div class="grid gap-3">
       <div
-        v-for="item in filtered"
+        v-for="(item, index) in filtered"
         :key="item.id"
         class="card bg-base-100 border border-base-300/60"
+        :class="{ 'ring-1 ring-primary/40': selection.isSelected(item, index) }"
       >
         <div class="card-body p-4">
           <div class="flex items-start justify-between gap-2 mb-2">
-            <div>
-              <span class="badge badge-outline badge-xs mr-2">{{ CATEGORY_LABELS[item.category] ?? item.category }}</span>
-              <span class="font-semibold text-sm">{{ item.title || '未命名' }}</span>
-              <span v-if="!item.work_id" class="badge badge-ghost badge-xs ml-2">内置</span>
+            <div class="flex items-start gap-2 min-w-0">
+              <input
+                v-if="item.work_id"
+                type="checkbox"
+                class="checkbox checkbox-xs mt-0.5 shrink-0"
+                :checked="selection.isSelected(item, index)"
+                @change="selection.toggle(item, index)"
+              />
+              <div class="min-w-0">
+                <span class="badge badge-outline badge-xs mr-2">{{ CATEGORY_LABELS[item.category] ?? item.category }}</span>
+                <span class="font-semibold text-sm">{{ item.title || '未命名' }}</span>
+                <span v-if="!item.work_id" class="badge badge-ghost badge-xs ml-2">内置</span>
+              </div>
             </div>
             <div class="flex gap-1 shrink-0">
               <button type="button" class="btn btn-ghost btn-xs" @click="copyContent(item.content)">复制</button>
-              <button v-if="item.work_id" type="button" class="btn btn-ghost btn-xs text-error" @click="removeMaterial(item.id)">删除</button>
+              <button
+                v-if="item.work_id"
+                type="button"
+                class="btn btn-ghost btn-xs text-error"
+                @click="removeMaterial(item.id).then(() => load())"
+              >
+                删除
+              </button>
             </div>
           </div>
           <pre class="text-xs whitespace-pre-wrap text-base-content/70 leading-relaxed">{{ item.content }}</pre>

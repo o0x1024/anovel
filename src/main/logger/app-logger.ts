@@ -1,5 +1,6 @@
 import { app } from 'electron'
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG'
@@ -12,7 +13,11 @@ export interface LogFileInfo {
 }
 
 function ensureLogDir(): string {
-  const dir = path.join(process.cwd(), 'logs')
+  const dir = app.isReady()
+    ? app.isPackaged
+      ? path.join(app.getPath('userData'), 'logs')
+      : path.join(process.cwd(), 'logs')
+    : path.join(os.tmpdir(), 'anovel-logs')
   fs.mkdirSync(dir, { recursive: true })
   return dir
 }

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import GeneralSettingsPanel from './GeneralSettingsPanel.vue'
 import BackupSettingsPanel from './BackupSettingsPanel.vue'
-import PromptTemplatesPanel from './PromptTemplatesPanel.vue'
 import AiServiceSettingsPanel from './AiServiceSettingsPanel.vue'
 
 interface Toast {
@@ -13,16 +13,41 @@ interface Toast {
 
 const categories = [
   { id: 'ai', label: 'AI 服务', icon: 'robot' },
-  { id: 'prompts', label: 'Prompt 模板', icon: 'file-lines' },
   { id: 'general', label: '常规设置', icon: 'desktop' },
   { id: 'backup', label: '数据备份', icon: 'database' }
 ] as const
 
 type CategoryId = (typeof categories)[number]['id']
 
+const route = useRoute()
+const router = useRouter()
 const activeCategory = ref<CategoryId>('ai')
 const toasts = ref<Toast[]>([])
 let toastId = 0
+
+function categoryFromQuery(): CategoryId | null {
+  const raw = route.query.category
+  const id = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw[0] : ''
+  return categories.some(c => c.id === id) ? (id as CategoryId) : null
+}
+
+onMounted(() => {
+  const fromQuery = categoryFromQuery()
+  if (fromQuery) activeCategory.value = fromQuery
+})
+
+watch(
+  () => route.query.category,
+  () => {
+    const fromQuery = categoryFromQuery()
+    if (fromQuery) activeCategory.value = fromQuery
+  }
+)
+
+watch(activeCategory, (id) => {
+  if (route.query.category === id) return
+  void router.replace({ path: '/setting', query: { ...route.query, category: id } })
+})
 
 function showToast(type: Toast['type'], message: string) {
   const id = ++toastId
@@ -87,8 +112,6 @@ function toastAlertClass(type: Toast['type']): string {
         <GeneralSettingsPanel v-if="activeCategory === 'general'" />
 
         <BackupSettingsPanel v-else-if="activeCategory === 'backup'" />
-
-        <PromptTemplatesPanel v-else-if="activeCategory === 'prompts'" />
 
         <AiServiceSettingsPanel
           v-else-if="activeCategory === 'ai'"

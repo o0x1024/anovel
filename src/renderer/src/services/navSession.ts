@@ -21,10 +21,14 @@ function writeMap(map: NavPathMap): void {
   }
 }
 
-/** 将具体路由映射到侧边栏菜单项 path */
 export function navKeyForPath(path: string): string {
   const normalized = path.split('?')[0].split('#')[0]
-  if (normalized.startsWith('/work/')) return '/'
+  if (normalized.startsWith('/novel/')) {
+    return '/'
+  }
+  if (normalized.startsWith('/story/')) {
+    return '/stories'
+  }
   return normalized
 }
 

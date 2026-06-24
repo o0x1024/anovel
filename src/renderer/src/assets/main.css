@@ -393,6 +393,13 @@
   --menu-active-bg: color-mix(in oklab, var(--color-primary) 14%, transparent);
 }
 
+/* 编辑器侧栏：禁止 menu 换列，避免高度不足时菜单项横向溢出 */
+.editor-sidebar-menu {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+}
+
 .menu :where(li:not(.menu-title) > *:not(ul, details, .menu-title, .btn)),
 .menu :where(li:not(.menu-title) > details > summary:not(.menu-title)) {
   display: grid;

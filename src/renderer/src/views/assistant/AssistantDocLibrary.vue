@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { uploadAssistantDocument, ASSISTANT_UPLOAD_ACCEPT } from '../../utils/assistantUpload'
 import type { AssistantDocumentRow } from '../../../../shared/assistant-types'
 
@@ -27,6 +27,81 @@ const formFileName = ref('')
 const selectedDoc = computed(() => docs.value.find(doc => doc.id === selectedId.value) ?? null)
 const isEditing = computed(() => editingId.value !== null)
 const isCreating = computed(() => editingId.value === 0)
+
+// --- 文档详情按需加载：避免一次性把整篇正文塞进 DOM 造成卡顿 ---
+// 将正文按段落 + 字数上限切成多个块，默认只渲染前几块，滚动到底部时再追加。
+const CHUNK_CHAR_LIMIT = 3000
+const INITIAL_CHUNKS = 3
+const STEP_CHUNKS = 3
+
+function splitIntoChunks(text: string): string[] {
+  if (!text) return []
+  const lines = text.split('\n')
+  const chunks: string[] = []
+  let buf = ''
+  const flush = () => { if (buf) { chunks.push(buf); buf = '' } }
+  for (const line of lines) {
+    // 单行超长（无换行符的巨型段落）按上限硬切，防止一个块过大
+    let remaining = line
+    while (remaining.length > CHUNK_CHAR_LIMIT) {
+      flush()
+      chunks.push(remaining.slice(0, CHUNK_CHAR_LIMIT))
+      remaining = remaining.slice(CHUNK_CHAR_LIMIT)
+    }
+    const candidate = buf ? buf + '\n' + remaining : remaining
+    if (candidate.length > CHUNK_CHAR_LIMIT && buf) {
+      flush()
+      buf = remaining
+    } else {
+      buf = candidate
+    }
+  }
+  flush()
+  return chunks
+}
+
+const chunks = computed(() => splitIntoChunks(selectedDoc.value?.content_text ?? ''))
+const renderedChunkCount = ref(INITIAL_CHUNKS)
+const allRendered = computed(() => renderedChunkCount.value >= chunks.value.length)
+const visibleChunks = computed(() => chunks.value.slice(0, renderedChunkCount.value))
+
+const detailScroll = ref<HTMLElement | null>(null)
+const sentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+
+function loadMore() {
+  if (renderedChunkCount.value < chunks.value.length) {
+    renderedChunkCount.value = Math.min(chunks.value.length, renderedChunkCount.value + STEP_CHUNKS)
+  }
+}
+
+function resetRender() {
+  renderedChunkCount.value = INITIAL_CHUNKS
+}
+
+// 选中文档或退出编辑后，重置已渲染块数并重新挂载观察器
+watch(() => selectedId.value, resetRender)
+watch(() => isEditing.value, (editing) => { if (!editing) resetRender() })
+
+// 哨兵节点出现/变化时挂载 IntersectionObserver，进入视窗即加载下一批
+watch(sentinel, async (el) => {
+  await nextTick()
+  if (observer) { observer.disconnect(); observer = null }
+  if (!el) return
+  observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) loadMore()
+    }
+  }, { root: detailScroll.value, rootMargin: '300px' })
+  observer.observe(el)
+})
+
+// 全部渲染完成后断开观察器，避免无意义的回调
+watch(allRendered, (done) => {
+  if (done && observer) { observer.disconnect(); observer = null }
+})
+
+onBeforeUnmount(() => { observer?.disconnect(); observer = null })
 
 onMounted(refresh)
 
@@ -261,7 +336,7 @@ function attachDoc(doc: AssistantDocumentRow) {
           </label>
         </div>
 
-        <div v-else-if="selectedDoc" class="flex-1 min-h-0 overflow-auto p-4">
+        <div v-else-if="selectedDoc" ref="detailScroll" class="flex-1 min-h-0 overflow-auto p-4">
           <h4 class="font-semibold">{{ selectedDoc.title }}</h4>
           <p class="text-xs text-base-content/40 mt-1">
             {{ selectedDoc.char_count.toLocaleString() }} 字 · {{ formatDate(selectedDoc.create_time) }}
@@ -269,7 +344,21 @@ function attachDoc(doc: AssistantDocumentRow) {
           <p v-if="selectedDoc.file_name" class="text-xs text-base-content/45 mt-1">
             文件名：{{ selectedDoc.file_name }}
           </p>
-          <pre class="mt-3 text-xs bg-base-200 rounded-lg p-3 whitespace-pre-wrap">{{ selectedDoc.content_text }}</pre>
+          <pre
+            v-for="(chunk, i) in visibleChunks"
+            :key="`${selectedId}-${i}`"
+            class="mt-3 text-xs bg-base-200 rounded-lg p-3 whitespace-pre-wrap break-words"
+          >{{ chunk }}</pre>
+          <div ref="sentinel" class="py-4">
+            <div v-if="!allRendered" class="flex flex-col items-center gap-2 text-xs text-base-content/40">
+              <span class="loading loading-spinner loading-sm" />
+              <span>已加载 {{ visibleChunks.length }} / {{ chunks.length }} 段，滚动加载更多…</span>
+              <button type="button" class="btn btn-ghost btn-xs" @click="loadMore">加载更多</button>
+            </div>
+            <div v-else-if="chunks.length > 0" class="text-center text-[11px] text-base-content/30">
+              已全部加载（{{ chunks.length }} 段）
+            </div>
+          </div>
         </div>
 
         <div v-else class="flex-1 grid place-items-center text-sm text-base-content/40">

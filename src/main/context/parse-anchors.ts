@@ -1,14 +1,49 @@
 import { ANCHOR_TYPES } from '../db'
 import { extractJsonCandidates } from './settings-quality-json'
 
+export type AnchorScope = 'work' | 'volume' | 'chapter'
+
 export interface ParsedAnchor {
   type: string
   title: string
   content: string
+  scope?: AnchorScope
 }
 
 export interface RevisedAnchor extends ParsedAnchor {
   id?: number
+}
+
+const SCOPE_ALIASES: Record<string, AnchorScope> = {
+  '全书级': 'work',
+  '全書級': 'work',
+  '分卷级': 'volume',
+  '分捲級': 'volume',
+  '章节级': 'chapter',
+  '章節級': 'chapter',
+  'work': 'work',
+  'volume': 'volume',
+  'chapter': 'chapter'
+}
+
+function normalizeScope(raw: string): AnchorScope | undefined {
+  const key = raw.trim()
+  return SCOPE_ALIASES[key]
+}
+
+/** 从类型标签中分离 scope，如 "scene][章节级" → {type:"scene", scope:"chapter"} */
+function splitTypeAndScope(raw: string): { type: string; scope?: AnchorScope } {
+  // 格式: "类型" 或 "类型][范围"
+  const withScope = raw.match(/^(\w+)\]\[([^\]]+)\]$/)
+  if (withScope) {
+    return { type: withScope[1], scope: normalizeScope(withScope[2]) }
+  }
+  // 格式: "类型][范围" (没有尾部])
+  const partial = raw.match(/^(\w+)\]\[(.+)$/)
+  if (partial) {
+    return { type: partial[1], scope: normalizeScope(partial[2]) }
+  }
+  return { type: raw }
 }
 
 const TYPE_ALIASES: Record<string, string> = {
@@ -51,12 +86,13 @@ export function parseAnchorSuggestions(content: string): ParsedAnchor[] {
     const body = tagged[2].trim()
     if (!body) continue
 
-    const type = normalizeType(typeRaw)
-    const split = body.match(/^([^：:]+)[：:]\s*(.+)$/)
-    if (split) {
-      anchors.push({ type, title: split[1].trim(), content: split[2].trim() })
+    const split = splitTypeAndScope(typeRaw)
+    const type = normalizeType(split.type)
+    const colon = body.match(/^([^：:]+)[：:]\s*(.+)$/)
+    if (colon) {
+      anchors.push({ type, title: colon[1].trim(), content: colon[2].trim(), scope: split.scope })
     } else {
-      anchors.push({ type, title: body.slice(0, 30), content: body })
+      anchors.push({ type, title: body.slice(0, 30), content: body, scope: split.scope })
     }
   }
 
@@ -83,14 +119,18 @@ export function parseRevisedAnchorsFromAi(content: string): RevisedAnchor[] {
             if (!title && !body) return null
             const idRaw = row.id
             const id = idRaw == null || idRaw === '' ? undefined : Number(idRaw)
+            const typeRaw = String(row.type ?? 'plot')
+            const split = splitTypeAndScope(typeRaw)
+            const scope = row.scope ? normalizeScope(String(row.scope)) : split.scope
             return {
               id: Number.isFinite(id) ? id : undefined,
-              type: normalizeType(String(row.type ?? 'plot')),
+              type: normalizeType(split.type),
               title: title || body.slice(0, 30),
-              content: body || title
+              content: body || title,
+              scope
             }
           })
-          .filter((a): a is RevisedAnchor => a !== null)
+          .filter((a): a is NonNullable<typeof a> => a !== null) as RevisedAnchor[]
       )
       if (result.length > 0) return result
     } catch {
@@ -121,13 +161,17 @@ function parseAnchorsFromJson(content: string): ParsedAnchor[] {
           const title = String(row.title ?? row.name ?? '').trim()
           const body = String(row.content ?? row.description ?? '').trim()
           if (!title && !body) return null
+          const typeRaw = String(row.type ?? 'plot')
+          const split = splitTypeAndScope(typeRaw)
+          const scope = row.scope ? normalizeScope(String(row.scope)) : split.scope
           return {
-            type: normalizeType(String(row.type ?? 'plot')),
+            type: normalizeType(split.type),
             title: title || body.slice(0, 30),
-            content: body || title
+            content: body || title,
+            scope
           }
         })
-        .filter((a): a is ParsedAnchor => a !== null)
+        .filter((a): a is NonNullable<typeof a> => a !== null) as ParsedAnchor[]
     )
   } catch {
     return []

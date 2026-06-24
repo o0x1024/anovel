@@ -15,6 +15,7 @@ export interface OpenAICompatGenerationParams {
   frequencyPenalty?: number
   presencePenalty?: number
   topP?: number
+  thinkingEnabled?: boolean
   /** DeepSeek 提供商专属：思考模式 */
   deepseekOptions?: DeepSeekProviderOptions
 }
@@ -35,7 +36,7 @@ export function buildOpenAICompatibleBody(
   if (isKimiK2Model(modelId)) {
     // K2.6：temperature / top_p / penalty 均不可改，勿传入高级配置中的值
     body.max_completion_tokens = maxOut
-    body.thinking = { type: 'disabled' }
+    body.thinking = { type: request.thinkingEnabled !== false ? 'enabled' : 'disabled' }
     return body
   }
 
@@ -56,9 +57,33 @@ export function buildOpenAICompatibleBody(
   if (request.frequencyPenalty != null) body.frequency_penalty = request.frequencyPenalty
   if (request.presencePenalty != null) body.presence_penalty = request.presencePenalty
   if (request.topP != null) body.top_p = request.topP
+
   if (request.deepseekOptions) {
-    applyDeepSeekThinkingParams(body, request.deepseekOptions)
+    const optionsToApply = {
+      ...request.deepseekOptions,
+      thinkingEnabled: request.thinkingEnabled !== undefined 
+        ? request.thinkingEnabled 
+        : request.deepseekOptions.thinkingEnabled
+    }
+    applyDeepSeekThinkingParams(body, optionsToApply)
+  } else {
+    const isReasoningModel = /deepseek-(?:r1|chat|reasoner)|reasoner|reasoning|thinking|k1\.5|qwq/i.test(modelId)
+    if (isReasoningModel) {
+      const thinkingEnabled = request.thinkingEnabled !== undefined
+        ? request.thinkingEnabled
+        : true
+
+      body.thinking = { type: thinkingEnabled ? 'enabled' : 'disabled' }
+      if (thinkingEnabled) {
+        // 思考模式开启时，大部分平台要求不能传 temperature/top_p 等，或者会忽略它们
+        delete body.temperature
+        delete body.top_p
+        delete body.frequency_penalty
+        delete body.presence_penalty
+      }
+    }
   }
+
   if (options.stream) {
     body.stream_options = { include_usage: true }
   }

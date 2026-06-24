@@ -14,8 +14,8 @@ const sourceLabels: Record<string, string> = {
   microinnovation: '微创新',
   role_engine_gen: '角色驱动',
   world_rules_gen: '世界规则',
-  emotion_curve_gen: '情感曲线',
-  ending_image_gen: '终局意象'
+  rhythm_curve_gen: '节奏曲线',
+  ending_structure_gen: '终局结构'
 }
 
 const selecting = ref(false)
@@ -93,14 +93,14 @@ const sourceStepToSlot: Record<string, import('../../../../../shared/incubator-s
   expand: 'hook',
   role_engine_gen: 'role_engine',
   world_rules_gen: 'world_rules',
-  emotion_curve_gen: 'emotion_curve',
-  ending_image_gen: 'ending_image'
+  rhythm_curve_gen: 'rhythm_curve',
+  ending_structure_gen: 'ending_structure'
 }
 
 function openAdopt(c: IncubatorCandidate) {
   const step = c.sourceStep === 'expand' || c.sourceStep === 'variants'
     || c.sourceStep === 'role_engine_gen' || c.sourceStep === 'world_rules_gen'
-    || c.sourceStep === 'emotion_curve_gen' || c.sourceStep === 'ending_image_gen'
+    || c.sourceStep === 'rhythm_curve_gen' || c.sourceStep === 'ending_structure_gen'
     ? c.sourceStep : 'expand'
   adopt.openFromCandidate(
     c.id,

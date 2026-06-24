@@ -26,10 +26,14 @@ import {
   buildAnalysisUserPrompt,
   buildDiagnoseApplyUserPrompt
 } from '../../../../../shared/incubator-analysis-prompts'
+import { STORY_INCUBATOR_ANALYSIS_PROMPTS } from '../../../../../shared/story-incubator-prompts'
 import { incubatorSeedTextKey, incubatorStateKey, storylineAdoptKey } from './incubator-context'
+
+import { useBodyGenerationModel } from '../../../composables/useBodyGenerationModel'
 
 const props = defineProps<{ workId: number }>()
 const emit = defineEmits<{ workspaceRefresh: [] }>()
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const incubator = inject(incubatorStateKey)!
 const seedText = inject(incubatorSeedTextKey)!
@@ -40,8 +44,8 @@ const ANALYSIS_UI_ORDER = [
   'expand',
   'role_engine',
   'world_rules',
-  'emotion_curve',
-  'ending_image',
+  'rhythm_curve',
+  'ending_structure',
   'frontstory',
   'diagnose',
   'reverse',
@@ -61,23 +65,27 @@ interface AnalysisConfig {
   sourceStep?: IncubatorCandidateSourceStep
 }
 
-function toAnalysisConfig(key: string): AnalysisConfig | null {
-  const p = INCUBATOR_ANALYSIS_PROMPTS[key]
-  if (!p) return null
-  return {
-    key,
-    label: p.label,
-    step: p.step,
-    system: p.system,
-    cardFormat: p.cardFormat,
-    slotTarget: p.slotTarget,
-    sourceStep: p.sourceStep as IncubatorCandidateSourceStep | undefined
-  }
-}
+const workType = ref<string | null>(null)
+window.anovel.invoke('work:get', props.workId).then(w => {
+  workType.value = (w as { work_type?: string })?.work_type ?? null
+})
 
-const analyses: AnalysisConfig[] = ANALYSIS_UI_ORDER.map(k => toAnalysisConfig(k)).filter(
-  (x): x is AnalysisConfig => x != null
-)
+const analyses = computed<AnalysisConfig[]>(() => {
+  const prompts = workType.value === 'story' ? STORY_INCUBATOR_ANALYSIS_PROMPTS : INCUBATOR_ANALYSIS_PROMPTS
+  return ANALYSIS_UI_ORDER.map(k => {
+    const p = prompts[k] || INCUBATOR_ANALYSIS_PROMPTS[k]
+    if (!p) return null
+    return {
+      key: k,
+      label: p.label,
+      step: p.step,
+      system: p.system,
+      cardFormat: p.cardFormat,
+      slotTarget: p.slotTarget,
+      sourceStep: p.sourceStep as IncubatorCandidateSourceStep | undefined
+    }
+  }).filter((x): x is AnalysisConfig => x != null)
+})
 
 type AnalysisKey = string
 
@@ -92,15 +100,24 @@ const applyingDiagnoseFixes = ref(false)
 const diagnoseApplyMessage = ref('')
 const cardsByKey = ref<Partial<Record<AnalysisKey, CardItem[]>>>({})
 const parseWarningsByKey = ref<Partial<Record<AnalysisKey, string>>>({})
+const clearingAll = ref(false)
 
 const visibleTabs = computed(() =>
-  analyses.filter(item =>
+  analyses.value.filter(item =>
     !!(resultsByKey.value[item.key] || errorsByKey.value[item.key] || loadingByKey.value[item.key])
   )
 )
 
+const hasAnySavedResults = computed(() =>
+  analyses.value.some(item => !!resultsByKey.value[item.key]?.trim())
+)
+
+const isAnyLoading = computed(() =>
+  analyses.value.some(item => !!loadingByKey.value[item.key])
+)
+
 const activeAnalysis = computed(() =>
-  analyses.find(item => item.key === activeTab.value) ?? null
+  analyses.value.find(item => item.key === activeTab.value) ?? null
 )
 
 const activeCards = computed(() => cardsByKey.value[activeTab.value ?? ''] ?? [])
@@ -114,34 +131,104 @@ const filledSlotsMap = computed(() => {
   return map
 })
 
+const getSlotMappingLabel = (key: string) => {
+  const isStory = workType.value === 'story'
+  const labels: Record<string, string> = {
+    core_conflict: isStory ? '主冲突轴 (对应微创新变体)' : '主冲突轴 (对应变体探索)',
+    hook: isStory ? '前台钩子 (对应黄金开局扩写)' : '前台钩子 (对应方向扩写)',
+    world_rules: isStory ? '世界规则轴 (对应背景规则轴)' : '世界规则轴 (对应世界规则轴)',
+    role_engine: isStory ? '角色驱动轴 (对应反差人设轴)' : '角色驱动轴 (对应角色驱动轴)',
+    rhythm_curve: isStory ? '节奏曲线轴 (对应极速节奏曲线)' : '节奏曲线轴 (对应节奏曲线轴)',
+    ending_structure: isStory ? '终局结构 (对应清算终局结构)' : '终局结构 (对应终局结构)'
+  }
+  return labels[key] || INCUBATOR_SLOT_LABELS[key as keyof typeof INCUBATOR_SLOT_LABELS] || key
+}
+
 const workflowHint = computed(() => {
   const nextSlot = INCUBATOR_SLOT_FILL_ORDER.find(k => !filledSlotsMap.value[k]?.trim())
   if (nextSlot) {
-    return `下一步建议先填「${INCUBATOR_SLOT_LABELS[nextSlot]}」；分析时会自动带入已确认槽位。完整流程见页顶「推荐操作顺序」。`
+    return `下一步建议先填「${getSlotMappingLabel(nextSlot)}」；分析时会自动带入已确认槽位。完整流程见页顶「推荐操作顺序」。`
   }
   return '六槽已齐：请运行门禁并冻结；重跑分析仍会带入已确认槽位作为约束。'
 })
 
+const charactersList = ref<string[]>([])
+
+async function loadCharacters() {
+  try {
+    const registryNames = await window.anovel.invoke('name:list', props.workId, 'character') as { name: string }[]
+    const cards = await window.anovel.invoke('characterCards:list', props.workId) as { name: string }[]
+    const namesSet = new Set<string>()
+    cards.forEach(c => {
+      const name = c.name?.trim()
+      if (name) namesSet.add(name)
+    })
+    registryNames.forEach(r => {
+      const name = r.name?.trim()
+      if (name) namesSet.add(name)
+    })
+    charactersList.value = [...namesSet]
+  } catch (e) {
+    console.error('Failed to load characters:', e)
+  }
+}
+
+watch(() => props.workId, () => {
+  void loadCharacters()
+}, { immediate: true })
+
 async function loadSavedResults() {
+  void loadCharacters()
   const settings = await window.anovel.invoke('setting:listByWork', props.workId) as { type: string; content: string }[]
   const loaded: Partial<Record<AnalysisKey, string>> = {}
-  for (const item of analyses) {
+  for (const item of analyses.value) {
     const row = settings.find(s => s.type === item.step)
     if (row?.content) loaded[item.key] = row.content
   }
   resultsByKey.value = loaded
-  const firstKey = analyses.find(item => loaded[item.key])?.key
+  const firstKey = analyses.value.find(item => loaded[item.key])?.key
   if (firstKey) activeTab.value = firstKey
-  for (const item of analyses) {
+  for (const item of analyses.value) {
     if (item.cardFormat && loaded[item.key]) {
-      const cards = await parseAndStoreCards(item, loaded[item.key]!, true)
-      await persistCards(item, cards)
+      await parseAndStoreCards(item, loaded[item.key]!, true)
     }
   }
   await incubator.refresh()
 }
 
 defineExpose({ loadSavedResults })
+
+async function clearAllResults() {
+  if (!hasAnySavedResults.value || clearingAll.value || isAnyLoading.value) return
+  if (
+    !confirm(
+      '确定清除全部 AI 分析结果？\n\n将删除所有分析文本及同步到候选池的 AI 候选（手动添加的候选、创作种子与主线槽位不受影响）。'
+    )
+  ) {
+    return
+  }
+
+  clearingAll.value = true
+  try {
+    await window.anovel.invoke('incubator:clearAnalysisResults', props.workId)
+
+    resultsByKey.value = {}
+    errorsByKey.value = {}
+    cardsByKey.value = {}
+    parseWarningsByKey.value = {}
+    activeTab.value = null
+    diagnoseApplyMessage.value = ''
+
+    await incubator.refresh()
+    emit('workspaceRefresh')
+  } catch (e) {
+    const message = String(e)
+    await reportRendererError('incubator', `清除分析结果失败: ${message}`, { workId: props.workId })
+    alert(`清除失败：${message}`)
+  } finally {
+    clearingAll.value = false
+  }
+}
 
 async function parseAndStoreCards(
   config: AnalysisConfig,
@@ -153,6 +240,8 @@ async function parseAndStoreCards(
     items = await window.anovel.invoke('incubator:parseVariants', content, legacyFallback) as CardItem[]
   } else if (config.cardFormat === 'expand') {
     items = await window.anovel.invoke('incubator:parseExpansion', content, legacyFallback) as CardItem[]
+  } else if (config.cardFormat === 'anchors') {
+    items = await window.anovel.invoke('incubator:parseAnchors', content) as CardItem[]
   }
   cardsByKey.value = { ...cardsByKey.value, [config.key]: items }
   parseWarningsByKey.value = {
@@ -166,6 +255,7 @@ async function parseAndStoreCards(
 
 async function persistCards(config: AnalysisConfig, items: CardItem[]) {
   if (!items.length || !config.sourceStep) return
+  if (config.key === 'anchors') return // 锚点有独立导入按钮，不自动持久化到候选池
   if (config.key === 'variants') {
     await window.anovel.invoke('incubator:persistVariants', props.workId, toPlainForIpc(items))
   } else if (config.key === 'expand') {
@@ -180,16 +270,22 @@ async function persistCards(config: AnalysisConfig, items: CardItem[]) {
   }
 }
 
-for (const cfg of analyses) {
-  if (!cfg.cardFormat) continue
-  watch(
-    () => resultsByKey.value[cfg.key],
-    (content) => {
-      if (content) void parseAndStoreCards(cfg, content, false)
-      else cardsByKey.value = { ...cardsByKey.value, [cfg.key]: [] }
+watch(
+  () => analyses.value,
+  (newAnalyses) => {
+    for (const cfg of newAnalyses) {
+      if (!cfg.cardFormat) continue
+      watch(
+        () => resultsByKey.value[cfg.key],
+        (content) => {
+          if (content) void parseAndStoreCards(cfg, content, false)
+          else cardsByKey.value = { ...cardsByKey.value, [cfg.key]: [] }
+        }
+      )
     }
-  )
-}
+  },
+  { immediate: true }
+)
 
 function isItemLoading(key: AnalysisKey) {
   return !!loadingByKey.value[key]
@@ -206,14 +302,16 @@ async function runAnalysis(item: AnalysisConfig) {
     const userPrompt = buildAnalysisUserPrompt(
       seedText.value.trim(),
       filledSlotsMap.value,
-      item.key
+      item.key,
+      charactersList.value
     )
     const res = await window.anovel.invoke('model:chat', {
       prompt: userPrompt,
       systemPrompt: item.system,
       workId: props.workId,
       step: item.step,
-      enrichWorkContext: false
+      enrichWorkContext: false,
+      ...bodyModelParams()
     }) as ModelChatResult
 
     if (res.success) {
@@ -250,14 +348,16 @@ async function applyDiagnoseFixesToSlots() {
     const userPrompt = buildDiagnoseApplyUserPrompt(
       seedText.value.trim(),
       filledSlotsMap.value,
-      report
+      report,
+      charactersList.value
     )
     const res = await window.anovel.invoke('model:chat', {
       prompt: userPrompt,
       systemPrompt: INCUBATOR_DIAGNOSE_APPLY_SYSTEM,
       workId: props.workId,
       step: 'incubator_diagnose_apply',
-      enrichWorkContext: false
+      enrichWorkContext: false,
+      ...bodyModelParams()
     }) as ModelChatResult
 
     if (!res.success) {
@@ -299,11 +399,19 @@ async function importAnchorsToDb() {
   if (!content || importingAnchors.value) return
   importingAnchors.value = true
   try {
-    const parsed = await window.anovel.invoke('anchor:parseSuggestions', content) as {
-      type: string
-      title: string
-      content: string
-    }[]
+    // 优先用 JSON 解析（新格式），回退到 Markdown 解析（旧格式兼容）
+    let parsed: { type: string; title: string; content: string; scope?: string }[] = []
+    const trimmed = content.trim()
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/) ?? trimmed.match(/(\[[\s\S]*\])/)
+    if (fenced) {
+      try {
+        const arr = JSON.parse(fenced[1] ?? fenced[0])
+        if (Array.isArray(arr) && arr.length > 0 && arr[0].title && arr[0].content) parsed = arr
+      } catch { /* 回退 */ }
+    }
+    if (!parsed.length) {
+      parsed = await window.anovel.invoke('anchor:parseSuggestions', content) as typeof parsed
+    }
     if (parsed.length === 0) {
       alert('未能从结果中解析出锚点')
       return
@@ -313,9 +421,18 @@ async function importAnchorsToDb() {
       type: a.type,
       title: a.title,
       content: a.content,
+      scope: a.scope,
       created_step: 'incubator_anchors'
     })))
     alert(`已导入 ${parsed.length} 个锚点`)
+
+    // 自动匹配：尝试将新导入的锚点绑定到已有章节/分卷
+    try {
+      const matchRes = await window.anovel.invoke('anchor:autoMatch', props.workId, bodyModelParams()) as { success: boolean; matched?: number; message?: string }
+      if (matchRes.success && matchRes.matched) {
+        alert(`已自动匹配 ${matchRes.matched} 个锚点到对应章节/分卷`)
+      }
+    } catch { /* 非关键 */ }
   } finally {
     importingAnchors.value = false
   }
@@ -352,7 +469,7 @@ function showMarkdownForActive(): boolean {
 function adoptSourceStep(config: AnalysisConfig): AdoptSourceStep {
   const s = config.sourceStep
   if (s === 'variants' || s === 'expand' || s === 'role_engine_gen' ||
-      s === 'world_rules_gen' || s === 'emotion_curve_gen' || s === 'ending_image_gen') return s
+      s === 'world_rules_gen' || s === 'rhythm_curve_gen' || s === 'ending_structure_gen') return s
   return 'expand'
 }
 
@@ -405,15 +522,24 @@ function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
 <template>
   <div>
     <p class="text-xs text-base-content/50 mb-3">{{ workflowHint }}</p>
-    <div class="flex flex-wrap gap-2 mb-4">
+    <div class="flex flex-wrap items-center gap-2 mb-4">
       <button
         v-for="item in analyses"
         :key="item.key"
         class="btn btn-outline btn-primary btn-sm"
-        :disabled="!seedText.trim() || isItemLoading(item.key)"
+        :disabled="!seedText.trim() || isItemLoading(item.key) || clearingAll"
         @click="runAnalysis(item)"
       >
         {{ isItemLoading(item.key) ? '分析中...' : item.label }}
+      </button>
+      <button
+        v-if="hasAnySavedResults"
+        type="button"
+        class="btn btn-outline btn-error btn-sm ml-auto"
+        :disabled="clearingAll || isAnyLoading"
+        @click="clearAllResults"
+      >
+        {{ clearingAll ? '清除中...' : '清除全部分析' }}
       </button>
     </div>
 
@@ -555,7 +681,7 @@ function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
               :work-id="workId"
               :step="activeAnalysis.step"
               :content="resultsByKey[activeAnalysis.key]!"
-              :regenerate-prompt="buildAnalysisUserPrompt(seedText, filledSlotsMap, activeAnalysis.key)"
+              :regenerate-prompt="buildAnalysisUserPrompt(seedText, filledSlotsMap, activeAnalysis.key, charactersList)"
               :regenerate-system-prompt="activeAnalysis.system"
               :enrich-work-context="false"
               @update:content="updateActiveResult"

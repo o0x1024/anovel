@@ -25,7 +25,8 @@ function formatDate(dateStr: string): string {
   return new Date(`${dateStr}Z`).toLocaleString('zh-CN')
 }
 
-function writingStyleLabel(styleId: number): string {
+function writingStyleLabel(styleId: number | null): string {
+  if (styleId == null) return '无文风'
   return props.styleNameById.get(styleId) ?? `文风#${styleId}`
 }
 </script>

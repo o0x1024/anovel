@@ -80,12 +80,12 @@ async function runChecklist() {
   <div>
     <PanelTitle title="写作障碍应对" subtitle="随机灵感、情节走向、角色思维实验、改文自检与卡文类型指南" />
 
-    <div role="tablist" class="tabs tabs-boxed tabs-sm mb-4 bg-base-200/50 w-fit flex-wrap">
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'blocktype' }" @click="tab = 'blocktype'">卡文类型</button>
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'inspiration' }" @click="tab = 'inspiration'">随机灵感</button>
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'directions' }" @click="tab = 'directions'">5 种走向</button>
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'whatif' }" @click="tab = 'whatif'">如果…会怎样</button>
-      <button role="tab" class="tab" :class="{ 'tab-active': tab === 'checklist' }" @click="tab = 'checklist'">改文自检</button>
+    <div role="tablist" class="tabs tabs-box tabs-sm w-fit mb-4">
+      <a role="tab" href="#" class="tab" :class="{ 'tab-active': tab === 'blocktype' }" @click.prevent="tab = 'blocktype'">卡文类型</a>
+      <a role="tab" href="#" class="tab" :class="{ 'tab-active': tab === 'inspiration' }" @click.prevent="tab = 'inspiration'">随机灵感</a>
+      <a role="tab" href="#" class="tab" :class="{ 'tab-active': tab === 'directions' }" @click.prevent="tab = 'directions'">5 种走向</a>
+      <a role="tab" href="#" class="tab" :class="{ 'tab-active': tab === 'whatif' }" @click.prevent="tab = 'whatif'">如果…会怎样</a>
+      <a role="tab" href="#" class="tab" :class="{ 'tab-active': tab === 'checklist' }" @click.prevent="tab = 'checklist'">改文自检</a>
     </div>
 
     <p v-if="error" class="text-error text-sm mb-3">{{ error }}</p>

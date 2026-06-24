@@ -1,13 +1,25 @@
 <script setup lang="ts">
-import { computed, inject, unref, type Ref } from 'vue'
+import { computed, inject, unref, ref, watch, type Ref } from 'vue'
 import {
   INCUBATOR_SLOT_KEYS,
-  INCUBATOR_SLOT_LABELS
+  INCUBATOR_SLOT_LABELS,
+  getIncubatorSlotLabel
 } from '../../../../../shared/incubator-slots'
 import { INCUBATOR_CANDIDATE_ADOPT_MIN_SCORE } from '../../../../../shared/incubator-gate'
 import { storylineAdoptKey } from './incubator-context'
 
+const props = defineProps<{ workId: number }>()
+
 const adopt = inject(storylineAdoptKey)!
+
+const workType = ref<string | null>(null)
+watch(() => props.workId, async (id) => {
+  if (!id) return
+  try {
+    const w = await window.anovel.invoke('work:get', id) as { work_type?: string } | null
+    workType.value = w?.work_type ?? null
+  } catch {}
+}, { immediate: true })
 
 /** 未 reactive 时 Ref 对象在 :class 里恒为 truthy，会误显示弹窗 */
 function refBool(r: Ref<boolean> | boolean): boolean {
@@ -37,7 +49,7 @@ const scoreBelowThreshold = computed(
       <label class="text-xs text-base-content/50">目标槽位</label>
       <select v-model="adopt.slotKey" class="select select-bordered select-sm w-full mb-3">
         <option v-for="key in INCUBATOR_SLOT_KEYS" :key="key" :value="key">
-          {{ INCUBATOR_SLOT_LABELS[key] }}
+          {{ getIncubatorSlotLabel(key, workType) }}
         </option>
       </select>
       <p

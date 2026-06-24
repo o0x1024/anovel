@@ -6,6 +6,7 @@ export interface AnchorRow {
   type: string
   title: string
   content: string
+  scope: string | null
   is_active: number
   created_step: string | null
   target_chapter_id: number | null
@@ -18,6 +19,7 @@ export interface AnchorCreateInput {
   type: string
   title: string
   content: string
+  scope?: string | null
   created_step?: string
   target_chapter_id?: number | null
   target_volume_id?: number | null
@@ -57,12 +59,13 @@ export class AnchorDAO extends BaseDAO {
 
   create(input: AnchorCreateInput): number {
     return this.insert(
-      'INSERT INTO anchors (work_id, type, title, content, created_step, target_chapter_id, target_volume_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO anchors (work_id, type, title, content, scope, created_step, target_chapter_id, target_volume_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [
         input.work_id,
         input.type,
         input.title,
         input.content,
+        input.scope ?? null,
         input.created_step ?? null,
         input.target_chapter_id ?? null,
         input.target_volume_id ?? null
@@ -74,6 +77,7 @@ export class AnchorDAO extends BaseDAO {
     title?: string
     content?: string
     type?: string
+    scope?: string | null
     target_chapter_id?: number | null
     target_volume_id?: number | null
   }): boolean {
@@ -82,6 +86,7 @@ export class AnchorDAO extends BaseDAO {
     if (fields.title !== undefined) { sets.push('title = ?'); vals.push(fields.title) }
     if (fields.content !== undefined) { sets.push('content = ?'); vals.push(fields.content) }
     if (fields.type !== undefined) { sets.push('type = ?'); vals.push(fields.type) }
+    if (fields.scope !== undefined) { sets.push('scope = ?'); vals.push(fields.scope) }
     if (fields.target_chapter_id !== undefined) { sets.push('target_chapter_id = ?'); vals.push(fields.target_chapter_id) }
     if (fields.target_volume_id !== undefined) { sets.push('target_volume_id = ?'); vals.push(fields.target_volume_id) }
     if (sets.length === 0) return false

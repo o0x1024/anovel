@@ -1,4 +1,4 @@
-import { coreSettingDAO, volumeChapterDAO } from '../db'
+import { coreSettingDAO, volumeChapterDAO, workDAO } from '../db'
 import { getWritingStats } from './writing-stats'
 import {
   DEFAULT_NOVEL_LENGTH,
@@ -6,6 +6,7 @@ import {
   TARGET_WORD_PRESETS,
   WORDS_PER_CHAPTER_PRESETS,
   planFromNovelLength,
+  getPresetsForType,
   type NovelLength
 } from '../../shared/writing-plan-presets'
 
@@ -17,6 +18,7 @@ export interface WritingPlan {
   novelLength: NovelLength
   targetTotalWords: number
   wordsPerChapter: number
+  workType?: string
 }
 
 export interface VolumePlanStatus {
@@ -40,7 +42,8 @@ export interface WritingPlanStatus {
 }
 
 export const DEFAULT_WRITING_PLAN: WritingPlan = {
-  ...planFromNovelLength(DEFAULT_NOVEL_LENGTH)
+  ...planFromNovelLength(DEFAULT_NOVEL_LENGTH),
+  workType: 'novel'
 }
 
 export { TARGET_WORD_PRESETS, WORDS_PER_CHAPTER_PRESETS, NOVEL_LENGTH_PRESETS }
@@ -49,46 +52,103 @@ function isNovelLength(value: unknown): value is NovelLength {
   return value === 'short' || value === 'medium' || value === 'long'
 }
 
-function normalizePlan(raw: Partial<WritingPlan> | null | undefined): WritingPlan {
+function normalizePlan(raw: Partial<WritingPlan> | null | undefined, workType: string = 'novel'): WritingPlan {
+  const finalWorkType = raw?.workType || workType
   const novelLength = isNovelLength(raw?.novelLength) ? raw.novelLength : DEFAULT_NOVEL_LENGTH
-  const preset = NOVEL_LENGTH_PRESETS[novelLength]
+  const presets = getPresetsForType(finalWorkType)
+  const preset = presets[novelLength]
   const targetTotalWords = Number(raw?.targetTotalWords)
   const wordsPerChapter = Number(raw?.wordsPerChapter)
+
+  const minWords = finalWorkType === 'story' ? 6_000 : 50_000
+  const maxWords = finalWorkType === 'story' ? 80_000 : 5_000_000
+
   return {
     novelLength,
-    targetTotalWords: targetTotalWords >= 50_000 && targetTotalWords <= 5_000_000
+    targetTotalWords: targetTotalWords >= minWords && targetTotalWords <= maxWords
       ? Math.round(targetTotalWords)
       : preset.targetTotalWords,
-    wordsPerChapter: (WORDS_PER_CHAPTER_PRESETS as readonly number[]).includes(wordsPerChapter)
+    wordsPerChapter: wordsPerChapter >= 500 && wordsPerChapter <= 20_000
       ? wordsPerChapter
-      : preset.wordsPerChapter
+      : preset.wordsPerChapter,
+    workType: finalWorkType
   }
 }
 
 export function initWritingPlanForWork(workId: number, novelLength: NovelLength = DEFAULT_NOVEL_LENGTH): WritingPlan {
-  const plan = normalizePlan(planFromNovelLength(novelLength))
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? 'novel'
+  const plan = normalizePlan({
+    ...planFromNovelLength(novelLength, workType),
+    workType
+  })
+  workDAO.update(workId, {
+    novelLength: plan.novelLength,
+    targetTotalWords: plan.targetTotalWords,
+    wordsPerChapter: plan.wordsPerChapter
+  })
+  // 同时写入 core_settings 保持向后兼容
   coreSettingDAO.upsert(workId, WRITING_PLAN_TYPE, JSON.stringify(plan))
   return plan
 }
 
 export function loadWritingPlan(workId: number): WritingPlan {
-  const row = coreSettingDAO.getByType(workId, WRITING_PLAN_TYPE)
-  if (!row?.content) return { ...DEFAULT_WRITING_PLAN }
-  try {
-    return normalizePlan(JSON.parse(row.content) as Partial<WritingPlan>)
-  } catch {
-    return { ...DEFAULT_WRITING_PLAN }
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? 'novel'
+  // 优先从 works 表列读取
+  if (work?.novel_length && work?.target_total_words) {
+    const plan = normalizePlan({
+      novelLength: isNovelLength(work.novel_length) ? work.novel_length : undefined,
+      targetTotalWords: work.target_total_words ?? undefined,
+      wordsPerChapter: work.words_per_chapter ?? undefined,
+      workType
+    })
+    // 回填 core_settings 保持数据一致
+    coreSettingDAO.upsert(workId, WRITING_PLAN_TYPE, JSON.stringify(plan))
+    return plan
   }
+
+  // 回退到 core_settings JSON（旧数据）
+  const row = coreSettingDAO.getByType(workId, WRITING_PLAN_TYPE)
+  if (row?.content) {
+    try {
+      const parsed = JSON.parse(row.content) as Partial<WritingPlan>
+      const plan = normalizePlan({
+        ...parsed,
+        workType: parsed.workType || workType
+      })
+      // 升迁到 works 表列
+      workDAO.update(workId, {
+        novelLength: plan.novelLength,
+        targetTotalWords: plan.targetTotalWords,
+        wordsPerChapter: plan.wordsPerChapter
+      })
+      return plan
+    } catch {
+      // fall through to default
+    }
+  }
+
+  return normalizePlan({ workType })
 }
 
 export function saveWritingPlan(workId: number, input: Partial<WritingPlan>): WritingPlan {
-  const plan = normalizePlan({ ...loadWritingPlan(workId), ...input })
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? 'novel'
+  const plan = normalizePlan({ ...loadWritingPlan(workId), ...input, workType })
+  workDAO.update(workId, {
+    novelLength: plan.novelLength,
+    targetTotalWords: plan.targetTotalWords,
+    wordsPerChapter: plan.wordsPerChapter
+  })
   coreSettingDAO.upsert(workId, WRITING_PLAN_TYPE, JSON.stringify(plan))
   return plan
 }
 
 export function applyNovelLengthPreset(workId: number, novelLength: NovelLength): WritingPlan {
-  return saveWritingPlan(workId, planFromNovelLength(novelLength))
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? 'novel'
+  return saveWritingPlan(workId, planFromNovelLength(novelLength, workType))
 }
 
 export function suggestTotalChapters(plan: WritingPlan): number {

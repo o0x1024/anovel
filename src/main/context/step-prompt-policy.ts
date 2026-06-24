@@ -1,5 +1,5 @@
 import type { WorkContextOptions } from './work-context'
-import { isCoreSettingsCharacterGenerateStep } from './style-step-rules'
+import { isCoreSettingsAiGenerateStep } from './style-step-rules'
 
 /** 正文生成 */
 export function isBodyGenerationStep(step: string | undefined): boolean {
@@ -37,6 +37,7 @@ export function isCoreSettingsFlowStep(step: string | undefined): boolean {
  */
 export function isFocusedAnalysisStep(step: string | undefined): boolean {
   if (!step) return false
+  if (step === 'story_title_hook_gen') return true
   if (step.endsWith('_self_check')) return true
   const prefixes = [
     'critique_',
@@ -45,6 +46,7 @@ export function isFocusedAnalysisStep(step: string | undefined): boolean {
     'memory_extract',
     'ai_trace_',
     'lab_deai',
+    'lab_aigc_detect',
     'model_debate',
     'revision_checklist',
     'writer_block_'
@@ -56,7 +58,7 @@ export function shouldInjectAnchors(step: string | undefined): boolean {
   if (!step) return false
   if (isIncubatorStep(step)) return false
   if (isFocusedAnalysisStep(step)) return false
-  if (isCoreSettingsCharacterGenerateStep(step)) return false
+  if (isCoreSettingsAiGenerateStep(step)) return false
   return true
 }
 
@@ -65,7 +67,7 @@ export function shouldInjectTasteAndConditionRules(step: string | undefined): bo
   if (isOutlinePlanningStep(step)) return false
   if (isIncubatorStep(step)) return false
   if (isFocusedAnalysisStep(step)) return false
-  if (isCoreSettingsCharacterGenerateStep(step)) return false
+  if (isCoreSettingsAiGenerateStep(step)) return false
   return true
 }
 
@@ -75,7 +77,7 @@ export function shouldInjectWritingStyle(step: string | undefined): boolean {
   if (isFocusedAnalysisStep(step)) return false
   if (isOutlinePlanningStep(step)) return false
   if (isIncubatorStep(step)) return false
-  if (isCoreSettingsCharacterGenerateStep(step)) return false
+  if (isCoreSettingsAiGenerateStep(step)) return false
   return true
 }
 
@@ -128,7 +130,7 @@ function mergeBodyWorkContextOptions(
   options: WorkContextOptions,
   chapterVolumeId?: number
 ): WorkContextOptions {
-  const excludeCoreTypes = [...new Set([...(options.excludeCoreTypes ?? []), 'worldview'])]
+  const excludeCoreTypes = [...new Set([...(options.excludeCoreTypes ?? []), 'world_pressure'])]
   return {
     ...options,
     includeIncubator: false,

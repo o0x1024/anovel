@@ -6,14 +6,37 @@ import {
 } from '../../db/dao/incubator'
 import { INCUBATOR_SLOT_LABELS, INCUBATOR_SLOT_KEYS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
+import type { IncubatorGateReport } from '../../../shared/incubator-types'
 import { assertTransition } from './state-machine'
 import { runIncubatorGate } from './gate-check'
 import { getBranchBaseVersionId } from './version-ops'
 import { synthesizeStorylineForFreeze } from './synthesize-storyline'
+import type { WorkModelOptions } from '../../../shared/work-model-options'
+
+function getCachedGateReport(workId: number): IncubatorGateReport | null {
+  const stateRow = incubatorStateDAO.getByWork(workId)
+  if (!stateRow?.last_gate_report_json) return null
+  try {
+    const parsed = JSON.parse(stateRow.last_gate_report_json) as Partial<IncubatorGateReport>
+    if (typeof parsed.passed !== 'boolean') return null
+    return {
+      passed: parsed.passed,
+      filledSlotCount: parsed.filledSlotCount ?? 0,
+      serializabilityScore: parsed.serializabilityScore ?? 0,
+      conflictClosureScore: parsed.conflictClosureScore ?? 0,
+      issues: parsed.issues ?? [],
+      suggestions: parsed.suggestions ?? [],
+      coherence: parsed.coherence ?? []
+    }
+  } catch {
+    return null
+  }
+}
 
 export async function freezeIncubatorStorylineVersion(
   workId: number,
-  label?: string
+  label?: string,
+  modelOpts?: WorkModelOptions
 ): Promise<{ success: boolean; error?: string; versionId?: number }> {
   const frozenCount = incubatorVersionDAO.listByWork(workId).filter(v => v.is_frozen === 1).length
   const resolvedLabel = label ?? `Storyline V${frozenCount + 1}`
@@ -22,11 +45,30 @@ export async function freezeIncubatorStorylineVersion(
     const prevFrozen = incubatorVersionDAO.getLatestFrozen(workId)
     if (prevFrozen) resolvedBaseId = prevFrozen.id
   }
-  const gate = runIncubatorGate(workId)
+
+  // 优先使用缓存的 AI 门禁报告，避免重复调用 AI 导致非确定性结果
+  let gate = getCachedGateReport(workId)
+  if (gate) {
+    console.log(`[freeze] workId=${workId} 使用缓存门禁报告: passed=${gate.passed}, issues=${gate.issues.length}, coherence=${gate.coherence.length}`)
+  } else {
+    console.log(`[freeze] workId=${workId} 无缓存门禁报告，重新运行 AI 门禁`)
+    gate = await runIncubatorGate(workId, undefined, modelOpts)
+    console.log(`[freeze] workId=${workId} AI 门禁结果: passed=${gate.passed}, issues=${gate.issues.length}`)
+  }
+
   if (!gate.passed) {
+    const reasons: string[] = []
+    const blockers = (gate.coherence ?? []).filter(c => c.severity === 'blocking')
+    if (blockers.length) {
+      reasons.push(...blockers.map(b => `[${b.slotKey}] ${b.issue}`))
+    }
+    if (gate.issues.length) {
+      reasons.push(...gate.issues)
+    }
+    const detail = reasons.length ? reasons.join('；') : '门禁未通过，请运行 AI 门禁查看详情'
     return {
       success: false,
-      error: `门禁未通过：${gate.issues.join('；')}`
+      error: `门禁未通过：${detail}`
     }
   }
 
@@ -37,7 +79,7 @@ export async function freezeIncubatorStorylineVersion(
     slotMap[key] = row?.content?.trim() ?? ''
   }
 
-  const synthesis = await synthesizeStorylineForFreeze(workId, slotMap)
+  const synthesis = await synthesizeStorylineForFreeze(workId, slotMap, modelOpts)
 
   const snapshot = {
     slots: slotMap,

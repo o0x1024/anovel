@@ -1,7 +1,9 @@
 import { coreSettingDAO, aiFavoriteDAO, writingStyleDAO } from '../db'
+import { STYLE_CORE_DIRECTIVE } from './writing-techniques'
 import { bodyWordCountBounds } from '../../shared/body-word-target'
+import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../shared/style-reference-limits'
 import type { AiTraceIssue } from './ai-trace-detect'
-import { resolvePrompt } from './prompt-registry'
+import { computeDocMetrics, computeHeuristicAiScore } from '../perplexity/heuristic-detect'
 
 const ANTI_AI_RULES_TYPE = 'anti_ai_rules'
 const REFERENCE_TEXT_TYPE = 'reference_text'
@@ -19,6 +21,14 @@ export interface AntiAiPreset {
 
 /** 表层规则：针对 AI 高频词汇和模板句式 */
 export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
+  {
+    label: '禁电影镜头链',
+    rule: '禁止"电影镜头链"式描写：不要逐帧写动作（"目光落在…上→嘴角微微上扬→缓缓开口"），用一句复合句概括或省略中间过程。禁止"目光落在/扫过…上""嘴角微微上扬""脚步一顿""缓缓开口/站起身/回过头"等镜头调度词',
+    demo: {
+      before: '他转过身，目光落在她手中的信封上。嘴角微微上扬，缓缓开口道："你来了。"',
+      after: '他瞟了眼她手里攥着的信封，说了句"你来了"。'
+    }
+  },
   {
     label: '禁模板情感句',
     rule: '禁止使用「心中涌起一股」「眼中闪过一丝」「嘴角微微上扬」「不禁」「仿佛」「宛如」等模板化情感描写，改用具体的身体动作/感官细节传递情绪',
@@ -49,6 +59,30 @@ export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
     demo: {
       before: '「我认为我们应该重新考虑这个计划，因为目前的情况已经发生了很大的变化。」',
       after: '「这计划，算了，不行。你自己看看外头那架势。」'
+    }
+  },
+  {
+    label: '禁机械对话标注',
+    rule: '禁止"他说，""她问。""XX说。"等裸对话标注。对话标注必须附带动作、神态、语气或环境描写，或省略标注让上下文暗示说话人。人类网文作者用"说道/问道"并搭配修饰语（"缓缓的说道""冷冷问道"），绝不会写"他说，""她问。"',
+    demo: {
+      before: '"我先走了。"他说，"猫爬架放这儿。"\n"它们平时不这样。"她说。\n"秦浩？"林晚问。',
+      after: '"我先走了。"他把猫爬架往墙角一搁，"放这儿。"\n"它们平时不这样。"她蹲下去戳了戳猫肚子。\n"秦浩？"林晚皱起了眉。'
+    }
+  },
+  {
+    label: '禁短促强否定收尾',
+    rule: '禁止在动作场景中用"没/没有+单/双音节动词"作为短促结尾（制造伪冷酷感），应补充连贯动作或细节',
+    demo: {
+      before: '老太太端起茶杯，没喝。碎瓷溅上林薇的脚踝时，她没躲。',
+      after: '老太太端起茶杯吹了吹浮沫，又原样搁回了桌上。碎瓷溅上脚踝，林薇连眼皮都没眨一下。'
+    }
+  },
+  {
+    label: '禁机械精确度量',
+    rule: '禁止在日常动作或场景描写中滥用具体的度数、厘米/毫米等物理量词，应用模糊量词或具象参照物',
+    demo: {
+      before: '向外旋开15度，在第十七厘米的位置，上方三毫米处。',
+      after: '向外旋开一条窄缝，差不多在中间偏上一点的位置。'
     }
   }
 ]
@@ -237,23 +271,17 @@ function demoConflictsWithRules(demo: { before: string; after: string }, rules: 
 }
 
 const HUMAN_WRITING_META = [
-  '【人类写作底层模式 - AI 检测器的核心判据是统计分布，不是某几个词】',
-  '人类作者的文字有三个 AI 做不到的统计特征，你必须刻意模拟：',
-  '',
-  'A. 困惑度波动（Perplexity Burstiness）',
-  '   人写的文字里，有些句子极其平淡可预测（"他坐下了。"），紧接着就是意想不到的表达。',
-  '   → 做法：每隔 3-5 句就插入一个完全"无聊"的动作句或环境句，然后突然接一个跳跃性的细节。',
-  '',
-  'B. 信息密度不均匀',
-  '   人写的段落里，有的段只说一件事（"他没动。"），有的段塞满了杂乱的细节。',
-  '   → 做法：交替使用"高密度段"（一段里塞 3-4 个具体细节）和"低密度段"（一段只一两句话）。',
-  '',
-  'C. 词汇选择的意外性',
-  '   人类会突然用一个"不属于这个语境"的词：品牌名、方言、粗话、数字、跑题的联想。',
-  '   → 做法：叙述中每 300 字至少掺入 1 个具体的、意外的、不优美的细节词。',
-  '',
-  '反面教材：如果你的输出全篇像散文诗——句句优美、段段饱满、节奏均匀——那就是 100% AI 味。',
-  '目标：写出来的东西应该像一个赶稿的人类作者在深夜写的——有精彩的段落，也有偷懒的段落，有灵光一闪也有平铺直叙。'
+  '【去AI痕迹——外部检测器最敏感的特征】',
+  'A. 禁止"电影镜头链"式描写：不要写"他转身→目光落在…上→嘴角微微上扬→缓缓开口"这类逐帧分镜。',
+  '   用一句复合句概括动作，或省略中间过程直接写结果。',
+  'B. 禁止书面连接词：然而、因此、此外、与此同时、不仅如此、尽管如此等。',
+  '   直接删除或用口语词替代（"结果""谁知""这下"）。',
+  'C. 禁止机械对话标注（"他说，""她问。"）——改为附带动作/神态/语气的标注，或省略标注。',
+  'D. 禁止模板情感句（"心中涌起一股…""眼中闪过一丝…"）删除或改为具体动作。',
+  'E. 禁止总结收束句（"这一刻他明白了…""或许这便是…"）直接删除。',
+  'F. 词汇选择偏口语/低频/方言化：多用具象冷门词，少用标准书面语。',
+  '   叙述中每 300 字至少掺入 1 个具体的、不常见的细节词。',
+  '目标：写出来的东西像一个赶稿的人类作者写的有精彩有糙段，有灵光一闪也有平铺直叙。'
 ].join('\n')
 
 /**
@@ -283,7 +311,7 @@ export function formatAntiAiRulesFromList(rules: string[]): string {
   )
   if (hasDeepRules) {
     lines.push('')
-    lines.push(resolvePrompt('body_generation.human_writing_meta') || HUMAN_WRITING_META)
+    lines.push(HUMAN_WRITING_META)
   }
 
   lines.push('')
@@ -298,12 +326,52 @@ export function formatBuiltinAntiAiRulesForPrompt(): string {
   return formatAntiAiRulesFromList(rules)
 }
 
+const STYLE_CONFLICT_RULE_PATTERN = /怪诞|品牌名|方言|粗话|跑题|词汇意外性|不属于这个语境/
+const BODY_GENERATION_LIGHT_RULE_PATTERN = /连接词|模板化|模板情感|解释腔|总结式段尾|口语化|电影镜头链|镜头调度|机械对话标注|裸对话标注|裸标注/
+
+function pickBodyGenerationRules(rules: string[]): string[] {
+  const picked = rules.filter(rule =>
+    BODY_GENERATION_LIGHT_RULE_PATTERN.test(rule) &&
+    !STYLE_CONFLICT_RULE_PATTERN.test(rule)
+  )
+  return picked
+}
+
+function shouldScopeAntiAiRulesForStep(step: string | undefined): boolean {
+  if (!step) return false
+  return (
+    step === 'body_generation' ||
+    step === 'body_style_rewrite' ||
+    step === 'quality_diagnosis_ai' ||
+    step === 'quality_apply_fixes' ||
+    step === 'critique_apply_fixes'
+  )
+}
+
+function scopeAntiAiRulesForStep(workId: number, rules: string[], step: string | undefined): string[] {
+  if (!step || !hasStyleReferenceText(workId)) return rules
+  if (!shouldScopeAntiAiRulesForStep(step)) return rules
+  if (step === 'body_generation') return pickBodyGenerationRules(rules)
+  if (!rules.length) return rules
+  return rules.filter(rule => !STYLE_CONFLICT_RULE_PATTERN.test(rule))
+}
+
 /**
  * 格式化去 AI 味规则 + 正面示范 (few-shot) + 人类写作底层模式到 system prompt。
  * 规则放在 system prompt 最末尾（见 context-budget priority），以覆盖前面的 few-shot 示范。
+ *
+ * body_generation 步骤：若作品未配置 per-work 规则，自动 fallback 到基于朱雀实验结论
+ * 的轻量级去 AI 味指引（HUMAN_WRITING_META），确保正文生成始终有去 AI 味兜底。
  */
-export function formatAntiAiRulesForPrompt(workId: number): string {
-  return formatAntiAiRulesFromList(getAntiAiRules(workId))
+export function formatAntiAiRulesForPrompt(workId: number, step?: string): string {
+  const scoped = scopeAntiAiRulesForStep(workId, getAntiAiRules(workId), step)
+  const formatted = formatAntiAiRulesFromList(scoped)
+  if (formatted) return formatted
+
+  if (step === 'body_generation') {
+    return HUMAN_WRITING_META
+  }
+  return ''
 }
 
 /**
@@ -318,16 +386,14 @@ export function buildStyleFewShotForStyle(styleId: number): string {
   let budget = MAX_FEWSHOT_CHARS
 
   if (style.reference_text?.trim()) {
-    const ref = style.reference_text.trim().slice(0, 3000)
-    parts.push(
-      '【目标范文】\n' + ref
-    )
-    budget -= ref.length
+    const ref = style.reference_text.trim().slice(0, MAX_STYLE_REFERENCE_TEXT_CHARS)
+    parts.push('【目标范文】\n' + ref)
   }
 
   if (style.sample_text?.trim() && budget > 200) {
-    const sample = style.sample_text.trim().slice(0, Math.min(500, budget))
+    const sample = style.sample_text.trim().slice(0, Math.min(300, budget))
     parts.push(`【文风参考样例 · ${style.name}】\n${sample}`)
+    budget -= sample.length
   }
 
   if (parts.length === 0) return ''
@@ -410,6 +476,20 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
         }
       }
     }
+    if (/电影镜头链|镜头调度/.test(rule)) {
+      const filmPatterns: [RegExp, string][] = [
+        [/(?:目光|视线|眼神)(?:落在|扫过|越过|移到|停在|掠过).{0,15}上/g, '目光落在…上'],
+        [/嘴角微微(?:上扬|勾起|一弯)/g, '嘴角微微上扬'],
+        [/缓缓(?:开口|站起身|回过头|转过身|抬起头)/g, '缓缓…'],
+        [/脚步(?:一顿|顿了顿|微微一顿)/g, '脚步一顿'],
+      ]
+      for (const [pat, label] of filmPatterns) {
+        const n = (content.match(pat) ?? []).length
+        if (n > 0) {
+          violations.push({ rule, detail: `含电影镜头链「${label}」× ${n}`, count: n })
+        }
+      }
+    }
 
     if (/句长突发|突发性/.test(rule)) {
       const cv = calcSentenceLengthCV(content)
@@ -427,6 +507,48 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
           detail: `碎片短句（≤6字）仅占 ${Math.round(ss.ratio * 100)}%（${ss.short}/${ss.total}句），要求至少 20%`,
           count: ss.short
         })
+      }
+    }
+
+    if (/机械对话标注|裸对话标注|裸标注/.test(rule)) {
+      const mechPatterns: RegExp[] = [
+        /[""\u201d](?:他|她)说[，。！？]/g,
+        /[""\u201d](?:他|她)问[，。！？]/g,
+        /[""\u201d][\u4e00-\u9fff]{1,4}说[，。！？]/g,
+        /[""\u201d][\u4e00-\u9fff]{1,4}问[，。！？]/g,
+      ]
+      let mechCount = 0
+      const mechExamples: string[] = []
+      for (const pat of mechPatterns) {
+        const matches = content.match(pat) ?? []
+        for (const m of matches) {
+          const core = m.replace(/^[""\u201d]/, '').replace(/[，。！？]$/, '')
+          if (core.endsWith('说道') || core.endsWith('问道') || core.endsWith('道')) continue
+          if (/(?:笑|冷|怒|急|沉声|轻声|低声|大声|淡淡|缓缓|森然|冷冷|温声|厉声)/.test(core)) continue
+          mechCount++
+          if (mechExamples.length < 3) mechExamples.push(m.slice(0, 15))
+        }
+      }
+      if (mechCount > 0) {
+        violations.push({
+          rule,
+          detail: `含机械对话标注 ${mechCount} 处（${mechExamples.join('、')}），应附带动作/神态/语气描写`,
+          count: mechCount
+        })
+      }
+    }
+
+    if (/短促强否定/.test(rule)) {
+      const n = (content.match(/，没(?:有)?[\u4e00-\u9fa5]{1,2}[。！？]/g) ?? []).length
+      if (n > 0) {
+        violations.push({ rule, detail: `含短句强否定收尾 × ${n}`, count: n })
+      }
+    }
+
+    if (/精确度量/.test(rule)) {
+      const n = (content.match(/(?:\d+|[一二三四五六七八九十百千万零]+)(?:度|厘米|毫米|米)/g) ?? []).length
+      if (n > 0) {
+        violations.push({ rule, detail: `含机械精确物理量词 × ${n}`, count: n })
       }
     }
 
@@ -451,13 +573,13 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
 //  收藏佳句 / 文风样例 / 参考范文 → few-shot 示范
 // ---------------------------------------------------------------------------
 
-const MAX_FEWSHOT_CHARS = 17000
+const MAX_FEWSHOT_CHARS = 4000
 
 /**
  * 收集 few-shot 示范文本，按优先级注入：
- *  1. style.reference_text (≤15000字) — 目标文风范文，最核心的风格信号
- *  2. work_reference_text  (≤1500字) — 作品专属参考
- *  3. style.sample_text + favorites (≤500字) — 补充示范
+ *  1. style.reference_text（全量，≤15000字）— 目标文风范文，最核心的风格信号
+ *  2. work_reference_text  (≤600字) — 作品专属参考
+ *  3. style.sample_text + favorites（短摘）— 补充示范
  */
 export function buildStyleFewShot(workId: number): string {
   const parts: string[] = []
@@ -467,22 +589,21 @@ export function buildStyleFewShot(workId: number): string {
   const style = styleId ? writingStyleDAO.getById(styleId) : undefined
 
   if (style?.reference_text?.trim()) {
-    const ref = style.reference_text.trim().slice(0, 15000)
+    const ref = style.reference_text.trim().slice(0, MAX_STYLE_REFERENCE_TEXT_CHARS)
     parts.push(
       '【目标范文 - 正文的用词、句式、节奏、对话密度必须与此范文保持一致】\n' + ref
     )
-    budget -= ref.length
   }
 
   const workRef = getWorkReferenceText(workId)
   if (workRef && budget > 200) {
-    const ref = workRef.slice(0, Math.min(1500, budget))
+    const ref = workRef.slice(0, Math.min(600, budget))
     parts.push('【作品专属参考范文】\n' + ref)
     budget -= ref.length
   }
 
   if (style?.sample_text?.trim() && budget > 200) {
-    const sample = style.sample_text.trim().slice(0, Math.min(500, budget))
+    const sample = style.sample_text.trim().slice(0, Math.min(300, budget))
     parts.push(`【文风参考样例 · ${style.name}】\n${sample}`)
     budget -= sample.length
   }
@@ -491,9 +612,9 @@ export function buildStyleFewShot(workId: number): string {
     .filter(f => f.source_step === 'body_generation' && f.content.trim())
   if (favorites.length > 0 && budget > 200) {
     const excerpts: string[] = []
-    for (const fav of favorites.slice(0, 3)) {
+    for (const fav of favorites.slice(0, 2)) {
       const text = fav.content.trim()
-      const excerpt = text.length > 400 ? text.slice(0, 400) + '…' : text
+      const excerpt = text.length > 220 ? text.slice(0, 220) + '…' : text
       if (budget - excerpt.length < 0) break
       excerpts.push(excerpt)
       budget -= excerpt.length
@@ -522,13 +643,38 @@ export function hasStyleReferenceText(workId: number): boolean {
 // ---------------------------------------------------------------------------
 
 /**
+ * 用启发式检测器筛选范文段落：只保留「人味高」（低 AI 分）的段落，
+ * 让 persona 仅由真正像人写的范本推导，形成正反馈。范文若本身偏 AI，
+ * 会被过滤掉，避免让模型学 AI 的困惑度分布。
+ */
+function filterHumanLikeParagraphs(referenceText: string): string {
+  const paragraphs = referenceText.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean)
+  if (paragraphs.length <= 1) return referenceText.trim()
+  const docMetrics = computeDocMetrics(referenceText)
+  // 人味门槛：启发式分 <= 此值才视为「像人写的」范本
+  const HUMAN_SCORE_CEILING = 60
+  const kept = paragraphs.filter(p => {
+    if (p.replace(/\s/g, '').length < 20) return true // 短段落不判，保留结构
+    return computeHeuristicAiScore(p, docMetrics, 52) <= HUMAN_SCORE_CEILING
+  })
+  // 若过滤后所剩无几（范文整体偏 AI），退回原文，避免 persona 失效
+  const keptChars = kept.reduce((s, p) => s + p.replace(/\s/g, '').length, 0)
+  if (keptChars < 80) return referenceText.trim()
+  return kept.join('\n\n')
+}
+
+/**
  * 分析参考文本的统计特征，生成一段简洁的写作人设描述。
  * 注入 system prompt 最前面，让模型以此人设写作。
+ * 范文会先过检测器筛选，仅保留人味高的段落。
  */
 export function buildAntiAiPersona(referenceText: string): string {
   if (!referenceText.trim() || referenceText.length < 100) return ''
 
-  const sentences = referenceText
+  const filtered = filterHumanLikeParagraphs(referenceText)
+  if (filtered.length < 100) return ''
+
+  const sentences = filtered
     .split(/[。！？!?…]+/)
     .map(s => s.trim())
     .filter(s => s.length > 0)
@@ -537,15 +683,15 @@ export function buildAntiAiPersona(referenceText: string): string {
   const lengths = sentences.map(s => s.replace(/\s/g, '').length)
   const avgLen = lengths.reduce((a, b) => a + b, 0) / lengths.length
 
-  const metaphorCount = countMetaphors(referenceText)
-  const totalChars = referenceText.replace(/\s/g, '').length
+  const metaphorCount = countMetaphors(filtered)
+  const totalChars = filtered.replace(/\s/g, '').length
   const metaphorPer500 = totalChars > 0 ? metaphorCount / (totalChars / 500) : 0
 
-  const dialogueMatches = referenceText.match(/[「""][^「""」]*[」""]/g) ?? []
+  const dialogueMatches = filtered.match(/[「""][^「""」]*[」""]/g) ?? []
   const dialogueChars = dialogueMatches.reduce((sum, m) => sum + m.length, 0)
   const dialogueRatio = totalChars > 0 ? dialogueChars / totalChars : 0
 
-  const paragraphs = referenceText.split(/\n\s*\n/).filter(p => p.trim())
+  const paragraphs = filtered.split(/\n\s*\n/).filter(p => p.trim())
   const shortParas = paragraphs.filter(p => p.trim().length < 30).length
   const shortParaRatio = paragraphs.length > 0 ? shortParas / paragraphs.length : 0
 
@@ -569,13 +715,12 @@ export function buildAntiAiPersona(referenceText: string): string {
   traits.push('允许重复用词，不刻意追求词汇多样性')
   traits.push('经常交代不重要的背景细节和日常琐碎')
 
-  return ''
-  // return [
-  //   '【你的写作人设】',
-  //   `你是一个${traits.slice(0, 2).join('、')}的网文作者。`,
-  //   `写作特点：${traits.join('；')}。`,
-  //   '你不是散文诗人，不追求句句精致。你赶稿，写得快，有好段也有糙段。'
-  // ].join('\n')
+  return [
+    '【你的写作人设】',
+    `你是一个${traits.slice(0, 2).join('、')}的网文作者。`,
+    `写作特点：${traits.join('；')}。`,
+    '你不是散文诗人，不追求句句精致。你赶稿，写得快，有好段也有糙段。'
+  ].join('\n')
 }
 
 /**
@@ -600,18 +745,56 @@ export function buildAntiAiPersonaForWork(workId: number): string {
 //  稿件优化：纯文风 system prompt（Step 2 去 AI 味重写）
 // ---------------------------------------------------------------------------
 
-const STYLE_REWRITE_INSTRUCTION = [
-  '你是一个注重细节的严肃的网文作者。你的任务是将初稿重写为与【目标范文】文笔高度一致的版本。',
+export const STYLE_REWRITE_INSTRUCTION = [
+  '你是资深网文编辑。核心任务是降低AIGC特征。',
   '',
-  '**核心目标：重写后的文字读起来必须像目标范文作者亲笔写的，而非 AI 修改的。**',
+  '核心目标：不改剧情与人设，不重排主事件，只改确实生硬的表达。',
   '',
-  '重写规则（按优先级排列）：',
-  '1. 用词、句式长短、叙述节奏、对话密度、信息分布必须与【目标范文】保持一致',
-  '2. 若指定了目标字数，重写后正文必须控制在该字数范围内（允许±10%浮动），可适当精简冗余描写以达到字数要求',
-  '3. 保持原文的核心情节走向和关键事件不变，但允许删减重复、冗余的细节描写',
-  '4. 不得添加原文没有的新情节线',
-  '5. 鼓励大幅调整段落划分、句子长短、叙述节奏以贴近范文风格',
-  '6. 像一个赶稿的人类作者，不是力求完美的 AI',
+  '★★★ 最高优先级——外部检测器最敏感的AI指纹（必须首先消除）：',
+  '',
+  '【致命】禁止"电影镜头链"式描写：',
+  '  禁止连续的逐帧动作分镜（"他转身→目光落在…上→嘴角微微上扬→缓缓开口"）。',
+  '  禁止"目光落在/扫过/越过…上"的句式，改为"看了眼…"或直接省略。',
+  '  禁止"嘴角微微上扬/微勾"、"脚步顿了顿"、"缓缓回过头"等镜头调度词。',
+  '',
+  '【高危】消灭书面连接词：',
+  '  禁用：然而、因此、此外、与此同时、不仅如此、尽管如此、值得注意的是、总而言之。',
+  '  替代：直接删除，或改为口语词（"结果""谁知""这下""得了"）。',
+  '',
+  '【中危】消灭机械对话标注：',
+  '  禁止"他说，""她问。""XX说。"等裸标注，必须附带动作/神态/语气。',
+  '  ✗ "走吧。"他说。→ ✓ "走吧。"他把背包往肩上一甩。',
+  '  ✗ "真的？"她问。→ ✓ "真的？"她皱了下眉。',
+  '  也可省略标注让上下文暗示说话人。',
+  '',
+  '【中危】消灭模板情感句和总结收束句：',
+  '  禁用："心中涌起一股…""眼中闪过一丝…""一股…涌上心头"。',
+  '  禁用段尾/章尾总结："这一刻他明白了…""或许这便是…""对于…而言…"。',
+  '',
+  '【中危】消灭"短句强否定"收尾：',
+  '  禁用：动作句后接逗号加"没/没有+动词"的短促结尾。',
+  '  ✗ "碎瓷溅上脚踝，她没躲。" → ✓ "碎瓷溅上脚踝，她连躲的动作都没有。"',
+  '  ✗ "老太太端起茶杯，没喝。" → ✓ "老太太端起茶杯看了看，又搁回了桌上。"',
+  '  【如何改更有人味】人类不会机械地重复"没说话"制造冷酷感，而会用具体的转移注意力的动作（低头抿水、视线错开、拨弄物件）来填补沉默的张力。',
+  '',
+  '【低危】消灭机械精确度量：',
+  '  禁用：日常描写中滥用具体的度数、厘米/毫米等物理量词。',
+  '  ✗ "向外旋开15度，上方三毫米处" → ✓ "旋开一条窄缝，稍微偏上一点"。',
+  '  【如何改更有人味】将精确数字转化为感性模糊的状态描述（如"震颤两次"改为"眼底微微一颤"）。',
+  '',
+  '其他重写规则：',
+  '1.禁用高频破折号：全篇"——"控制在1-2处以内',
+  '2.保留冗余和啰嗦：人类写作有"废话"，动作描写允许拆碎、重复、不精简',
+  '3.保持口语粗糙感：使用口语/俗语/方言化用词，不追求每个词的文学性',
+  '4.心理活动散漫化：允许"想到哪说到哪"，不归纳为整齐的排比或连问',
+  '5.避免对称/并列结构：不使用"A着B，C着D"这种过于工整的句式。要求：打破句式的对称性，恢复人类讲话时不对称的自然感。',
+  '6.引入"断裂感"：每500字至少有一处叙事断裂——用连词合并部分原子短句（电报式短句），消除机器人一样死板的动作切分。',
+  '7.质量不均匀原则：刻意让某些段落"写得差"——描写粗糙、像流水账，与精写段落形成对比',
+  '8.词汇选择偏口语/低频/方言化：多用具象冷门词替代标准书面语',
+  '',
+  '【章末钩子例外】',
+  '若 user prompt 中包含"章末留钩"或"章末钩子"相关待改进项，对最后 300-500 字允许超越"不改剧情"限制：',
+  '可重组结尾节奏、在高张力处截断、添加悬念暗示句、删除平淡收束。前文不受影响。',
   '',
   '只输出重写后的正文，不要解释。'
 ].join('\n')
@@ -645,19 +828,18 @@ export function buildStyleRewriteUserPrompt(
  *  3. 写作人设（从范文推断的统计特征）
  *  4. 文风模板
  *  5. 参考范文（few-shot）
- *  6. 去 AI 味规则
- *  7. 文风锚定提醒
+ *  6. （可选）去 AI 味规则
  */
 export function buildStyleRewriteSystemPrompt(workId: number): string {
   const parts: string[] = []
 
   const hasRef = hasStyleReferenceText(workId)
   if (hasRef) {
-    const coreDirective = resolvePrompt('body_generation.style_core_directive')?.trim()
+    const coreDirective = STYLE_CORE_DIRECTIVE.trim()
     if (coreDirective) parts.push(coreDirective)
   }
 
-  parts.push(resolvePrompt('body_style_rewrite.system') || STYLE_REWRITE_INSTRUCTION)
+  parts.push(STYLE_REWRITE_INSTRUCTION)
 
   if (hasRef) {
     const persona = buildAntiAiPersonaForWork(workId)
@@ -674,14 +856,6 @@ export function buildStyleRewriteSystemPrompt(workId: number): string {
   const fewShot = buildStyleFewShot(workId)
   if (fewShot) parts.push(fewShot)
 
-  const antiAiRules = formatAntiAiRulesForPrompt(workId)
-  if (antiAiRules) parts.push(antiAiRules)
-
-  if (hasRef) {
-    const anchor = resolvePrompt('body_generation.style_anchor')?.trim()
-    if (anchor) parts.push(anchor)
-  }
-
   return parts.join('\n\n')
 }
 
@@ -691,7 +865,7 @@ export function buildStyleRewriteSystemPrompt(workId: number): string {
 
 /**
  * 为 AI 质量诊断构建文风上下文。
- * 包含：文风 prompt 模板、参考范文（截断）、去 AI 规则。
+ * 包含：文风 prompt 模板、参考范文（全量）、去 AI 规则。
  * 不含生成/重写指令——诊断只需要知道"目标是什么"，不需要"怎么写"。
  */
 export function buildStyleDiagnosisContext(workId: number): string {
@@ -716,7 +890,7 @@ export function buildStyleDiagnosisContext(workId: number): string {
   const fewShot = buildStyleFewShot(workId)
   if (fewShot) parts.push(fewShot)
 
-  const antiAiRules = formatAntiAiRulesForPrompt(workId)
+  const antiAiRules = formatAntiAiRulesForPrompt(workId, 'quality_diagnosis_ai')
   if (antiAiRules) parts.push(antiAiRules)
 
   return parts.join('\n\n')
@@ -729,10 +903,17 @@ export function buildStyleDiagnosisContext(workId: number): string {
 export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
   const rules: string[] = []
   for (const issue of issues) {
-    if (issue.type === 'connector' && issue.examples[0]) {
+    if (issue.type === 'film_shot_chain') {
+      const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁电影镜头链')
+      if (preset) rules.push(preset.rule)
+      else rules.push('禁止"电影镜头链"式描写：不要逐帧写动作（"目光落在→嘴角上扬→缓缓开口"），用一句复合句概括或省略中间过程')
+    } else if (issue.type === 'connector' && issue.examples[0]) {
       rules.push(`避免过度使用连接词「${issue.examples[0]}」，同词整章不超过 1 次`)
     } else if (issue.type === 'template' && issue.examples[0]) {
       rules.push(`禁止使用模板化表达「${issue.examples[0]}」及同类 AI 腔句式`)
+    } else if (issue.type === 'closure_summary') {
+      const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁总结式段尾')
+      if (preset) rules.push(preset.rule)
     } else if (issue.type === 'structure') {
       rules.push('段落长度须有明显变化，混入短句、碎片句和单句段，避免各段字数接近')
     } else if (issue.type === 'metaphor_density') {
@@ -740,6 +921,9 @@ export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
       if (preset) rules.push(preset.rule)
     } else if (issue.type === 'low_burstiness' || issue.type === 'no_short_sentences') {
       const preset = DEEP_ANTI_AI_PRESETS.find(p => p.label === '句长突发性')
+      if (preset) rules.push(preset.rule)
+    } else if (issue.type === 'mechanical_dialogue_tag') {
+      const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁机械对话标注')
       if (preset) rules.push(preset.rule)
     } else if (issue.type === 'emotional_saturation' || issue.type === 'no_emotional_rest') {
       const preset = DEEP_ANTI_AI_PRESETS.find(p => p.label === '叙述温度起伏')

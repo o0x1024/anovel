@@ -101,10 +101,7 @@ export function useDeaiTask() {
 
   async function refreshSystemPromptFromStyle(forStyleId?: number | null) {
     const id = forStyleId ?? styleId.value
-    if (!id) {
-      systemPrompt.value = ''
-      return
-    }
+    if (!id) return
     try {
       systemPrompt.value = await window.anovel.invoke(
         'lab:buildSystemPrompt',
@@ -118,13 +115,10 @@ export function useDeaiTask() {
   }
 
   function ensureStyleIdValid() {
-    const rows = writingStyles.value
-    if (!rows.length) {
+    if (!styleId.value) return
+    if (!writingStyles.value.some(s => s.id === styleId.value)) {
       styleId.value = null
-      return
     }
-    if (styleId.value && rows.some(s => s.id === styleId.value)) return
-    styleId.value = rows[0].id
   }
 
   async function loadWritingStyles() {
@@ -145,12 +139,11 @@ export function useDeaiTask() {
     }
   }
 
-  async function run() {
+  async function run(labModelParams?: { modelType?: string; modelName?: string }) {
     const text = originalText.value.trim()
     if (!text) throw new Error('请输入待处理文本')
     const prompt = systemPrompt.value.trim()
     if (!prompt) throw new Error('请填写 System Prompt')
-    if (!styleId.value) throw new Error('请选择文风')
     const antiAiRules = plainStringList(selectedAntiAiRules.value)
     const created = await window.anovel.invoke('lab:taskCreate', {
       originalText: text,
@@ -168,7 +161,7 @@ export function useDeaiTask() {
     errorMessage.value = ''
 
     try {
-      await window.anovel.invoke('lab:run', created.id)
+      await window.anovel.invoke('lab:run', created.id, labModelParams ?? {})
     } catch (error) {
       status.value = 'error'
       errorMessage.value = error instanceof Error ? error.message : '处理失败'
@@ -194,11 +187,13 @@ export function useDeaiTask() {
     selectedAntiAiRules.value = parseAntiAiRulesFromTask(task)
     const rules = plainStringList(selectedAntiAiRules.value)
     systemPrompt.value = task.system_prompt?.trim()
-      || await window.anovel.invoke(
-        'lab:buildSystemPrompt',
-        task.style_id,
-        rules
-      ) as string
+      || (task.style_id != null
+        ? await window.anovel.invoke(
+          'lab:buildSystemPrompt',
+          task.style_id,
+          rules
+        ) as string
+        : '')
     errorMessage.value = task.error_message ?? ''
     status.value = task.status === 'pending' ? 'idle' : task.status
     ensureStyleIdValid()
@@ -222,8 +217,8 @@ export function useDeaiTask() {
     resultText.value = ''
     sourceFile.value = ''
     selectedAntiAiRules.value = []
-    styleId.value = writingStyles.value[0]?.id ?? null
-    void refreshSystemPromptFromStyle()
+    styleId.value = null
+    systemPrompt.value = ''
     status.value = 'idle'
     errorMessage.value = ''
     persistPageStateNow()

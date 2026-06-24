@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, inject, watch } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
+import ListBatchToolbar from '../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../composables/useListSelection'
 import { editorNavKey } from './editor-nav'
 
 const props = defineProps<{ workId: number }>()
@@ -44,6 +51,9 @@ const mergingIdeaId = ref<number | null>(null)
 const mergeTarget = ref('')
 const merging = ref(false)
 
+const activeIdeas = computed(() => ideas.value.filter(i => !i.is_merged))
+const selection = useListSelection(activeIdeas)
+
 const chapterMergeOptions = computed(() =>
   chapters.value.flatMap(ch => [
     { value: `chapter:${ch.id}:outline`, label: `合龙到章节大纲 · ${ch.volume_name} / ${ch.title}` },
@@ -61,6 +71,7 @@ watch(() => nav?.quickIdeaTrigger.value, () => {
 
 async function loadIdeas() {
   ideas.value = await window.anovel.invoke('idea:listByWork', props.workId) as never[]
+  selection.clearSelection()
 }
 
 async function loadChapters() {
@@ -82,6 +93,19 @@ async function createIdea() {
 
 async function deleteIdea(id: number) {
   await window.anovel.invoke('idea:delete', id)
+}
+
+async function deleteSelectedIdeas() {
+  const items = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(items.length, '灵感'))) return
+  await runBatchDelete(items, item => deleteIdea(item.id))
+  await loadIdeas()
+}
+
+async function deleteAllIdeas() {
+  const items = activeIdeas.value
+  if (!(await confirmDeleteAll(items.length, '灵感'))) return
+  await runBatchDelete(items, item => deleteIdea(item.id))
   await loadIdeas()
 }
 
@@ -137,19 +161,42 @@ async function confirmMerge() {
       </button>
     </div>
 
-    <div v-if="ideas.length === 0" class="text-center py-12 text-base-content/40">
+    <div v-if="activeIdeas.length === 0" class="text-center py-12 text-base-content/40">
       <font-awesome-icon icon="brain" class="text-4xl mb-3 opacity-30" />
       <p>还没有灵感碎片</p>
     </div>
-    <div v-else class="space-y-3">
-      <div v-for="idea in ideas" :key="idea.id" class="card bg-base-200 border border-base-300 shadow-sm p-4">
+    <template v-else>
+      <ListBatchToolbar
+        :total="activeIdeas.length"
+        :selectable-count="selection.selectableCount"
+        :selected-count="selection.selectedCount"
+        :all-selected="selection.allSelected"
+        @toggle-all="selection.toggleAll()"
+        @delete-selected="deleteSelectedIdeas"
+        @delete-all="deleteAllIdeas"
+      />
+      <div class="space-y-3">
+      <div
+        v-for="(idea, index) in activeIdeas"
+        :key="idea.id"
+        class="card bg-base-200 border border-base-300 shadow-sm p-4"
+        :class="{ 'ring-1 ring-primary/40': selection.isSelected(idea, index) }"
+      >
         <div class="flex items-start justify-between mb-1 gap-2">
-          <span class="badge badge-primary badge-sm">{{ ideaTypeLabels[idea.type] || idea.type }}</span>
+          <div class="flex items-start gap-2 min-w-0">
+            <input
+              type="checkbox"
+              class="checkbox checkbox-xs mt-0.5 shrink-0"
+              :checked="selection.isSelected(idea, index)"
+              @change="selection.toggle(idea, index)"
+            />
+            <span class="badge badge-primary badge-sm">{{ ideaTypeLabels[idea.type] || idea.type }}</span>
+          </div>
           <div class="flex gap-1">
             <button class="btn btn-outline btn-primary btn-xs" @click="startMerge(idea.id)">
               合龙
             </button>
-            <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteIdea(idea.id)">
+            <button class="btn btn-ghost btn-xs text-error gap-1" @click="deleteIdea(idea.id).then(loadIdeas)">
               <font-awesome-icon icon="trash" class="w-3 h-3" />
               删除
             </button>
@@ -182,6 +229,7 @@ async function confirmMerge() {
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </template>
   </div>
 </template>

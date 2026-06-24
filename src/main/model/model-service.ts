@@ -123,14 +123,23 @@ export class ModelService {
 
       if (isDeepSeekProvider(config.model_type)) {
         enrichedRequest.deepseekOptions = parseDeepSeekProviderOptions(config.provider_options_json)
+        if (enrichedRequest.thinkingEnabled !== undefined) {
+          enrichedRequest.deepseekOptions.thinkingEnabled = enrichedRequest.thinkingEnabled
+        }
       }
 
       const tempLog: Record<string, unknown> = {
         temperature: enrichedRequest.temperature ?? 0.7
       }
+      const styleSections = (report.sections || [])
+        .filter(section => section.included && ['style', 'style_fewshot', 'style_anchor', 'anti_ai_rules'].includes(section.key))
+        .map(section => `${section.key}:${section.tokens}`)
       if (stepDefaults.temperatureGroup) {
         tempLog.temperatureGroup = stepDefaults.temperatureGroup
         tempLog.temperatureRange = stepDefaults.temperatureRange
+      }
+      if (styleSections.length > 0) {
+        tempLog.styleSections = styleSections
       }
 
       appLogger.info('llm', 'LLM 请求已发送', {
@@ -193,7 +202,8 @@ export class ModelService {
           step: request.step,
           workId: request.workId,
           durationMs: response.durationMs ?? 0,
-          usage: response.usage
+          usage: response.usage,
+          content: response.content
         })
 
         if (request.workId && request.workId > 0) {
@@ -349,12 +359,25 @@ function getStepGenerationDefaults(step?: string, workId?: number): StepGenerati
 
   if (isWorkScopedModelRequest(workId)) {
     const sampled = resolveWorkRequestTemperature(workId!, step)
-    return {
+    const result: StepGenerationDefaults = {
       ...base,
       temperature: sampled.temperature,
       temperatureGroup: sampled.group,
       temperatureRange: sampled.range
     }
+    // 正文生成：强制叠加频率/存在惩罚，打破模型反复套用偏爱句式的自强化，
+    // 直击困惑度信号（检测器 70% 权重）；topP 收紧兜住提温后的连贯性。
+    if (step === 'body_generation') {
+      result.frequencyPenalty = Math.min(saved.frequencyPenalty + 0.35, 2)
+      result.presencePenalty = Math.min(saved.presencePenalty + 0.25, 2)
+      result.topP = Math.min(saved.topP, 0.9)
+    }
+    // 去 AI 重写：高随机性以拉高困惑度，覆盖被检出段落
+    if (sampled.group === 'deai') {
+      result.frequencyPenalty = Math.min(saved.frequencyPenalty + 0.2, 2)
+      result.presencePenalty = Math.min(saved.presencePenalty + 0.15, 2)
+    }
+    return result
   }
 
   base.temperature = saved.temperature

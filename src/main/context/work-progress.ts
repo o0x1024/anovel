@@ -13,7 +13,7 @@ export interface WorkStepProgress {
   settingsQuality?: SettingsQualityStatus
 }
 
-const CORE_TYPES = ['character', 'worldview', 'conflict'] as const
+const CORE_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast'] as const
 
 function hasContent(map: Map<string, string>, type: string): boolean {
   return !!map.get(type)?.trim()
@@ -51,10 +51,10 @@ export function getWorkStepProgress(workId: number): WorkStepProgress {
         : hasIdea
           ? 'ready'
           : 'pending',
-    settings: !coreDone
-      ? (hasIdea ? 'ready' : 'pending')
-      : qualityStatus.canProceed
-        ? 'done'
+    settings: qualityStatus.canProceed
+      ? 'done'
+      : !coreDone
+        ? (hasIdea ? 'ready' : 'pending')
         : 'review',
     volumes: hasVolumes ? 'done' : coreDone ? 'ready' : 'pending',
     chapters: hasOutlines ? 'done' : hasChapters ? 'ready' : hasVolumes ? 'ready' : 'pending',

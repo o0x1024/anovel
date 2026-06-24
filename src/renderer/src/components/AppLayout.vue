@@ -9,7 +9,8 @@ const route = useRoute()
 const { width: sidebarWidth, isResizing, startResize } = useSidebarWidth()
 
 const navItems = [
-  { path: '/', icon: 'book-open', label: '作品管理', section: 'workspace' },
+  { path: '/', icon: 'book-open', label: '小说管理', section: 'workspace' },
+  { path: '/stories', icon: 'feather-alt', label: '短故事管理', section: 'workspace' },
   { path: '/style', icon: 'palette', label: '文风管理', section: 'workspace' },
   { path: '/assistant', icon: 'robot', label: 'AI 助手', section: 'intelligence' },
   { path: '/ai-lab', icon: 'flask', label: 'AI 实验室', section: 'intelligence' },
@@ -18,7 +19,12 @@ const navItems = [
 ]
 
 const activeRoute = computed(() => {
-  if (route.path.startsWith('/work/')) return '/'
+  if (route.path.startsWith('/novel/')) {
+    return '/'
+  }
+  if (route.path.startsWith('/story/')) {
+    return '/stories'
+  }
   return route.path
 })
 const workspaceNavItems = computed(() => navItems.filter(item => item.section === 'workspace'))
@@ -50,7 +56,7 @@ function navigateNav(navPath: string) {
           <div class="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
             <font-awesome-icon icon="project-diagram" class="text-lg" />
           </div>
-          <span class="bg-gradient-to-r from-primary to-secondary bg-clip-text text-transparent">ANovel</span>
+          <span class="bg-gradient-to-r from-primary to-secondary bg-clip-text ">ANovel</span>
         </h1>
         <p class="text-xs text-base-content/40 font-medium tracking-wide">AI-POWERED NOVEL ASSISTANT</p>
       </div>

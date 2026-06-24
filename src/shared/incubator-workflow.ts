@@ -36,12 +36,12 @@ export const INCUBATOR_RECOMMENDED_WORKFLOW: IncubatorWorkflowStepDef[] = [
   {
     id: 'gate',
     label: '④ 跨槽门禁',
-    detail: '主线编排面板运行门禁，处理 blocking 项后可定位到对应槽位修改'
+    detail: '主线编排面板运行 AI 门禁评审；未通过时可点「AI 自动修复」处理阻断项，或定位到对应槽位手动修改'
   },
   {
     id: 'freeze',
     label: '⑤ 冻结统合',
-    detail: '门禁通过后冻结版本；修改槽位后可再次冻结为 V2、V3…，下游核心设定自动跟最新冻结'
+    detail: 'AI 门禁通过后冻结版本；修改槽位后可再次冻结为 V2、V3…，下游核心设定自动跟最新冻结'
   },
   {
     id: 'settings',

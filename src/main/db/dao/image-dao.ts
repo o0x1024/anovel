@@ -49,15 +49,18 @@ export class ImageDAO extends BaseDAO {
 
   upsertVolcengineConfig(accessKey: string, secretKey: string, region?: string, enabled?: boolean): void {
     const existing = this.getVolcengineConfig()
+    const trimmedSecret = secretKey.trim()
+    const secretToStore =
+      trimmedSecret && trimmedSecret !== '***' ? trimmedSecret : (existing?.secret_key ?? '')
     if (existing) {
       this.run(
         'UPDATE volcengine_configs SET access_key = ?, secret_key = ?, region = ?, is_enabled = ? WHERE id = ?',
-        [accessKey, secretKey, region ?? existing.region, enabled !== false ? 1 : 0, existing.id]
+        [accessKey, secretToStore, region ?? existing.region, enabled !== false ? 1 : 0, existing.id]
       )
     } else {
       this.insert(
         'INSERT INTO volcengine_configs (access_key, secret_key, region, is_enabled) VALUES (?, ?, ?, ?)',
-        [accessKey, secretKey, region ?? 'cn-beijing', enabled !== false ? 1 : 0]
+        [accessKey, secretToStore, region ?? 'cn-beijing', enabled !== false ? 1 : 0]
       )
     }
   }

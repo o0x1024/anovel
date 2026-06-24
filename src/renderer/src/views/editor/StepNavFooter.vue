@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, inject, ref } from 'vue'
+import { computed, inject, ref, onMounted } from 'vue'
 import {
   editorNavKey,
   getNextStep,
-  NEXT_STEP_LABELS,
+  getNextStepLabel,
   type WorkflowStepKey,
   type SettingsQualityStatus
 } from './editor-nav'
@@ -16,10 +16,22 @@ const props = defineProps<{
 
 const nav = inject(editorNavKey)
 const navigating = ref(false)
+const workType = ref<string | null>(null)
 
-const nextStep = computed(() => getNextStep(props.step))
+onMounted(async () => {
+  if (props.workId != null) {
+    try {
+      const w = await window.anovel.invoke('work:get', props.workId) as { work_type?: string } | null
+      workType.value = w?.work_type ?? null
+    } catch (e) {
+      console.error('Failed to get work type in StepNavFooter', e)
+    }
+  }
+})
+
+const nextStep = computed(() => getNextStep(props.step, workType.value))
 const nextLabel = computed(() =>
-  nextStep.value ? NEXT_STEP_LABELS[props.step] : ''
+  nextStep.value ? getNextStepLabel(props.step, workType.value) : ''
 )
 const progressHint = computed(() =>
   props.hint ?? nav?.stepProgress.value?.hints[props.step] ?? ''
@@ -31,20 +43,21 @@ async function handleNext() {
   if (props.step === 'settings' && props.workId != null) {
     const status = await window.anovel.invoke('settingsQuality:getStatus', props.workId) as SettingsQualityStatus
     if (!status.canProceed && status.needsReview) {
+      const targetName = workType.value === 'story' ? '正文生成' : '分卷大纲'
       let msg: string
       if (status.isStale) {
-        msg = '设定内容已变更，质量自检报告已过期。仍要进入分卷大纲？'
+        msg = `设定内容已变更，质量自检报告已过期。仍要进入${targetName}？`
       } else if (!status.hasOverallCheck) {
-        msg = '尚未完成设定质量自检。仍要进入分卷大纲？'
+        msg = `尚未完成设定质量自检。仍要进入${targetName}？`
       } else if (status.blockingCount > 0) {
-        msg = `自检仍有 ${status.blockingCount} 个不合格项${status.overallScore != null ? `（总分 ${status.overallScore}）` : ''}。仍要进入分卷大纲？`
+        msg = `自检仍有 ${status.blockingCount} 个不合格项${status.overallScore != null ? `（总分 ${status.overallScore}）` : ''}。仍要进入${targetName}？`
       } else if (status.overallScore != null && status.overallScore < 75) {
-        msg = `自检总分 ${status.overallScore} 未达通过线（75）。仍要进入分卷大纲？`
+        msg = `自检总分 ${status.overallScore} 未达通过线（75）。仍要进入${targetName}？`
       } else if (status.unresolvedIssues.length > 0) {
         const preview = status.unresolvedIssues.slice(0, 3).join('\n')
-        msg = `自检仍有 ${status.unresolvedIssues.length} 条未决问题，例如：\n${preview}\n\n仍要进入分卷大纲？`
+        msg = `自检仍有 ${status.unresolvedIssues.length} 条未决问题，例如：\n${preview}\n\n仍要进入${targetName}？`
       } else {
-        msg = '设定质量自检未达标。仍要进入分卷大纲？'
+        msg = `设定质量自检未达标。仍要进入${targetName}？`
       }
       if (!confirm(msg)) return
     }

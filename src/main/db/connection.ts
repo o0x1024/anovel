@@ -4,6 +4,7 @@ import { app } from 'electron'
 import { ensureIncrementalMigrations } from './migrations'
 
 let db: Database.Database | null = null
+let migrationsApplied = false
 
 /**
  * 获取数据库实例（单例）
@@ -19,7 +20,10 @@ export function getDatabase(): Database.Database {
     db.pragma('foreign_keys = ON')
   }
 
-  ensureIncrementalMigrations(db)
+  if (!migrationsApplied) {
+    ensureIncrementalMigrations(db)
+    migrationsApplied = true
+  }
   return db
 }
 
@@ -30,5 +34,6 @@ export function closeDatabase(): void {
   if (db) {
     db.close()
     db = null
+    migrationsApplied = false
   }
 }

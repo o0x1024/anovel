@@ -26,6 +26,7 @@ import {
   openAICompatibleAuthHeaders,
   type MimoProviderOptions
 } from '../../../../shared/mimo-api-params'
+import VolcengineImageSettings from './VolcengineImageSettings.vue'
 import {
   BAILIAN_API_BASE_CN,
   BAILIAN_REGION_LABELS,
@@ -1214,6 +1215,8 @@ function onProtocolChange(protocol: ProviderProtocol) {
         </div>
       </div>
     </div>
+
+    <VolcengineImageSettings class="mt-6" @toast="(type, message) => showToast(type, message)" />
 
     <!-- 添加自定义提供商弹窗 -->
     <dialog :class="['modal', { 'modal-open': showAddModal }]">

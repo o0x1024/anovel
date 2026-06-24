@@ -17,6 +17,16 @@ export function initSchema(): void {
       title VARCHAR(100) NOT NULL,
       description TEXT,
       cover_image VARCHAR(200),
+      novel_length VARCHAR(10) DEFAULT 'medium',
+      target_total_words INTEGER,
+      words_per_chapter INTEGER,
+      step_temperature_json TEXT,
+      work_type VARCHAR(20) DEFAULT 'novel',
+      status VARCHAR(20) DEFAULT 'ongoing',
+      genre VARCHAR(50),
+      tags TEXT,
+      deleted INTEGER NOT NULL DEFAULT 0,
+      deleted_time DATETIME,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       update_time DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -58,6 +68,7 @@ export function initSchema(): void {
       word_count INTEGER DEFAULT 0,
       sort INTEGER NOT NULL,
       status VARCHAR(20) DEFAULT 'draft',
+      outline_diagnosis TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE
@@ -115,6 +126,7 @@ export function initSchema(): void {
       type VARCHAR(20) NOT NULL,
       title VARCHAR(100) NOT NULL,
       content TEXT NOT NULL,
+      scope VARCHAR(10) DEFAULT 'work',
       is_active INTEGER DEFAULT 1,
       created_step VARCHAR(20),
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -148,7 +160,7 @@ export function initSchema(): void {
       is_merged INTEGER DEFAULT 0,
       merged_target VARCHAR(100),
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE SET NULL
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
 
     -- ============================================
@@ -310,7 +322,8 @@ export function initSchema(): void {
       is_default INTEGER DEFAULT 0,
       extracted_from_work_id INTEGER,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-      update_time DATETIME DEFAULT CURRENT_TIMESTAMP
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (extracted_from_work_id) REFERENCES works(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS work_taste_relation (
@@ -318,7 +331,9 @@ export function initSchema(): void {
       work_id INTEGER NOT NULL,
       profile_id INTEGER NOT NULL,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(work_id, profile_id)
+      UNIQUE(work_id, profile_id),
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (profile_id) REFERENCES taste_profile(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS style_deviation_log (
@@ -340,12 +355,13 @@ export function initSchema(): void {
 
     CREATE TABLE IF NOT EXISTS generated_images (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      work_id INTEGER,
+      work_id INTEGER NOT NULL,
       chapter_id INTEGER,
       prompt TEXT NOT NULL,
       local_path VARCHAR(200) NOT NULL,
       image_type VARCHAR(20),
-      create_time DATETIME DEFAULT CURRENT_TIMESTAMP
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS materials (
@@ -357,7 +373,24 @@ export function initSchema(): void {
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS name_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      category VARCHAR(20) NOT NULL,
+      name VARCHAR(100) NOT NULL,
+      meaning TEXT,
+      constraints_json TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'candidate',
+      linked_entity TEXT,
+      source VARCHAR(20) NOT NULL DEFAULT 'manual',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_name_entries_work
+      ON name_entries(work_id, category, status);
   `)
 
-  console.log('[DB] Schema initialized (V2.8)')
+  console.log('[DB] Schema initialized (V2.9)')
 }

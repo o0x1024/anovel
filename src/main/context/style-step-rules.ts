@@ -16,15 +16,11 @@ function matchStepPrefix(step: string | undefined, prefixes: string[]): boolean 
   return prefixes.some(p => step === p || step.startsWith(`${p}_`) || step.startsWith(p))
 }
 
-/** 作品管理 · 核心设定三项的「AI 生成」步骤（非修订/自检） */
+/** 核心设定 AI 生成（人设/世界观/冲突/人设卡片）：不注入文风、品味、锚点等 */
 export function isCoreSettingsAiGenerateStep(step: string | undefined): boolean {
   if (!step) return false
-  return /^settings_(character|worldview|conflict|idea)$/.test(step)
-}
-
-/** 核心设定 · 人设「AI 生成建议」：仅需故事方向，不注入文风/品味/锚点等 */
-export function isCoreSettingsCharacterGenerateStep(step: string | undefined): boolean {
-  return step === 'settings_character'
+  if (step === 'character_cards_generate' || step.startsWith('character_cards_')) return true
+  return step.startsWith('settings_')
 }
 
 export function resolveLayersForStep(step: string | undefined): StyleStepLayer[] {
@@ -52,11 +48,8 @@ export function resolveLayersForStep(step: string | undefined): StyleStepLayer[]
   if (matchStepPrefix(step, ['incubator'])) {
     return ['identity']
   }
-  if (isCoreSettingsCharacterGenerateStep(step)) {
-    return []
-  }
   if (isCoreSettingsAiGenerateStep(step)) {
-    return ['identity']
+    return []
   }
   if (matchStepPrefix(step, ['settings'])) {
     return ['identity', 'decision']
@@ -172,7 +165,7 @@ export function resolveStepStyleInjection(
   promptTemplate: string,
   stepRulesJson: string | null | undefined
 ): StepStyleInjection {
-  if (isCoreSettingsCharacterGenerateStep(step)) {
+  if (isCoreSettingsAiGenerateStep(step)) {
     return { languageText: null, stepRulesText: null, layers: [] }
   }
 

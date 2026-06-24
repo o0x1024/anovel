@@ -1,5 +1,5 @@
 import { foreshadowingDAO, characterSnapshotDAO } from '../db'
-import type { ForeshadowingDepth } from '../db'
+import type { ForeshadowingDepth } from '../db/dao/foreshadowing-dao'
 
 interface ExtractedMemory {
   foreshadowing_planted?: {
@@ -25,6 +25,12 @@ export interface MemoryExtractResult {
   planted: number
   resolved: number
   snapshots: number
+}
+
+export interface ForeshadowingResolutionResult {
+  resolved: { id: number; evidence: string }[]
+  partial: { id: number; evidence: string }[]
+  pending: number[]
 }
 
 export function parseMemoryExtract(content: string): ExtractedMemory {
@@ -57,19 +63,7 @@ export function applyMemoryExtract(
     planted++
   }
 
-  const pending = foreshadowingDAO.listPending(workId)
-  for (const item of extracted.foreshadowing_resolved ?? []) {
-    if (!item.description?.trim()) continue
-    const match = pending.find(p =>
-      p.description.includes(item.description.slice(0, 8)) ||
-      item.description.includes(p.description.slice(0, 8))
-    )
-    if (match) {
-      foreshadowingDAO.resolve(match.id, chapterId, item.location)
-      resolved++
-    }
-  }
-
+  // 硬编码匹配已移除 — 回收检测改用 AI 语义判断（foreshadowing:detectResolutions）
   for (const snap of extracted.character_snapshots ?? []) {
     if (!snap.character_name?.trim()) continue
     characterSnapshotDAO.create({
@@ -86,6 +80,88 @@ export function applyMemoryExtract(
   }
 
   return { planted, resolved, snapshots }
+}
+
+export const FORESHADOWING_RESOLVE_SYSTEM_PROMPT = [
+  '你是伏笔回收分析器。根据章节内容，判断每条待回收伏笔的回收状态。',
+  '',
+  '判断标准：',
+  '- resolved：本章明确揭示了伏笔的真相/结果，读者能感知到"这个伏笔已经回收了"',
+  '- partial：本章推进了该伏笔（给出线索、暗示、部分揭示），但未完全回收',
+  '- pending：本章未涉及该伏笔',
+  '',
+  '注意：',
+  '- 只看本章内容，不要推测未来章节',
+  '- 伏笔回收可能是隐晦的——比如通过角色的行为、对话暗示，不一定是明说',
+  '- evidence 字段摘录文中支持你判断的关键句子（不超过 50 字）',
+  '',
+  '输出严格 JSON：',
+  '{"results":[{"id":1,"status":"resolved","evidence":"文中关键句"},{"id":2,"status":"pending","evidence":""}]}',
+  '不要输出其他文字。'
+].join('\n')
+
+export function parseForeshadowingResolutions(content: string): ForeshadowingResolutionResult {
+  const trimmed = content.trim()
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/)
+  const jsonText = fenced ? fenced[1].trim() : trimmed
+
+  let data: unknown
+  try {
+    data = JSON.parse(jsonText)
+  } catch {
+    const bare = jsonText.match(/\{[\s\S]*"results"[\s\S]*\}/)
+    if (!bare) return { resolved: [], partial: [], pending: [] }
+    try { data = JSON.parse(bare[0]) } catch { return { resolved: [], partial: [], pending: [] } }
+  }
+
+  if (!data || typeof data !== 'object') return { resolved: [], partial: [], pending: [] }
+  const results = (data as Record<string, unknown>).results
+  if (!Array.isArray(results)) return { resolved: [], partial: [], pending: [] }
+
+  const resolved: ForeshadowingResolutionResult['resolved'] = []
+  const partial: ForeshadowingResolutionResult['partial'] = []
+  const pending: number[] = []
+
+  for (const item of results) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const id = typeof row.id === 'number' ? row.id : parseInt(String(row.id ?? ''), 10)
+    if (!Number.isFinite(id)) continue
+    const status = String(row.status ?? '').toLowerCase()
+    const evidence = typeof row.evidence === 'string' ? row.evidence.trim() : ''
+    if (status === 'resolved') resolved.push({ id, evidence })
+    else if (status === 'partial') partial.push({ id, evidence })
+    else pending.push(id)
+  }
+
+  return { resolved, partial, pending }
+}
+
+export function applyForeshadowingResolutions(
+  workId: number,
+  chapterId: number,
+  result: ForeshadowingResolutionResult
+): { resolved: number; partial: number } {
+  let resolvedCount = 0
+  let partialCount = 0
+
+  for (const item of result.resolved) {
+    const row = foreshadowingDAO.getById(item.id)
+    if (!row || row.work_id !== workId) continue
+    if (row.status === 'resolved') continue
+    foreshadowingDAO.resolve(item.id, chapterId, item.evidence || undefined)
+    resolvedCount++
+  }
+
+  for (const item of result.partial) {
+    const row = foreshadowingDAO.getById(item.id)
+    if (!row || row.work_id !== workId) continue
+    if (row.status === 'resolved' || row.status === 'abandoned') continue
+    foreshadowingDAO.updateStatus(item.id, 'partial')
+    partialCount++
+  }
+
+  return { resolved: resolvedCount, partial: partialCount }
 }
 
 export const MEMORY_EXTRACT_SYSTEM_PROMPT = [

@@ -8,11 +8,13 @@ const props = withDefaults(
     disabled?: boolean
     placeholder?: string
     emptyText?: string
+    allowCustom?: boolean
   }>(),
   {
     disabled: false,
     placeholder: '搜索或选择模型…',
-    emptyText: '无匹配模型'
+    emptyText: '无匹配模型',
+    allowCustom: true
   }
 )
 
@@ -51,6 +53,17 @@ function closeDropdown() {
 function selectOption(value: string) {
   emit('update:modelValue', value)
   closeDropdown()
+}
+
+function handleEnter() {
+  const q = query.value.trim()
+  if (props.allowCustom && q && !props.options.includes(q)) {
+    selectOption(q)
+    return
+  }
+  if (filteredOptions.value[0]) {
+    selectOption(filteredOptions.value[0])
+  }
 }
 
 function onDocumentPointerDown(e: PointerEvent) {
@@ -106,7 +119,7 @@ onUnmounted(() => {
             placeholder="输入关键词筛选…"
             autofocus
             @keydown.escape.prevent="closeDropdown"
-            @keydown.enter.prevent="filteredOptions[0] && selectOption(filteredOptions[0])"
+            @keydown.enter.prevent="handleEnter"
           />
         </label>
         <p class="text-xs text-base-content/40 mt-1 px-0.5">
@@ -114,6 +127,16 @@ onUnmounted(() => {
         </p>
       </div>
       <ul class="menu menu-sm max-h-52 overflow-y-auto p-1">
+        <li v-if="allowCustom && query.trim() && !options.includes(query.trim())">
+          <button
+            type="button"
+            class="font-mono text-xs text-primary font-bold"
+            @click="selectOption(query.trim())"
+          >
+            <font-awesome-icon icon="plus" class="w-3 h-3 mr-1" />
+            手动输入: {{ query.trim() }}
+          </button>
+        </li>
         <li v-for="opt in filteredOptions" :key="opt">
           <button
             type="button"

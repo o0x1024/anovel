@@ -2,6 +2,10 @@
 import { RouterView } from 'vue-router'
 import AppLayout from './components/AppLayout.vue'
 import AiActivityPanel from './components/AiActivityPanel.vue'
+import AppToast from './components/AppToast.vue'
+import { useBodyGenerationDelivery } from './composables/useBodyGenerationDelivery'
+
+useBodyGenerationDelivery()
 </script>
 
 <template>
@@ -13,4 +17,5 @@ import AiActivityPanel from './components/AiActivityPanel.vue'
     </RouterView>
   </AppLayout>
   <AiActivityPanel />
+  <AppToast />
 </template>

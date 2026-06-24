@@ -29,10 +29,12 @@ import {
 import {
   MAX_ACTIVE_ANCHORS,
   BODY_CONTINUITY_RULE,
-  CHAPTER_OUTLINE_LENGTH_RULES,
+  STYLE_CORE_DIRECTIVE,
+  STYLE_ANCHOR_TEMPLATE,
+  chapterOutlineLengthRules,
   VOLUME_OUTLINE_LENGTH_RULES
 } from './writing-techniques'
-import { resolvePrompt } from './prompt-registry'
+import { loadWritingPlan } from './writing-plan'
 import {
   estimateTokens,
   DEFAULT_MAX_CONTEXT_TOKENS,
@@ -45,6 +47,7 @@ import {
   shouldInjectWritingStyle
 } from './step-prompt-policy'
 import { resolveChapterCharacterNames, buildFocusCharacterHint } from './character-cards'
+import { formatAdoptedNamesForBodyContext } from './name-registry'
 import { filterAnchorsForChapter, filterAnchorsForVolume } from './anchor-scope'
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
@@ -112,27 +115,53 @@ const ANCHOR_TYPE_LABELS: Record<string, string> = {
   contrast: '反差锚点'
 }
 
-function formatAnchorsForPrompt(anchors: AnchorRow[]): string {
-  const priority = (t: string) => {
-    if (t === 'plot' || t === 'memory' || t === 'contrast') return 0
-    if (t === 'character' || t === 'emotion') return 1
-    return 2
-  }
-  const sorted = [...anchors].sort((a, b) => priority(a.type) - priority(b.type))
-  const limited = sorted.slice(0, MAX_ACTIVE_ANCHORS)
-  const lines = limited.map(a => {
+function formatAnchorsForPrompt(anchors: AnchorRow[], chapterId?: number, volumeId?: number): string {
+  // Tier 1: 全书级(const) + 绑定本章/卷 → 永远注入
+  const constAnchors = anchors.filter(a => a.scope === 'work')
+  const boundAnchors = anchors.filter(a =>
+    (chapterId && a.target_chapter_id === chapterId) ||
+    (volumeId && a.target_volume_id === volumeId && !a.target_chapter_id)
+  )
+  const prioritySet = new Set(constAnchors.concat(boundAnchors).map(a => a.id))
+
+  // Tier 2: 其余 → 受 12 限制
+  const rest = anchors.filter(a => !prioritySet.has(a.id))
+  const limited = rest.slice(0, MAX_ACTIVE_ANCHORS)
+
+  const formatLine = (a: AnchorRow, tag?: string) => {
+    const scopeLabel = a.scope === 'work' ? '📌' : a.scope === 'volume' ? '📖' : a.scope === 'chapter' ? '📍' : ''
+    const boundLabel = a.target_chapter_id ? ' [本章]' : a.target_volume_id ? ' [本卷]' : ''
     const label = ANCHOR_TYPE_LABELS[a.type] || `${a.type}锚点`
-    return `- [${label}] ${a.content}`
-  })
-  const overflowNote = anchors.length > MAX_ACTIVE_ANCHORS
-    ? `\n（另有 ${anchors.length - MAX_ACTIVE_ANCHORS} 个活跃锚点未注入，请在锚点管理中精简活跃数量≤${MAX_ACTIVE_ANCHORS}）`
-    : ''
+    return `- ${scopeLabel}[${label}]${boundLabel} ${a.content}`
+  }
+
+  const lines: string[] = []
+  if (constAnchors.length) lines.push(...constAnchors.map(a => formatLine(a)))
+  if (boundAnchors.length) lines.push(...boundAnchors.map(a => formatLine(a)))
+  if (limited.length) lines.push(...limited.map(a => formatLine(a)))
+
+  const dropped = rest.length - limited.length
+  let note = ''
+  if (dropped > 0) {
+    const droppedNames = rest.slice(MAX_ACTIVE_ANCHORS).map(a => `「${a.title}」`).join('、')
+    note = `\n⚠ 以下 ${dropped} 个锚点未注入（超出 ${MAX_ACTIVE_ANCHORS} 限制）：${droppedNames}`
+  }
+
   return [
-    '【创作锚点约束 - 必须严格遵守】',
-    '以下锚点是作者的核心创作意图，不可更改或忽略：',
+    '【创作锚点约束 - 必须严格遵守，不可更改或忽略】',
+    constAnchors.length ? `📌 全书级(${constAnchors.length}) + 📍绑定(${boundAnchors.length}) + 未绑定(${limited.length}) = ${constAnchors.length + boundAnchors.length + limited.length} 个` : '',
     ...lines,
-    overflowNote
+    note
   ].filter(Boolean).join('\n')
+}
+
+/**
+ * 从文风 prompt_template 中剥离内嵌的去 AI 味规则段落。
+ * body_generation 的 anti-AI 规则由独立的规则系统（anti-ai-rules.ts）统一管理，
+ * 避免文风模板中的旧规则与规则系统产生冲突。
+ */
+function stripEmbeddedAntiAiSection(text: string): string {
+  return text.replace(/\n*【去AIGC味[^\n]*】[\s\S]*$/, '').trim()
 }
 
 function resolveStyleTexts(request: ModelRequest): {
@@ -209,8 +238,8 @@ export function collectPromptSections(
   // ── System Zone 1: prompt 开头（高注意力）── 写作规则 / 人设 / 关键约束
   if (request.systemPrompt?.trim()) {
     let baseSystemText = request.systemPrompt.trim()
-    if (workId && isBodyStep && hasStyleReferenceText(workId)) {
-      const styleDirective = resolvePrompt('body_generation.style_core_directive')?.trim()
+    if (workId && request.step === 'body_style_rewrite' && hasStyleReferenceText(workId)) {
+      const styleDirective = STYLE_CORE_DIRECTIVE.trim()
       if (styleDirective && !baseSystemText.includes('【目标范文】')) {
         baseSystemText = `${baseSystemText}\n${styleDirective}`
       }
@@ -240,7 +269,10 @@ export function collectPromptSections(
   }
 
   if (shouldInjectWritingStyle(request.step)) {
-    const { languageText, stepRulesText } = resolveStyleTexts(request)
+    let { languageText, stepRulesText } = resolveStyleTexts(request)
+    if (languageText && request.step?.startsWith('body_')) {
+      languageText = stripEmbeddedAntiAiSection(languageText)
+    }
     if (languageText) {
       sections.push(systemRuleSection({
         key: 'style',
@@ -263,28 +295,28 @@ export function collectPromptSections(
     }
   }
 
-  if (
-    workId &&
-    (request.step === 'body_generation' || request.step?.startsWith('body_'))
-  ) {
-    const antiAiText = formatAntiAiRulesForPrompt(workId)
+  if (workId && request.step?.startsWith('body_')) {
+    const antiAiText = formatAntiAiRulesForPrompt(workId, request.step)
     if (antiAiText) {
+      const isBodyGeneration = request.step === 'body_generation'
       sections.push(systemRuleSection({
         key: 'anti_ai_rules',
-        label: '去AI味强制规则',
-        priority: 15,
-        renderOrder: 10,
+        label: isBodyGeneration ? '去模板轻约束' : '去AI味强制规则',
+        priority: isBodyGeneration ? 4 : 15,
+        renderOrder: isBodyGeneration ? 12 : 10,
         text: antiAiText,
         trimStrategy: 'none'
       }))
     }
+  }
 
+  if (workId && request.step === 'body_generation') {
     sections.push(systemRuleSection({
       key: 'body_continuity_rule',
       label: '正文连贯性约束',
       priority: 12,
       renderOrder: 15,
-      text: resolvePrompt('body_generation.continuity_rule') || BODY_CONTINUITY_RULE,
+      text: BODY_CONTINUITY_RULE,
       trimStrategy: 'none'
     }))
   }
@@ -303,6 +335,20 @@ export function collectPromptSections(
     }
   }
 
+  if (isBodyStep && workId) {
+    const adoptedNamesBlock = formatAdoptedNamesForBodyContext(workId)
+    if (adoptedNamesBlock) {
+      sections.push(systemRuleSection({
+        key: 'adopted_names',
+        label: '已确立名称',
+        priority: 3,
+        renderOrder: 22,
+        text: adoptedNamesBlock,
+        trimStrategy: 'none'
+      }))
+    }
+  }
+
   // ── User context ── 排列顺序不变
   if (workId && request.chapterId && shouldEnrichMemory) {
     const ctx = continuity ?? getPreviousChapterContext(workId, request.chapterId)
@@ -311,7 +357,7 @@ export function collectPromptSections(
       sections.push(userContextSection({
         key: 'continuity',
         label: '上一章全文',
-        priority: 1,
+        priority: 5,
         text: continuityText,
         trimStrategy: 'tail'
       }))
@@ -329,7 +375,7 @@ export function collectPromptSections(
     sections.push(userContextSection({
       key: 'chapter_meta',
       label: '本章大纲/ABC/人设',
-      priority: 2,
+      priority: 8,
       text: memory.sections.chapterMeta,
       trimStrategy: 'drop'
     }))
@@ -339,7 +385,7 @@ export function collectPromptSections(
     sections.push(userContextSection({
       key: 'foreshadowing',
       label: '待回收伏笔',
-      priority: 3,
+      priority: 10,
       text: memory.sections.foreshadowing,
       trimStrategy: 'drop'
     }))
@@ -349,7 +395,7 @@ export function collectPromptSections(
     sections.push(userContextSection({
       key: 'snapshots',
       label: '角色快照',
-      priority: 3,
+      priority: 10,
       text: memory.sections.snapshots,
       trimStrategy: 'drop'
     }))
@@ -363,7 +409,7 @@ export function collectPromptSections(
       sections.push(userContextSection({
         key: 'retrieved_chapters',
         label: '相关历史章节',
-        priority: 4,
+        priority: 12,
         text: retrievedText,
         trimStrategy: 'drop'
       }))
@@ -375,7 +421,7 @@ export function collectPromptSections(
     sections.push(systemRuleSection({
       key: 'worldview',
       label: '世界观规则',
-      priority: 6,
+      priority: 13,
       renderOrder: 40,
       text: memory.sections.worldview,
       trimStrategy: 'drop'
@@ -386,7 +432,7 @@ export function collectPromptSections(
     sections.push(systemRuleSection({
       key: 'timeline',
       label: '故事时间线',
-      priority: 7,
+      priority: 14,
       renderOrder: 45,
       text: memory.sections.timeline,
       trimStrategy: 'drop'
@@ -415,7 +461,7 @@ export function collectPromptSections(
       sections.push(systemRuleSection({
         key: 'work_context',
         label: '作品上下文',
-        priority: 8,
+        priority: 15,
         renderOrder: 50,
         text: ctx.text,
         trimStrategy: 'drop'
@@ -450,7 +496,7 @@ export function collectPromptSections(
         label: scopeNote,
         priority: 5,
         renderOrder: 75,
-        text: formatAnchorsForPrompt(anchors),
+        text: formatAnchorsForPrompt(anchors, request.chapterId, request.volumeId),
         trimStrategy: 'drop'
       }))
     }
@@ -499,12 +545,13 @@ export function collectPromptSections(
       request.step === 'volume_chapters_batch' ||
       request.step?.startsWith('chapter_outline_'))
   ) {
+    const wpc = loadWritingPlan(workId).wordsPerChapter
     sections.push(systemRuleSection({
       key: 'chapter_outline_length',
       label: '章节大纲体裁',
       priority: 12,
       renderOrder: 90,
-      text: CHAPTER_OUTLINE_LENGTH_RULES,
+      text: chapterOutlineLengthRules(wpc),
       trimStrategy: 'none'
     }))
   }
@@ -521,11 +568,13 @@ export function collectPromptSections(
         priority: 8,
         renderOrder: 4,
         text: fewShotText,
-        trimStrategy: 'tail'
+        trimStrategy: 'none'
       }))
 
-      if (hasStyleReferenceText(workId)) {
-        const anchorTemplate = resolvePrompt('body_generation.style_anchor')
+      // 文风尾注锚定仅用于正文生成。稿件优化阶段保留 system 约束，
+      // 避免在 user prompt 侧重复追加风格锚定造成提示词冗余。
+      if (request.step === 'body_generation' && hasStyleReferenceText(workId)) {
+        const anchorTemplate = STYLE_ANCHOR_TEMPLATE
         if (anchorTemplate) {
           sections.push(userContextSection({
             key: 'style_anchor',
@@ -533,12 +582,13 @@ export function collectPromptSections(
             priority: 0,
             renderOrder: 9999,
             text: anchorTemplate,
-            trimStrategy: 'drop'
+            trimStrategy: 'none'
           }))
         }
       }
     }
   }
+
 
   return sections
 }
@@ -551,7 +601,9 @@ function calcPressure(usageRatio: number): ContextPressure {
 }
 
 function tailTrimSection(text: string, targetTokens: number): string {
-  const marker = '【上一章全文 - 本章须从此文自然延续】'
+  const marker = text.includes('【上一章全文 - 仅供了解剧情上下文')
+    ? '【上一章全文 - 仅供了解剧情上下文，不可重复其中任何内容】'
+    : '【上一章全文 - 本章须从此文自然延续】'
   const idx = text.indexOf(marker)
   if (idx < 0) {
     const chars = Math.max(500, Math.floor(targetTokens * 1.5))

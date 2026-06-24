@@ -72,7 +72,7 @@ export function buildNarrativeMemorySections(
         abcParts.push(`爽点链角色：${ch.beat_role}（${BEAT_ROLE_LABELS[ch.beat_role] || ch.beat_role}）`)
       }
       if (ch.foreshadow_target?.trim()) abcParts.push(`铺垫目标：${ch.foreshadow_target.trim()}`)
-      if (ch.next_hook?.trim()) abcParts.push(`章末钩子目标：${ch.next_hook.trim()}`)
+      if (ch.next_hook?.trim()) abcParts.push(`章末钩子目标（必须落实）：${ch.next_hook.trim()}——本章结尾必须体现此悬念，禁止平淡收束`)
       if (abcParts.length) metaParts.push('【本章节奏定位】', abcParts.join('\n'))
 
       if (ch.pov_mode) {

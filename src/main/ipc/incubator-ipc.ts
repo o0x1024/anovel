@@ -1,10 +1,12 @@
 import { toPlainForIpc } from '../../shared/ipc-plain'
+import type { WorkModelOptions } from '../../shared/work-model-options'
 import type {
   IncubatorAdoptMode,
   IncubatorAdoptToSlotInput,
   IncubatorAdoptToSlotResult,
   IncubatorCandidateSourceStep,
   IncubatorCandidateStatus,
+  IncubatorVersionDetail,
   IncubatorWorkspaceState
 } from '../../shared/incubator-types'
 import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS, isIncubatorSlotKey } from '../../shared/incubator-slots'
@@ -33,6 +35,8 @@ import {
 import { updateDraftSlotContent } from '../context/incubator/update-slot'
 import { parseDiagnosePatches } from '../context/incubator/parse-diagnose-patches'
 import { applyDiagnosePatchesToSlots } from '../context/incubator/apply-diagnose-patches'
+import { applyGateReplacements } from '../context/incubator/apply-gate-replacements'
+import { runGateFix } from '../context/incubator/gate-fix'
 import {
   branchFromIncubatorVersion,
   compareIncubatorVersions,
@@ -40,6 +44,7 @@ import {
   listIncubatorVersions,
   restoreIncubatorVersion
 } from '../context/incubator/version-ops'
+import { clearIncubatorAnalysisResults } from '../context/incubator/clear-analysis-results'
 import { safeIpcHandle } from './ipc-safe'
 
 function workspaceAt(workId: number): IncubatorWorkspaceState {
@@ -84,20 +89,25 @@ export function registerIncubatorIpcHandlers(): void {
     return { ...result, workspace: workspaceAt(workId as number) }
   })
 
-  safeIpcHandle('incubator:runGate', (_e, workId) => {
-    const report = runIncubatorGate(workId as number)
+  safeIpcHandle('incubator:runGate', async (_e, workId, userInstruction, modelOpts) => {
+    const report = await runIncubatorGate(
+      workId as number,
+      userInstruction as string | undefined,
+      { webContents: _e.sender },
+      modelOpts as WorkModelOptions | undefined
+    )
     return { report, workspace: workspaceAt(workId as number) }
   })
 
-  safeIpcHandle('incubator:freezeVersion', async (_e, workId, label) => {
-    const result = await freezeIncubatorStorylineVersion(workId as number, label as string | undefined)
+  safeIpcHandle('incubator:freezeVersion', async (_e, workId, label, modelOpts?: WorkModelOptions) => {
+    const result = await freezeIncubatorStorylineVersion(workId as number, label as string | undefined, modelOpts)
     return { ...result, workspace: workspaceAt(workId as number) }
   })
 
   safeIpcHandle(
     'incubator:persistVariants',
-    (_e, workId, items) => {
-      const ids = persistVariantsAsCandidates(
+    async (_e, workId, items) => {
+      const ids = await persistVariantsAsCandidates(
         workId as number,
         items as { title: string; summary: string; dimension?: string }[]
       )
@@ -107,8 +117,8 @@ export function registerIncubatorIpcHandlers(): void {
 
   safeIpcHandle(
     'incubator:persistExpansion',
-    (_e, workId, versions) => {
-      const ids = persistExpansionAsCandidates(
+    async (_e, workId, versions) => {
+      const ids = await persistExpansionAsCandidates(
         workId as number,
         versions as { title: string; summary: string; highlights?: string; audience?: string }[]
       )
@@ -118,8 +128,8 @@ export function registerIncubatorIpcHandlers(): void {
 
   safeIpcHandle(
     'incubator:persistSlotAnalysis',
-    (_e, workId, sourceStep, versions) => {
-      const ids = persistSlotAnalysisAsCandidates(
+    async (_e, workId, sourceStep, versions) => {
+      const ids = await persistSlotAnalysisAsCandidates(
         workId as number,
         sourceStep as IncubatorCandidateSourceStep,
         versions as { title: string; summary: string }[]
@@ -130,8 +140,8 @@ export function registerIncubatorIpcHandlers(): void {
 
   safeIpcHandle(
     'incubator:registerManualCandidate',
-    (_e, workId, sourceStep, payload) => {
-      const id = ensureCandidateFromManual(
+    async (_e, workId, sourceStep, payload) => {
+      const id = await ensureCandidateFromManual(
         workId as number,
         sourceStep as import('../../shared/incubator-types').IncubatorCandidateSourceStep,
         payload as {
@@ -148,14 +158,14 @@ export function registerIncubatorIpcHandlers(): void {
 
   safeIpcHandle(
     'incubator:syncParsedCandidates',
-    (_e, workId, source, raw, legacyFallback = false) => {
+    async (_e, workId, source, raw, legacyFallback = false) => {
       const wid = workId as number
       if (source === 'variants') {
         const items = parseIncubatorVariants(raw as string, legacyFallback as boolean)
-        persistVariantsAsCandidates(wid, items)
+        await persistVariantsAsCandidates(wid, items)
       } else {
         const versions = parseExpansionVersions(raw as string)
-        persistExpansionAsCandidates(wid, versions)
+        await persistExpansionAsCandidates(wid, versions)
       }
       return workspaceAt(wid)
     }
@@ -181,23 +191,29 @@ export function registerIncubatorIpcHandlers(): void {
     return { deleted, workspace: workspaceAt(wid) }
   })
 
-  safeIpcHandle('incubator:rescoreCandidate', (_e, workId, candidateId) => {
+  safeIpcHandle('incubator:clearAnalysisResults', (_e, workId) => {
+    const wid = workId as number
+    const result = clearIncubatorAnalysisResults(wid)
+    return { ...result, workspace: workspaceAt(wid) }
+  })
+
+  safeIpcHandle('incubator:rescoreCandidate', async (_e, workId, candidateId) => {
     const wid = workId as number
     const cid = candidateId as number
     const row = incubatorCandidateDAO.getById(cid)
     if (!row || row.work_id !== wid) throw new Error('候选不存在')
-    rescoreCandidate(cid)
+    await rescoreCandidate(cid)
     return workspaceAt(wid)
   })
 
-  safeIpcHandle('incubator:rescoreAll', (_e, workId) => {
+  safeIpcHandle('incubator:rescoreAll', async (_e, workId) => {
     const wid = workId as number
-    const count = rescoreAllCandidates(wid)
+    const count = await rescoreAllCandidates(wid)
     return { count, workspace: workspaceAt(wid) }
   })
 
-  safeIpcHandle('incubator:setUserScoreAdjustment', (_e, workId, candidateId, adjustment) => {
-    const result = applyUserScoreAdjustment(
+  safeIpcHandle('incubator:setUserScoreAdjustment', async (_e, workId, candidateId, adjustment) => {
+    const result = await applyUserScoreAdjustment(
       workId as number,
       candidateId as number,
       adjustment as number
@@ -221,6 +237,24 @@ export function registerIncubatorIpcHandlers(): void {
     return { ...result, workspace: workspaceAt(workId as number) }
   })
 
+  safeIpcHandle('incubator:applyGateReplacements', (_e, workId, items) => {
+    const result = applyGateReplacements(
+      workId as number,
+      items as import('../context/incubator/apply-gate-replacements').GateReplacementInput[]
+    )
+    return { ...result, workspace: workspaceAt(workId as number) }
+  })
+
+  safeIpcHandle('incubator:runGateFix', async (_e, workId, gateReport, modelOpts) => {
+    const result = await runGateFix(
+      workId as number,
+      gateReport as import('../../shared/incubator-types').IncubatorGateReport,
+      { webContents: _e.sender, sessionTitle: '门禁自动修复' },
+      modelOpts as WorkModelOptions | undefined
+    )
+    return { ...result, workspace: workspaceAt(workId as number) }
+  })
+
   safeIpcHandle('incubator:listVersions', (_e, workId) =>
     listIncubatorVersions(workId as number))
 
@@ -234,12 +268,41 @@ export function registerIncubatorIpcHandlers(): void {
         content: detail.snapshot.slots[key]?.trim() ?? ''
       }))
       .filter(s => s.content)
+    // 解析冻结时存储的门禁报告快照
+    let gate: IncubatorVersionDetail['gate'] = null
+    if (detail.snapshot.gate) {
+      const g = detail.snapshot.gate as unknown as Record<string, unknown>
+      gate = {
+        passed: !!g.passed,
+        filledSlotCount: (g.filledSlotCount as number) ?? slotPreviews.length,
+        serializabilityScore: (g.serializabilityScore as number) ?? 0,
+        conflictClosureScore: (g.conflictClosureScore as number) ?? 0,
+        issues: Array.isArray(g.issues) ? g.issues as string[] : [],
+        suggestions: Array.isArray(g.suggestions) ? g.suggestions as string[] : [],
+        coherence: Array.isArray(g.coherence)
+          ? (g.coherence as Array<Record<string, unknown>>)
+              .filter(c =>
+                typeof c.slotKey === 'string' &&
+                typeof c.severity === 'string' &&
+                typeof c.issue === 'string' &&
+                typeof c.suggestion === 'string'
+              )
+              .map(c => ({
+                slotKey: c.slotKey as IncubatorSlotKey,
+                severity: c.severity as 'blocking' | 'warning',
+                issue: c.issue as string,
+                suggestion: c.suggestion as string
+              }))
+          : []
+      }
+    }
     return {
       version: detail.version,
       filledSlotCount: slotPreviews.length,
       slotPreviews,
       synthesizedSummary: detail.snapshot.synthesizedSummary ?? null,
-      qualitySnapshot: detail.snapshot.qualitySnapshot ?? null
+      qualitySnapshot: detail.snapshot.qualitySnapshot ?? null,
+      gate
     }
   })
 
@@ -262,7 +325,7 @@ export function registerIncubatorIpcHandlers(): void {
 
   safeIpcHandle(
     'incubator:adoptLegacyToSlot',
-    (_e, workId, payload, slotKey, mode) => {
+    async (_e, workId, payload, slotKey, mode) => {
       const sk = slotKey as string
       if (!isIncubatorSlotKey(sk)) {
         return { success: false, error: '无效的槽位' }
@@ -275,7 +338,7 @@ export function registerIncubatorIpcHandlers(): void {
         audience?: string | null
         sourceStep: 'variants' | 'expand'
       }
-      const candidateId = ensureCandidateFromManual(
+      const candidateId = await ensureCandidateFromManual(
         workId as number,
         p.sourceStep,
         p

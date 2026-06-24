@@ -11,11 +11,12 @@ import type { WorkStepTemperatureConfig } from '../../shared/work-step-temperatu
 export interface WorkBackupBundle {
   version: 1
   exportedAt: string
-  work: { title: string; description: string | null }
+  work: { title: string; description: string | null; work_type?: string }
   settings: { type: string; content: string }[]
   volumes: { name: string; description: string | null; sort: number; chapters: {
     title: string; outline: string | null; content: string | null; word_count: number
     sort: number; status: string; emotion_intensity: number | null
+    outline_diagnosis?: string | null
   }[] }[]
   anchors: { type: string; title: string; content: string; is_active: number }[]
   ideas: { type: string; content: string; tags: string | null }[]
@@ -37,7 +38,7 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
   return {
     version: 1,
     exportedAt: new Date().toISOString(),
-    work: { title: work.title, description: work.description },
+    work: { title: work.title, description: work.description, work_type: work.work_type ?? 'novel' },
     settings,
     volumes: volumes.map(vol => ({
       name: vol.name,
@@ -52,7 +53,8 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
           word_count: c.word_count,
           sort: c.sort,
           status: c.status,
-          emotion_intensity: c.emotion_intensity
+          emotion_intensity: c.emotion_intensity,
+          outline_diagnosis: c.outline_diagnosis
         }))
     })),
     anchors: anchorDAO.listByWork(workId).map(a => ({
@@ -87,7 +89,8 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
 export function importWorkBundle(bundle: WorkBackupBundle): number {
   const workId = workDAO.create({
     title: `${bundle.work.title}（导入）`,
-    description: bundle.work.description ?? undefined
+    description: bundle.work.description ?? undefined,
+    workType: bundle.work.work_type ?? 'novel'
   })
 
   for (const s of bundle.settings) {
@@ -103,7 +106,8 @@ export function importWorkBundle(bundle: WorkBackupBundle): number {
         outline: ch.outline ?? undefined,
         word_count: ch.word_count,
         status: ch.status,
-        emotion_intensity: ch.emotion_intensity ?? undefined
+        emotion_intensity: ch.emotion_intensity ?? undefined,
+        outline_diagnosis: ch.outline_diagnosis ?? undefined
       })
     }
   }

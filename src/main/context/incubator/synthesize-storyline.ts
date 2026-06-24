@@ -1,6 +1,7 @@
 import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
 import { INCUBATOR_SYNTHESIZE_SYSTEM } from '../../../shared/incubator-analysis-prompts'
+import { withWorkModelOptions, type WorkModelOptions } from '../../../shared/work-model-options'
 import { modelService } from '../../model'
 
 export interface StorylineSynthesisResult {
@@ -23,20 +24,20 @@ export function buildSlotsPromptBody(slotMap: Record<string, string>): string {
  */
 export async function synthesizeStorylineForFreeze(
   workId: number,
-  slotMap: Record<string, string>
+  slotMap: Record<string, string>,
+  modelOpts?: WorkModelOptions
 ): Promise<StorylineSynthesisResult | null> {
   const body = buildSlotsPromptBody(slotMap)
   if (!body.trim()) return null
 
-  const res = await modelService.chat({
+  const res = await modelService.chat(withWorkModelOptions({
     prompt: body,
     systemPrompt: INCUBATOR_SYNTHESIZE_SYSTEM,
     workId,
     step: 'incubator_synthesize_freeze',
     enrichWorkContext: false,
-    enrichNarrativeMemory: false,
-    maxTokens: 4096
-  })
+    enrichNarrativeMemory: false
+  }, modelOpts))
 
   if (!res.success || !res.content.trim()) return null
 

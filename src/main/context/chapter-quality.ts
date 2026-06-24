@@ -1,5 +1,3 @@
-import { volumeChapterDAO } from '../db'
-
 export interface QualityCheckItem {
   key: string
   label: string
@@ -18,289 +16,313 @@ export interface QualityDiagnosisResult {
 }
 
 /**
- * 规则驱动的章节质量诊断（开篇/密度/节奏/冲突/动态描写/视角）
+ * 章节质量诊断已全面移交 AI（quality:diagnoseAI）。
+ * 此函数保留 API 兼容性，始终返回通过状态。
  */
 export function diagnoseChapterQuality(
-  workId: number,
-  chapterId: number,
-  content: string,
-  options?: { isFirstChapter?: boolean; povMode?: string | null }
+  _workId: number,
+  _chapterId: number,
+  _content: string,
+  _options?: { isFirstChapter?: boolean; povMode?: string | null }
 ): QualityDiagnosisResult {
-  const items: QualityCheckItem[] = []
-  const text = content.trim()
-  const wordCount = text.replace(/\s/g, '').length
-  const isFirst = options?.isFirstChapter ?? isFirstChapterOfWork(workId, chapterId)
-  const ch = volumeChapterDAO.getChapter(chapterId)
-  const povMode = options?.povMode ?? ch?.pov_mode ?? null
-
-  if (isFirst) {
-    const opening = text.slice(0, 300)
-    const hasSettingDump = (opening.match(/设定|背景|世界观|体系/g) || []).length >= 2
-    const hasScene = /说|道|看|走|站|坐|门|窗|雨|风|笑|喊|跑/.test(opening)
-    items.push({
-      key: 'opening_hook',
-      label: '首页见山',
-      severity: 'fatal',
-      passed: hasScene && !hasSettingDump && opening.length >= 80,
-      detail: hasSettingDump
-        ? '开篇存在设定堆砌风险，建议先建立场景与期待'
-        : hasScene
-          ? '开篇较快进入场景'
-          : '开篇缺少具体场景，建议加强画面感'
-    })
-
-    const dynamicSignals = countDynamicDescriptionSignals(opening)
-    items.push({
-      key: 'dynamic_opening',
-      label: '动态描写',
-      severity: 'warning',
-      passed: dynamicSignals >= 2,
-      detail: dynamicSignals >= 2
-        ? '开篇含动作/声音/他人反应等动态元素'
-        : '开篇偏静态陈述，建议用动作链或他人反应引入人物'
-    })
-  } else if (text.length >= 200) {
-    const opening = text.slice(0, 200)
-    const restartSignals = (opening.match(/话说|且说|与此同时|另一边|镜头转向|时间回到|让我们/g) || []).length
-    items.push({
-      key: 'continuity_restart',
-      label: '衔接自然',
-      severity: 'warning',
-      passed: restartSignals === 0,
-      detail: restartSignals > 0
-        ? '开篇疑似重新开场，建议直接承接上一章结尾'
-        : '未见明显重开场信号'
-    })
-  }
-
-  const hookPatterns = [/然而|突然|没想到|究竟|到底|秘密|危险|明天|等待|消失|出现|发现/g]
-  const lastPart = text.slice(-Math.min(500, text.length))
-  const hookMatches = lastPart.match(hookPatterns) || []
-  const nextHookTarget = ch?.next_hook?.trim()
-  items.push({
-    key: 'chapter_hook',
-    label: '章末留钩',
-    severity: 'fatal',
-    passed: hookMatches.length >= 1 || /[？?…]$/.test(lastPart.trim()),
-    detail: hookMatches.length >= 1
-      ? nextHookTarget
-        ? `章末有悬念信号；大纲钩子目标：${nextHookTarget}`
-        : '章末存在悬念/转折信号'
-      : nextHookTarget
-        ? `章末钩子较弱，建议落实大纲目标：${nextHookTarget}`
-        : '章末钩子较弱，建议增加悬念或冲突升级'
-  })
-
-  const tellCount = countTellNotShow(text)
-  if (tellCount >= 5) {
-    items.push({
-      key: 'tell_not_show',
-      label: '展示而非告知',
-      severity: 'warning',
-      passed: false,
-      detail: `检测到约 ${tellCount} 处直述性格/外貌/情绪，建议改为事件与细节展示`
-    })
-  } else {
-    items.push({
-      key: 'tell_not_show',
-      label: '展示而非告知',
-      severity: 'info',
-      passed: true,
-      detail: tellCount > 0 ? `少量直述（${tellCount} 处），可接受` : '未发现明显直述堆砌'
-    })
-  }
-
-  if (povMode === 'third_limited' || povMode === 'first') {
-    const povIssues = detectPovShifts(text, povMode)
-    items.push({
-      key: 'pov_consistency',
-      label: '视角一致',
-      severity: povIssues > 2 ? 'warning' : 'info',
-      passed: povIssues <= 2,
-      detail: povIssues > 2
-        ? `检测到约 ${povIssues} 处疑似视角切换/全知插入，建议统一叙事视角`
-        : '视角基本稳定'
-    })
-  }
-
-  const infoPoints = estimateInfoPoints(text)
-  if (infoPoints > 8) {
-    items.push({
-      key: 'info_overload',
-      label: '信息过载',
-      severity: 'warning',
-      passed: false,
-      detail: `检测到约 ${infoPoints} 个信息点，建议拆分或删减`
-    })
-  } else if (infoPoints < 2 && wordCount > 2000) {
-    items.push({
-      key: 'info_sparse',
-      label: '信息贫乏',
-      severity: 'warning',
-      passed: false,
-      detail: '字数较多但信息点偏少，存在水文风险；可加快剧情或拉配角支线'
-    })
-  } else {
-    items.push({
-      key: 'info_density',
-      label: '信息密度',
-      severity: 'info',
-      passed: true,
-      detail: `约 ${infoPoints} 个核心信息点，密度适中`
-    })
-  }
-
-  const conflictWords = text.match(/冲突|对抗| fight|打|杀|争|威胁|危机|敌人|对手/gi) || []
-  items.push({
-    key: 'conflict_strength',
-    label: '冲突强度',
-    severity: 'warning',
-    passed: conflictWords.length >= 2,
-    detail: conflictWords.length >= 2
-      ? '章节存在明确冲突信号'
-      : '冲突信号偏弱，建议强化对抗动机或代价'
-  })
-
-  const fatalCount = items.filter(i => !i.passed && i.severity === 'fatal').length
-  const warningCount = items.filter(i => !i.passed && i.severity === 'warning').length
-
-  let writerBlockHint: string | undefined
-  if (items.some(i => i.key === 'info_sparse' && !i.passed)) {
-    writerBlockHint = 'plot_stuck'
-  } else if (items.some(i => i.key === 'continuity_restart' && !i.passed)) {
-    writerBlockHint = 'flat_pacing'
-  } else if (items.some(i => i.key === 'tell_not_show' && !i.passed)) {
-    writerBlockHint = 'character_flat'
-  }
-
   return {
-    items,
-    fatalCount,
-    warningCount,
-    passed: fatalCount === 0,
-    summary: fatalCount > 0
-      ? `发现 ${fatalCount} 项致命问题、${warningCount} 项警告`
-      : warningCount > 0
-        ? `无致命问题，${warningCount} 项需优化`
-        : '基础质量检查通过',
-    writerBlockHint
+    items: [],
+    fatalCount: 0,
+    warningCount: 0,
+    passed: true,
+    summary: '质量评估由 AI 诊断执行',
+    writerBlockHint: undefined
   }
 }
 
-function isFirstChapterOfWork(workId: number, chapterId: number): boolean {
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  return chapters.length > 0 && chapters[0].id === chapterId
-}
-
-function estimateInfoPoints(text: string): number {
-  const sentences = text.split(/[。！？\n]/).filter(s => s.trim().length > 8)
-  let points = 0
-  for (const s of sentences) {
-    if (/发现|决定|出现|原来|得知|发生|变成|获得|失去|答应|拒绝/.test(s)) points++
-  }
-  return Math.min(points, 20)
-}
-
-function countDynamicDescriptionSignals(text: string): number {
-  let score = 0
-  if (/走|跑|站|坐|转|抬|低|握|推|拉|笑|哭|喊/.test(text)) score++
-  if (/说|道|问|答|叫|骂/.test(text)) score++
-  if (/听|看|望|瞥|盯/.test(text)) score++
-  if (/风|雨|门|灯|脚步|笑声/.test(text)) score++
-  return score
-}
-
-function countTellNotShow(text: string): number {
-  const patterns = [
-    /性格(?:很|十分|非常|极其|颇为)?/g,
-    /为人(?:很|十分|非常)?/g,
-    /(?:十分|非常|极其|特别)(?:美丽|漂亮|英俊|帅气|好看)/g,
-    /(?:很|十分|非常)(?:善良|邪恶|冷酷|温柔|聪明|愚蠢|勇敢|胆小)/g,
-    /给人一种.{0,6}的感觉/g
-  ]
-  let count = 0
-  for (const p of patterns) {
-    count += (text.match(p) || []).length
-  }
-  return count
-}
-
-function detectPovShifts(text: string, mode: string): number {
-  const omniscientPatterns = [
-    /他不知道的是/g,
-    /与此同时，在.{2,20}(?:里|中|处)/g,
-    /镜头(?:转向|切换到)/g,
-    /(?:其实|实际上).{0,10}(?:心里|心中)/g
-  ]
-  if (mode === 'first') {
-    omniscientPatterns.push(/他(?:想|觉得|感到)/g)
-  }
-  let count = 0
-  for (const p of omniscientPatterns) {
-    count += (text.match(p) || []).length
-  }
-  return count
-}
-
-/** 将规则诊断中未通过的项格式化为稿件优化/修复用的提示 */
-export function formatQualityFixHints(result: QualityDiagnosisResult): string | undefined {
-  const failed = result.items.filter(
-    i => !i.passed && (i.severity === 'fatal' || i.severity === 'warning')
-  )
-  if (failed.length === 0) return undefined
-
-  const lines = [
-    '【章节质量待改进项】',
-    '重写时请同时改善以下规则诊断指出的问题（保持情节与关键事件不变，调整写法与结构）：',
-    ''
-  ]
-  for (const item of failed) {
-    const tag = item.severity === 'fatal' ? '【致命】' : '【警告】'
-    lines.push(`${tag}${item.label}：${item.detail}`)
-  }
-  return lines.join('\n')
+/** 保留 API 兼容性，规则诊断已移除，始终返回 undefined */
+export function formatQualityFixHints(_result: QualityDiagnosisResult): string | undefined {
+  return undefined
 }
 
 export const QUALITY_AI_SYSTEM_PROMPT = [
-  '你是番茄小说平台的资深编辑，对章节进行深度质量诊断。',
+  '你是番茄小说平台的资深编辑，对章节进行全面质量诊断。',
+  '若下方提供了【目标范文】，诊断与修改建议须参考其句长节奏、对话密度和信息分布；无范文时用白描、动作、口语化短句替代 AI 腔。',
   '',
-  '检查维度：',
-  '1. 内容质量：开篇见山、章末留钩、信息密度、过渡章风险、冲突动机与代价、节奏情绪、动态描写、展示而非告知、视角一致性',
-  '2. AI 痕迹检测（重点）：',
-  '   - 连接词堆砌（然而/因此/与此同时/总的来说/此外）',
-  '   - 模板化情感表达（心中涌起一股/眼中闪过一丝/不禁/仿佛……一般）',
-  '   - 段落长度过于均匀（缺乏节奏变化）',
-  '   - 修辞密度过高（比喻/拟人堆积）',
-  '   - 句长过于均匀（缺少碎片短句和长句交替）',
-  '   - 情感饱和度过高（缺少"白开水"段落）',
+  '## 诊断维度（逐项评估）',
   '',
-  '输出格式（严格按此结构）：',
-  '## 致命问题',
-  '列出最严重的内容/结构问题，最多 5 条；经评估确实不存在致命级问题时，本节可省略或写「无」，禁止凑数。',
-  '每条须含：问题简述 + 引用原文关键句 + 去 AI 味的修改建议。',
-  '格式：问题描述 ——「原文句子」→ 建议改为「修改后句子」',
-  '**修改建议的首要前提是去除 AI 腔：禁止给出更文学/更流畅但仍是 AI 味的通用替代句。**',
-  '## AI 痕迹',
-  '逐条列出检测到的 AI 痕迹，每条引用原文具体句子并给出修改示例',
-  '格式：「原文句子」→ 建议改为「修改后句子」',
-  '## 警告',
-  '列出需要注意的问题',
-  '## 优点',
-  '列出做得好的地方',
-  '## 修改建议',
-  '按优先级列出具体可执行的修改建议'
+  '### A. 开篇质量',
+  '- 首页见山：前 100 字是否快速建立场景与期待？是否存在设定堆砌（背景/世界观/体系连续出现）？',
+  '- 动态描写：开篇是否有动作/声音/对话等动态元素引入人物？还是纯静态陈述？',
+  '- 衔接自然（非首章）：是否存在"话说/且说/与此同时/另一边/镜头转向"等重启信号？应直接承接上章。',
+  '',
+  '### B. 展示 vs 告知',
+  '- 是否存在大量直述性格/外貌/情绪（"性格很善良""十分美丽""给人一种…的感觉"）？',
+  '- 应改为事件与细节展示，而非形容词堆砌。',
+  '',
+  '### C. 视角一致性',
+  '- 若章节设定为限知视角（第三人称限知/第一人称），是否出现全知越界？',
+  '- 典型越界信号："他不知道的是…""与此同时，在某处…""其实/实际上他心里…"',
+  '',
+  '### D. 信息密度与节奏',
+  '- 信息过载：核心信息点是否过多（>8 个），导致读者消化困难？',
+  '- 信息贫乏：字数多但信息点少（<2 个/2000 字以上），是否存在水文风险？',
+  '- 冲突强度：章节是否存在明确的对抗/冲突/威胁？纯过渡章是否有微冲突？',
+  '',
+  '### E. AI 典型句式与表达（重要）',
+  '检测以下高频 AI 句式模式，每出现 1 处计 1 次，>=2 处判定为严重：',
+  '',
+  '【句式模板】',
+  '- "不是A，而是B"/"不是A，是B" 式对比强调（AI 极高频使用此句式做心理转折）',
+  '- "与其说A，不如说B" 式伪辩证',
+  '- "虽然A，但是B" 正反对比（非对话中的口语转折）',
+  '- "这不是A，这是B" 式定义重申',
+  '',
+  '【连接词堆砌】',
+  '- 然而、因此、此外、与此同时、不仅如此、尽管如此、值得注意的是、总而言之、综上',
+  '',
+  '【模板情感/动作句】',
+  '- "心中涌起一股…""眼中闪过一丝…""嘴角微微上扬"',
+  '- "目光落在…上""缓缓开口/站起身/回过头"',
+  '- "这一刻他明白了…""或许这便是…""对于…而言…"',
+  '',
+  '【机械对话标注】（AI 极高频特征，人类网文作者几乎不使用）',
+  '- "对话。"他说，"继续。" / "对话。"她说。 / "对话？"XX问。',
+  '  这种裸标注（主语+说/问，无任何修饰）是 AI 生成文本的标志性特征。',
+  '  人类网文作者使用"说道/问道"并搭配语气/动作/神态描写：',
+  '  ✗ "走吧。"他说。→ ✓ "走吧。"他把背包往肩上一甩。',
+  '  ✗ "真的？"她问。→ ✓ "真的？"她皱了下眉。',
+  '  ✗ "你来了。"秦浩说。→ ✓ "你来了。"秦浩不咸不淡的说道，头也没抬。',
+  '  也可省略标注，靠上下文暗示说话人。>=3 处裸标注判定为严重。',
+  '',
+  '【修辞句式滥用】（AI 极度偏好修辞手法，人类网文作者很少在叙事中大量使用）',
+  '- 比喻堆砌："仿佛/宛如/犹如/好似/像…一样/似的/般"，每 500 字超过 2 次即为过度',
+  '- 排比/反复："…也…，…也…""…是…，…是…，…是…" 式三段及以上排比',
+  '- 通感/移觉："声音是XX色的""空气弥漫着XX的味道""阳光带着XX的温度"',
+  '- 拟人滥用："风/夜/月/雨+人类动作"（如"夜色吞噬了…""风在耳边低语""月光温柔地抚摸"）',
+  '- 对偶/工整句："A了B，C了D""A如B，C如D" 式过于整齐的对仗',
+  '- 隐喻哲理化："人生就像…""命运如同…""时间是…" 式升华句',
+  '- 意象叠加：同一段内 >=3 个不同意象比喻（如"像刀/如火/似水"连续出现）',
+  '',
+  '【电报式短句连发】（AI 高频特征，人类网文极少出现）',
+  '- 连续 3 句以上≤10字的短句堆砌，模拟"文学感"的碎片式断句',
+  '  ✗ "老妪抬起头。灰蒙蒙的眼睛看着他。没说话。"',
+  '  ✗ "他站住了。回过头。眼神很冷。"',
+  '  人类网文作者会将部分短句合并为复合句，或用对话/动作打断节奏：',
+  '  ✓ "老妪抬起头，灰蒙蒙的眼睛看着他，半天没吱声。"',
+  '  >=1 组电报式短句即应标记。',
+  '',
+  '【短句强否定收尾】（AI 偏好用短促的否定动作收尾，制造伪高深/冷酷感）',
+  '- "动作/场景，+没/没有+单/双音节动词。"',
+  '  ✗ "碎瓷溅上林薇的脚踝时，她没躲。"',
+  '  ✗ "老太太端起茶杯，没喝。"',
+  '  人类作者通常会加入连贯动作或改变句式："老太太端起茶杯吹了吹浮沫，又搁回了桌上。"',
+  '  >=2 处即应标记。',
+  '',
+  '【机械精确度量滥用】（AI 偏好用精确的数字假装细节丰富）',
+  '- 日常描写中滥用具体的度数、厘米/毫米等物理量词',
+  '  ✗ "向外旋开15度，第十七厘米的位置，上方三毫米处"',
+  '  ✗ "他嘴角往下拉了五毫米"',
+  '  人类网文作者写日常多用模糊量词或具象参照物（"旋开一条窄缝"、"稍微偏上一点"）。',
+  '  >=1 处即应标记。',
+  '',
+  '【平行否定/肯定结构】（AI 极高频对称结构，人类作者偏好不对称表达）',
+  '- "没X，也没Y" / "不X，也不Y" / "既没X，也没Y"',
+  '  ✗ "他没喝，也没催她。" / "陈默没说话，也没动。"',
+  '  人类作者倾向不对称："他端着碗，没催她。"或只保留一个否定。',
+  '  >=2 处即应标记。',
+  '',
+  '【动词回声】（AI 偏好用同一动词重复制造节奏感）',
+  '- 相邻句/分句中同一动词重复出现',
+  '  ✗ "陆镜南盯着系统面板上那行绿色数字，已经盯了一刻钟。"',
+  '  ✗ "她看着窗外的雨，看了很久。"',
+  '  人类作者倾向换词或省略重复："盯着面板上那行绿色数字，一刻钟没挪眼。"',
+  '  >=2 处即应标记。',
+  '',
+  '判定标准：修辞手法合计每 1000 字 >=1 处即为严重（人类网文通常 <=1 处/1000字）。',
+  '诊断时须标注每种修辞的出现次数和具体位置。',
+  '',
+  '诊断时须列出具体例句和出现次数。若 AI 句式 >=1 处，在 top_issues 中给出逐条替换建议（fix_hint 写明原句→改后句）。',
+  '【如何改更有人味（修复指南）】',
+  '1. 模糊化数值：将【机械精确度量】的数字转化为感性模糊的状态描述（如"震颤两次"改为"眼底微微一颤"，"敲了三下"改为"不轻不重地叩击"）。',
+  '2. 打破对称与节奏切分：针对【电报式短句】与【平行结构】，用连词或从句合并原子动作，打破工整对仗，恢复人类语气的连贯与呼吸感（如"他走到门口，停住，侧过头。"合并为"他走到门口时步子顿住，侧过半张脸。"）。',
+  '3. 丰富空白动作：针对【短句强否定收尾】与【动词回声】，人类不会机械地重复"没+动作"制造冷酷感，而会用具体的转移注意力动作（低头抿水、视线错开、拨弄物件）来填补沉默的张力。',
+  '',
+  '### F. 内容逻辑（重要 — 仅在提供【章节上下文】时评估）',
+  '若正文末尾附带了【章节上下文】，对以下子维度逐项评估；若未提供，跳过此维度，content_logic 给满分。',
+  '',
+  '**F1. 情节因果**',
+  '- 事件之间的因果链是否成立？是否存在"无因之果"（突然出现未铺垫的转折）或"有因无果"（铺垫后无下文）？',
+  '- 角色的决策是否有合理动机驱动？还是为了剧情需要强行推动？',
+  '',
+  '**F2. 人物行为一致性**',
+  '- 角色行为是否符合已建立的人设（性格、能力、立场）？',
+  '- 是否存在人设崩塌（如设定谨慎的角色突然鲁莽行事，却无合理解释）？',
+  '- 角色对话风格是否与其身份/性格匹配？',
+  '',
+  '**F3. 时空逻辑**',
+  '- 事件发生的时间顺序是否自洽？是否存在时间线矛盾（如白天→夜晚→又回到白天，无时间跳跃说明）？',
+  '- 空间转换是否合理？角色是否出现了不可能的位移（如刚在A地，下段无任何交代就在B地）？',
+  '',
+  '**F4. 前章连续性**（仅在提供上一章摘要时评估）',
+  '- 与上一章末尾状态是否矛盾？（如上章受伤的角色本章无伤行动、上章离开的角色本章仍在场等）',
+  '- 是否遗漏了上章末尾的悬念/承诺？',
+  '',
+  '**F5. 世界观与设定一致性**（仅在提供核心设定时评估）',
+  '- 是否违反已设定的世界观规则（如修仙体系、力量等级、社会制度等）？',
+  '- 是否出现与已有设定矛盾的新设定？',
+  '',
+  '诊断时须列出具体矛盾点及在文中的位置。若存在逻辑问题，在 top_issues 中给出修复方向。',
+  '',
+  '### G. 章末钩子（重要 - 单独评估）',
+  '对最后 150-300 字进行叙事张力分析：',
+  '',
+  '【通过标准（满足任一即可）】',
+  '- 事件中断：在冲突/动作/对话的高点截断，读者需翻页才能知道结果',
+  '- 信息不对称：揭示了读者知道但角色不知道（或反之）的关键信息',
+  '- 新威胁/新变量：章末出现改变局势的新元素（人物、事件、信息）',
+  '- 悬念式对话：角色说出暗示性/未完成的话语',
+  '- 承诺未兑现：承诺或暗示即将发生重大事件，但本章未展开',
+  '- 抉择时刻：角色面临必须做出的选择，但尚未行动',
+  '',
+  '【不通过（翻页动力不足）】',
+  '- 总结/感悟式收束（"这一刻他明白了…""或许这便是…"）',
+  '- 情绪渲染式收束（"夜色渐深""一切归于平静"）',
+  '- 事件完整闭合且无新悬念',
+  '- 纯环境/氛围描写收尾，无叙事张力',
+  '',
+  '若章末钩子不通过，在 top_issues 中给出具体 fix_hint：说明应如何重组结尾（从哪里截断、添加什么暗示、删除什么收束句），fix_hint 必须包含可直接执行的改写方向。',
+  '',
+  '### H. 字数达标（仅在提供目标字数诊断数据时评估）',
+  '若正文末尾附带了【目标字数诊断数据】，直接使用系统预计算的实际字数（含标点，不含空白，对齐网文平台口径）和偏差百分比（禁止自行重新计数，AI 计数不准确）。',
+  '根据预计算的偏差百分比判定：',
+  '- 达标：偏差在 ±10% 以内',
+  '- 轻微超标/不足：偏差 10%-25%',
+  '- 严重超标/不足：偏差 >25%',
+  '- 若严重超标，必须在 patches 中直接给出裁剪补丁：将原文中注水、啰嗦的段落（find）替换为精简干脆的短句或空字符串（replace）。',
+  '- 若严重不足，必须在 patches 中直接给出扩写补丁：将原文中干瘪的一两句话（find）替换为包含丰富动作、神态、对话细节的长段落（replace）。',
+  '- 若未提供目标字数诊断数据，跳过此维度，word_count 给满分',
+  '',
+  '### I. 锚点对齐（仅在提供锚点时评估）',
+  '若正文末尾附带了【本章创作锚点】列表，逐条评估每个锚点在正文中的语义落地情况。',
+  '判断标准：',
+  '- aligned：锚点意图在正文中有明确的情节、动作或描写体现',
+  '- partial：正文涉及了锚点相关元素，但核心意图未充分展开',
+  '- missing：正文中未找到与该锚点意图相关的内容',
+  '- not_applicable：该锚点与本章内容无关（不应在本章体现）',
+  '',
+  '注意：判断「对齐」是看语义意图是否落地，而非关键词是否出现。',
+  '若未提供锚点列表，跳过此维度，JSON 中 anchor_alignment 留空数组。',
+  '',
+  '## 量化评分',
+  '',
+  '### 总分',
+  '- 总分：0-100',
+  '- 是否硬性失败：true/false',
+  '',
+  '### 10项评分（逐项给分）',
+  '1) AI句式占比（12分）：含E节所列全部AI典型句式（"不是A而是B"/连接词/模板情感句/过度修辞等），总计<=1处满分',
+  '2) 对话密度（10分）：对话字数占比 25%-40% 满分',
+  '3) 句长波动（10分）：句长有明显起伏，连续同构长句不超过2句',
+  '4) 短句占比（8分）：<=8字短句占比达到阈值',
+  '5) 强意象复用（8分）：同一强意象每章<=2次',
+  '6) 场景描写克制（8分）：单次纯环境描写<=1句；同一自然意象<=1次；纯环境占比<=5%',
+  '7) 推进信息密度（10分）：每300-500字至少1个推进信息',
+  '8) 大纲覆盖度（14分）：必写节点全部落地',
+  '9) 内容逻辑（10分）：F节全部子维度综合评估，无逻辑矛盾满分；未提供章节上下文时给满分',
+  '10) 字数达标（10分）：偏差<=10%满分，10%-25%扣5分，>25%扣10分；未提供目标字数时给满分',
+  '',
+  '### 硬失败条件（任一触发即 hard_fail=true）',
+  '- 出现明显全知视角越界（限知/第一人称章节）',
+  '- 关键大纲节点缺失',
+  '- 章末钩子不通过（按 G 节标准判定）',
+  '- 开篇大量设定堆砌（首章首页见山失败）',
+  '- 字数偏差超过 25%（严重超标或严重不足）',
+  '- 严重逻辑矛盾（如明显违反因果、人设崩塌、时间线自相矛盾）',
+  '',
+  '### 评分一致性硬约束',
+  '1. 总分必须等于 10 项分数之和。',
+  '2. 若 hard_fail=true，则总分必须 <= 59。',
+  '3. 若存在致命级问题或「不达标项」非空，总分不得为 100。',
+  '',
+  '### 输出格式（严格）',
+  '直接输出 JSON，不要输出任何诊断过程说明、分析文字或 markdown 标题。',
+  '```json',
+  '{',
+  '  "score_total": 0,',
+  '  "hard_fail": false,',
+  '  "scores": {',
+  '    "ai_pattern_ratio": 0,',
+  '    "dialogue_density": 0,',
+  '    "sentence_variation": 0,',
+  '    "short_sentence_ratio": 0,',
+  '    "imagery_repeat": 0,',
+  '    "scene_description_cap": 0,',
+  '    "new_info_density": 0,',
+  '    "outline_coverage": 0,',
+  '    "content_logic": 0,',
+  '    "word_count": 0',
+  '  },',
+  '  "failed_rules": [],',
+  '  "top_issues": [',
+  '    { "id": "", "evidence": "", "fix_hint": "" }',
+  '  ],',
+  '  "patches": [',
+  '    { "find": "原文中需要修改的精确片段（必须与原文完全一致，长度尽可能大于 10 字以确保唯一性）", "replace": "修改后的片段" }',
+  '  ],',
+  '  "anchor_alignment": [',
+  '    { "title": "锚点标题", "verdict": "aligned|partial|missing|not_applicable", "reason": "简要说明" }',
+  '  ]',
+  '}',
+  '```',
+  '',
+  'JSON 必须是有效对象；scores 必须是对象，禁止把 scores 写成字符串。',
+  'find 规则：必须是原文中精确存在的字符串，否则定位替换会失败；长度尽可能大于 10 字以确保在章节中唯一；如果是章末钩子修复，find 应取原本的结尾段落（如原本最后一两句话，长度大于 20 字），replace 为改写后的结尾。如果所有问题都无需修改，可输出空数组 []。',
+  'anchor_alignment 数组与提供的锚点列表一一对应；若未提供锚点则为空数组。'
 ].join('\n')
 
 export const QUALITY_APPLY_FIXES_PROMPT = [
   '你是文字修改专家。根据下方的诊断报告，对原文进行修改。',
   '',
   '规则：',
-  '1. 严格按照诊断报告中「→ 建议改为」的修改建议执行',
+  '1. 诊断报告是 JSON 格式，根据 top_issues 数组中每条的 fix_hint 执行修改',
   '2. 修改报告中指出的所有 AI 痕迹问题',
-  '3. 执行「修改建议」中列出的改动',
-  '4. 保持原文的情节、事件、对话内容不变',
-  '5. 不要添加新内容，只修改有问题的地方',
-  '6. 保持原文字数基本不变（±5%）',
+  '3. 执行每条 fix_hint 中列出的改动',
+  '4. 若报告指出内容逻辑问题（因果断裂、人设矛盾、时间线错误等），须在保持主线情节的前提下修补逻辑：补充缺失的因果过渡、纠正与人设不符的行为/对话、修正时间线矛盾',
+  '5. 保持原文的情节发展、核心冲突和关键对话内容不变',
+  '6. 不要随意添加与大纲和当前情节无关的新情节线，只聚焦于修改和优化问题点',
+  '7. 优化字数以达到目标范围：',
+  '   - 若诊断报告指出实际字数超标，必须通过删除注水段落（冗余环境描写、重复心理活动、无推进信息的过渡段）将字数压缩至目标范围内。',
+  '   - 若诊断报告指出实际字数严重不足，必须结合当前章节的大纲和前后脉络，合理丰富细节（通过增补神态、心理活动描写、动作细节及环境渲染等手段，使情节更丰满，但禁止无意义的词句复读或强行拉长）。',
+  '   - 若字数已在合理目标区间内，应保持原文字数基本不变（允许 ±5% 波动）。',
+  '',
+  '【例外：章末钩子修复】',
+  '若诊断报告指出"章末钩子"相关问题，则对最后 300-500 字享有以下特权（仅限结尾区域）：',
+  '- 允许重组结尾事件顺序，将紧张时刻移至章末',
+  '- 允许在对话/动作/冲突的高点截断，制造未完成态',
+  '- 允许添加 1-2 句悬念暗示（新威胁、角色异常、信息揭示）',
+  '- 允许删除总结/升华/感悟类收束，替换为开放式结尾',
+  '- 前文（非最后 500 字）仍须严格保持不变',
   '',
   '只输出修改后的完整正文，不要解释。'
 ].join('\n')
+
+export const ADJUST_WORDS_EXPAND_PROMPT = [
+  '你是小说精修与细节扩写专家。你的任务是根据目标字数，合理地扩充当前章节的内容，使其更加充实、丰满。',
+  '',
+  '【扩写规则 — 核心要求】',
+  '1. 必须合理自然地扩充细节，绝不能注水、说废话或复读字词。',
+  '2. 应该从以下维度丰富小说内容：',
+  '   - 细节化动作与神态描写（将原本粗略的动作细化为一连串自然的动作和表情变化）',
+  '   - 挖掘心理活动（深挖人物在面临选择、冲突或对话时的内心想法、思想挣扎、情绪起伏）',
+  '   - 场景与氛围衬托（增加符合当时情境的环境描写、光影变化、声音与气味，烘托角色内心与局势紧张感）',
+  '   - 丰富对话表现力（增加对话中语气的停顿、潜台词描写、神态动作穿插，丰富交锋感）',
+  '3. 严禁改变原有的情节走向、人设和大纲逻辑，必须与前文无缝衔接。',
+  '4. 只输出扩写后的完整章节内容，不要解释。'
+].join('\n')
+
+export const ADJUST_WORDS_COMPRESS_PROMPT = [
+  '你是小说精修与压缩去水专家。你的任务是将字数严重超标的章节，精简压缩至合理的目标字数范围内。',
+  '',
+  '【压缩规则 — 核心要求】',
+  '1. 强力去水：大刀阔斧地删除大段与情节推进无关的背景介绍、多余的环境描写、重复渲染的心理活动。',
+  '2. 精炼语句：把啰嗦、拖沓的句子重构为精炼、干脆且极具网感的短句，合并多余的过渡性情节。',
+  '3. 保证故事骨架与逻辑完整：绝不能删减核心情节、关键动作对话、重要设定以及大纲必须覆盖的内容。',
+  '4. 只输出压缩后的完整章节内容，不要解释。'
+].join('\n')
+

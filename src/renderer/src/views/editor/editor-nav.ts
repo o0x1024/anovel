@@ -50,6 +50,8 @@ export interface SettingsQualityStatus {
   convergenceStalled: boolean
   manuallyAccepted: boolean
   canReviseBlocking: boolean
+  canReviseAdvisory: boolean
+  advisoryOptimizeCount: number
   meetsPassCriteria: boolean
 }
 
@@ -70,14 +72,6 @@ export interface EditorNav {
 
 export const editorNavKey: InjectionKey<EditorNav> = Symbol('editorNav')
 
-export const WORKFLOW_STEP_ORDER: WorkflowStepKey[] = [
-  'incubator',
-  'settings',
-  'volumes',
-  'chapters',
-  'generate'
-]
-
 export const NEXT_STEP_LABELS: Record<WorkflowStepKey, string> = {
   incubator: '进入核心设定',
   settings: '进入分卷大纲',
@@ -86,10 +80,26 @@ export const NEXT_STEP_LABELS: Record<WorkflowStepKey, string> = {
   generate: ''
 }
 
-export function getNextStep(current: WorkflowStepKey): WorkflowStepKey | null {
-  const idx = WORKFLOW_STEP_ORDER.indexOf(current)
-  return idx >= 0 && idx < WORKFLOW_STEP_ORDER.length - 1
-    ? WORKFLOW_STEP_ORDER[idx + 1]
+export function getWorkflowStepOrder(workType?: string | null): WorkflowStepKey[] {
+  if (workType === 'story') {
+    return ['incubator', 'settings', 'chapters', 'generate']
+  }
+  return ['incubator', 'settings', 'volumes', 'chapters', 'generate']
+}
+
+export function getNextStepLabel(current: WorkflowStepKey, workType?: string | null): string {
+  if (workType === 'story') {
+    if (current === 'settings') return '进入节拍大纲'
+    if (current === 'chapters') return '进入正文生成'
+  }
+  return NEXT_STEP_LABELS[current]
+}
+
+export function getNextStep(current: WorkflowStepKey, workType?: string | null): WorkflowStepKey | null {
+  const order = getWorkflowStepOrder(workType)
+  const idx = order.indexOf(current)
+  return idx >= 0 && idx < order.length - 1
+    ? order[idx + 1]
     : null
 }
 
@@ -99,4 +109,9 @@ export const STEP_MENU_LABELS: Record<WorkflowStepKey, string> = {
   volumes: '分卷大纲',
   chapters: '章节情节',
   generate: '正文生成'
+}
+
+export function getStepMenuLabel(step: WorkflowStepKey, workType?: string | null): string {
+  if (workType === 'story' && step === 'chapters') return '节拍大纲'
+  return STEP_MENU_LABELS[step]
 }

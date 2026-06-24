@@ -37,13 +37,19 @@ export { imageDAO } from './dao/image-dao'
 export type { GeneratedImageRow, VolcengineConfigRow } from './dao/image-dao'
 export { materialDAO } from './dao/material-dao'
 export type { MaterialRow } from './dao/material-dao'
+export { nameEntryDAO } from './dao/name-entry-dao'
 export { assistantRoleDAO } from './dao/assistant-role-dao'
 export { assistantDocumentDAO } from './dao/assistant-document-dao'
 export { assistantConversationDAO } from './dao/assistant-conversation-dao'
 export { assistantMessageDAO } from './dao/assistant-message-dao'
 export { labTaskDAO } from './dao/lab-task-dao'
-export { promptTemplateDAO } from './dao/prompt-template-dao'
-export type { PromptTemplateInfo, PromptCategory, PromptRiskLevel } from './dao/prompt-template-dao'
+export { goalRoutineDAO } from './dao/goal-routine-dao'
+export type {
+  GoalRoutineStatus,
+  GoalRoutineStateRow,
+  GoalRoutineTurnRow,
+  GoalStateUpdate
+} from './dao/goal-routine-dao'
 export {
   incubatorSeedDAO,
   incubatorCandidateDAO,
@@ -52,3 +58,4 @@ export {
   incubatorVersionDAO,
   incubatorStateDAO
 } from './dao/incubator'
+export { aigcWordtableDAO } from './dao/aigc-wordtable-dao'

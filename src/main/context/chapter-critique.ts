@@ -104,6 +104,20 @@ export function formatCritiqueFixReport(result: CritiqueResult): string {
   return lines.join('\n')
 }
 
+export const CRITIQUE_APPLY_FIXES_PROMPT = [
+  '你是资深小说编辑。根据下方的六维批判报告，对原文进行修改。',
+  '',
+  '规则：',
+  '1. 优先修复「未达标维度及问题」中列出的具体问题',
+  '2. 修改须针对报告指出的维度：角色一致性、情节合理性、对话自然度、节奏把控、锚点对齐、AI 痕迹',
+  '3. 保持原文的核心情节、事件顺序和对话内容不变',
+  '4. 不要添加报告未要求的新情节线',
+  '5. 保持原文字数基本不变（±5%）',
+  '6. 若下方提供了【目标范文】，修改后的文字须与范文文笔一致',
+  '',
+  '只输出修改后的完整正文，不要解释。'
+].join('\n')
+
 export const CRITIQUE_SYSTEM_PROMPT = [
   '你是资深小说编辑，对刚生成的章节正文进行六维批判性自评。',
   '评分 1-10，6 分及以上为通过。',

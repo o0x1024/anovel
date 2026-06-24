@@ -25,6 +25,7 @@ export interface ChapterRow {
   next_hook: string | null
   pov_mode: string | null
   characters: string | null
+  outline_diagnosis: string | null
   create_time: string
   update_time: string
 }
@@ -59,14 +60,20 @@ export class VolumeChapterDAO extends BaseDAO {
     )
   }
 
-  updateVolume(id: number, fields: { name?: string; description?: string }): boolean {
+  updateVolume(id: number, fields: { name?: string; description?: string; sort?: number; expectedUpdateTime?: string }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
     if (fields.name !== undefined) { sets.push('name = ?'); vals.push(fields.name) }
     if (fields.description !== undefined) { sets.push('description = ?'); vals.push(fields.description) }
+    if (fields.sort !== undefined) { sets.push('sort = ?'); vals.push(fields.sort) }
     if (sets.length === 0) return false
     vals.push(id)
-    return this.run(`UPDATE volumes SET ${sets.join(', ')} WHERE id = ?`, vals).changes > 0
+    let sql = `UPDATE volumes SET ${sets.join(', ')} WHERE id = ?`
+    if (fields.expectedUpdateTime) {
+      sql += ` AND update_time = ?`
+      vals.push(fields.expectedUpdateTime)
+    }
+    return this.run(sql, vals).changes > 0
   }
 
   deleteVolume(id: number): boolean {
@@ -105,6 +112,13 @@ export class VolumeChapterDAO extends BaseDAO {
 
   // ==================== 章节 ====================
 
+  private assertVolumeExists(volumeId: number): void {
+    const row = this.get<{ id: number }>('SELECT id FROM volumes WHERE id = ?', [volumeId])
+    if (!row) {
+      throw new Error(`分卷不存在（id=${volumeId}），请刷新章节列表后重试`)
+    }
+  }
+
   listChapters(volumeId: number): ChapterRow[] {
     return this.all<ChapterRow>('SELECT * FROM chapters WHERE volume_id = ? ORDER BY sort', [volumeId])
   }
@@ -114,6 +128,7 @@ export class VolumeChapterDAO extends BaseDAO {
   }
 
   createChapter(volumeId: number, title: string, outline?: string, sort?: number): number {
+    this.assertVolumeExists(volumeId)
     const maxSort = this.get<{ m: number }>(
       'SELECT COALESCE(MAX(sort), 0) + 1 AS m FROM chapters WHERE volume_id = ?', [volumeId]
     )
@@ -125,12 +140,14 @@ export class VolumeChapterDAO extends BaseDAO {
 
   updateChapter(id: number, fields: {
     title?: string; outline?: string; content?: string; word_count?: number; status?: string
+    sort?: number; volume_id?: number; expectedUpdateTime?: string
     emotion_intensity?: number
     beat_role?: string | null
     foreshadow_target?: string | null
     next_hook?: string | null
     pov_mode?: string | null
     characters?: string | null
+    outline_diagnosis?: string | null
   }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
@@ -142,16 +159,27 @@ export class VolumeChapterDAO extends BaseDAO {
     }
     if (fields.word_count !== undefined) { sets.push('word_count = ?'); vals.push(fields.word_count) }
     if (fields.status !== undefined) { sets.push('status = ?'); vals.push(fields.status) }
+    if (fields.sort !== undefined) { sets.push('sort = ?'); vals.push(fields.sort) }
+    if (fields.volume_id !== undefined) {
+      this.assertVolumeExists(fields.volume_id)
+      sets.push('volume_id = ?'); vals.push(fields.volume_id)
+    }
     if (fields.emotion_intensity !== undefined) { sets.push('emotion_intensity = ?'); vals.push(fields.emotion_intensity) }
     if (fields.beat_role !== undefined) { sets.push('beat_role = ?'); vals.push(fields.beat_role) }
     if (fields.foreshadow_target !== undefined) { sets.push('foreshadow_target = ?'); vals.push(fields.foreshadow_target) }
     if (fields.next_hook !== undefined) { sets.push('next_hook = ?'); vals.push(fields.next_hook) }
     if (fields.pov_mode !== undefined) { sets.push('pov_mode = ?'); vals.push(fields.pov_mode) }
     if (fields.characters !== undefined) { sets.push('characters = ?'); vals.push(fields.characters) }
+    if (fields.outline_diagnosis !== undefined) { sets.push('outline_diagnosis = ?'); vals.push(fields.outline_diagnosis) }
     if (sets.length === 0) return false
     sets.push("update_time = datetime('now')")
     vals.push(id)
-    return this.run(`UPDATE chapters SET ${sets.join(', ')} WHERE id = ?`, vals).changes > 0
+    let sql = `UPDATE chapters SET ${sets.join(', ')} WHERE id = ?`
+    if (fields.expectedUpdateTime) {
+      sql += ` AND update_time = ?`
+      vals.push(fields.expectedUpdateTime)
+    }
+    return this.run(sql, vals).changes > 0
   }
 
   deleteChapter(id: number): boolean {
@@ -168,10 +196,12 @@ export class VolumeChapterDAO extends BaseDAO {
       next_hook?: string | null
       pov_mode?: string | null
       characters?: string | null
+      outline_diagnosis?: string | null
     }[],
     mode: 'append' | 'replace' = 'append'
   ): number[] {
     if (items.length === 0) return []
+    this.assertVolumeExists(volumeId)
 
     return this.transaction(() => {
       if (mode === 'replace') {
@@ -192,7 +222,8 @@ export class VolumeChapterDAO extends BaseDAO {
           foreshadow_target: item.foreshadow_target ?? undefined,
           next_hook: item.next_hook ?? undefined,
           pov_mode: item.pov_mode ?? undefined,
-          characters: item.characters ?? undefined
+          characters: item.characters ?? undefined,
+          outline_diagnosis: item.outline_diagnosis ?? undefined
         })
         ids.push(id)
       }
@@ -212,12 +243,69 @@ export class VolumeChapterDAO extends BaseDAO {
     )
   }
 
+  /** 按指定 ID 顺序重排章节的 sort 值 */
+  reorderChapters(orderedIds: number[]): boolean {
+    return this.transaction(() => {
+      for (let i = 0; i < orderedIds.length; i++) {
+        this.run('UPDATE chapters SET sort = ? WHERE id = ?', [i + 1, orderedIds[i]])
+      }
+      return true
+    })
+  }
+
+  /** 按指定 ID 顺序重排分卷的 sort 值 */
+  reorderVolumes(orderedIds: number[]): boolean {
+    return this.transaction(() => {
+      for (let i = 0; i < orderedIds.length; i++) {
+        this.run('UPDATE volumes SET sort = ? WHERE id = ?', [i + 1, orderedIds[i]])
+      }
+      return true
+    })
+  }
+
+  /** 将章节移动到目标分卷的指定位置 */
+  moveChapter(chapterId: number, targetVolumeId: number, targetSort: number): boolean {
+    return this.transaction(() => {
+      const chapter = this.getChapter(chapterId)
+      if (!chapter) throw new Error('章节不存在')
+      this.assertVolumeExists(targetVolumeId)
+
+      // 目标分卷中 sort >= targetSort 的章节后移
+      this.run(
+        'UPDATE chapters SET sort = sort + 1 WHERE volume_id = ? AND sort >= ?',
+        [targetVolumeId, targetSort]
+      )
+
+      // 移动章节
+      this.run(
+        'UPDATE chapters SET volume_id = ?, sort = ?, update_time = datetime(\'now\') WHERE id = ?',
+        [targetVolumeId, targetSort, chapterId]
+      )
+
+      // 压缩原分卷的 sort 空隙
+      this.run(
+        `UPDATE chapters SET sort = sort - 1
+         WHERE volume_id = ? AND sort > ?`,
+        [chapter.volume_id, chapter.sort]
+      )
+
+      return true
+    })
+  }
+
   // ==================== 章节版本 ====================
 
   listVersions(chapterId: number): ChapterVersionRow[] {
     return this.all<ChapterVersionRow>(
       'SELECT * FROM chapter_versions WHERE chapter_id = ? ORDER BY version_number DESC',
       [chapterId]
+    )
+  }
+
+  getVersion(versionId: number, chapterId: number): ChapterVersionRow | undefined {
+    return this.get<ChapterVersionRow>(
+      'SELECT * FROM chapter_versions WHERE id = ? AND chapter_id = ?',
+      [versionId, chapterId]
     )
   }
 
@@ -235,6 +323,29 @@ export class VolumeChapterDAO extends BaseDAO {
       [chapterId, latest?.v ?? 1, data.outline ?? null, data.content ?? null,
         data.word_count ?? 0, data.model_type ?? null, data.style_id ?? null, data.generation_round ?? 1]
     )
+  }
+
+  /** 带版本快照的更新：修改前自动保存当前内容为历史版本 */
+  updateChapterWithVersion(chapterId: number, fields: {
+    title?: string; outline?: string; content?: string; word_count?: number; status?: string
+    sort?: number; volume_id?: number; expectedUpdateTime?: string
+    emotion_intensity?: number
+    beat_role?: string | null; foreshadow_target?: string | null
+    next_hook?: string | null; pov_mode?: string | null; characters?: string | null
+    outline_diagnosis?: string | null
+  }, versionMeta?: { model_type?: string; style_id?: number; generation_round?: number }): boolean {
+    const current = this.getChapter(chapterId)
+    if (current) {
+      this.createVersion(chapterId, {
+        outline: current.outline ?? undefined,
+        content: current.content ?? undefined,
+        word_count: current.word_count ?? 0,
+        model_type: versionMeta?.model_type,
+        style_id: versionMeta?.style_id,
+        generation_round: versionMeta?.generation_round ?? 1
+      })
+    }
+    return this.updateChapter(chapterId, fields)
   }
 
   restoreVersion(chapterId: number, versionId: number): boolean {

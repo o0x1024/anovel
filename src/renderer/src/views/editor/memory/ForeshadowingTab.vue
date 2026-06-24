@@ -1,5 +1,12 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import ListBatchToolbar from '../../../components/ListBatchToolbar.vue'
+import {
+  useListSelection,
+  confirmBatchDelete,
+  confirmDeleteAll,
+  runBatchDelete
+} from '../../../composables/useListSelection'
 
 const props = defineProps<{ workId: number }>()
 
@@ -25,6 +32,8 @@ const newItem = ref({ description: '', plant_chapter_id: null as number | null, 
 const resolvingId = ref<number | null>(null)
 const resolveChapterId = ref<number | null>(null)
 
+const selection = useListSelection(items)
+
 const depthLabels: Record<string, string> = { shallow: '浅', normal: '普通', deep: '深' }
 const statusLabels: Record<string, string> = {
   pending: '待回收',
@@ -39,6 +48,7 @@ onMounted(async () => {
 
 async function loadItems() {
   items.value = await window.anovel.invoke('foreshadowing:listByWork', props.workId) as Foreshadowing[]
+  selection.clearSelection()
 }
 
 async function loadChapters() {
@@ -59,9 +69,21 @@ async function createItem() {
   await loadItems()
 }
 
-async function deleteItem(id: number) {
-  if (!confirm('删除此伏笔？')) return
+async function deleteItem(id: number, skipConfirm = false) {
+  if (!skipConfirm && !confirm('删除此伏笔？')) return
   await window.anovel.invoke('foreshadowing:delete', id)
+}
+
+async function deleteSelectedItems() {
+  const selected = selection.getSelectedItems()
+  if (!(await confirmBatchDelete(selected.length, '伏笔'))) return
+  await runBatchDelete(selected, item => deleteItem(item.id, true))
+  await loadItems()
+}
+
+async function deleteAllItems() {
+  if (!(await confirmDeleteAll(items.value.length, '伏笔'))) return
+  await runBatchDelete(items.value, item => deleteItem(item.id, true))
   await loadItems()
 }
 
@@ -90,12 +112,23 @@ function chapterTitle(id: number | null) {
 
 <template>
   <div class="space-y-4">
-    <div class="flex items-center justify-between">
+    <div class="flex items-center justify-between gap-3 flex-wrap">
       <p class="text-sm text-base-content/50">追踪伏笔埋设与回收，生成正文时自动注入待回收列表。</p>
-      <button class="btn btn-primary btn-sm" @click="showForm = !showForm">
+      <button class="btn btn-primary btn-sm shrink-0" @click="showForm = !showForm">
         {{ showForm ? '取消' : '添加伏笔' }}
       </button>
     </div>
+
+    <ListBatchToolbar
+      v-if="items.length > 0"
+      :total="items.length"
+      :selectable-count="selection.selectableCount"
+      :selected-count="selection.selectedCount"
+      :all-selected="selection.allSelected"
+      @toggle-all="selection.toggleAll()"
+      @delete-selected="deleteSelectedItems"
+      @delete-all="deleteAllItems"
+    />
 
     <div v-if="showForm" class="card bg-base-100 border border-base-300 p-4 space-y-2">
       <textarea v-model="newItem.description" rows="2" class="textarea textarea-bordered w-full textarea-sm" placeholder="伏笔描述..." />
@@ -116,9 +149,21 @@ function chapterTitle(id: number | null) {
 
     <div v-if="items.length === 0" class="text-center py-8 text-base-content/40 text-sm">暂无伏笔记录</div>
     <div v-else class="space-y-2">
-      <div v-for="item in items" :key="item.id" class="card bg-base-100 border border-base-300 p-3">
+      <div
+        v-for="(item, index) in items"
+        :key="item.id"
+        class="card bg-base-100 border border-base-300 p-3"
+        :class="{ 'ring-2 ring-primary/50': selection.isSelected(item, index) }"
+      >
         <div class="flex items-start justify-between gap-2">
-          <div class="flex-1">
+          <div class="flex items-start gap-2 flex-1 min-w-0">
+            <input
+              type="checkbox"
+              class="checkbox checkbox-sm mt-0.5 shrink-0"
+              :checked="selection.isSelected(item, index)"
+              @change="selection.toggle(item, index)"
+            />
+            <div class="flex-1">
             <div class="flex flex-wrap gap-1 mb-1">
               <span class="badge badge-sm" :class="item.status === 'resolved' ? 'badge-success' : 'badge-warning'">
                 {{ statusLabels[item.status] || item.status }}
@@ -130,6 +175,7 @@ function chapterTitle(id: number | null) {
               埋设：{{ chapterTitle(item.plant_chapter_id) }}
               <span v-if="item.payoff_chapter_id"> · 回收：{{ chapterTitle(item.payoff_chapter_id) }}</span>
             </p>
+            </div>
           </div>
           <div class="flex gap-1 shrink-0">
             <button
@@ -146,7 +192,7 @@ function chapterTitle(id: number | null) {
             >
               放弃
             </button>
-            <button class="btn btn-ghost btn-xs text-error" @click="deleteItem(item.id)">删除</button>
+            <button class="btn btn-ghost btn-xs text-error" @click="deleteItem(item.id).then(loadItems)">删除</button>
           </div>
         </div>
         <div v-if="resolvingId === item.id" class="mt-2 pt-2 border-t border-base-300 flex gap-2 items-center">
