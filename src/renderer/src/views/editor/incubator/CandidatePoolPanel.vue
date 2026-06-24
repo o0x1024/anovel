@@ -189,6 +189,13 @@ function openAdopt(c: IncubatorCandidate) {
               >
                 {{ c.latestScore.finalTotal }} 分
               </span>
+              <span
+                v-if="c.latestScore?.rationale"
+                class="text-[11px] text-base-content/40 italic truncate max-w-[180px]"
+                :title="c.latestScore.rationale"
+              >
+                {{ c.latestScore.rationale }}
+              </span>
             </div>
             <p v-if="c.dimension" class="text-xs text-base-content/50 mt-0.5">{{ c.dimension }}</p>
           </div>

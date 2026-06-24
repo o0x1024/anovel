@@ -72,8 +72,6 @@ window.anovel.invoke('work:get', props.workId).then(w => {
   workType.value = (w as { work_type?: string })?.work_type ?? null
 })
 
-const promptStyle = ref<'literary' | 'popular'>('literary')
-
 const analyses = computed<AnalysisConfig[]>(() => {
   if (workType.value === 'story') {
     return ANALYSIS_UI_ORDER.map(k => {
@@ -90,22 +88,8 @@ const analyses = computed<AnalysisConfig[]>(() => {
       }
     }).filter((x): x is AnalysisConfig => x != null)
   }
-  const base = promptStyle.value === 'popular' ? INCUBATOR_POPULAR_PROMPTS : INCUBATOR_ANALYSIS_PROMPTS
-  const promptLabel = promptStyle.value === 'popular' ? '爽文向' : '文学向'
   return ANALYSIS_UI_ORDER.map(k => {
-    const p = base[k]
-    if (!p) return null
-    return {
-      key: k,
-      label: `${p.label}`,
-      step: p.step,
-      system: p.system,
-      cardFormat: p.cardFormat,
-      slotTarget: p.slotTarget,
-      sourceStep: p.sourceStep as IncubatorCandidateSourceStep | undefined
-    }
-  }).filter((x): x is AnalysisConfig => x != null)
-})
+    const p = INCUBATOR_POPULAR_PROMPTS[k]
     if (!p) return null
     return {
       key: k,
@@ -508,7 +492,7 @@ function adoptSourceStep(config: AnalysisConfig): AdoptSourceStep {
 function findCandidateForCard(
   config: AnalysisConfig,
   card: CardItem
-): (IncubatorCandidate & { latestScore?: { finalTotal: number } | null }) | null {
+): (IncubatorCandidate & { latestScore?: { finalTotal: number; rationale?: string | null } | null }) | null {
   const step = config.sourceStep
   if (!step) return null
   const title = normalizeCandidateTitle(card.title)
@@ -523,6 +507,12 @@ function cardFinalScore(config: AnalysisConfig, card: CardItem): number | null {
   const c = findCandidateForCard(config, card)
   if (!c?.latestScore) return null
   return c.latestScore.finalTotal
+}
+
+function cardRationale(config: AnalysisConfig, card: CardItem): string | null {
+  const c = findCandidateForCard(config, card)
+  if (!c?.latestScore) return null
+  return c.latestScore.rationale ?? null
 }
 
 function canAdoptCard(config: AnalysisConfig, card: CardItem): boolean {
@@ -554,25 +544,6 @@ function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
 <template>
   <div>
     <p class="text-xs text-base-content/50 mb-3">{{ workflowHint }}</p>
-    <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-      <div v-if="workType !== 'story'" class="join join-sm">
-        <button
-          class="join-item btn btn-xs"
-          :class="promptStyle === 'literary' ? 'btn-primary' : 'btn-ghost'"
-          @click="promptStyle = 'literary'"
-        >
-          文学向
-        </button>
-        <button
-          class="join-item btn btn-xs"
-          :class="promptStyle === 'popular' ? 'btn-primary' : 'btn-ghost'"
-          @click="promptStyle = 'popular'"
-        >
-          爽文向
-        </button>
-      </div>
-      <span v-else></span>
-    </div>
     <div class="flex flex-wrap items-center gap-2 mb-4">
       <button
         v-for="item in analyses"
@@ -702,6 +673,13 @@ function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
                         {{ cardFinalScore(activeAnalysis!, card) }} 分
                       </span>
                       <span v-else class="badge badge-ghost badge-sm">评分中…</span>
+                      <span
+                        v-if="cardRationale(activeAnalysis!, card)"
+                        class="text-[11px] text-base-content/40 italic truncate max-w-[200px]"
+                        :title="cardRationale(activeAnalysis!, card)!"
+                      >
+                        {{ cardRationale(activeAnalysis!, card) }}
+                      </span>
                     </div>
                     <p v-if="card.dimension" class="text-xs text-base-content/50 mt-0.5">{{ card.dimension }}</p>
                   </div>
