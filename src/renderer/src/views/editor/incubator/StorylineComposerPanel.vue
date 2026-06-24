@@ -8,8 +8,10 @@ import {
 } from '../../../../../shared/incubator-slots'
 import {
   INCUBATOR_TWEAK_SYSTEM,
-  buildTweakUserPrompt
+  buildTweakUserPrompt,
+  INCUBATOR_SLOT_FILL_ORDER
 } from '../../../../../shared/incubator-analysis-prompts'
+import { nextUnfilledSlotKey } from '../../../../../shared/incubator-workflow'
 import type {
   IncubatorDraftSlot,
   IncubatorGateReport,
@@ -117,6 +119,8 @@ const slots = computed(() =>
 )
 
 const filledCount = computed(() => slots.value.filter(s => s.filled).length)
+
+const nextUnfilled = computed(() => nextUnfilledSlotKey(ws.value))
 
 const latestFrozen = computed(() => ws.value?.latestFrozenVersion ?? null)
 
@@ -604,7 +608,18 @@ defineExpose({ getSlotContentsForPreview })
       </div>
     </div>
 
-    <p class="text-xs text-base-content/40 mb-2">槽位内容编辑后自动保存（约 0.8 秒）</p>
+    <div class="text-xs text-base-content/50 mb-2 flex items-center gap-2 flex-wrap">
+      <span>推荐顺序：</span>
+      <span v-for="k in INCUBATOR_SLOT_FILL_ORDER" :key="k" class="inline-flex items-center">
+        <span
+          class="px-1.5 py-0.5 rounded"
+          :class="k === nextUnfilled ? 'badge-primary text-primary-content' : (slots.find(s => s.key === k)?.filled ? 'bg-base-300 text-base-content' : '')"
+        >
+          {{ getIncubatorSlotLabel(k, workType) }}
+        </span>
+        <span v-if="k !== INCUBATOR_SLOT_FILL_ORDER[INCUBATOR_SLOT_FILL_ORDER.length - 1]" class="mx-1">→</span>
+      </span>
+    </div>
 
     <div class="space-y-3 max-h-[420px] overflow-y-auto scrollbar-thin pr-1">
       <div

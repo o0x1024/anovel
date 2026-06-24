@@ -31,7 +31,7 @@ export const INCUBATOR_RECOMMENDED_WORKFLOW: IncubatorWorkflowStepDef[] = [
   {
     id: 'slots',
     label: '③ 主线编排',
-    detail: `按序填满主线槽位：${INCUBATOR_SLOT_FILL_ORDER.map(k => INCUBATOR_SLOT_LABELS[k]).join(' → ')}；可运行主题/冲突/世界/角色/终局等专属分析并采纳`
+    detail: `按序填满主线槽位：爽点公式定位 → 套路变体 → 黄金开局 → 世界体系 → 人设标签 → 爽点终局；可运行右栏专属分析并采纳`
   },
   {
     id: 'gate',

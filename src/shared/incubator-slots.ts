@@ -42,12 +42,19 @@ export function isIncubatorSlotKey(value: string): value is IncubatorSlotKey {
 }
 
 export function getIncubatorSlotLabel(key: IncubatorSlotKey, workType?: string | null): string {
-  const isStory = workType === 'story'
-  if (isStory) {
+  if (workType === 'story') {
     if (key === 'world_rules') return '背景规则'
     if (key === 'role_engine') return '反差人设'
     if (key === 'opening') return '黄金开局'
     if (key === 'ending') return '清算终局'
+    return INCUBATOR_SLOT_LABELS[key]
   }
+  // 网文向 — 与 AI 分析按钮名称对齐
+  if (key === 'premise') return '爽点公式定位'
+  if (key === 'core_conflict') return '套路变体'
+  if (key === 'world_rules') return '世界体系'
+  if (key === 'role_engine') return '人设标签'
+  if (key === 'opening') return '黄金开局'
+  if (key === 'ending') return '爽点终局'
   return INCUBATOR_SLOT_LABELS[key]
 }
