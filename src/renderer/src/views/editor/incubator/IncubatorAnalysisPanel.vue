@@ -27,6 +27,7 @@ import {
   buildDiagnoseApplyUserPrompt
 } from '../../../../../shared/incubator-analysis-prompts'
 import { STORY_INCUBATOR_ANALYSIS_PROMPTS } from '../../../../../shared/story-incubator-prompts'
+import { INCUBATOR_POPULAR_PROMPTS } from '../../../../../shared/incubator-popular-prompts'
 import { incubatorSeedTextKey, incubatorStateKey, storylineAdoptKey } from './incubator-context'
 
 import { useBodyGenerationModel } from '../../../composables/useBodyGenerationModel'
@@ -71,10 +72,40 @@ window.anovel.invoke('work:get', props.workId).then(w => {
   workType.value = (w as { work_type?: string })?.work_type ?? null
 })
 
+const promptStyle = ref<'literary' | 'popular'>('literary')
+
 const analyses = computed<AnalysisConfig[]>(() => {
-  const prompts = workType.value === 'story' ? STORY_INCUBATOR_ANALYSIS_PROMPTS : INCUBATOR_ANALYSIS_PROMPTS
+  if (workType.value === 'story') {
+    return ANALYSIS_UI_ORDER.map(k => {
+      const p = STORY_INCUBATOR_ANALYSIS_PROMPTS[k] || INCUBATOR_ANALYSIS_PROMPTS[k]
+      if (!p) return null
+      return {
+        key: k,
+        label: p.label,
+        step: p.step,
+        system: p.system,
+        cardFormat: p.cardFormat,
+        slotTarget: p.slotTarget,
+        sourceStep: p.sourceStep as IncubatorCandidateSourceStep | undefined
+      }
+    }).filter((x): x is AnalysisConfig => x != null)
+  }
+  const base = promptStyle.value === 'popular' ? INCUBATOR_POPULAR_PROMPTS : INCUBATOR_ANALYSIS_PROMPTS
+  const promptLabel = promptStyle.value === 'popular' ? '爽文向' : '文学向'
   return ANALYSIS_UI_ORDER.map(k => {
-    const p = prompts[k] || INCUBATOR_ANALYSIS_PROMPTS[k]
+    const p = base[k]
+    if (!p) return null
+    return {
+      key: k,
+      label: `${p.label}`,
+      step: p.step,
+      system: p.system,
+      cardFormat: p.cardFormat,
+      slotTarget: p.slotTarget,
+      sourceStep: p.sourceStep as IncubatorCandidateSourceStep | undefined
+    }
+  }).filter((x): x is AnalysisConfig => x != null)
+})
     if (!p) return null
     return {
       key: k,
@@ -523,6 +554,25 @@ function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
 <template>
   <div>
     <p class="text-xs text-base-content/50 mb-3">{{ workflowHint }}</p>
+    <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+      <div v-if="workType !== 'story'" class="join join-sm">
+        <button
+          class="join-item btn btn-xs"
+          :class="promptStyle === 'literary' ? 'btn-primary' : 'btn-ghost'"
+          @click="promptStyle = 'literary'"
+        >
+          文学向
+        </button>
+        <button
+          class="join-item btn btn-xs"
+          :class="promptStyle === 'popular' ? 'btn-primary' : 'btn-ghost'"
+          @click="promptStyle = 'popular'"
+        >
+          爽文向
+        </button>
+      </div>
+      <span v-else></span>
+    </div>
     <div class="flex flex-wrap items-center gap-2 mb-4">
       <button
         v-for="item in analyses"
