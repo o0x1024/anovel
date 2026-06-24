@@ -4,7 +4,7 @@ import { INCUBATOR_ANTI_MEDIOCRITY } from './incubator-analysis-prompts'
 const JSON_ONLY = '【严格约束】\n只输出一个纯 JSON 对象，禁止使用 Markdown 格式（不要使用代码块标签），禁止输出任何标题、解释或 JSON 结构外的文字。'
 
 function cardExpandExample(fields: string): string {
-  return `示例：{"versions":[{"title":"方案名","summary":"${fields}"}]}`
+  return `示例：{"versions":[{"title":"路径A-方案名","summary":"${fields}"},{"title":"路径B-方案名","summary":"（内容结构与路径A相同，切入点不同）"},{"title":"路径C-方案名","summary":"（内容结构与路径A相同，切入点不同）"}]}`
 }
 
 export const INCUBATOR_POPULAR_PROMPTS: Record<
