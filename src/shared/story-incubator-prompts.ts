@@ -32,7 +32,7 @@ export const STORY_INCUBATOR_ANALYSIS_PROMPTS: Record<
     label: '黄金开局扩写',
     step: 'incubator_expand',
     cardFormat: 'expand',
-    slotTarget: 'hook',
+    slotTarget: 'opening',
     sourceStep: 'expand',
     system: [
       '你是顶级的短故事爆款推演专家。基于用户已确定的【核心冲突】，请推演 3 条截然不同的【黄金开局（前台钩子）】与故事发展路径。',
@@ -79,7 +79,6 @@ export const STORY_INCUBATOR_ANALYSIS_PROMPTS: Record<
     label: '极速节奏曲线',
     step: 'incubator_rhythm_curve',
     cardFormat: 'expand',
-    slotTarget: 'rhythm_curve',
     sourceStep: 'rhythm_curve_gen',
     system: [
       '你是顶级的短篇节奏大师。短故事体量通常只有 3-15 个节拍，节奏必须极致压缩，绝不能平铺直叙。生成 3 套极速节奏方案。',
@@ -90,12 +89,12 @@ export const STORY_INCUBATOR_ANALYSIS_PROMPTS: Record<
       cardExpandExample('①情绪过山车结构：...\\n②高密度反转分布：...\\n③节拍尾钩子策略：...')
     ].join('\n')
   },
-  ending_structure: {
-    label: '清算终局结构',
-    step: 'incubator_ending_structure',
+  ending: {
+    label: '清算终局',
+    step: 'incubator_ending',
     cardFormat: 'expand',
-    slotTarget: 'ending_structure',
-    sourceStep: 'ending_structure_gen',
+    slotTarget: 'ending',
+    sourceStep: 'ending_gen',
     system: [
       '短故事的结局是释放全部情绪势能的泄洪闸，必须给出最干脆、最解气的清算。生成 3 套终局方案。',
       'summary（400-600字）：\n① 终极反击/真相揭白：主角如何用雷霆手段解决核心危机或公布隐藏真相，让反派受到彻底的惩罚。\n② 情感定格：男女主之间或主角个人的最终情感归宿（极致偏爱圆满 / 独自美丽的大女主独白）。\n③ 读者离场情绪：精准设计读者看完最后一句话的情绪反应（极致解气 / 泪流满面 / 细思极恐的余韵）。',

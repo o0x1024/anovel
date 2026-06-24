@@ -17,7 +17,7 @@ export function heuristicScoreCandidate(row: IncubatorCandidateRow): IncubatorSc
   const hasHighlights = !!row.highlights?.trim()
   const hasAudience = !!row.audience?.trim()
   const isExpand = row.source_step === 'expand'
-  const isSlotAnalysis = ['role_engine_gen', 'world_rules_gen', 'rhythm_curve_gen', 'ending_structure_gen']
+  const isSlotAnalysis = ['premise_gen', 'role_engine_gen', 'world_rules_gen', 'rhythm_curve_gen', 'ending_gen']
     .includes(row.source_step)
 
   /** 摘要有效长度：过短惩罚，80–350 字区间加分 */

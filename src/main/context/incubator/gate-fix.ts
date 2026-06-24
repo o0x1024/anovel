@@ -25,7 +25,7 @@ function loadCharacterNames(workId: number): string[] {
     }
   } catch { /* ignore */ }
   try {
-    const registryNames = nameEntryDAO.listByWork(workId, 'character')
+    const registryNames = nameEntryDAO.listByWork(workId, 'character', 'adopted')
     for (const r of registryNames) {
       const name = r.name?.trim()
       if (name) namesSet.add(name)

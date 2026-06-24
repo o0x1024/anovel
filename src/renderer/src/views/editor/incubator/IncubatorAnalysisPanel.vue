@@ -40,12 +40,13 @@ const seedText = inject(incubatorSeedTextKey)!
 const adopt = inject(storylineAdoptKey)!
 
 const ANALYSIS_UI_ORDER = [
+  'premise',
   'variants',
   'expand',
   'role_engine',
   'world_rules',
   'rhythm_curve',
-  'ending_structure',
+  'ending',
   'frontstory',
   'diagnose',
   'reverse',
@@ -134,12 +135,12 @@ const filledSlotsMap = computed(() => {
 const getSlotMappingLabel = (key: string) => {
   const isStory = workType.value === 'story'
   const labels: Record<string, string> = {
-    core_conflict: isStory ? '主冲突轴 (对应微创新变体)' : '主冲突轴 (对应变体探索)',
-    hook: isStory ? '前台钩子 (对应黄金开局扩写)' : '前台钩子 (对应方向扩写)',
-    world_rules: isStory ? '世界规则轴 (对应背景规则轴)' : '世界规则轴 (对应世界规则轴)',
-    role_engine: isStory ? '角色驱动轴 (对应反差人设轴)' : '角色驱动轴 (对应角色驱动轴)',
-    rhythm_curve: isStory ? '节奏曲线轴 (对应极速节奏曲线)' : '节奏曲线轴 (对应节奏曲线轴)',
-    ending_structure: isStory ? '终局结构 (对应清算终局结构)' : '终局结构 (对应终局结构)'
+    premise: isStory ? '主题前提 (对应主题前提)' : '主题前提 (对应主题前提)',
+    core_conflict: isStory ? '核心冲突 (对应微创新变体)' : '核心冲突 (对应变体探索)',
+    world_rules: isStory ? '世界规则 (对应背景规则)' : '世界规则 (对应世界规则)',
+    role_engine: isStory ? '角色驱动 (对应反差人设)' : '角色驱动 (对应角色驱动)',
+    opening: isStory ? '开局设计 (对应黄金开局扩写)' : '开局设计 (对应开局扩写)',
+    ending: isStory ? '终局设计 (对应清算终局)' : '终局设计 (对应终局设计)'
   }
   return labels[key] || INCUBATOR_SLOT_LABELS[key as keyof typeof INCUBATOR_SLOT_LABELS] || key
 }
@@ -149,14 +150,14 @@ const workflowHint = computed(() => {
   if (nextSlot) {
     return `下一步建议先填「${getSlotMappingLabel(nextSlot)}」；分析时会自动带入已确认槽位。完整流程见页顶「推荐操作顺序」。`
   }
-  return '六槽已齐：请运行门禁并冻结；重跑分析仍会带入已确认槽位作为约束。'
+  return '主线槽位已齐：请运行门禁并冻结；重跑分析仍会带入已确认槽位作为约束。'
 })
 
 const charactersList = ref<string[]>([])
 
 async function loadCharacters() {
   try {
-    const registryNames = await window.anovel.invoke('name:list', props.workId, 'character') as { name: string }[]
+    const registryNames = await window.anovel.invoke('name:list', props.workId, 'character', 'adopted') as { name: string }[]
     const cards = await window.anovel.invoke('characterCards:list', props.workId) as { name: string }[]
     const namesSet = new Set<string>()
     cards.forEach(c => {
@@ -468,8 +469,8 @@ function showMarkdownForActive(): boolean {
 
 function adoptSourceStep(config: AnalysisConfig): AdoptSourceStep {
   const s = config.sourceStep
-  if (s === 'variants' || s === 'expand' || s === 'role_engine_gen' ||
-      s === 'world_rules_gen' || s === 'rhythm_curve_gen' || s === 'ending_structure_gen') return s
+  if (s === 'variants' || s === 'expand' || s === 'premise_gen' ||
+      s === 'role_engine_gen' || s === 'world_rules_gen' || s === 'rhythm_curve_gen' || s === 'ending_gen') return s
   return 'expand'
 }
 
@@ -501,7 +502,7 @@ function canAdoptCard(config: AnalysisConfig, card: CardItem): boolean {
 function openAdoptFromCard(config: AnalysisConfig, card: CardItem) {
   const step = adoptSourceStep(config)
   const candidate = findCandidateForCard(config, card)
-  const slot = config.slotTarget ?? 'hook'
+  const slot = config.slotTarget ?? 'opening'
   if (candidate) {
     adopt.openFromCandidate(
       candidate.id,

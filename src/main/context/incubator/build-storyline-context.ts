@@ -4,10 +4,9 @@ import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
 
 /** 人设 AI 生成：统合摘要 + 与角色强相关的槽位 */
 export const CHARACTER_SETTING_SLOT_KEYS: IncubatorSlotKey[] = [
-  'hook',
+  'opening',
   'core_conflict',
-  'role_engine',
-  'rhythm_curve'
+  'role_engine'
 ]
 
 export interface FrozenStorylineContextOptions {
@@ -15,8 +14,8 @@ export interface FrozenStorylineContextOptions {
   includeQualitySnapshot?: boolean
   /** 统合摘要后附带已采纳槽位正文 */
   includeSlots?: boolean
-  /** 附带的槽位键；默认六槽全量 */
-  slotKeys?: IncubatorSlotKey[]
+  /** 附带的槽位键；默认全量 */
+  slotKeys?: readonly IncubatorSlotKey[]
 }
 
 const SYNTH_HEADING = '统合主线摘要'
@@ -32,7 +31,7 @@ function formatSynthSection(summary: string): string {
 
 function formatSlotSections(
   slotMap: Record<string, string | undefined>,
-  keys: IncubatorSlotKey[]
+  keys: readonly IncubatorSlotKey[]
 ): string[] {
   return keys
     .map((k: IncubatorSlotKey) => {

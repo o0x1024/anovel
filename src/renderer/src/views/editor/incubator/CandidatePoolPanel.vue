@@ -12,10 +12,11 @@ const sourceLabels: Record<string, string> = {
   expand: '扩写',
   manual: '手动',
   microinnovation: '微创新',
+  premise_gen: '主题前提',
   role_engine_gen: '角色驱动',
   world_rules_gen: '世界规则',
   rhythm_curve_gen: '节奏曲线',
-  ending_structure_gen: '终局结构'
+  ending_gen: '终局设计'
 }
 
 const selecting = ref(false)
@@ -90,22 +91,23 @@ function canAdoptToSlot(c: IncubatorCandidate & { latestScore?: { finalTotal: nu
 
 const sourceStepToSlot: Record<string, import('../../../../../shared/incubator-slots').IncubatorSlotKey> = {
   variants: 'core_conflict',
-  expand: 'hook',
+  expand: 'opening',
+  premise_gen: 'premise',
   role_engine_gen: 'role_engine',
   world_rules_gen: 'world_rules',
-  rhythm_curve_gen: 'rhythm_curve',
-  ending_structure_gen: 'ending_structure'
+  ending_gen: 'ending'
 }
 
 function openAdopt(c: IncubatorCandidate) {
   const step = c.sourceStep === 'expand' || c.sourceStep === 'variants'
-    || c.sourceStep === 'role_engine_gen' || c.sourceStep === 'world_rules_gen'
-    || c.sourceStep === 'rhythm_curve_gen' || c.sourceStep === 'ending_structure_gen'
+    || c.sourceStep === 'premise_gen' || c.sourceStep === 'role_engine_gen'
+    || c.sourceStep === 'world_rules_gen' || c.sourceStep === 'rhythm_curve_gen'
+    || c.sourceStep === 'ending_gen'
     ? c.sourceStep : 'expand'
   adopt.openFromCandidate(
     c.id,
     { title: c.title, summary: c.summary, sourceStep: step },
-    sourceStepToSlot[c.sourceStep] ?? 'hook',
+    sourceStepToSlot[c.sourceStep] ?? 'opening',
     adoptScore(c)
   )
 }

@@ -102,7 +102,8 @@ export function adoptCandidateToSlot(input: IncubatorAdoptToSlotInput): Incubato
   incubatorCandidateDAO.setStatus(candidateId, 'adopted')
 
   const filled = incubatorDraftSlotDAO.countFilledSlots(workId)
-  const toState = applyStatePathAfterAdopt(fromState, filled)
+  const filledSlotKeys = incubatorDraftSlotDAO.listFilledSlotKeys(workId)
+  const toState = applyStatePathAfterAdopt(fromState, filled, filledSlotKeys)
   incubatorStateDAO.setState(workId, toState)
 
   return {

@@ -619,4 +619,22 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       `)
     }
   } catch { /* 已存在 */ }
+
+  // V3.6: 主线槽位重构 — hook→opening, ending_structure→ending; rhythm_curve 降级为派生分析（非槽位）
+  try {
+    if (hasTable(db, 'incubator_storyline_draft_slots')) {
+      db.exec(`UPDATE incubator_storyline_draft_slots SET slot_key = 'opening' WHERE slot_key = 'hook'`)
+      db.exec(`UPDATE incubator_storyline_draft_slots SET slot_key = 'ending' WHERE slot_key = 'ending_structure'`)
+      db.exec(`UPDATE incubator_storyline_draft_slots SET slot_key = 'ending' WHERE slot_key = 'ending_image'`)
+      db.exec(`UPDATE incubator_storyline_draft_slots SET slot_key = 'opening' WHERE slot_key = 'hook' AND slot_key NOT IN ('opening')`)
+    }
+    if (hasTable(db, 'incubator_candidates')) {
+      db.exec(`UPDATE incubator_candidates SET source_step = 'ending_gen' WHERE source_step = 'ending_structure_gen'`)
+      db.exec(`UPDATE incubator_candidates SET source_step = 'ending_gen' WHERE source_step = 'ending_image_gen'`)
+    }
+    if (hasTable(db, 'core_settings')) {
+      db.exec(`UPDATE core_settings SET type = 'incubator_ending' WHERE type = 'incubator_ending_structure'`)
+      db.exec(`UPDATE core_settings SET type = 'incubator_ending' WHERE type = 'incubator_ending_image'`)
+    }
+  } catch { /* 表可能不存在，跳过 */ }
 }

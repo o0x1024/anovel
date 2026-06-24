@@ -4,7 +4,7 @@ import type { IncubatorAdoptMode } from '../../../../shared/incubator-types'
 import type { IncubatorSlotKey } from '../../../../shared/incubator-slots'
 import { reportRendererError } from '../../utils/reportError'
 
-export type AdoptSourceStep = 'variants' | 'expand' | 'role_engine_gen' | 'world_rules_gen' | 'rhythm_curve_gen' | 'ending_structure_gen'
+export type AdoptSourceStep = 'variants' | 'expand' | 'premise_gen' | 'role_engine_gen' | 'world_rules_gen' | 'rhythm_curve_gen' | 'ending_gen'
 
 export interface AdoptLegacyPayload {
   sourceStep: AdoptSourceStep
@@ -22,7 +22,7 @@ export function useStorylineAdopt(workId: number, onSuccess: () => Promise<void>
   const payload = ref<AdoptLegacyPayload | null>(null)
   const candidateId = ref<number | null>(null)
   const candidateFinalScore = ref<number | null>(null)
-  const slotKey = ref<IncubatorSlotKey>('hook')
+  const slotKey = ref<IncubatorSlotKey>('opening')
   const mode = ref<IncubatorAdoptMode>('append_slot')
 
   const adoptModeOptions: { value: IncubatorAdoptMode; label: string }[] = [
@@ -46,7 +46,7 @@ export function useStorylineAdopt(workId: number, onSuccess: () => Promise<void>
       highlights: item.highlights ?? null,
       audience: item.audience ?? null
     })
-    slotKey.value = targetSlot ?? (sourceStep === 'variants' ? 'core_conflict' : 'hook')
+    slotKey.value = targetSlot ?? (sourceStep === 'variants' ? 'core_conflict' : 'opening')
     mode.value = 'append_slot'
     adoptError.value = ''
     modalOpen.value = true
@@ -55,7 +55,7 @@ export function useStorylineAdopt(workId: number, onSuccess: () => Promise<void>
   function openFromCandidate(
     id: number,
     item: { title: string; summary: string; sourceStep: AdoptSourceStep },
-    defaultSlot: IncubatorSlotKey = 'hook',
+    defaultSlot: IncubatorSlotKey = 'opening',
     finalScore?: number | null
   ) {
     candidateId.value = id

@@ -5,6 +5,7 @@ import type {
   IncubatorVersionCompareResult,
   IncubatorVersionDetail
 } from '../../../../../shared/incubator-types'
+import { INCUBATOR_SLOT_KEYS } from '../../../../../shared/incubator-slots'
 import SectionsPreviewDialog, { type PreviewSection } from '../../../components/SectionsPreviewDialog.vue'
 import { incubatorStateKey } from './incubator-context'
 
@@ -78,7 +79,7 @@ function openVersionPreviewDialog(versionId: number) {
   if (gate) {
     const gateLines: string[] = [
       `门禁状态：${gate.passed ? '✅ 通过' : '❌ 未通过'}`,
-      `已填槽位：${gate.filledSlotCount}/6`,
+      `已填槽位：${gate.filledSlotCount}/${INCUBATOR_SLOT_KEYS.length}`,
       `可连载性评分：${gate.serializabilityScore}`,
       `冲突闭环评分：${gate.conflictClosureScore}`
     ]

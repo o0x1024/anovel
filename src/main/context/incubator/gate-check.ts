@@ -19,7 +19,7 @@ function loadCharacterNames(workId: number): string[] {
     }
   } catch { /* ignore */ }
   try {
-    const registryNames = nameEntryDAO.listByWork(workId, 'character')
+    const registryNames = nameEntryDAO.listByWork(workId, 'character', 'adopted')
     for (const r of registryNames) {
       const name = r.name?.trim()
       if (name) namesSet.add(name)
@@ -124,12 +124,12 @@ function fallbackGateReport(filledSlotCount: number, reason: string): IncubatorG
     conflictClosureScore: 0,
     issues: [
       '门禁模型调用异常，无法完成自动判定',
-      '需对六槽进行独立结构审查',
-      ...(filledSlotCount < 6 ? [`仅 ${filledSlotCount}/6 槽已填写，缺少内容`] : [])
+      '需对主线槽位进行独立结构审查',
+      ...(filledSlotCount < 6 ? [`仅 ${filledSlotCount}/${6} 槽已填写，缺少内容`] : [])
     ],
     suggestions: [
       reason || '请稍后重试门禁，或检查模型配置后再试',
-      '请逐一审查六槽内容，重点检查：主冲突是否清晰且可持续推进、角色驱动是否真正支撑主冲突而非平行叙述、世界规则是否构成压力系统并能持续逼迫角色选择、六槽之间是否因果闭环',
+      '请逐一审查各槽位内容，重点检查：主题前提是否清晰、核心冲突是否可持续推进、角色驱动是否真正支撑核心冲突而非平行叙述、世界规则是否构成压力系统并能持续逼迫角色选择、开局到终局是否因果闭环、终局是否回答了主题前提',
       '若发现薄弱或空置槽位，请基于创作种子补全或强化该槽位（400-800字，必须极其饱满完善，细节丰富）'
     ],
     coherence: []

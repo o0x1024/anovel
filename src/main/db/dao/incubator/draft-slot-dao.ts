@@ -76,6 +76,13 @@ export class IncubatorDraftSlotDAO extends BaseDAO {
     return rows.filter(r => r.content.trim().length > 0).length
   }
 
+  listFilledSlotKeys(workId: number): IncubatorSlotKey[] {
+    const rows = this.listActiveByWork(workId)
+    return rows
+      .filter(r => r.content.trim().length > 0)
+      .map(r => r.slot_key as IncubatorSlotKey)
+  }
+
   /** 清除指向已删除候选的 source_candidate_id，避免 FK 写入失败 */
   private resolveSourceCandidateId(workId: number, candidateId: number | null | undefined): number | null {
     if (candidateId == null) return null

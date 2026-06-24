@@ -165,7 +165,7 @@ export function getBranchBaseVersionId(workId: number): number | null {
   return incubatorStateDAO.getBranchBaseVersion(workId)
 }
 
-/** 当前草案六槽是否与最新冻结快照不一致（含分支编辑） */
+/** 当前草案是否与最新冻结快照不一致（含分支编辑） */
 export function draftDiffersFromLatestFrozen(workId: number): boolean {
   if (incubatorStateDAO.getBranchBaseVersion(workId) != null) return true
 

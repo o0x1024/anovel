@@ -46,16 +46,16 @@ const steps = computed(() => {
       return {
         ...step,
         detail: isStory
-          ? '右侧「AI 分析」运行「微创新变体」产生主冲突，运行「黄金开局扩写」产生前台钩子 → 候选池评分 → 采写入槽'
-          : '右侧「AI 分析」运行「变体探索」产生主冲突，运行「方向扩写」产生前台钩子 → 候选池评分 → 采写入槽'
+          ? '右侧「AI 分析」运行「主题前提」产生主题，运行「微创新变体」产生核心冲突，运行「黄金开局扩写」产生开局 → 候选池评分 → 采写入槽'
+          : '右侧「AI 分析」运行「主题前提」产生主题，运行「变体探索」产生核心冲突，运行「开局扩写」产生开局 → 候选池评分 → 采写入槽'
       }
     }
     if (step.id === 'slots') {
       return {
         ...step,
         detail: isStory
-          ? '按序填满六槽：主冲突(对齐微创新变体) → 前台钩子(对齐黄金开局扩写) → 背景规则轴(对齐背景规则) → 反差人设轴(对齐反差人设) → 极速节奏曲线(对齐极速节奏) → 清算终局结构(对齐清算终局)；右侧有各槽同名分析模块可生成并采纳'
-          : '按序填满六槽：主冲突(对齐变体探索) → 前台钩子(对齐方向扩写) → 世界规则轴(对齐世界规则) → 角色驱动轴(对齐角色驱动) → 节奏曲线轴(对齐节奏曲线) → 终局结构(对齐终局结构)；右侧有各槽同名分析模块可生成并采纳'
+          ? '按序填满主线槽位：主题前提 → 核心冲突(对齐微创新变体) → 背景规则(对齐背景规则) → 反差人设(对齐反差人设) → 黄金开局(对齐黄金开局扩写) → 清算终局(对齐清算终局)；右侧有各槽同名分析模块可生成并采纳'
+          : '按序填满主线槽位：主题前提 → 核心冲突(对齐变体探索) → 世界规则(对齐世界规则) → 角色驱动(对齐角色驱动) → 开局设计(对齐开局扩写) → 终局设计(对齐终局设计)；右侧有各槽同名分析模块可生成并采纳'
       }
     }
     return step
@@ -69,12 +69,12 @@ const currentStepLabel = computed(
 const getSlotMappingLabel = (key: string) => {
   const isStory = workType.value === 'story'
   const labels: Record<string, string> = {
-    core_conflict: isStory ? '主冲突轴 (对齐微创新变体)' : '主冲突轴 (对齐变体探索)',
-    hook: isStory ? '前台钩子 (对齐黄金开局扩写)' : '前台钩子 (对齐方向扩写)',
-    world_rules: isStory ? '世界规则轴 (对齐背景规则轴)' : '世界规则轴 (对齐世界规则轴)',
-    role_engine: isStory ? '角色驱动轴 (对齐反差人设轴)' : '角色驱动轴 (对齐角色驱动轴)',
-    rhythm_curve: isStory ? '节奏曲线轴 (对齐极速节奏曲线)' : '节奏曲线轴 (对齐节奏曲线轴)',
-    ending_structure: isStory ? '终局结构 (对齐清算终局结构)' : '终局结构 (对齐终局结构)'
+    premise: isStory ? '主题前提 (对齐主题前提)' : '主题前提 (对齐主题前提)',
+    core_conflict: isStory ? '核心冲突 (对齐微创新变体)' : '核心冲突 (对齐变体探索)',
+    world_rules: isStory ? '世界规则 (对齐背景规则)' : '世界规则 (对齐世界规则)',
+    role_engine: isStory ? '角色驱动 (对齐反差人设)' : '角色驱动 (对齐角色驱动)',
+    opening: isStory ? '开局设计 (对齐黄金开局扩写)' : '开局设计 (对齐开局扩写)',
+    ending: isStory ? '终局设计 (对齐清算终局)' : '终局设计 (对齐终局设计)'
   }
   return labels[key] || INCUBATOR_SLOT_LABELS[key as keyof typeof INCUBATOR_SLOT_LABELS] || key
 }
@@ -82,7 +82,7 @@ const getSlotMappingLabel = (key: string) => {
 const nextSlotHint = computed(() => {
   if (currentStepId.value !== 'slots') return ''
   const key = nextUnfilledSlotKey(incubator.workspace)
-  return key ? `下一步建议先填「${getSlotMappingLabel(key)}」` : '六槽已齐，可运行门禁'
+  return key ? `下一步建议先填「${getSlotMappingLabel(key)}」` : '主线槽位已齐，可运行门禁'
 })
 </script>
 

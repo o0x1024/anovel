@@ -20,10 +20,11 @@ export type IncubatorCandidateSourceStep =
   | 'benchmark'
   | 'tone'
   | 'frontstory'
+  | 'premise_gen'
   | 'role_engine_gen'
   | 'world_rules_gen'
   | 'rhythm_curve_gen'
-  | 'ending_structure_gen'
+  | 'ending_gen'
 
 export type IncubatorCandidateStatus =
   | 'new'

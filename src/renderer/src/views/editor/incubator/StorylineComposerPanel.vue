@@ -33,7 +33,7 @@ const charactersList = ref<string[]>([])
 async function loadCharacters() {
   if (!props.workId) return
   try {
-    const registryNames = await window.anovel.invoke('name:list', props.workId, 'character') as { name: string }[]
+    const registryNames = await window.anovel.invoke('name:list', props.workId, 'character', 'adopted') as { name: string }[]
     const cards = await window.anovel.invoke('characterCards:list', props.workId) as { name: string }[]
     const namesSet = new Set<string>()
     cards.forEach(c => {
@@ -402,7 +402,7 @@ async function freeze() {
   if (!canFreezeStoryline.value) return
   await flushPendingSlots()
   freezeResult.value = null
-  freezeStage.value = '校验门禁并统合六槽主线（LLM 生成中，约 10-30s）…'
+  freezeStage.value = '校验门禁并统合主线槽位（LLM 生成中，约 10-30s）…'
   try {
     const ok = await incubator.freezeVersion()
     if (ok) {
@@ -446,7 +446,7 @@ defineExpose({ getSlotContentsForPreview })
 <template>
   <div class="card bg-base-200 border border-base-300 shadow-sm p-4">
     <div class="flex items-center justify-between gap-2 mb-3 flex-wrap">
-      <h4 class="font-semibold text-sm">主线编排（{{ filledCount }}/6）</h4>
+      <h4 class="font-semibold text-sm">主线编排（{{ filledCount }}/{{ INCUBATOR_SLOT_KEYS.length }}）</h4>
       <div class="flex flex-wrap gap-1">
         <button
           v-if="ws?.lastAdopt"
@@ -469,7 +469,7 @@ defineExpose({ getSlotContentsForPreview })
           type="button"
           class="btn btn-outline btn-xs"
           :disabled="applyingTweak || filledCount === 0"
-          title="按你的想法微调六槽，如修改角色名字、统一称谓等"
+          title="按你的想法微调主线槽位，如修改角色名字、统一称谓等"
           @click="openTweakModal"
         >
           {{ applyingTweak ? '微调中...' : '微调' }}
@@ -535,7 +535,7 @@ defineExpose({ getSlotContentsForPreview })
       <div class="flex items-center justify-between gap-2 flex-wrap mb-1">
         <p :class="gateReport.passed ? 'text-success' : 'text-warning'">
           AI 门禁：{{ gateReport.passed ? '通过' : '未通过' }}
-          · 槽位 {{ gateReport.filledSlotCount }}/6
+          · 槽位 {{ gateReport.filledSlotCount }}/{{ INCUBATOR_SLOT_KEYS.length }}
         </p>
         <button
           v-if="canRunGateAutoFix"
@@ -639,7 +639,7 @@ defineExpose({ getSlotContentsForPreview })
       <div class="modal-box max-w-lg">
         <h3 class="font-bold text-sm mb-2">主线微调</h3>
         <p class="text-xs text-base-content/55 mb-3">
-          描述你想调整的内容，AI 会在现有六槽基础上合并修改（如主角/配角改名、统一称谓、删减冗余设定等）。
+          描述你想调整的内容，AI 会在现有主线槽位基础上合并修改（如主角/配角改名、统一称谓、删减冗余设定等）。
         </p>
         <textarea
           v-model="tweakInstructions"

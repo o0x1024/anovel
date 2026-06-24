@@ -1,5 +1,5 @@
 import { INCUBATOR_SLOT_FILL_ORDER } from './incubator-analysis-prompts'
-import { INCUBATOR_SLOT_LABELS, INCUBATOR_SLOT_KEYS, type IncubatorSlotKey } from './incubator-slots'
+import { INCUBATOR_REQUIRED_SLOTS, INCUBATOR_SLOT_LABELS, INCUBATOR_SLOT_KEYS, type IncubatorSlotKey } from './incubator-slots'
 import type { IncubatorWorkspaceState } from './incubator-types'
 
 export type IncubatorWorkflowStepId =
@@ -30,8 +30,8 @@ export const INCUBATOR_RECOMMENDED_WORKFLOW: IncubatorWorkflowStepDef[] = [
   },
   {
     id: 'slots',
-    label: '③ 六槽编排',
-    detail: `按序填满六槽：${INCUBATOR_SLOT_FILL_ORDER.map(k => INCUBATOR_SLOT_LABELS[k]).join(' → ')}；可运行角色/世界/情感/终局等专属分析并采纳`
+    label: '③ 主线编排',
+    detail: `按序填满主线槽位：${INCUBATOR_SLOT_FILL_ORDER.map(k => INCUBATOR_SLOT_LABELS[k]).join(' → ')}；可运行主题/冲突/世界/角色/终局等专属分析并采纳`
   },
   {
     id: 'gate',
@@ -77,9 +77,13 @@ export function resolveIncubatorWorkflowStep(input: {
   if (!hasSeed) return 'seed'
 
   const filled = countFilledIncubatorSlots(ws)
+  const filledKeys = ws?.activeDraftSlots
+    ?.filter(s => s.content?.trim() && INCUBATOR_SLOT_KEYS.includes(s.slotKey as IncubatorSlotKey))
+    .map(s => s.slotKey as IncubatorSlotKey) ?? []
+  const requiredFilled = INCUBATOR_REQUIRED_SLOTS.every(k => filledKeys.includes(k))
   const hasCandidates = (ws?.candidates?.length ?? 0) > 0
   if (filled === 0 && !hasCandidates) return 'explore'
-  if (filled < INCUBATOR_SLOT_FILL_ORDER.length) return 'slots'
+  if (!requiredFilled) return 'slots'
 
   if (!ws?.gateSummary?.passed) return 'gate'
   if (!ws?.latestFrozenVersion && ws?.state !== 'V1Frozen') return 'freeze'

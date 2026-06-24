@@ -20,7 +20,7 @@ export function buildSlotsPromptBody(slotMap: Record<string, string>): string {
 }
 
 /**
- * 冻结前 LLM 统合六槽；失败时返回 null，由调用方回退拼接。
+ * 冻结前 LLM 统合主线槽位；失败时返回 null，由调用方回退拼接。
  */
 export async function synthesizeStorylineForFreeze(
   workId: number,

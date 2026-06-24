@@ -25,5 +25,6 @@ export function updateDraftSlotContent(
   const stateRow = incubatorStateDAO.getByWork(workId)
   const fromState = (stateRow?.state ?? 'SeedReady') as import('../../../shared/incubator-types').IncubatorWorkflowState
   const filled = incubatorDraftSlotDAO.countFilledSlots(workId)
-  incubatorStateDAO.setState(workId, applyStatePathAfterAdopt(fromState, filled))
+  const filledSlotKeys = incubatorDraftSlotDAO.listFilledSlotKeys(workId)
+  incubatorStateDAO.setState(workId, applyStatePathAfterAdopt(fromState, filled, filledSlotKeys))
 }
