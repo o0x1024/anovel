@@ -1,11 +1,14 @@
 import { BaseDAO } from './base-dao'
 import type { PerplexityApiConfig } from '../../../shared/aigc-detect-types'
+import type { AutoOptimizeConfig } from '../../../shared/auto-optimize-config'
+import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../shared/auto-optimize-config'
 
 export const GLOBAL_LLM_PROVIDER_KEY = 'global_llm_provider'
 export const GLOBAL_LLM_MODEL_KEY = 'global_llm_model'
 export const BUILTIN_STYLES_SEEDED_KEY = 'builtin_styles_seeded'
 const GENERATION_PARAMS_KEY = 'generation_params'
 const PERPLEXITY_API_CONFIG_KEY = 'perplexity_api_config'
+const AUTO_OPTIMIZE_CONFIG_KEY = 'auto_optimize_config'
 
 export interface GlobalLlmDefault {
   provider: string | null
@@ -117,6 +120,34 @@ export class AppPreferenceDAO extends BaseDAO {
       apiKey: config.apiKey ?? current.apiKey
     }
     this.setPreference(PERPLEXITY_API_CONFIG_KEY, JSON.stringify(merged))
+    return merged
+  }
+
+  getAutoOptimizeConfig(): AutoOptimizeConfig {
+    const raw = this.getPreference(AUTO_OPTIMIZE_CONFIG_KEY)
+    if (!raw) return { ...DEFAULT_AUTO_OPTIMIZE_CONFIG }
+    try {
+      const parsed = JSON.parse(raw) as Partial<AutoOptimizeConfig>
+      return {
+        enabled: parsed.enabled ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.enabled,
+        maxIterations: parsed.maxIterations ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.maxIterations,
+        targetTotalScore: parsed.targetTotalScore ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.targetTotalScore,
+        stopOnHardFail: parsed.stopOnHardFail ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.stopOnHardFail
+      }
+    } catch {
+      return { ...DEFAULT_AUTO_OPTIMIZE_CONFIG }
+    }
+  }
+
+  setAutoOptimizeConfig(config: Partial<AutoOptimizeConfig>): AutoOptimizeConfig {
+    const current = this.getAutoOptimizeConfig()
+    const merged: AutoOptimizeConfig = {
+      enabled: config.enabled ?? current.enabled,
+      maxIterations: config.maxIterations ?? current.maxIterations,
+      targetTotalScore: config.targetTotalScore ?? current.targetTotalScore,
+      stopOnHardFail: config.stopOnHardFail ?? current.stopOnHardFail
+    }
+    this.setPreference(AUTO_OPTIMIZE_CONFIG_KEY, JSON.stringify(merged))
     return merged
   }
 }

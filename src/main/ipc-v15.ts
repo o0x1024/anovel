@@ -884,6 +884,21 @@ function parseTimelineGeneration(content: string): Array<{
     return { success: true, patchedText, appliedCount: applied.length, patches: applied }
   })
 
+  // ==================== 自动优化配置 ====================
+  ipcMain.handle('quality:getAutoOptimizeConfig', () => {
+    return appPreferenceDAO.getAutoOptimizeConfig()
+  })
+
+  ipcMain.handle('quality:setAutoOptimizeConfig', (_e, config: Record<string, unknown>) => {
+    const parsed: { enabled?: boolean; maxIterations?: number; targetTotalScore?: number; stopOnHardFail?: boolean } = {
+      enabled: typeof config.enabled === 'boolean' ? config.enabled : undefined,
+      maxIterations: typeof config.maxIterations === 'number' ? config.maxIterations : undefined,
+      targetTotalScore: typeof config.targetTotalScore === 'number' ? config.targetTotalScore : undefined,
+      stopOnHardFail: typeof config.stopOnHardFail === 'boolean' ? config.stopOnHardFail : undefined
+    }
+    return appPreferenceDAO.setAutoOptimizeConfig(parsed)
+  })
+
   // ==================== 反均值化引擎 ====================
   ipcMain.handle('antimean:surpriseScore', async (e, workId: number, content: string) => {
     const res = await modelService.chat({

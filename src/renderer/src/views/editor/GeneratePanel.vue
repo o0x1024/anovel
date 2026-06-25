@@ -22,6 +22,8 @@ import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body
 import { formatBodyWordTargetLine, countWords } from '../../../../shared/body-word-target'
 import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../../shared/body-generation-prompt'
 import { WORDS_PER_CHAPTER_PRESETS } from '../../../../shared/writing-plan-presets'
+import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../../shared/auto-optimize-config'
+import type { AutoOptimizeConfig } from '../../../../shared/auto-optimize-config'
 import {
   beginBodyGeneration,
   endBodyGeneration,
@@ -210,6 +212,10 @@ const autoHumanize = ref(true)
 const autoRewrite = ref(false)
 const humanizing = ref(false)
 const styleRewriting = ref(false)
+const autoOptimizeConfig = ref<AutoOptimizeConfig>({ ...DEFAULT_AUTO_OPTIMIZE_CONFIG })
+const autoOptimizing = ref(false)
+const autoOptimizeMsg = ref('')
+const autoOptimizeModalOpen = ref(false)
 const humanizeStats = ref<{ wordSubstitutionHits: number; uniformSentenceRuns: number; avgTokenPredictability: string } | null>(null)
 const versionHistoryRef = ref<InstanceType<typeof ChapterVersionHistory> | null>(null)
 const workReferenceText = ref('')
@@ -315,6 +321,10 @@ onMounted(async () => {
   if (volumes.value.length) selectedVolume.value = volumes.value[0].id
   blockHints.value = await window.anovel.invoke('writerBlock:types') as typeof blockHints.value
   workReferenceText.value = await window.anovel.invoke('setting:getWorkReferenceText', props.workId) as string
+  try {
+    const saved = await window.anovel.invoke('quality:getAutoOptimizeConfig') as AutoOptimizeConfig
+    autoOptimizeConfig.value = { ...DEFAULT_AUTO_OPTIMIZE_CONFIG, ...saved }
+  } catch { /* ignore */ }
 })
 
 async function reloadChapters() {
@@ -624,6 +634,13 @@ async function generateBody() {
       result.value = content
     }
     if (content) {
+      if (autoOptimizeConfig.value.enabled) {
+        const optimized = await runAutoOptimize(content)
+        if (optimized !== content) {
+          content = optimized
+          result.value = content
+        }
+      }
       cacheBodyContent(chapterId, content)
       if (selectedChapterId.value === chapterId) {
         await runPostGenerateChecks(content)
@@ -854,6 +871,109 @@ async function styleRewrite() {
     showToast('error', e instanceof Error ? e.message : '稿件优化失败')
   } finally {
     styleRewriting.value = false
+  }
+}
+
+async function runAutoOptimize(content: string): Promise<string> {
+  const config = autoOptimizeConfig.value
+  if (!config.enabled) return content
+  if (autoOptimizing.value) return content
+
+  let currentContent = content
+  autoOptimizing.value = true
+  autoOptimizeMsg.value = ''
+
+  try {
+    for (let i = 1; i <= config.maxIterations; i++) {
+      autoOptimizeMsg.value = `自动优化中（第 ${i}/${config.maxIterations} 轮）…`
+
+      const diagRes = await window.anovel.invoke(
+        'quality:diagnoseAI',
+        props.workId,
+        selectedChapterId.value,
+        currentContent,
+        { ...bodyModelParams(), wordTarget: wordTarget.value }
+      ) as {
+        success: boolean
+        report?: string
+        scoreTotal?: number
+        hardFail?: boolean
+        scoreBreakdown?: QualityAiMetrics['breakdown']
+        error?: string
+      }
+
+      if (!diagRes.success) {
+        autoOptimizeMsg.value = `第 ${i} 轮诊断失败：${diagRes.error}`
+        break
+      }
+
+      const scoreTotal = diagRes.scoreTotal ?? 0
+      const hardFail = diagRes.hardFail ?? false
+
+      if (config.stopOnHardFail && hardFail) {
+        autoOptimizeMsg.value = `第 ${i} 轮总分 ${scoreTotal}，硬失败，停止优化`
+        break
+      }
+
+      if (scoreTotal >= config.targetTotalScore) {
+        autoOptimizeMsg.value = `优化完成：总分 ${scoreTotal}，已达目标 ${config.targetTotalScore}`
+        break
+      }
+
+      if (i === config.maxIterations) {
+        autoOptimizeMsg.value = `已达最大轮次，当前总分 ${scoreTotal}（目标 ${config.targetTotalScore}）`
+        break
+      }
+
+      const patches = toPlainForIpc(diagRes.scoreBreakdown?.patches ?? [])
+      if (patches.length > 0) {
+        const patchRes = await window.anovel.invoke(
+          'quality:applyLocalPatches',
+          currentContent,
+          patches
+        ) as { success: boolean; patchedText?: string; appliedCount?: number }
+        if (patchRes.success && patchRes.patchedText && (patchRes.appliedCount ?? 0) > 0) {
+          currentContent = patchRes.patchedText
+          continue
+        }
+      }
+
+      if (!diagRes.report) {
+        autoOptimizeMsg.value = `第 ${i} 轮无诊断报告，停止优化`
+        break
+      }
+
+      const fixRes = await window.anovel.invoke(
+        'quality:applyFixes',
+        props.workId,
+        currentContent,
+        diagRes.report,
+        { ...bodyModelParams(), wordTarget: wordTarget.value }
+      ) as { success: boolean; content?: string; error?: string }
+
+      if (fixRes.success && fixRes.content) {
+        currentContent = fixRes.content
+      } else {
+        autoOptimizeMsg.value = `第 ${i} 轮优化失败：${fixRes.error || '未知错误'}`
+        break
+      }
+    }
+  } catch (e) {
+    autoOptimizeMsg.value = `自动优化异常：${e instanceof Error ? e.message : String(e)}`
+  } finally {
+    autoOptimizing.value = false
+  }
+
+  return currentContent
+}
+
+async function saveAutoOptimizeConfig(config: Partial<AutoOptimizeConfig>) {
+  try {
+    const saved = await window.anovel.invoke('quality:setAutoOptimizeConfig', config) as AutoOptimizeConfig
+    autoOptimizeConfig.value = { ...autoOptimizeConfig.value, ...saved }
+    showToast('success', '自动优化配置已保存')
+  } catch {
+    showToast('error', '保存配置失败')
   }
 }
 
@@ -1454,6 +1574,25 @@ async function copyCompleteStory() {
                 <input v-model="autoRewrite" type="checkbox" class="checkbox checkbox-xs checkbox-primary" />
                 <span class="text-base-content/60">深度去AI</span>
               </label>
+              <div class="flex items-center gap-1" title="生成后自动运行 AI 诊断与优化，直到分项评分达到目标">
+                <label class="flex items-center gap-1 text-xs cursor-pointer">
+                  <input
+                    v-model="autoOptimizeConfig.enabled"
+                    type="checkbox"
+                    class="checkbox checkbox-xs checkbox-primary"
+                    @change="saveAutoOptimizeConfig({ enabled: autoOptimizeConfig.enabled })"
+                  />
+                  <span class="text-base-content/60" :class="{ 'text-primary font-medium': autoOptimizeConfig.enabled }">自动优化</span>
+                </label>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-xs px-1"
+                  title="设置自动优化目标"
+                  @click="autoOptimizeModalOpen = true"
+                >
+                  <font-awesome-icon icon="cog" class="w-3 h-3" />
+                </button>
+              </div>
               <button
                 v-if="result.trim()"
                 type="button"
@@ -1524,7 +1663,15 @@ async function copyCompleteStory() {
                 :source-input="lastPrompt"
                 size="xs"
               />
-            </div>
+              </div>
+              <p
+                v-if="autoOptimizeMsg"
+                class="text-xs shrink-0"
+                :class="autoOptimizing ? 'text-info' : (autoOptimizeMsg.includes('完成') || autoOptimizeMsg.includes('已达') ? 'text-success' : 'text-warning')"
+              >
+                <font-awesome-icon v-if="autoOptimizing" icon="spinner" spin class="w-3 h-3 mr-1" />
+                {{ autoOptimizeMsg }}
+              </p>
 
             <AntiAiRulesPanel
               ref="antiAiRulesPanelRef"
@@ -1760,4 +1907,56 @@ async function copyCompleteStory() {
 
     <StepNavFooter step="generate" hint="保存正文后可选择是否更新叙事记忆体；可在侧边栏「叙事记忆体」查看伏笔与快照" class="shrink-0 mt-4" />
   </div>
+
+  <dialog class="modal" :class="{ 'modal-open': autoOptimizeModalOpen }">
+    <div class="modal-box max-w-sm">
+      <h3 class="font-bold text-sm mb-4">自动优化设置</h3>
+
+      <div class="space-y-4">
+        <label class="flex items-center justify-between gap-2 text-sm">
+          <span>目标总分</span>
+          <div class="flex items-center gap-2">
+            <input
+              v-model.number="autoOptimizeConfig.targetTotalScore"
+              type="range"
+              min="60"
+              max="100"
+              step="5"
+              class="range range-xs range-primary w-28"
+            />
+            <span class="text-xs font-mono w-8 text-right">{{ autoOptimizeConfig.targetTotalScore }}</span>
+          </div>
+        </label>
+
+        <label class="flex items-center justify-between gap-2 text-sm">
+          <span>最大优化轮次</span>
+          <select v-model.number="autoOptimizeConfig.maxIterations" class="select select-bordered select-xs w-20">
+            <option :value="1">1 轮</option>
+            <option :value="2">2 轮</option>
+            <option :value="3">3 轮</option>
+            <option :value="5">5 轮</option>
+          </select>
+        </label>
+
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input v-model="autoOptimizeConfig.stopOnHardFail" type="checkbox" class="checkbox checkbox-xs checkbox-primary" />
+          <span>硬失败时停止</span>
+        </label>
+      </div>
+
+      <div class="modal-action">
+        <button type="button" class="btn btn-ghost btn-sm" @click="autoOptimizeModalOpen = false">取消</button>
+        <button
+          type="button"
+          class="btn btn-primary btn-sm"
+          @click="saveAutoOptimizeConfig({ targetTotalScore: autoOptimizeConfig.targetTotalScore, maxIterations: autoOptimizeConfig.maxIterations, stopOnHardFail: autoOptimizeConfig.stopOnHardFail }); autoOptimizeModalOpen = false"
+        >
+          保存
+        </button>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop" @click="autoOptimizeModalOpen = false">
+      <button type="button">close</button>
+    </form>
+  </dialog>
 </template>
