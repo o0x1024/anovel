@@ -915,9 +915,20 @@ async function runAutoOptimize(content: string): Promise<string> {
         break
       }
 
-      if (scoreTotal >= config.targetTotalScore) {
-        autoOptimizeMsg.value = `优化完成：总分 ${scoreTotal}，已达目标 ${config.targetTotalScore}`
+      const items = diagRes.scoreBreakdown?.items
+      const hasBreakdown = items && items.length > 0
+      const allAboveMin = hasBreakdown
+        ? items!.every(item => item.ratio >= config.minSubScoreRatio)
+        : true
+
+      if (scoreTotal >= config.targetTotalScore && allAboveMin) {
+        const pct = Math.round(config.minSubScoreRatio * 100)
+        autoOptimizeMsg.value = `优化完成：总分 ${scoreTotal}，各项均 ≥ ${pct}%，已达目标`
         break
+      }
+
+      if (scoreTotal >= config.targetTotalScore && !allAboveMin) {
+        autoOptimizeMsg.value = `总分 ${scoreTotal} 已达目标，但存在低于 ${Math.round(config.minSubScoreRatio * 100)}% 的小项，继续优化`
       }
 
       if (i === config.maxIterations) {
@@ -1929,6 +1940,21 @@ async function copyCompleteStory() {
         </label>
 
         <label class="flex items-center justify-between gap-2 text-sm">
+          <span>小项最低比率</span>
+          <div class="flex items-center gap-2">
+            <input
+              v-model.number="autoOptimizeConfig.minSubScoreRatio"
+              type="range"
+              min="0.5"
+              max="1"
+              step="0.05"
+              class="range range-xs range-primary w-28"
+            />
+            <span class="text-xs font-mono w-8 text-right">{{ Math.round(autoOptimizeConfig.minSubScoreRatio * 100) }}%</span>
+          </div>
+        </label>
+
+        <label class="flex items-center justify-between gap-2 text-sm">
           <span>最大优化轮次</span>
           <select v-model.number="autoOptimizeConfig.maxIterations" class="select select-bordered select-xs w-20">
             <option :value="1">1 轮</option>
@@ -1949,7 +1975,7 @@ async function copyCompleteStory() {
         <button
           type="button"
           class="btn btn-primary btn-sm"
-          @click="saveAutoOptimizeConfig({ targetTotalScore: autoOptimizeConfig.targetTotalScore, maxIterations: autoOptimizeConfig.maxIterations, stopOnHardFail: autoOptimizeConfig.stopOnHardFail }); autoOptimizeModalOpen = false"
+          @click="saveAutoOptimizeConfig({ targetTotalScore: autoOptimizeConfig.targetTotalScore, minSubScoreRatio: autoOptimizeConfig.minSubScoreRatio, maxIterations: autoOptimizeConfig.maxIterations, stopOnHardFail: autoOptimizeConfig.stopOnHardFail }); autoOptimizeModalOpen = false"
         >
           保存
         </button>

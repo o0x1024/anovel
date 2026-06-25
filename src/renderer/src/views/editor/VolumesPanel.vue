@@ -35,17 +35,44 @@ const volumeDiagnosisResult = ref('')
 const volumeDiagnosisError = ref('')
 const showDiagnosisResult = ref(false)
 
+const fixingVolumes = ref(false)
+const volumeFixError = ref('')
+const volumeFixResult = ref('')
+
+const volumeFixSystemPrompt = [
+  '你是犀利、资深的网文总编辑，擅长根据诊断报告对分卷大纲进行精准修复。',
+  '根据下方的诊断报告和当前分卷列表，对存在问题的分卷进行修复。',
+  '',
+  '修复要求：',
+  '1. 修复每卷的 name 和 description 以解决诊断报告中指出的逻辑与质量问题',
+  '2. 保持每卷 description 80-300 字（主题 + 主冲突 + 卷末钩子）',
+  '3. name 须像真实分卷名（如「卷一：《标题》」）',
+  '4. 只输出一个 JSON 对象，禁止 Markdown 正文、标题或额外文字',
+  '5. patches 数组按需包含需修改的分卷，不修改的分卷不要输出',
+  '',
+  '输出格式示例：',
+  '{"patches":[{"volumeId":1,"name":"卷一：《新标题》","description":"主题…；主冲突…；卷末钩子…"}]}'
+].join('\n')
+
 const volumeDiagnosisSystemPrompt = [
-  '你是犀利、资深的网文总编辑，擅长从宏观角度诊断分卷大纲的逻辑结构问题。',
+  '你是犀利、资深的网文总编辑，擅长从宏观角度诊断分卷大纲的逻辑结构与质量问题。',
   '请对提供的分卷大纲及作品设定进行全面诊断，重点关注以下方面：',
+  '',
+  '## 逻辑维度',
   '',
   '1. 【分卷递进逻辑】：各卷主题之间是否存在清晰的递进关系？冲突是否层层升级而非平行重复？',
   '2. 【因果链与收束设计】：跨卷的因果链条是否断裂？前期铺垫的悬念/伏笔是否在后续得到回应？',
   '3. 【冲突升级曲线】：从卷一至最后一卷，矛盾冲突是否持续升级？是否存在冲突强度停滞甚至回落的问题？',
   '4. 【故事弧完整性】：故事起承转合是否完整？高潮点分布是否合理？结局卷是否为积累的矛盾提供有力收束？',
-  '5. 【节奏与体量分布】：各卷说明的篇幅体量是否均匀？是否存在关键卷过于单薄或配比失衡？',
-  '6. 【角色动机跨卷一致性】：主要角色的行为逻辑和成长弧线是否跨卷一致？是否存在人设崩塌隐患？',
+  '5. 【角色动机跨卷一致性】：主要角色的行为逻辑和成长弧线是否跨卷一致？是否存在人设崩塌隐患？',
+  '',
+  '## 质量维度',
+  '',
+  '6. 【节奏与体量分布】：各卷说明的篇幅体量是否均匀？是否存在关键卷过于单薄或配比失衡？',
   '7. 【设定使用效率】：世界观规则和金手指设定是否被有效利用？是否存在设定了但后文未用的浪费？',
+  '8. 【分卷说明质量】：每卷 description 是否清晰体现主题、主冲突和卷末钩子？是否存在描述空洞、模板化或信息不足的问题？',
+  '9. 【分卷命名质量】：分卷名称是否有吸引力？是否为真实的分卷标题而非通用标签？是否存在命名重复或缺乏辨识度？',
+  '10. 【钩子与悬念设计】：每卷末尾是否有足够的悬念或钩子推动读者进入下一卷？钩子是否与前文铺垫一致？',
   '',
   '【输出要求】',
   '请用中文输出诊断报告，针对每个问题维度，指出涉及的具体分卷、具体问题点，并给出可操作的改进建议。',
@@ -159,7 +186,7 @@ async function runVolumeDiagnosis() {
       includeQualityIssues: true
     }) as { text: string }
 
-    const userPrompt = `请对以下作品的分卷大纲进行逻辑诊断：\n\n${ctx.text || '（暂无作品上下文）'}`
+    const userPrompt = `请对以下作品的分卷大纲进行逻辑与质量诊断：\n\n${ctx.text || '（暂无作品上下文）'}`
 
     const res = await window.anovel.invoke('model:chat', {
       prompt: userPrompt,
@@ -178,6 +205,105 @@ async function runVolumeDiagnosis() {
   } finally {
     diagnosingVolumes.value = false
   }
+}
+
+async function runVolumeFix() {
+  if (fixingVolumes.value || !volumeDiagnosisResult.value) return
+  fixingVolumes.value = true
+  volumeFixError.value = ''
+  volumeFixResult.value = ''
+
+  try {
+    const volumesList = volumes.value.map(v => ({
+      id: v.id,
+      name: v.name,
+      description: v.description || ''
+    }))
+
+    const userPrompt = [
+      '【诊断报告】',
+      volumeDiagnosisResult.value,
+      '',
+      '【当前分卷列表】',
+      JSON.stringify(volumesList, null, 2),
+      '',
+      '请根据诊断报告对分卷进行修复，只输出 JSON patches。'
+    ].join('\n')
+
+    const res = await window.anovel.invoke('model:chat', {
+      prompt: userPrompt,
+      systemPrompt: volumeFixSystemPrompt,
+      workId: props.workId,
+      step: 'volume_diagnose_fix'
+    }) as { success: boolean; content: string; error?: string }
+
+    if (!res.success) {
+      volumeFixError.value = res.error || '修复调用失败'
+      return
+    }
+
+    const jsonText = extractJsonFromContent(res.content)
+    if (!jsonText) {
+      volumeFixError.value = '未能从 AI 回复解析出修复内容'
+      return
+    }
+
+    let parsed: { patches?: { volumeId: number; name?: string; description?: string }[] }
+    try {
+      parsed = JSON.parse(jsonText)
+    } catch {
+      volumeFixError.value = '修复 JSON 解析失败'
+      return
+    }
+
+    if (!parsed.patches || parsed.patches.length === 0) {
+      volumeFixResult.value = '诊断未发现需修复的问题，所有分卷已达标'
+      return
+    }
+
+    for (const patch of parsed.patches) {
+      const fields: Record<string, unknown> = {}
+      if (patch.name) fields.name = patch.name
+      if (patch.description !== undefined) fields.description = patch.description
+      if (Object.keys(fields).length > 0) {
+        await window.anovel.invoke('volume:update', patch.volumeId, fields)
+      }
+    }
+
+    await loadVolumes()
+    volumeFixResult.value = `已修复 ${parsed.patches.length} 个分卷`
+  } catch (e) {
+    volumeFixError.value = '修复失败: ' + String(e)
+  } finally {
+    fixingVolumes.value = false
+  }
+}
+
+function extractJsonFromContent(content: string): string | null {
+  const fenceMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) return fenceMatch[1].trim()
+  const braceStart = content.indexOf('{')
+  if (braceStart >= 0) {
+    let depth = 0
+    let inString = false
+    let escaped = false
+    for (let i = braceStart; i < content.length; i++) {
+      const ch = content[i]
+      if (inString) {
+        if (escaped) { escaped = false; continue }
+        if (ch === '\\') { escaped = true; continue }
+        if (ch === '"') inString = false
+        continue
+      }
+      if (ch === '"') { inString = true; continue }
+      if (ch === '{') depth++
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) return content.slice(braceStart, i + 1)
+      }
+    }
+  }
+  return null
 }
 
 async function applyParsedVolumes(mode: 'append' | 'replace') {
@@ -238,7 +364,7 @@ function aiSuggestionSummary(): string {
       </button>
       <button class="btn btn-outline btn-warning gap-1" :disabled="diagnosingVolumes" @click="runVolumeDiagnosis">
         <font-awesome-icon :icon="diagnosingVolumes ? 'spinner' : 'stethoscope'" :spin="diagnosingVolumes" class="w-3.5 h-3.5" />
-        {{ diagnosingVolumes ? '诊断中...' : '诊断大纲逻辑' }}
+        {{ diagnosingVolumes ? '诊断中...' : '诊断大纲逻辑和质量' }}
       </button>
     </div>
 
@@ -331,19 +457,37 @@ function aiSuggestionSummary(): string {
         <div class="flex items-center justify-between gap-2 mb-3">
           <h4 class="font-semibold text-sm flex items-center gap-1.5">
             <font-awesome-icon icon="stethoscope" class="w-3.5 h-3.5 text-warning" />
-            逻辑诊断报告
+            逻辑与质量诊断报告
           </h4>
-          <button class="btn btn-ghost btn-xs gap-1" @click="showDiagnosisResult = false">
-            <font-awesome-icon icon="times" class="w-3 h-3" />
-            关闭
-          </button>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="volumeDiagnosisResult && !fixingVolumes"
+              class="btn btn-primary btn-xs gap-1"
+              @click="runVolumeFix"
+            >
+              <font-awesome-icon icon="wrench" class="w-3 h-3" />
+              应用修复
+            </button>
+            <button class="btn btn-ghost btn-xs gap-1" @click="showDiagnosisResult = false">
+              <font-awesome-icon icon="times" class="w-3 h-3" />
+              关闭
+            </button>
+          </div>
         </div>
         <div v-if="volumeDiagnosisError" class="alert alert-error text-sm">{{ volumeDiagnosisError }}</div>
         <div v-else-if="diagnosingVolumes" class="text-sm text-base-content/50 flex items-center gap-2">
           <font-awesome-icon icon="spinner" spin class="w-4 h-4" />
           诊断中，请稍候...
         </div>
-        <MarkdownContent v-else-if="volumeDiagnosisResult" :content="volumeDiagnosisResult" />
+        <MarkdownContent v-else-if="volumeDiagnosisResult && !fixingVolumes" :content="volumeDiagnosisResult" />
+        <div v-else-if="fixingVolumes" class="text-sm text-base-content/50 flex items-center gap-2">
+          <font-awesome-icon icon="spinner" spin class="w-4 h-4" />
+          正在根据诊断结果修复分卷大纲...
+        </div>
+        <div v-else-if="volumeFixError" class="alert alert-error text-sm">{{ volumeFixError }}</div>
+        <div v-else-if="volumeFixResult" class="text-sm text-success">
+          修复完成：{{ volumeFixResult }}
+        </div>
       </div>
     </div>
 

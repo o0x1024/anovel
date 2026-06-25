@@ -132,7 +132,8 @@ export class AppPreferenceDAO extends BaseDAO {
         enabled: parsed.enabled ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.enabled,
         maxIterations: parsed.maxIterations ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.maxIterations,
         targetTotalScore: parsed.targetTotalScore ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.targetTotalScore,
-        stopOnHardFail: parsed.stopOnHardFail ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.stopOnHardFail
+        stopOnHardFail: parsed.stopOnHardFail ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.stopOnHardFail,
+        minSubScoreRatio: parsed.minSubScoreRatio ?? DEFAULT_AUTO_OPTIMIZE_CONFIG.minSubScoreRatio
       }
     } catch {
       return { ...DEFAULT_AUTO_OPTIMIZE_CONFIG }
@@ -145,7 +146,8 @@ export class AppPreferenceDAO extends BaseDAO {
       enabled: config.enabled ?? current.enabled,
       maxIterations: config.maxIterations ?? current.maxIterations,
       targetTotalScore: config.targetTotalScore ?? current.targetTotalScore,
-      stopOnHardFail: config.stopOnHardFail ?? current.stopOnHardFail
+      stopOnHardFail: config.stopOnHardFail ?? current.stopOnHardFail,
+      minSubScoreRatio: config.minSubScoreRatio ?? current.minSubScoreRatio
     }
     this.setPreference(AUTO_OPTIMIZE_CONFIG_KEY, JSON.stringify(merged))
     return merged

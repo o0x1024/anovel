@@ -890,11 +890,12 @@ function parseTimelineGeneration(content: string): Array<{
   })
 
   ipcMain.handle('quality:setAutoOptimizeConfig', (_e, config: Record<string, unknown>) => {
-    const parsed: { enabled?: boolean; maxIterations?: number; targetTotalScore?: number; stopOnHardFail?: boolean } = {
+    const parsed: { enabled?: boolean; maxIterations?: number; targetTotalScore?: number; stopOnHardFail?: boolean; minSubScoreRatio?: number } = {
       enabled: typeof config.enabled === 'boolean' ? config.enabled : undefined,
       maxIterations: typeof config.maxIterations === 'number' ? config.maxIterations : undefined,
       targetTotalScore: typeof config.targetTotalScore === 'number' ? config.targetTotalScore : undefined,
-      stopOnHardFail: typeof config.stopOnHardFail === 'boolean' ? config.stopOnHardFail : undefined
+      stopOnHardFail: typeof config.stopOnHardFail === 'boolean' ? config.stopOnHardFail : undefined,
+      minSubScoreRatio: typeof config.minSubScoreRatio === 'number' ? config.minSubScoreRatio : undefined
     }
     return appPreferenceDAO.setAutoOptimizeConfig(parsed)
   })

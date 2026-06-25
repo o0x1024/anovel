@@ -75,7 +75,8 @@ const STEP_TITLES: Record<string, string> = {
   settings_conflict: 'AI 生成核心冲突',
   settings_conflict_coverage_suggest: '冲突映射补齐建议',
   settings_idea: 'AI 生成故事方向',
-  volume_chapters_batch: '批量生成分章'
+  volume_chapters_batch: '批量生成分章',
+  volume_diagnose_fix: '分卷大纲诊断修复'
 }
 
 export function resolveSessionTitle(step?: string, explicit?: string): string {
