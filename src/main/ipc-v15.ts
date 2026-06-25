@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, anchorAlignmentDAO, anchorDAO, volumeChapterDAO, coreSettingDAO } from './db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, anchorAlignmentDAO, anchorDAO, volumeChapterDAO, coreSettingDAO, appPreferenceDAO } from './db'
 import type { AnchorRow, TimelineEventRow } from './db'
 import { filterAnchorsForChapter } from './context/anchor-scope'
 import { modelService } from './model'

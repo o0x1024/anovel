@@ -30,6 +30,28 @@ const expandedVolumeIds = ref<Set<number>>(new Set())
 const { loading, result, error, chat, clearResult } = useModelChat(() => props.workId)
 const lastContext = ref('')
 
+const diagnosingVolumes = ref(false)
+const volumeDiagnosisResult = ref('')
+const volumeDiagnosisError = ref('')
+const showDiagnosisResult = ref(false)
+
+const volumeDiagnosisSystemPrompt = [
+  '你是犀利、资深的网文总编辑，擅长从宏观角度诊断分卷大纲的逻辑结构问题。',
+  '请对提供的分卷大纲及作品设定进行全面诊断，重点关注以下方面：',
+  '',
+  '1. 【分卷递进逻辑】：各卷主题之间是否存在清晰的递进关系？冲突是否层层升级而非平行重复？',
+  '2. 【因果链与收束设计】：跨卷的因果链条是否断裂？前期铺垫的悬念/伏笔是否在后续得到回应？',
+  '3. 【冲突升级曲线】：从卷一至最后一卷，矛盾冲突是否持续升级？是否存在冲突强度停滞甚至回落的问题？',
+  '4. 【故事弧完整性】：故事起承转合是否完整？高潮点分布是否合理？结局卷是否为积累的矛盾提供有力收束？',
+  '5. 【节奏与体量分布】：各卷说明的篇幅体量是否均匀？是否存在关键卷过于单薄或配比失衡？',
+  '6. 【角色动机跨卷一致性】：主要角色的行为逻辑和成长弧线是否跨卷一致？是否存在人设崩塌隐患？',
+  '7. 【设定使用效率】：世界观规则和金手指设定是否被有效利用？是否存在设定了但后文未用的浪费？',
+  '',
+  '【输出要求】',
+  '请用中文输出诊断报告，针对每个问题维度，指出涉及的具体分卷、具体问题点，并给出可操作的改进建议。',
+  '报告应直接、犀利、实用，避免套话和泛泛之谈。不要输出 JSON，直接输出带 Markdown 格式的诊断报告。'
+].join('\n')
+
 const volumeSystemPrompt = [
   '根据作品创作上下文，生成 3-5 卷分卷大纲。',
   '只输出一个 JSON 对象，禁止 Markdown 正文、标题、解释或代码块外的任何文字。',
@@ -121,6 +143,43 @@ async function aiGenerateVolumes() {
   })
 }
 
+async function runVolumeDiagnosis() {
+  if (diagnosingVolumes.value) return
+  diagnosingVolumes.value = true
+  volumeDiagnosisResult.value = ''
+  volumeDiagnosisError.value = ''
+  showDiagnosisResult.value = true
+
+  try {
+    const ctx = await window.anovel.invoke('context:buildWork', props.workId, {
+      includeIdea: true,
+      includeCoreSettings: true,
+      includeVolumes: true,
+      includeIncubator: true,
+      includeQualityIssues: true
+    }) as { text: string }
+
+    const userPrompt = `请对以下作品的分卷大纲进行逻辑诊断：\n\n${ctx.text || '（暂无作品上下文）'}`
+
+    const res = await window.anovel.invoke('model:chat', {
+      prompt: userPrompt,
+      systemPrompt: volumeDiagnosisSystemPrompt,
+      workId: props.workId,
+      step: 'volume_diagnose'
+    }) as { success: boolean; content: string; error?: string }
+
+    if (res.success) {
+      volumeDiagnosisResult.value = res.content
+    } else {
+      volumeDiagnosisError.value = res.error || '诊断失败'
+    }
+  } catch (e) {
+    volumeDiagnosisError.value = '诊断失败: ' + String(e)
+  } finally {
+    diagnosingVolumes.value = false
+  }
+}
+
 async function applyParsedVolumes(mode: 'append' | 'replace') {
   if (parsedVolumes.value.length === 0 || applyingVolumes.value) return
   if (mode === 'replace' && volumes.value.length > 0) {
@@ -176,6 +235,10 @@ function aiSuggestionSummary(): string {
       <button class="btn btn-outline btn-primary" :disabled="loading" @click="aiGenerateVolumes">
         <font-awesome-icon :icon="loading ? 'spinner' : 'robot'" :spin="loading" class="w-3.5 h-3.5 mr-1" />
         {{ loading ? '生成中...' : 'AI 生成分卷大纲' }}
+      </button>
+      <button class="btn btn-outline btn-warning gap-1" :disabled="diagnosingVolumes" @click="runVolumeDiagnosis">
+        <font-awesome-icon :icon="diagnosingVolumes ? 'spinner' : 'stethoscope'" :spin="diagnosingVolumes" class="w-3.5 h-3.5" />
+        {{ diagnosingVolumes ? '诊断中...' : '诊断大纲逻辑' }}
       </button>
     </div>
 
@@ -260,6 +323,27 @@ function aiSuggestionSummary(): string {
           @update:content="updateAiResult"
         />
         <AiSelfCheckPanel :work-id="workId" step="volumes" :content="result" />
+      </div>
+    </div>
+
+    <div v-if="showDiagnosisResult" class="card bg-base-200 border border-warning/30 shadow-sm mb-4">
+      <div class="p-4">
+        <div class="flex items-center justify-between gap-2 mb-3">
+          <h4 class="font-semibold text-sm flex items-center gap-1.5">
+            <font-awesome-icon icon="stethoscope" class="w-3.5 h-3.5 text-warning" />
+            逻辑诊断报告
+          </h4>
+          <button class="btn btn-ghost btn-xs gap-1" @click="showDiagnosisResult = false">
+            <font-awesome-icon icon="times" class="w-3 h-3" />
+            关闭
+          </button>
+        </div>
+        <div v-if="volumeDiagnosisError" class="alert alert-error text-sm">{{ volumeDiagnosisError }}</div>
+        <div v-else-if="diagnosingVolumes" class="text-sm text-base-content/50 flex items-center gap-2">
+          <font-awesome-icon icon="spinner" spin class="w-4 h-4" />
+          诊断中，请稍候...
+        </div>
+        <MarkdownContent v-else-if="volumeDiagnosisResult" :content="volumeDiagnosisResult" />
       </div>
     </div>
 
