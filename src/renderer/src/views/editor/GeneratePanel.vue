@@ -833,6 +833,9 @@ async function styleRewrite() {
             result.value = await applyHumanize(result.value)
           }
           await recheckAntiAiViolations(result.value)
+          if (autoOptimizeConfig.value.enabled) {
+            result.value = await runAutoOptimize(result.value)
+          }
           return
         }
       }
@@ -864,6 +867,9 @@ async function styleRewrite() {
         result.value = await applyHumanize(result.value)
       }
       await recheckAntiAiViolations(result.value)
+      if (autoOptimizeConfig.value.enabled) {
+        result.value = await runAutoOptimize(result.value)
+      }
     } else {
       showToast('error', fixRes.error || '稿件优化失败')
     }
