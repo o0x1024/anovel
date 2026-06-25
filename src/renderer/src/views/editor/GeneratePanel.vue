@@ -820,15 +820,11 @@ async function styleRewrite() {
       }
       if (patchRes.success && patchRes.patchedText) {
         result.value = patchRes.patchedText
-        qualityAiReport.value = ''
-        qualityAiMetrics.value = null
         const count = patchRes.appliedCount ?? 0
         if (count > 0) {
+          qualityAiReport.value = ''
+          qualityAiMetrics.value = null
           showToast('success', `已修复 ${count} 处问题`)
-        } else {
-          showToast('info', 'AI 未找到可匹配原文的修改，已跳过')
-        }
-        if (count > 0) {
           if (autoHumanize.value) {
             result.value = await applyHumanize(result.value)
           }
@@ -838,15 +834,22 @@ async function styleRewrite() {
           }
           return
         }
+        showToast('info', 'AI 未找到可匹配原文的修改，已跳过')
+        qualityAiMetrics.value = null
+        if (autoOptimizeConfig.value.enabled) {
+          result.value = await runAutoOptimize(result.value)
+        }
+        return
       }
       if (patchRes.error) {
         console.warn('[styleRewrite] 本地 Patch 失败，回退到全文重写模式：', patchRes.error)
       }
-    } else {
-      if (workType.value === 'story') {
-        showToast('info', 'AI 未在诊断中生成可修复的 patches')
-        return
+    } else if (workType.value === 'story') {
+      if (autoOptimizeConfig.value.enabled) {
+        result.value = await runAutoOptimize(result.value)
       }
+      showToast('info', 'AI 未在诊断中生成可修复的 patches')
+      return
     }
 
     // ====== 回退：全文重写模式 ======
