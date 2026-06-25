@@ -1,5 +1,5 @@
 import { INCUBATOR_GATE_CHECK_SYSTEM, buildGateCheckUserPrompt } from '../../../shared/incubator-analysis-prompts'
-import { INCUBATOR_SLOT_KEYS, isIncubatorSlotKey } from '../../../shared/incubator-slots'
+import { isIncubatorSlotKey } from '../../../shared/incubator-slots'
 import type { IncubatorGateReport } from '../../../shared/incubator-types'
 import { incubatorDraftSlotDAO, incubatorSeedDAO, incubatorStateDAO } from '../../db/dao/incubator'
 import { modelService } from '../../model'
@@ -8,6 +8,7 @@ import { withWorkModelOptions, type WorkModelOptions } from '../../../shared/wor
 import { extractJsonText } from '../parse-json-extract'
 import { loadCharacterCards } from '../character-cards'
 import { nameEntryDAO } from '../../db'
+import { getWorkSlotKeys } from './slot-helpers'
 
 function loadCharacterNames(workId: number): string[] {
   const namesSet = new Set<string>()
@@ -116,7 +117,7 @@ function parseGateReportContent(content: string, filledSlotCount: number): Incub
   }
 }
 
-function fallbackGateReport(filledSlotCount: number, reason: string): IncubatorGateReport {
+function fallbackGateReport(filledSlotCount: number, totalSlots: number, reason: string): IncubatorGateReport {
   return {
     passed: false,
     filledSlotCount,
@@ -125,7 +126,7 @@ function fallbackGateReport(filledSlotCount: number, reason: string): IncubatorG
     issues: [
       '门禁模型调用异常，无法完成自动判定',
       '需对主线槽位进行独立结构审查',
-      ...(filledSlotCount < 6 ? [`仅 ${filledSlotCount}/${6} 槽已填写，缺少内容`] : [])
+      ...(filledSlotCount < totalSlots ? [`仅 ${filledSlotCount}/${totalSlots} 槽已填写，缺少内容`] : [])
     ],
     suggestions: [
       reason || '请稍后重试门禁，或检查模型配置后再试',
@@ -144,14 +145,15 @@ export async function runIncubatorGate(
 ): Promise<IncubatorGateReport> {
   const slots = incubatorDraftSlotDAO.listActiveByWork(workId)
   const slotMap: Record<string, string> = {}
-  for (const key of INCUBATOR_SLOT_KEYS) {
+  for (const key of getWorkSlotKeys(workId)) {
     slotMap[key] = slots.find(s => s.slot_key === key)?.content?.trim() ?? ''
   }
 
   const seed = incubatorSeedDAO.getByWork(workId)?.content?.trim() ?? ''
   const characters = loadCharacterNames(workId)
 
-  const filledSlotCount = slots.filter(s => s.content.trim()).length
+  const validSlotKeys = getWorkSlotKeys(workId)
+  const filledSlotCount = slots.filter(s => s.content.trim() && (validSlotKeys as readonly string[]).includes(s.slot_key)).length
   const prompt = buildGateCheckUserPrompt(slotMap, seed, characters, userInstruction)
   const res = await modelService.chat(withWorkModelOptions({
     prompt,
@@ -164,8 +166,8 @@ export async function runIncubatorGate(
 
   const report = res.success && res.content.trim()
     ? (parseGateReportContent(res.content, filledSlotCount) ??
-      fallbackGateReport(filledSlotCount, 'AI 返回内容未通过门禁解析'))
-    : fallbackGateReport(filledSlotCount, res.error || '模型调用失败')
+      fallbackGateReport(filledSlotCount, validSlotKeys.length, 'AI 返回内容未通过门禁解析'))
+    : fallbackGateReport(filledSlotCount, validSlotKeys.length, res.error || '模型调用失败')
 
   incubatorStateDAO.ensure(workId)
   incubatorStateDAO.setLastGateReport(workId, JSON.stringify(report))

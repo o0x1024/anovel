@@ -1,6 +1,7 @@
 import { incubatorVersionDAO, incubatorDraftSlotDAO } from '../../db/dao/incubator'
-import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS } from '../../../shared/incubator-slots'
+import { ALL_SLOT_KEYS, INCUBATOR_SLOT_LABELS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
+import { getWorkSlotKeys, getWorkSlotLabel } from './slot-helpers'
 
 /** 人设 AI 生成：统合摘要 + 与角色强相关的槽位 */
 export const CHARACTER_SETTING_SLOT_KEYS: IncubatorSlotKey[] = [
@@ -52,7 +53,7 @@ export function parseSlotSectionsFromIdea(raw: string): Partial<Record<Incubator
   if (!text) return {}
 
   const result: Partial<Record<IncubatorSlotKey, string>> = {}
-  for (const k of INCUBATOR_SLOT_KEYS) {
+  for (const k of ALL_SLOT_KEYS) {
     const label = INCUBATOR_SLOT_LABELS[k]
     const re = new RegExp(
       `##\\s*${escapeRegExp(label)}\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)`,
@@ -115,7 +116,7 @@ function getSlotMapFromSnapshot(
   }
   const rows = incubatorDraftSlotDAO.listActiveByWork(workId)
   const map: Record<string, string> = {}
-  for (const k of INCUBATOR_SLOT_KEYS) {
+  for (const k of getWorkSlotKeys(workId)) {
     const row = rows.find(s => s.slot_key === k)
     map[k] = row?.content?.trim() ?? ''
   }
@@ -127,7 +128,7 @@ function buildFromSlotMap(
   slotMap: Record<string, string | undefined>,
   options: FrozenStorylineContextOptions
 ): string {
-  const slotKeys = options.slotKeys ?? INCUBATOR_SLOT_KEYS
+  const slotKeys = options.slotKeys ?? ALL_SLOT_KEYS
   const parts: string[] = []
 
   if (synthesizedSummary?.trim()) {
@@ -137,7 +138,7 @@ function buildFromSlotMap(
   if (options.includeSlots) {
     parts.push(...formatSlotSections(slotMap, slotKeys))
   } else if (!synthesizedSummary?.trim()) {
-    parts.push(...formatSlotSections(slotMap, INCUBATOR_SLOT_KEYS))
+    parts.push(...formatSlotSections(slotMap, ALL_SLOT_KEYS))
   }
 
   if (!parts.length) return ''
@@ -149,7 +150,7 @@ export function buildStorylineContextFromIdea(
   raw: string,
   options: Pick<FrozenStorylineContextOptions, 'includeSlots' | 'slotKeys'> = {}
 ): string {
-  const slotKeys = options.slotKeys ?? INCUBATOR_SLOT_KEYS
+  const slotKeys = options.slotKeys ?? ALL_SLOT_KEYS
   const synth = extractSynthesizedSummaryFromIdea(raw)
   const parts: string[] = []
   if (synth) parts.push(formatSynthSection(synth))
@@ -190,7 +191,7 @@ export function buildFrozenStorylineContext(
           }
         }
         if (options.includeSlots) {
-          const keys = options.slotKeys ?? INCUBATOR_SLOT_KEYS
+          const keys = options.slotKeys ?? getWorkSlotKeys(workId)
           parts.push(...formatSlotSections(slotMap, keys))
         }
         if (parts.length) return assembleParts(parts)
@@ -200,7 +201,7 @@ export function buildFrozenStorylineContext(
         return buildFromSlotMap(null, slotMap, {
           ...options,
           includeSlots: true,
-          slotKeys: options.slotKeys ?? INCUBATOR_SLOT_KEYS
+          slotKeys: options.slotKeys ?? getWorkSlotKeys(workId)
         })
       }
     } catch {
@@ -210,7 +211,7 @@ export function buildFrozenStorylineContext(
 
   const rows = incubatorDraftSlotDAO.listActiveByWork(workId)
   const slotMap: Record<string, string> = {}
-  for (const k of INCUBATOR_SLOT_KEYS) {
+  for (const k of getWorkSlotKeys(workId)) {
     const row = rows.find(s => s.slot_key === k)
     slotMap[k] = row?.content?.trim() ?? ''
   }
@@ -219,6 +220,6 @@ export function buildFrozenStorylineContext(
   return buildFromSlotMap(null, slotMap, {
     ...options,
     includeSlots: true,
-    slotKeys: options.slotKeys ?? INCUBATOR_SLOT_KEYS
+    slotKeys: options.slotKeys ?? getWorkSlotKeys(workId)
   })
 }

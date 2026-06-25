@@ -13,7 +13,7 @@ import {
 import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import type { NameEntryRow } from '../../../../shared/name-registry-types'
 
-const props = defineProps<{ workId: number }>()
+const props = defineProps<{ workId: number; protagonistOnly?: boolean }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const emit = defineEmits<{ 'content-changed': [] }>()
@@ -86,7 +86,7 @@ async function notifyContentChanged() {
 function emptyCard(): CharacterCard {
   return {
     name: '',
-    role: 'supporting',
+    role: props.protagonistOnly ? 'protagonist' : 'supporting',
     memoryTag: '',
     coreConflict: '',
     reactions: { instinct: '', rational: '', hidden: '' },
@@ -146,7 +146,7 @@ const cardsCompletionHints = computed(() => {
   if (missingMemoryTag > 0) hints.push(`${missingMemoryTag} 张缺少记忆标签`)
   if (missingCoreConflict > 0) hints.push(`${missingCoreConflict} 张缺少核心矛盾`)
   if (missingRelationBinding > 0) hints.push(`${missingRelationBinding} 张缺少关系绑定`)
-  if (protagonistCount === 0) hints.push('缺少主角（protagonist）卡片')
+  if (!props.protagonistOnly && protagonistCount === 0) hints.push('缺少主角（protagonist）卡片')
   return hints
 })
 
@@ -339,10 +339,15 @@ async function onNamePicked(entry: NameEntryRow) {
       <div>
         <h4 class="font-semibold flex items-center gap-2">
           <font-awesome-icon icon="gem" class="w-3.5 h-3.5 text-primary shrink-0" />
-          结构化人设卡片
+          {{ protagonistOnly ? '主角人设卡片' : '结构化人设卡片' }}
         </h4>
         <p class="text-xs text-base-content/40 mt-0.5">
-          矛盾点 · 记忆标签 · 行为反应 · 关系绑定（正文生成时按章节自动注入）
+          <template v-if="protagonistOnly">
+            主角的记忆标签 · 核心矛盾 · 行为反应（正文生成时自动注入，配角在「功能性配角」中定义即可）
+          </template>
+          <template v-else>
+            矛盾点 · 记忆标签 · 行为反应 · 关系绑定（正文生成时按章节自动注入）
+          </template>
         </p>
       </div>
       <div class="flex gap-2 shrink-0">
@@ -469,9 +474,13 @@ async function onNamePicked(entry: NameEntryRow) {
               </div>
               <NameSimilarityHint :work-id="workId" :name="draft.name" />
             </div>
-            <select v-model="draft.role" class="select select-bordered select-sm">
+            <select v-if="!protagonistOnly" v-model="draft.role" class="select select-bordered select-sm">
               <option v-for="r in ROLE_OPTIONS" :key="r.value" :value="r.value">{{ r.label }}</option>
             </select>
+            <div v-else class="flex items-center text-xs text-base-content/50 px-1">
+              <font-awesome-icon icon="crown" class="w-3 h-3 mr-1.5 text-primary" />
+              主角卡片
+            </div>
           </div>
           <input v-model="draft.memoryTag" placeholder="记忆标签 *（刀疤/口头禅/配饰）" class="input input-bordered input-sm w-full" />
           <input v-model="draft.coreConflict" placeholder="核心矛盾 *（价值观/行为/认知）" class="input input-bordered input-sm w-full" />

@@ -8,8 +8,8 @@ import type {
 import { normalizeCandidateTitle } from '../../../../../shared/incubator-candidate'
 import { INCUBATOR_CANDIDATE_ADOPT_MIN_SCORE } from '../../../../../shared/incubator-gate'
 import {
-  INCUBATOR_SLOT_KEYS,
-  INCUBATOR_SLOT_LABELS,
+  getSlotKeysForWorkType,
+  getIncubatorSlotLabel,
   type IncubatorSlotKey
 } from '../../../../../shared/incubator-slots'
 import type { AdoptSourceStep } from '../../../composables/incubator/useStorylineAdopt'
@@ -21,7 +21,7 @@ import AiInterventionBar from '../AiInterventionBar.vue'
 import AiSelfCheckPanel from '../AiSelfCheckPanel.vue'
 import {
   INCUBATOR_ANALYSIS_PROMPTS,
-  INCUBATOR_SLOT_FILL_ORDER,
+  getSlotFillOrderForWorkType,
   INCUBATOR_DIAGNOSE_APPLY_SYSTEM,
   buildAnalysisUserPrompt,
   buildDiagnoseApplyUserPrompt
@@ -72,10 +72,19 @@ window.anovel.invoke('work:get', props.workId).then(w => {
   workType.value = (w as { work_type?: string })?.work_type ?? null
 })
 
+const STORY_ANALYSIS_UI_ORDER = [
+  'premise',
+  'variants',
+  'expand',
+  'role_engine',
+  'rhythm_ending',
+  'diagnose'
+] as const
+
 const analyses = computed<AnalysisConfig[]>(() => {
   if (workType.value === 'story') {
-    return ANALYSIS_UI_ORDER.map(k => {
-      const p = STORY_INCUBATOR_ANALYSIS_PROMPTS[k] || INCUBATOR_ANALYSIS_PROMPTS[k]
+    return STORY_ANALYSIS_UI_ORDER.map(k => {
+      const p = STORY_INCUBATOR_ANALYSIS_PROMPTS[k]
       if (!p) return null
       return {
         key: k,
@@ -140,28 +149,21 @@ const activeCards = computed(() => cardsByKey.value[activeTab.value ?? ''] ?? []
 
 const filledSlotsMap = computed(() => {
   const map: Partial<Record<IncubatorSlotKey, string>> = {}
+  const validKeys = getSlotKeysForWorkType(workType.value)
   for (const s of incubator.workspace?.activeDraftSlots ?? []) {
     const key = s.slotKey as IncubatorSlotKey
-    if (INCUBATOR_SLOT_KEYS.includes(key) && s.content?.trim()) map[key] = s.content
+    if (validKeys.includes(key) && s.content?.trim()) map[key] = s.content
   }
   return map
 })
 
 const getSlotMappingLabel = (key: string) => {
-  const isStory = workType.value === 'story'
-  const labels: Record<string, string> = {
-    premise: isStory ? '主题前提 (对应主题前提)' : '主题前提 (对应主题前提)',
-    core_conflict: isStory ? '核心冲突 (对应微创新变体)' : '核心冲突 (对应变体探索)',
-    world_rules: isStory ? '世界规则 (对应背景规则)' : '世界规则 (对应世界规则)',
-    role_engine: isStory ? '角色驱动 (对应反差人设)' : '角色驱动 (对应角色驱动)',
-    opening: isStory ? '开局设计 (对应黄金开局扩写)' : '开局设计 (对应开局扩写)',
-    ending: isStory ? '终局设计 (对应清算终局)' : '终局设计 (对应终局设计)'
-  }
-  return labels[key] || INCUBATOR_SLOT_LABELS[key as keyof typeof INCUBATOR_SLOT_LABELS] || key
+  return getIncubatorSlotLabel(key as IncubatorSlotKey, workType.value)
 }
 
 const workflowHint = computed(() => {
-  const nextSlot = INCUBATOR_SLOT_FILL_ORDER.find(k => !filledSlotsMap.value[k]?.trim())
+  const fillOrder = getSlotFillOrderForWorkType(workType.value)
+  const nextSlot = fillOrder.find(k => !filledSlotsMap.value[k]?.trim())
   if (nextSlot) {
     return `下一步建议先填「${getSlotMappingLabel(nextSlot)}」；分析时会自动带入已确认槽位。完整流程见页顶「推荐操作顺序」。`
   }
@@ -399,7 +401,7 @@ async function applyDiagnoseFixesToSlots() {
 
     await incubator.refresh()
     emit('workspaceRefresh')
-    const labels = (applyRes.slotKeys ?? []).map(k => INCUBATOR_SLOT_LABELS[k]).join('、')
+    const labels = (applyRes.slotKeys ?? []).map(k => getIncubatorSlotLabel(k, workType.value)).join('、')
     diagnoseApplyMessage.value = `已写入 ${applyRes.applied} 处修复（${labels}），请至左侧「主线编排」查看`
   } catch (e) {
     const message = String(e)

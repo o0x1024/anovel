@@ -2,8 +2,8 @@ import {
   INCUBATOR_GATE_FIX_SYSTEM,
   buildGateFixUserPrompt
 } from '../../../shared/incubator-analysis-prompts'
-import { INCUBATOR_SLOT_KEYS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
+import { getWorkSlotKeys } from './slot-helpers'
 import type { IncubatorGateReport } from '../../../shared/incubator-types'
 import { incubatorDraftSlotDAO, incubatorSeedDAO, incubatorStateDAO } from '../../db/dao/incubator'
 import { modelService } from '../../model'
@@ -49,7 +49,8 @@ export async function runGateFix(
 ): Promise<GateFixResult> {
   const slots = incubatorDraftSlotDAO.listActiveByWork(workId)
   const slotMap: Partial<Record<IncubatorSlotKey, string>> = {}
-  for (const key of INCUBATOR_SLOT_KEYS) {
+  const slotKeyList = getWorkSlotKeys(workId)
+  for (const key of slotKeyList) {
     const content = slots.find(s => s.slot_key === key)?.content?.trim() ?? ''
     if (content) slotMap[key as IncubatorSlotKey] = content
   }

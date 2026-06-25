@@ -10,8 +10,9 @@ import VersionGraphPanel from './VersionGraphPanel.vue'
 import IncubatorWorkflowGuide from './IncubatorWorkflowGuide.vue'
 import SectionsPreviewDialog, { type PreviewSection } from '../../../components/SectionsPreviewDialog.vue'
 import {
-  INCUBATOR_SLOT_KEYS,
-  INCUBATOR_SLOT_LABELS
+  getSlotKeysForWorkType,
+  getIncubatorSlotLabel,
+  type IncubatorSlotKey
 } from '../../../../../shared/incubator-slots'
 import { useIncubatorState } from '../../../composables/incubator/useIncubatorState'
 import { useStorylineAdopt } from '../../../composables/incubator/useStorylineAdopt'
@@ -30,6 +31,9 @@ const rightTab = ref<'candidates' | 'scores' | 'analysis'>('candidates')
 const analysisRef = ref<InstanceType<typeof IncubatorAnalysisPanel> | null>(null)
 const seedPanelRef = ref<InstanceType<typeof SeedPanel> | null>(null)
 const storylineRef = ref<InstanceType<typeof StorylineComposerPanel> | null>(null)
+const workType = ref<string | null>(null)
+
+const activeSlotKeys = computed(() => getSlotKeysForWorkType(workType.value))
 
 const incubator = useIncubatorState(toRef(props, 'workId'))
 const adopt = useStorylineAdopt(props.workId, async () => {
@@ -46,6 +50,8 @@ async function loadWorkData() {
   const workId = props.workId
   if (!Number.isFinite(workId) || workId <= 0) return
   const ws = await incubator.refresh()
+  const workInfo = await window.anovel.invoke('work:get', workId) as { work_type?: string } | null
+  workType.value = workInfo?.work_type ?? null
   const settings = await window.anovel.invoke('setting:listByWork', props.workId) as { type: string; content: string }[]
   const idea = settings.find(s => s.type === 'idea')?.content?.trim() ?? ''
   const seedContent = ws.seed?.content?.trim() || idea || ws.ideaCompat || ''
@@ -77,10 +83,11 @@ const hasPreviewContent = computed(() => {
   const ws = incubator.workspace.value
   const seed = seedText.value.trim() || ws?.seed?.content?.trim() || ''
   if (seed) return true
+  const slotKeys = getSlotKeysForWorkType(workType.value)
   const slotContents = storylineRef.value?.getSlotContentsForPreview?.()
-  if (slotContents && INCUBATOR_SLOT_KEYS.some(key => slotContents[key]?.trim())) return true
+  if (slotContents && slotKeys.some(key => slotContents[key]?.trim())) return true
   const slots = ws?.activeDraftSlots ?? []
-  return INCUBATOR_SLOT_KEYS.some(key =>
+  return slotKeys.some(key =>
     slots.some(s => s.slotKey === key && s.content.trim())
   )
 })
@@ -95,14 +102,15 @@ async function openFullPreview() {
     const seed = seedText.value.trim() || ws?.seed?.content?.trim() || ''
     if (seed) sections.push({ label: '创作种子', content: seed })
 
+    const slotKeys = getSlotKeysForWorkType(workType.value)
     const slotContents = storylineRef.value?.getSlotContentsForPreview?.() ?? {}
     const persistedSlots = ws?.activeDraftSlots ?? []
-    for (const key of INCUBATOR_SLOT_KEYS) {
+    for (const key of slotKeys) {
       const content =
         slotContents[key]?.trim() ||
         persistedSlots.find(s => s.slotKey === key)?.content?.trim() ||
         ''
-      if (content) sections.push({ label: INCUBATOR_SLOT_LABELS[key], content })
+      if (content) sections.push({ label: getIncubatorSlotLabel(key, workType.value), content })
     }
 
     const frozen = ws?.latestFrozenVersion

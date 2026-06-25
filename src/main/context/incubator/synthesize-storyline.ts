@@ -1,8 +1,8 @@
-import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
 import { INCUBATOR_SYNTHESIZE_SYSTEM } from '../../../shared/incubator-analysis-prompts'
 import { withWorkModelOptions, type WorkModelOptions } from '../../../shared/work-model-options'
 import { modelService } from '../../model'
+import { getWorkSlotKeys, getWorkSlotLabel } from './slot-helpers'
 
 export interface StorylineSynthesisResult {
   synthesizedSummary: string
@@ -10,10 +10,11 @@ export interface StorylineSynthesisResult {
   raw: string
 }
 
-export function buildSlotsPromptBody(slotMap: Record<string, string>): string {
-  return INCUBATOR_SLOT_KEYS.map((k: IncubatorSlotKey) => {
+export function buildSlotsPromptBody(workId: number, slotMap: Record<string, string>): string {
+  const slotKeys = getWorkSlotKeys(workId)
+  return slotKeys.map((k: IncubatorSlotKey) => {
     const text = slotMap[k]?.trim()
-    return text ? `## ${INCUBATOR_SLOT_LABELS[k]}\n${text}` : ''
+    return text ? `## ${getWorkSlotLabel(workId, k)}\n${text}` : ''
   })
     .filter(Boolean)
     .join('\n\n')
@@ -27,7 +28,7 @@ export async function synthesizeStorylineForFreeze(
   slotMap: Record<string, string>,
   modelOpts?: WorkModelOptions
 ): Promise<StorylineSynthesisResult | null> {
-  const body = buildSlotsPromptBody(slotMap)
+  const body = buildSlotsPromptBody(workId, slotMap)
   if (!body.trim()) return null
 
   const res = await modelService.chat(withWorkModelOptions({

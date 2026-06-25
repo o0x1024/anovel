@@ -14,6 +14,7 @@ import {
   incubatorScoreDAO,
   incubatorStateDAO
 } from '../../db/dao/incubator'
+import { workDAO } from '../../db'
 import { applyStatePathAfterAdopt } from './state-machine'
 import { heuristicScoreCandidate } from './heuristic-score'
 

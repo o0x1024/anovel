@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, ref, onBeforeUnmount, unref, watch } from 'vue'
 import {
-  INCUBATOR_SLOT_KEYS,
+  getSlotKeysForWorkType,
   isIncubatorSlotKey,
   getIncubatorSlotLabel,
   type IncubatorSlotKey
@@ -9,7 +9,7 @@ import {
 import {
   INCUBATOR_TWEAK_SYSTEM,
   buildTweakUserPrompt,
-  INCUBATOR_SLOT_FILL_ORDER
+  getSlotFillOrderForWorkType
 } from '../../../../../shared/incubator-analysis-prompts'
 import { nextUnfilledSlotKey } from '../../../../../shared/incubator-workflow'
 import type {
@@ -64,6 +64,8 @@ watch(() => props.workId, async (id) => {
 /** provide(reactive(incubator)) 已 unwrap ref，勿再 .value */
 const ws = computed(() => incubator.workspace ?? null)
 const gateReport = computed(() => incubator.lastGateReport ?? null)
+const activeSlotKeys = computed(() => getSlotKeysForWorkType(workType.value))
+const slotFillOrder = computed(() => getSlotFillOrderForWorkType(workType.value))
 
 const slotDrafts = ref<Partial<Record<IncubatorSlotKey, string>>>({})
 const savingSlot = ref<IncubatorSlotKey | null>(null)
@@ -74,6 +76,11 @@ const slotSaveTimers: Partial<Record<IncubatorSlotKey, ReturnType<typeof setTime
 const focusSlot = ref<IncubatorSlotKey | null>(null)
 const applyingGateFixes = ref(false)
 const gateFixMessage = ref('')
+const autoFixEnabled = ref(true)
+const autoFixing = ref(false)
+const autoFixRound = ref(0)
+const autoFixMaxRounds = ref(3)
+const autoFixUntilClean = ref(false)
 const tweakModalOpen = ref(false)
 const tweakInstructions = ref('')
 const applyingTweak = ref(false)
@@ -105,7 +112,7 @@ const gateFixButtonLabel = computed(() => {
 })
 
 const slots = computed(() =>
-  INCUBATOR_SLOT_KEYS.map(key => {
+  activeSlotKeys.value.map(key => {
     const active = (ws.value?.activeDraftSlots ?? []).find((s: IncubatorDraftSlot) => s.slotKey === key)
     const draft = slotDrafts.value[key]
     const content = draft !== undefined ? draft : (active?.content ?? '')
@@ -120,7 +127,7 @@ const slots = computed(() =>
 
 const filledCount = computed(() => slots.value.filter(s => s.filled).length)
 
-const nextUnfilled = computed(() => nextUnfilledSlotKey(ws.value))
+const nextUnfilled = computed(() => nextUnfilledSlotKey(ws.value, workType.value))
 
 const latestFrozen = computed(() => ws.value?.latestFrozenVersion ?? null)
 
@@ -249,6 +256,95 @@ async function triggerGateCheck(useInstruction: boolean) {
   await flushPendingSlots()
   await incubator.runGate(useInstruction ? gateInstruction.value.trim() : undefined)
   emit('saved')
+
+  if (autoFixEnabled.value) {
+    await runAutoFixLoop()
+  }
+}
+
+async function runAutoFixLoop() {
+  const report = incubator.lastGateReport
+  if (!report || report.passed) return
+  const blockingCount = (report.coherence ?? []).filter(
+    (i: IncubatorGateReport['coherence'][number]) => i.severity === 'blocking'
+  ).length
+  if (blockingCount === 0) return
+
+  const maxRounds = autoFixUntilClean.value ? Infinity : autoFixMaxRounds.value
+  const roundLabel = autoFixUntilClean.value ? '∞' : String(maxRounds)
+  autoFixing.value = true
+  try {
+    for (let round = 1; round <= maxRounds; round++) {
+      autoFixRound.value = round
+      const currentReport = incubator.lastGateReport
+      if (!currentReport || currentReport.passed) break
+
+      const currentBlocking = (currentReport.coherence ?? []).filter(
+        (i: IncubatorGateReport['coherence'][number]) => i.severity === 'blocking'
+      ).length
+      if (currentBlocking === 0) break
+
+      gateFixMessage.value = `自动修复第 ${round}/${roundLabel} 轮：正在修复 ${currentBlocking} 个阻断项（LLM 重写中，约 15-40s）…`
+
+      const plainReport = JSON.parse(JSON.stringify(currentReport))
+      const fixRes = await window.anovel.invoke(
+        'incubator:runGateFix',
+        props.workId,
+        plainReport,
+        bodyModelParams()
+      ) as {
+        applied: number
+        slotKeys: IncubatorSlotKey[]
+        logicRebuild?: string
+        error?: string
+        workspace?: typeof incubator.workspace
+      }
+
+      if (fixRes.error) {
+        gateFixMessage.value = `自动修复失败：${fixRes.error}`
+        break
+      }
+
+      for (const key of fixRes.slotKeys ?? []) {
+        const next = { ...slotDrafts.value }
+        delete next[key]
+        slotDrafts.value = next
+      }
+
+      if (fixRes.workspace) {
+        incubator.workspace = fixRes.workspace
+      } else {
+        await incubator.refresh()
+      }
+      incubator.lastGateReport = null
+      emit('saved')
+
+      gateFixMessage.value = `自动修复第 ${round}/${roundLabel} 轮：正在重新运行门禁验证…`
+      const reCheckReport = await incubator.runGate()
+
+      if (reCheckReport.passed) {
+        gateFixMessage.value = `✓ 自动修复完成（${round} 轮），门禁已通过`
+        break
+      }
+
+      const reBlocking = (reCheckReport.coherence ?? []).filter(
+        (i: IncubatorGateReport['coherence'][number]) => i.severity === 'blocking'
+      ).length
+      if (reBlocking === 0) {
+        gateFixMessage.value = `✓ 自动修复完成（${round} 轮），无阻断项（仍有 ${reCheckReport.coherence?.length ?? 0} 个警告）`
+        break
+      }
+
+      if (!autoFixUntilClean.value && round === maxRounds) {
+        gateFixMessage.value = `自动修复已达到最大轮次（${maxRounds} 轮），仍有 ${reBlocking} 个阻断项。建议手动检查或调整后重试。`
+      }
+    }
+  } catch (e) {
+    gateFixMessage.value = `自动修复中断：${String(e)}`
+  } finally {
+    autoFixing.value = false
+    autoFixRound.value = 0
+  }
 }
 
 function openTweakModal() {
@@ -450,7 +546,7 @@ defineExpose({ getSlotContentsForPreview })
 <template>
   <div class="card bg-base-200 border border-base-300 shadow-sm p-4">
     <div class="flex items-center justify-between gap-2 mb-3 flex-wrap">
-      <h4 class="font-semibold text-sm">主线编排（{{ filledCount }}/{{ INCUBATOR_SLOT_KEYS.length }}）</h4>
+      <h4 class="font-semibold text-sm">主线编排（{{ filledCount }}/{{ activeSlotKeys.length }}）</h4>
       <div class="flex flex-wrap gap-1">
         <button
           v-if="ws?.lastAdopt"
@@ -464,10 +560,10 @@ defineExpose({ getSlotContentsForPreview })
         <button
           type="button"
           class="btn btn-outline btn-primary btn-xs"
-          :disabled="isGateRunning"
+          :disabled="isGateRunning || autoFixing"
           @click="openGateInstructionModal"
         >
-          {{ isGateRunning ? '评审中...' : '运行 AI 门禁' }}
+          {{ autoFixing ? `自动修复中（第 ${autoFixRound} 轮）…` : (isGateRunning ? '评审中...' : '运行 AI 门禁') }}
         </button>
         <button
           type="button"
@@ -539,13 +635,13 @@ defineExpose({ getSlotContentsForPreview })
       <div class="flex items-center justify-between gap-2 flex-wrap mb-1">
         <p :class="gateReport.passed ? 'text-success' : 'text-warning'">
           AI 门禁：{{ gateReport.passed ? '通过' : '未通过' }}
-          · 槽位 {{ gateReport.filledSlotCount }}/{{ INCUBATOR_SLOT_KEYS.length }}
+          · 槽位 {{ gateReport.filledSlotCount }}/{{ activeSlotKeys.length }}
         </p>
         <button
           v-if="canRunGateAutoFix"
           type="button"
           class="btn btn-outline btn-primary btn-xs"
-          :disabled="applyingGateFixes || isGateRunning"
+          :disabled="applyingGateFixes || isGateRunning || autoFixing"
           @click="applyGateAutoFix"
         >
           {{ gateFixButtonLabel }}
@@ -565,11 +661,15 @@ defineExpose({ getSlotContentsForPreview })
       <p
         v-if="gateFixMessage"
         class="text-[11px] mb-1 whitespace-pre-wrap"
-        :class="gateFixMessage.startsWith('已重写') ? 'text-success' : 'text-warning'"
+        :class="gateFixMessage.startsWith('✓') ? 'text-success' : (gateFixMessage.startsWith('已重写') ? 'text-success' : 'text-warning')"
       >
         {{ gateFixMessage }}
       </p>
-      <p v-if="canRunGateAutoFix && !applyingGateFixes" class="text-[11px] text-base-content/45 mb-1">
+      <div v-if="autoFixing" class="flex items-center gap-2 mb-1">
+        <span class="loading loading-spinner loading-xs text-primary"></span>
+        <span class="text-[11px] text-primary">自动修复进行中（第 {{ autoFixRound }}/{{ autoFixUntilClean ? '∞' : autoFixMaxRounds }} 轮）…</span>
+      </div>
+      <p v-if="canRunGateAutoFix && !applyingGateFixes && !autoFixing" class="text-[11px] text-base-content/45 mb-1">
         门禁发现 {{ gateBlockingCount }} 个阻断 + {{ gateWarningCount }} 个警告，点击「一键修复」由 AI 重写受影响槽位（整槽覆盖，确保跨槽一致）。
       </p>
       <ul v-if="gateReport.issues?.length" class="mt-1 text-base-content/60 list-disc pl-4">
@@ -610,14 +710,14 @@ defineExpose({ getSlotContentsForPreview })
 
     <div class="text-xs text-base-content/50 mb-2 flex items-center gap-2 flex-wrap">
       <span>推荐顺序：</span>
-      <span v-for="k in INCUBATOR_SLOT_FILL_ORDER" :key="k" class="inline-flex items-center">
+      <span v-for="k in slotFillOrder" :key="k" class="inline-flex items-center">
         <span
           class="px-1.5 py-0.5 rounded"
           :class="k === nextUnfilled ? 'badge-primary text-primary-content' : (slots.find(s => s.key === k)?.filled ? 'bg-base-300 text-base-content' : '')"
         >
           {{ getIncubatorSlotLabel(k, workType) }}
         </span>
-        <span v-if="k !== INCUBATOR_SLOT_FILL_ORDER[INCUBATOR_SLOT_FILL_ORDER.length - 1]" class="mx-1">→</span>
+        <span v-if="k !== slotFillOrder[slotFillOrder.length - 1]" class="mx-1">→</span>
       </span>
     </div>
 
@@ -705,13 +805,37 @@ defineExpose({ getSlotContentsForPreview })
           rows="5"
           class="textarea textarea-bordered textarea-sm w-full resize-y min-h-[6rem] text-xs"
           placeholder="例：重点校验女主疯批医生的人设在第一槽和第三槽的逻辑连贯性；检查克隆文明的能量设定是否在前三章钩子中构成阻断漏洞。"
-          :disabled="isGateRunning"
+          :disabled="isGateRunning || autoFixing"
         />
+        <label class="flex items-center gap-2 mt-3 cursor-pointer">
+          <input type="checkbox" v-model="autoFixEnabled" class="checkbox checkbox-xs checkbox-primary" :disabled="isGateRunning || autoFixing" />
+          <span class="text-xs text-base-content/70">自动修复阻断项</span>
+        </label>
+        <div v-if="autoFixEnabled" class="ml-6 mt-2 flex flex-wrap items-center gap-3 text-xs text-base-content/60">
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="radio" :checked="!autoFixUntilClean" @change="autoFixUntilClean = false" class="radio radio-xs radio-primary" :disabled="isGateRunning || autoFixing" />
+            <span>最多</span>
+            <input
+              type="number"
+              min="1"
+              max="20"
+              :value="autoFixMaxRounds"
+              @input="autoFixMaxRounds = Math.max(1, Number(($event.target as HTMLInputElement).value) || 1)"
+              class="input input-bordered input-xs w-14 text-center"
+              :disabled="isGateRunning || autoFixing || autoFixUntilClean"
+            />
+            <span>轮</span>
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="radio" :checked="autoFixUntilClean" @change="autoFixUntilClean = true" class="radio radio-xs radio-primary" :disabled="isGateRunning || autoFixing" />
+            <span>持续修复直到无阻断项</span>
+          </label>
+        </div>
         <div class="modal-action">
           <button
             type="button"
             class="btn btn-ghost btn-sm"
-            :disabled="isGateRunning"
+            :disabled="isGateRunning || autoFixing"
             @click="closeGateInstructionModal"
           >
             取消
@@ -719,7 +843,7 @@ defineExpose({ getSlotContentsForPreview })
           <button
             type="button"
             class="btn btn-outline btn-sm"
-            :disabled="isGateRunning"
+            :disabled="isGateRunning || autoFixing"
             @click="triggerGateCheck(false)"
           >
             直接审查
@@ -727,10 +851,10 @@ defineExpose({ getSlotContentsForPreview })
           <button
             type="button"
             class="btn btn-primary btn-sm"
-            :disabled="isGateRunning"
+            :disabled="isGateRunning || autoFixing"
             @click="triggerGateCheck(true)"
           >
-            {{ isGateRunning ? '审查中...' : '确认并开始审查' }}
+            {{ isGateRunning ? '审查中...' : (autoFixing ? '修复中...' : '确认并开始审查') }}
           </button>
         </div>
       </div>

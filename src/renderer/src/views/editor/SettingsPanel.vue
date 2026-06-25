@@ -40,9 +40,9 @@ const settingTypes = computed(() => {
       },
       {
         type: 'golden_finger' as const,
-        label: '设定与微创新',
+        label: '核心钩子与信息差',
         icon: 'star',
-        desc: '微创新核心梗（系统/弹幕/读心等）、信息差机制与设定局限性'
+        desc: '有特殊设定则填系统/弹幕/读心等金手指；纯情感向则填身份反差与信息差设计'
       },
       {
         type: 'pleasure_engine' as const,
@@ -198,16 +198,20 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 禁止任何叙事段落。'
   ].join('\n'),
   golden_finger: [
-    '你是顶级的短故事脑洞/设定设计师。基于以下短故事设计微创新设定（如读心术、弹幕、倒计时、微信直连阎王等）。',
-    '核心原则：',
-    '- 微创新机制（Micro-Innovation）：结合最新的爆款设定，创造独特的信息差。',
-    '- 限制机制：短故事中不需要复杂的升级体系，但必须要有限制（如每天只能听3句、弹幕只在危险时跳出），这能制造紧迫感。',
-    '输出要求：',
-    '- 用 Markdown 结构化输出：## 设定/金手指名称 / ## 核心展现机制 / ## 信息差构建（主角知道什么、配角不知道什么） / ## 局限与紧迫感 / ## 对核心冲突的推动作用',
+    '你是顶级的短故事核心钩子设计师。请先判断以下故事是否包含特殊设定机制（系统、弹幕、读心、倒计时、穿越等金手指），再选择对应路径输出。',
+    '',
+    '【路径 A：有特殊设定/金手指机制的故事】',
+    '若故事存在超自然/特殊信息差设定，输出：',
+    '## 设定名称与形态 / ## 核心展现机制（如何融入日常冲突） / ## 信息差构建（主角知道什么/别人不知道什么） / ## 限制与紧迫感（避免万能导致失去张力） / ## 对核心冲突的推动作用',
+    '',
+    '【路径 B：纯情感/现实向故事（无金手指）】',
+    '若故事无特殊设定机制，改为设计「身份反差与信息差」，输出：',
+    '## 身份反差设计（主角表面身份 vs 隐藏实力/背景） / ## 关键信息差（读者先知哪些、主角后知哪些、反派不知哪些） / ## 信息差释放节奏（何时揭晓、如何制造爽点） / ## 反差爆发场景（最能体现反差的1-2个关键场景设计）',
+    '',
+    '【通用要求】',
     '- 总字数 350-700 字',
-    '- 核心展现机制：它是如何融入日常冲突的（例如女主学卷子时弹幕剧透）',
-    '- 信息差构建：主角如何利用这个设定打对手一个措手不及',
-    '- 局限与紧迫感：避免设定过于万能导致故事失去张力'
+    '- 必须说明该设计如何直接服务于主角的爽点爆发',
+    '- 禁止万能设定，限制条件是制造张力的核心工具'
   ].join('\n'),
   pleasure_engine: [
     '你是顶级的短故事节奏与情绪设计大师。短故事完读率极度依赖“憋屈→清醒→反击→极致清算”的情绪曲线。',
@@ -277,8 +281,7 @@ const GEN_HINTS_META: Record<SettingType, {
     desc: '可指定金手指的方向与约束（如系统类型、能力范围、禁忌）。留空则依据主角设计自动推导。',
     placeholder: '例如：签到流系统，但不能太无敌；反噬机制要真实伤害级别；升级节奏偏慢…',
     showNamePicker: false
-  },
-  pleasure_engine: {
+  },  pleasure_engine: {
     title: '爽点机制',
     desc: '可指定本书的核心爽点方向与节奏偏好。留空则依据金手指和冲突自动推导。',
     placeholder: '例如：主打智斗碾压爽；每10章一个打脸高潮；不要纯升级爽…',
@@ -310,9 +313,19 @@ const genHints = ref('')
 const namePickerOpen = ref(false)
 const hintsInputRef = ref<HTMLTextAreaElement | null>(null)
 
-const hintsDialogMeta = computed(() =>
-  hintsDialogType.value ? GEN_HINTS_META[hintsDialogType.value] : null
-)
+const hintsDialogMeta = computed(() => {
+  if (!hintsDialogType.value) return null
+  const base = GEN_HINTS_META[hintsDialogType.value]
+  if (workType.value === 'story' && hintsDialogType.value === 'golden_finger') {
+    return {
+      ...base,
+      title: '核心钩子与信息差',
+      desc: '有特殊设定（系统/弹幕/读心等）填金手指方向；无特殊设定则描述身份反差或关键信息差设计。留空则 AI 自动判断并选择路径。',
+      placeholder: '例如：纯现实向，主角是假千金真大佬，信息差靠身份反差；或：有弹幕设定，每天只能看3条，内容关于今天最危险的人…'
+    }
+  }
+  return base
+})
 const expandedTypes = ref<Set<SettingType>>(new Set())
 const versionHistoryRefs = ref<Partial<Record<SettingType, { load: () => Promise<void> }>>>({})
 const characterCardsRef = ref<{ expandPanel?: () => void; load?: () => Promise<void> } | null>(null)
@@ -641,7 +654,12 @@ async function clearAllSettings() {
     <PanelTitle icon="sliders" title="核心设定" />
     <div class="flex items-start justify-between gap-4 mb-6">
       <p class="text-sm text-base-content/50 min-w-0">
-        六类核心设定构成网文的故事引擎。推荐按依赖顺序填充：主角 → 金手指 → 世界观压力 → 冲突引擎 → 爽点机制 → 配角功能组。AI 生成会自动带入已填的依赖设定。
+        <template v-if="workType === 'story'">
+          短故事核心设定。推荐填写顺序：主角与反差设定 → 核心钩子与信息差 → 情绪节奏与爽点 → 功能性配角 → 结构化人设卡片 → 爆款书名与导语。AI 生成会自动带入已填的依赖设定。
+        </template>
+        <template v-else>
+          六类核心设定构成网文的故事引擎。推荐按依赖顺序填充：主角 → 金手指 → 世界观压力 → 冲突引擎 → 爽点机制 → 配角功能组。AI 生成会自动带入已填的依赖设定。
+        </template>
       </p>
       <div class="flex gap-2 shrink-0">
         <button
@@ -728,7 +746,7 @@ async function clearAllSettings() {
         />
       </div>
 
-      <CharacterCardsPanel ref="characterCardsRef" :work-id="workId" @content-changed="onSettingContentChanged" />
+      <CharacterCardsPanel ref="characterCardsRef" :work-id="workId" :protagonist-only="workType === 'story'" @content-changed="onSettingContentChanged" />
     </div>
 
     <StoryTitleAndHookGenerator

@@ -1,5 +1,5 @@
-import { INCUBATOR_SLOT_FILL_ORDER } from './incubator-analysis-prompts'
-import { INCUBATOR_REQUIRED_SLOTS, INCUBATOR_SLOT_LABELS, INCUBATOR_SLOT_KEYS, type IncubatorSlotKey } from './incubator-slots'
+import { getSlotFillOrderForWorkType } from './incubator-analysis-prompts'
+import { getRequiredSlotsForWorkType, getSlotKeysForWorkType, type IncubatorSlotKey } from './incubator-slots'
 import type { IncubatorWorkspaceState } from './incubator-types'
 
 export type IncubatorWorkflowStepId =
@@ -50,18 +50,23 @@ export const INCUBATOR_RECOMMENDED_WORKFLOW: IncubatorWorkflowStepDef[] = [
   }
 ]
 
-export function countFilledIncubatorSlots(ws: IncubatorWorkspaceState | null): number {
+export function countFilledIncubatorSlots(
+  ws: IncubatorWorkspaceState | null,
+  workType?: string | null
+): number {
   if (!ws) return 0
-  const order = new Set(INCUBATOR_SLOT_KEYS)
+  const order = new Set<string>(getSlotKeysForWorkType(workType))
   return ws.activeDraftSlots.filter(
-    s => order.has(s.slotKey as IncubatorSlotKey) && s.content?.trim()
+    s => order.has(s.slotKey) && s.content?.trim()
   ).length
 }
 
 export function nextUnfilledSlotKey(
-  ws: IncubatorWorkspaceState | null
+  ws: IncubatorWorkspaceState | null,
+  workType?: string | null
 ): IncubatorSlotKey | null {
-  for (const key of INCUBATOR_SLOT_FILL_ORDER) {
+  const fillOrder = getSlotFillOrderForWorkType(workType)
+  for (const key of fillOrder) {
     const row = ws?.activeDraftSlots.find(s => s.slotKey === key)
     if (!row?.content?.trim()) return key
   }
@@ -71,16 +76,19 @@ export function nextUnfilledSlotKey(
 export function resolveIncubatorWorkflowStep(input: {
   seedText: string
   workspace: IncubatorWorkspaceState | null
+  workType?: string | null
 }): IncubatorWorkflowStepId {
-  const { seedText, workspace: ws } = input
+  const { seedText, workspace: ws, workType } = input
   const hasSeed = !!(seedText.trim() || ws?.seed?.content?.trim())
   if (!hasSeed) return 'seed'
 
-  const filled = countFilledIncubatorSlots(ws)
+  const slotKeys = getSlotKeysForWorkType(workType)
+  const requiredSlots = getRequiredSlotsForWorkType(workType)
+  const filled = countFilledIncubatorSlots(ws, workType)
   const filledKeys = ws?.activeDraftSlots
-    ?.filter(s => s.content?.trim() && INCUBATOR_SLOT_KEYS.includes(s.slotKey as IncubatorSlotKey))
+    ?.filter(s => s.content?.trim() && slotKeys.includes(s.slotKey as IncubatorSlotKey))
     .map(s => s.slotKey as IncubatorSlotKey) ?? []
-  const requiredFilled = INCUBATOR_REQUIRED_SLOTS.every(k => filledKeys.includes(k))
+  const requiredFilled = requiredSlots.every(k => filledKeys.includes(k))
   const hasCandidates = (ws?.candidates?.length ?? 0) > 0
   if (filled === 0 && !hasCandidates) return 'explore'
   if (!requiredFilled) return 'slots'

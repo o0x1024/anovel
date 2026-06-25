@@ -34,7 +34,7 @@ export const CORE_SETTING_LABELS: Record<CoreSettingType, string> = {
 
 export const STORY_SETTING_LABELS: Record<CoreSettingType, string> = {
   protagonist: '主角与反差设定',
-  golden_finger: '设定与微创新',
+  golden_finger: '核心钩子与信息差',
   pleasure_engine: '情绪节奏与爽点',
   world_pressure: '世界观压力规则',
   conflict_engine: '冲突升级引擎',

@@ -66,6 +66,7 @@ const batchSelectedIds = ref<Set<number>>(new Set())
 const lastAiContext = ref('')
 
 const batchChapterCount = ref(5)
+const chapterBaseOffset = ref(0)
 const batchLoading = ref(false)
 const batchResult = ref('')
 const parsedChapters = ref<ParsedChapter[]>([])
@@ -126,7 +127,7 @@ watch(selectedChapterId, () => {
 const { loading, result, error, chat, clearResult } = useModelChat(() => props.workId)
 
 const batchSystemPrompt = computed(() => {
-  const startNum = chapters.value.length + 1
+  const startNum = chapterBaseOffset.value + chapters.value.length + 1
   const wpc = planStatus.value?.plan.wordsPerChapter ?? DEFAULT_WORDS_PER_CHAPTER
   const oc = outlineConstraintsForWordTarget(wpc)
   
@@ -223,6 +224,7 @@ async function reloadVolumes() {
   }
   selectedVolumeInfo.value = volumes.value.find(vol => vol.id === selectedVolume.value) ?? null
   await loadChapters(selectedVolume.value!)
+  await refreshChapterBaseOffset()
   batchChapterCount.value = await window.anovel.invoke(
     'writingPlan:suggestBatchCount',
     props.workId,
@@ -246,6 +248,7 @@ watch(selectedVolume, async (v) => {
   if (v) {
     selectedVolumeInfo.value = volumes.value.find(vol => vol.id === v) ?? null
     await loadChapters(v)
+    await refreshChapterBaseOffset()
     batchChapterCount.value = await window.anovel.invoke(
       'writingPlan:suggestBatchCount',
       props.workId,
@@ -309,6 +312,21 @@ async function loadChapters(vid: number) {
   if (!chapters.value.some(c => c.id === selectedChapterId.value)) {
     selectedChapterId.value = chapters.value[0].id
   }
+}
+
+async function refreshChapterBaseOffset() {
+  if (!selectedVolume.value || workType.value === 'story') {
+    chapterBaseOffset.value = 0
+    return
+  }
+  const volIndex = volumes.value.findIndex(v => v.id === selectedVolume.value)
+  if (volIndex <= 0) {
+    chapterBaseOffset.value = 0
+    return
+  }
+  const precedingVolumeIds = new Set(volumes.value.slice(0, volIndex).map(v => v.id))
+  const allChapters = await window.anovel.invoke('chapter:listByWork', props.workId) as { volume_id: number }[]
+  chapterBaseOffset.value = allChapters.filter(c => precedingVolumeIds.has(c.volume_id)).length
 }
 
 const selectedChapter = computed(() =>
@@ -458,8 +476,9 @@ function buildVolumeContext(): string {
   const vol = selectedVolumeInfo.value
   if (!vol) return ''
   const existingCount = chapters.value.length
-  const startNum = existingCount + 1
+  const startNum = chapterBaseOffset.value + existingCount + 1
   const endNum = startNum + batchChapterCount.value - 1
+  const localEndNum = existingCount + batchChapterCount.value
   const volPlan = planStatus.value?.volumes.find(v => v.id === vol.id)
 
   const lines: string[] = []
@@ -498,13 +517,13 @@ function buildVolumeContext(): string {
     lines.push(`本卷已有 ${existingCount} 章：\n${summaries}`)
     lines.push(`请从第 ${startNum} 章开始，续写 ${batchChapterCount.value} 章的情节大纲（即第 ${startNum} 章到第 ${endNum} 章）。注意与前面章节的情节衔接和递进。`)
   } else {
-    lines.push(`请生成 ${batchChapterCount.value} 章的情节大纲（即第 1 章到第 ${endNum} 章）。`)
+    lines.push(`请生成 ${batchChapterCount.value} 章的情节大纲（即第 ${startNum} 章到第 ${endNum} 章）。`)
   }
 
   if (volPlan && volPlan.suggestedChapters > 0) {
-    if (endNum < volPlan.suggestedChapters) {
+    if (localEndNum < volPlan.suggestedChapters) {
       lines.push(`【重要写作指令】：\n当前生成的第 ${endNum} 章并不是本卷的最后一章（本卷规划为 ${volPlan.suggestedChapters} 章，后续还有其他章节）。请保持剧情悬念与故事张力，绝对不要在该章进行卷末收尾或强行结局，以确保与后续章节的情节顺畅衔接。`)
-    } else if (endNum === volPlan.suggestedChapters) {
+    } else if (localEndNum === volPlan.suggestedChapters) {
       lines.push(`【重要写作指令】：\n当前生成的第 ${endNum} 章是本卷的最后一章（本卷规划为 ${volPlan.suggestedChapters} 章）。请在第 ${endNum} 章进行合理的卷末情节收尾，并为下一卷留出适当的铺垫或悬念。`)
     } else {
       lines.push(`【重要写作指令】：\n当前生成已超出本卷原规划总章节数（规划为 ${volPlan.suggestedChapters} 章）。请根据当前剧情发展合理推进，并在适当位置安排情节的收敛或向下一阶段的过渡。`)
@@ -553,7 +572,7 @@ async function applyParsedChapters(mode: 'append' | 'replace') {
   }
   applyingChapters.value = true
   try {
-    const startNum = mode === 'append' ? chapters.value.length + 1 : 1
+    const startNum = mode === 'append' ? chapterBaseOffset.value + chapters.value.length + 1 : chapterBaseOffset.value + 1
     const items = parsedChapters.value.map((c, i) => ({
       title: renumberTitle(c.title, startNum + i),
       outline: c.outline ?? '',
@@ -768,7 +787,7 @@ async function runOutlineDiagnosis() {
     let promptContext = ''
     if (diagnosisScope.value === 'volume') {
       const vol = volumes.value.find(v => v.id === selectedVolume.value)
-      const chaptersText = chapters.value.map(c => `[ID: ${c.id}] ${c.title}：\n${c.outline || '（暂无大纲）'}`).join('\n\n')
+      const chaptersText = chapters.value.map(c => `${c.title}：\n${c.outline || '（暂无大纲）'}`).join('\n\n')
       promptContext = [
         `当前分卷：${vol?.name || ''}`,
         vol?.description ? `分卷说明：${vol.description}` : '',
@@ -795,7 +814,7 @@ async function runOutlineDiagnosis() {
             currentVolName = c.volume_name
             header = `\n### 分卷：${currentVolName}\n`
           }
-          return `${header}- [ID: ${c.id}] ${c.title}：\n${c.outline || '（暂无大纲）'}`
+          return `${header}- ${c.title}：\n${c.outline || '（暂无大纲）'}`
         }).join('\n')
         
       promptContext = [
@@ -811,7 +830,7 @@ async function runOutlineDiagnosis() {
           currentVolName = c.volume_name
           header = `\n### 分卷：${currentVolName}\n`
         }
-        return `${header}- [ID: ${c.id}] ${c.title}：\n${c.outline || '（暂无大纲）'}`
+        return `${header}- ${c.title}：\n${c.outline || '（暂无大纲）'}`
       }).join('\n')
       
       promptContext = `【全书分卷与章节大纲列表】\n${chaptersText}`
@@ -835,7 +854,7 @@ async function runOutlineDiagnosis() {
     const systemPrompt = [
       ...basePrompt,
       '    {',
-      '      "chapter_id": 章节的数字ID,',
+      '      "chapter_id": 章节标题中的章节序号（数字，如标题为"第10章 ……"则填10）,',
       '      "outline": "修改优化后的完整章节大纲文本（不要写任何批注，保持直接可用）",',
       '      "beat_role": "A/B/C/transition 中的一个或空字符串",',
       '      "foreshadow_target": "修改建议的铺垫目标或空字符串",',
@@ -888,16 +907,21 @@ async function applyAiFixes(revisedChapters: any[]) {
   try {
     const styleId = await window.anovel.invoke('style:getWorkStyleId', props.workId) as number | null
     
+    let searchChapters = chapters.value
+    if (diagnosisScope.value === 'cross' || diagnosisScope.value === 'all') {
+      searchChapters = await window.anovel.invoke('chapter:listByWork', props.workId) as Chapter[]
+    }
+    
     const resolveChapterId = (idOrNo: any): number | null => {
       const num = Number(idOrNo)
       if (isNaN(num)) return null
-      const directMatch = chapters.value.find(c => c.id === num)
-      if (directMatch) return directMatch.id
-      const numMatch = chapters.value.find(c => {
+      const numMatch = searchChapters.find(c => {
         const match = c.title.match(/^第\s*(\d+)\s*章/)
         return match && Number(match[1]) === num
       })
       if (numMatch) return numMatch.id
+      const directMatch = searchChapters.find(c => c.id === num)
+      if (directMatch) return directMatch.id
       return null
     }
 

@@ -1,4 +1,4 @@
-import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS, type IncubatorSlotKey } from './incubator-slots'
+import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS, STORY_SLOT_KEYS, type IncubatorSlotKey } from './incubator-slots'
 import type { IncubatorCandidateSourceStep, IncubatorGateReport } from './incubator-types'
 
 /** 反平庸硬约束（结构化分析类 prompt 共用） */
@@ -47,6 +47,20 @@ export const INCUBATOR_SLOT_FILL_ORDER: IncubatorSlotKey[] = [
   'ending'
 ]
 
+/** 短故事向填充顺序（5 槽，无 world_rules，rhythm_ending 替代 ending） */
+export const STORY_SLOT_FILL_ORDER: IncubatorSlotKey[] = [
+  'premise',
+  'core_conflict',
+  'role_engine',
+  'opening',
+  'rhythm_ending'
+]
+
+/** 按作品类型获取填充顺序 */
+export function getSlotFillOrderForWorkType(workType?: string | null): IncubatorSlotKey[] {
+  return workType === 'story' ? STORY_SLOT_FILL_ORDER : INCUBATOR_SLOT_FILL_ORDER
+}
+
 /** 各分析在生成时，应注入的已填槽位（链式约束） */
 export const ANALYSIS_SLOT_ANCHORS: Partial<Record<string, IncubatorSlotKey[]>> = {
   premise: [],
@@ -55,6 +69,7 @@ export const ANALYSIS_SLOT_ANCHORS: Partial<Record<string, IncubatorSlotKey[]>> 
   world_rules: ['premise', 'core_conflict', 'opening'],
   role_engine: ['premise', 'core_conflict', 'opening', 'world_rules'],
   rhythm_curve: ['premise', 'core_conflict', 'opening', 'world_rules', 'role_engine', 'ending'],
+  rhythm_ending: ['premise', 'core_conflict', 'opening', 'role_engine'],
   ending: ['premise', 'core_conflict', 'world_rules', 'role_engine', 'opening'],
   diagnose: [...INCUBATOR_SLOT_KEYS],
   reverse: [...INCUBATOR_SLOT_KEYS],
@@ -409,7 +424,7 @@ export const INCUBATOR_DIAGNOSE_APPLY_SYSTEM = [
   '2) text 是修复后该槽位的**完整内容**——把修复与原文合并，保留原有好的部分，修正有问题的部分，使全文连贯。',
   '3) 若该槽位原来为空，text 就是全新内容。',
   '4) 每条 patch 的 text 为可直接替换进槽位的 Markdown 段落（400-800字，必须极其饱满完善，细节丰富）。',
-  '5) slotKey 只能是：premise、core_conflict、world_rules、role_engine、opening、ending。',
+  '5) slotKey 只能是：premise、core_conflict、world_rules、role_engine、opening、ending、rhythm_ending。',
   INCUBATOR_ANTI_MEDIOCRITY,
   '只输出一个 JSON 对象，禁止其它文字：',
   '{"patches":[{"slotKey":"opening","text":"合并后的完整槽位内容..."}]}',

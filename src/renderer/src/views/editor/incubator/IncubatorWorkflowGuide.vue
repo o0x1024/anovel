@@ -33,7 +33,8 @@ watch(() => props.workId, () => {
 const currentStepId = computed(() =>
   resolveIncubatorWorkflowStep({
     seedText: seedText.value,
-    workspace: incubator.workspace
+    workspace: incubator.workspace,
+    workType: workType.value
   })
 )
 
@@ -46,7 +47,7 @@ const steps = computed(() => {
       return {
         ...step,
         detail: isStory
-          ? '右侧「AI 分析」运行「主题前提」产生主题，运行「微创新变体」产生核心冲突，运行「黄金开局扩写」产生开局 → 候选池评分 → 采写入槽'
+          ? '右侧「AI 分析」运行「情绪定位」产生主题，运行「微创新变体」产生核心冲突，运行「黄金开局扩写」产生开局 → 候选池评分 → 采写入槽'
           : '右侧「AI 分析」运行「主题前提」产生主题，运行「变体探索」产生核心冲突，运行「开局扩写」产生开局 → 候选池评分 → 采写入槽'
       }
     }
@@ -54,7 +55,7 @@ const steps = computed(() => {
       return {
         ...step,
         detail: isStory
-          ? '按序填满主线槽位：主题前提 → 核心冲突(对齐微创新变体) → 背景规则(对齐背景规则) → 反差人设(对齐反差人设) → 黄金开局(对齐黄金开局扩写) → 清算终局(对齐清算终局)；右侧有各槽同名分析模块可生成并采纳'
+          ? '按序填满主线槽位：情绪定位 → 核心冲突(对齐微创新变体) → 黄金开局(对齐黄金开局扩写) → 反差人设(对齐反差人设) → 节奏与清算(对齐节奏与清算)；右侧有各槽同名分析模块可生成并采纳'
           : '按序填满主线槽位：主题前提 → 核心冲突(对齐变体探索) → 世界规则(对齐世界规则) → 角色驱动(对齐角色驱动) → 开局设计(对齐开局扩写) → 终局设计(对齐终局设计)；右侧有各槽同名分析模块可生成并采纳'
       }
     }
@@ -68,20 +69,30 @@ const currentStepLabel = computed(
 
 const getSlotMappingLabel = (key: string) => {
   const isStory = workType.value === 'story'
+  if (isStory) {
+    const labels: Record<string, string> = {
+      premise: '情绪定位 (对齐情绪定位)',
+      core_conflict: '核心冲突 (对齐微创新变体)',
+      role_engine: '反差人设 (对齐反差人设)',
+      opening: '黄金开局 (对齐黄金开局扩写)',
+      rhythm_ending: '节奏与清算 (对齐节奏与清算)'
+    }
+    return labels[key] || key
+  }
   const labels: Record<string, string> = {
-    premise: isStory ? '主题前提 (对齐主题前提)' : '主题前提 (对齐主题前提)',
-    core_conflict: isStory ? '核心冲突 (对齐微创新变体)' : '核心冲突 (对齐变体探索)',
-    world_rules: isStory ? '世界规则 (对齐背景规则)' : '世界规则 (对齐世界规则)',
-    role_engine: isStory ? '角色驱动 (对齐反差人设)' : '角色驱动 (对齐角色驱动)',
-    opening: isStory ? '开局设计 (对齐黄金开局扩写)' : '开局设计 (对齐开局扩写)',
-    ending: isStory ? '终局设计 (对齐清算终局)' : '终局设计 (对齐终局设计)'
+    premise: '主题前提 (对齐主题前提)',
+    core_conflict: '核心冲突 (对齐变体探索)',
+    world_rules: '世界规则 (对齐世界规则)',
+    role_engine: '角色驱动 (对齐角色驱动)',
+    opening: '开局设计 (对齐开局扩写)',
+    ending: '终局设计 (对齐终局设计)'
   }
   return labels[key] || INCUBATOR_SLOT_LABELS[key as keyof typeof INCUBATOR_SLOT_LABELS] || key
 }
 
 const nextSlotHint = computed(() => {
   if (currentStepId.value !== 'slots') return ''
-  const key = nextUnfilledSlotKey(incubator.workspace)
+  const key = nextUnfilledSlotKey(incubator.workspace, workType.value)
   return key ? `下一步建议先填「${getSlotMappingLabel(key)}」` : '主线槽位已齐，可运行门禁'
 })
 </script>

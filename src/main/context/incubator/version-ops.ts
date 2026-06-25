@@ -5,8 +5,8 @@ import {
   incubatorVersionDAO,
   type IncubatorVersionRow
 } from '../../db/dao/incubator'
-import { INCUBATOR_SLOT_KEYS, INCUBATOR_SLOT_LABELS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
+import { getWorkSlotKeys, getWorkSlotLabel } from './slot-helpers'
 import type {
   IncubatorGateReport,
   IncubatorStorylineVersion,
@@ -46,16 +46,17 @@ export function parseVersionSnapshot(json: string): ParsedVersionSnapshot {
 }
 
 function syncIdeaFromSlots(workId: number, slots: Record<string, string>, title: string): void {
-  const summaryLines = INCUBATOR_SLOT_KEYS
+  const slotKeys = getWorkSlotKeys(workId)
+  const summaryLines = slotKeys
     .filter((k: IncubatorSlotKey) => slots[k]?.trim())
-    .map((k: IncubatorSlotKey) => `## ${INCUBATOR_SLOT_LABELS[k]}\n${slots[k].trim()}`)
+    .map((k: IncubatorSlotKey) => `## ${getWorkSlotLabel(workId, k)}\n${slots[k].trim()}`)
 
   if (!summaryLines.length) return
   coreSettingDAO.upsert(workId, 'idea', [`# ${title}`, ...summaryLines].join('\n\n'))
 }
 
 function applySnapshotToDraft(workId: number, slots: Record<string, string>): void {
-  for (const key of INCUBATOR_SLOT_KEYS) {
+  for (const key of getWorkSlotKeys(workId)) {
     const content = slots[key]?.trim() ?? ''
     if (content) {
       incubatorDraftSlotDAO.upsertActiveSlot({
@@ -134,12 +135,12 @@ export function compareIncubatorVersions(
   const b = getIncubatorVersionDetail(workId, versionIdB)
   if (!a || !b) return null
 
-  const slotDiffs = INCUBATOR_SLOT_KEYS.map(key => {
+  const slotDiffs = getWorkSlotKeys(workId).map(key => {
     const textA = a.snapshot.slots[key]?.trim() ?? ''
     const textB = b.snapshot.slots[key]?.trim() ?? ''
     return {
       slotKey: key,
-      label: INCUBATOR_SLOT_LABELS[key],
+      label: getWorkSlotLabel(workId, key),
       textA,
       textB,
       changed: textA !== textB
@@ -180,7 +181,7 @@ export function draftDiffersFromLatestFrozen(workId: number): boolean {
   }
 
   const active = incubatorDraftSlotDAO.listActiveByWork(workId)
-  for (const key of INCUBATOR_SLOT_KEYS) {
+  for (const key of getWorkSlotKeys(workId)) {
     const draft = active.find(s => s.slot_key === key)?.content?.trim() ?? ''
     const snap = snapSlots[key]?.trim() ?? ''
     if (draft !== snap) return true

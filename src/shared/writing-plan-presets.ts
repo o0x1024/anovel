@@ -66,11 +66,8 @@ export function getPresetsForType(workType?: string): Record<NovelLength, NovelL
 export const DEFAULT_NOVEL_LENGTH: NovelLength = 'medium'
 
 export const TARGET_WORD_PRESETS = [
-  NOVEL_LENGTH_PRESETS.short.targetTotalWords,
-  NOVEL_LENGTH_PRESETS.medium.targetTotalWords,
-  NOVEL_LENGTH_PRESETS.long.targetTotalWords,
-  1_000_000,
-  2_000_000
+  200_000, 300_000, 400_000, 500_000, 600_000, 700_000,
+  800_000, 1_000_000, 1_200_000, 1_500_000, 1_600_000, 2_000_000
 ] as const
 
 /** 每章目标字数选项 — 章节规划与正文生成共用 */

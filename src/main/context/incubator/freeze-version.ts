@@ -4,13 +4,13 @@ import {
   incubatorStateDAO,
   incubatorVersionDAO
 } from '../../db/dao/incubator'
-import { INCUBATOR_SLOT_LABELS, INCUBATOR_SLOT_KEYS } from '../../../shared/incubator-slots'
 import type { IncubatorSlotKey } from '../../../shared/incubator-slots'
 import type { IncubatorGateReport } from '../../../shared/incubator-types'
 import { assertTransition } from './state-machine'
 import { runIncubatorGate } from './gate-check'
 import { getBranchBaseVersionId } from './version-ops'
 import { synthesizeStorylineForFreeze } from './synthesize-storyline'
+import { getWorkSlotKeys, getWorkSlotLabel } from './slot-helpers'
 import type { WorkModelOptions } from '../../../shared/work-model-options'
 
 function getCachedGateReport(workId: number): IncubatorGateReport | null {
@@ -72,9 +72,10 @@ export async function freezeIncubatorStorylineVersion(
     }
   }
 
+  const slotKeyList = getWorkSlotKeys(workId)
   const slots = incubatorDraftSlotDAO.listActiveByWork(workId)
   const slotMap: Record<string, string> = {}
-  for (const key of INCUBATOR_SLOT_KEYS) {
+  for (const key of slotKeyList) {
     const row = slots.find(s => s.slot_key === key)
     slotMap[key] = row?.content?.trim() ?? ''
   }
@@ -104,9 +105,9 @@ export async function freezeIncubatorStorylineVersion(
 
   incubatorStateDAO.setBranchBaseVersion(workId, null)
 
-  const summaryLines = INCUBATOR_SLOT_KEYS
+  const summaryLines = slotKeyList
     .filter((k: IncubatorSlotKey) => slotMap[k])
-    .map((k: IncubatorSlotKey) => `## ${INCUBATOR_SLOT_LABELS[k]}\n${slotMap[k]}`)
+    .map((k: IncubatorSlotKey) => `## ${getWorkSlotLabel(workId, k)}\n${slotMap[k]}`)
 
   const ideaParts = ['# 主线故事线（冻结版）']
   if (synthesis?.synthesizedSummary) {

@@ -68,7 +68,7 @@ export function getTargetWordPresets(workType?: string): number[] {
   if (workType === 'story') {
     return [6000, 10000, 20000, 30000, 40000, 60000, 80000]
   }
-  return [200000, 800000, 1600000, 1000000, 2000000]
+  return [200000, 300000, 400000, 500000, 600000, 700000, 800000, 1000000, 1200000, 1500000, 1600000, 2000000]
 }
 
 export function getWordsPerChapterPresets(workType?: string): number[] {

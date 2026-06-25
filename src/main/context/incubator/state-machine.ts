@@ -1,5 +1,5 @@
 import type { IncubatorWorkflowState } from '../../../shared/incubator-types'
-import { INCUBATOR_REQUIRED_SLOTS, type IncubatorSlotKey } from '../../../shared/incubator-slots'
+import { getRequiredSlotsForWorkType, type IncubatorSlotKey } from '../../../shared/incubator-slots'
 
 const ALLOWED: Record<IncubatorWorkflowState, IncubatorWorkflowState[]> = {
   SeedReady: ['CandidatesGenerated', 'Composing'],
@@ -23,17 +23,22 @@ export function assertTransition(from: IncubatorWorkflowState, to: IncubatorWork
 }
 
 /**
- * 判断是否满足 DraftReady 条件：所有承重槽位（premise/core_conflict/opening/ending）均已填写。
- * world_rules 与 role_engine 为强推荐但非阻断。
+ * 判断是否满足 DraftReady 条件：所有承重槽位均已填写。
+ * 小说向：premise/core_conflict/opening/ending
+ * 短故事向：premise/core_conflict/opening/rhythm_ending
  */
-export function isDraftReady(filledSlotKeys: IncubatorSlotKey[]): boolean {
+export function isDraftReady(filledSlotKeys: IncubatorSlotKey[], workType?: string | null): boolean {
   const filled = new Set(filledSlotKeys)
-  return INCUBATOR_REQUIRED_SLOTS.every(k => filled.has(k))
+  return getRequiredSlotsForWorkType(workType).every(k => filled.has(k))
 }
 
-export function inferStateAfterAdopt(filledSlots: number, filledSlotKeys?: IncubatorSlotKey[]): IncubatorWorkflowState {
-  if (filledSlotKeys && isDraftReady(filledSlotKeys)) return 'DraftReady'
-  if (filledSlots >= 5) return 'DraftReady'
+export function inferStateAfterAdopt(
+  filledSlots: number,
+  filledSlotKeys?: IncubatorSlotKey[],
+  workType?: string | null
+): IncubatorWorkflowState {
+  if (filledSlotKeys && isDraftReady(filledSlotKeys, workType)) return 'DraftReady'
+  if (filledSlotKeys && getRequiredSlotsForWorkType(workType).every(k => filledSlotKeys.includes(k))) return 'DraftReady'
   return 'Composing'
 }
 
@@ -41,9 +46,10 @@ export function inferStateAfterAdopt(filledSlots: number, filledSlotKeys?: Incub
 export function resolveStatePathAfterAdopt(
   from: IncubatorWorkflowState,
   filledSlots: number,
-  filledSlotKeys?: IncubatorSlotKey[]
+  filledSlotKeys?: IncubatorSlotKey[],
+  workType?: string | null
 ): IncubatorWorkflowState[] {
-  const target = inferStateAfterAdopt(filledSlots, filledSlotKeys)
+  const target = inferStateAfterAdopt(filledSlots, filledSlotKeys, workType)
   if (from === target) return []
 
   const path: IncubatorWorkflowState[] = []
@@ -68,9 +74,10 @@ export function resolveStatePathAfterAdopt(
 export function applyStatePathAfterAdopt(
   from: IncubatorWorkflowState,
   filledSlots: number,
-  filledSlotKeys?: IncubatorSlotKey[]
+  filledSlotKeys?: IncubatorSlotKey[],
+  workType?: string | null
 ): IncubatorWorkflowState {
-  const path = resolveStatePathAfterAdopt(from, filledSlots, filledSlotKeys)
+  const path = resolveStatePathAfterAdopt(from, filledSlots, filledSlotKeys, workType)
   let current = from
   for (const next of path) {
     assertTransition(current, next)

@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, unref, ref, watch, type Ref } from 'vue'
 import {
-  INCUBATOR_SLOT_KEYS,
-  INCUBATOR_SLOT_LABELS,
+  getSlotKeysForWorkType,
   getIncubatorSlotLabel
 } from '../../../../../shared/incubator-slots'
 import { INCUBATOR_CANDIDATE_ADOPT_MIN_SCORE } from '../../../../../shared/incubator-gate'
@@ -34,9 +33,7 @@ const candidateScore = computed(() => {
   return typeof s === 'number' ? s : s?.value ?? null
 })
 
-const scoreBelowThreshold = computed(
-  () => candidateScore.value != null && candidateScore.value < INCUBATOR_CANDIDATE_ADOPT_MIN_SCORE
-)
+const slotKeys = computed(() => getSlotKeysForWorkType(workType.value))
 </script>
 
 <template>
@@ -48,7 +45,7 @@ const scoreBelowThreshold = computed(
       </p>
       <label class="text-xs text-base-content/50">目标槽位</label>
       <select v-model="adopt.slotKey" class="select select-bordered select-sm w-full mb-3">
-        <option v-for="key in INCUBATOR_SLOT_KEYS" :key="key" :value="key">
+        <option v-for="key in slotKeys" :key="key" :value="key">
           {{ getIncubatorSlotLabel(key, workType) }}
         </option>
       </select>
