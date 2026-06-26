@@ -21,6 +21,7 @@ import {
   ADJUST_WORDS_EXPAND_PROMPT,
   ADJUST_WORDS_COMPRESS_PROMPT
 } from './context/chapter-quality'
+import { stripForbiddenNotIsPatterns } from '../shared/normalize-body-text'
 
 const QUALITY_PATCH_SYSTEM_PROMPT = [
   '你是文字编辑，只输出修复指令 JSON，绝不输出全文。',
@@ -735,7 +736,7 @@ function parseTimelineGeneration(content: string): Array<{
       thinkingEnabled: modelOpts?.thinkingEnabled
     }, { webContents: e.sender })
     return res.success
-      ? { success: true, content: res.content }
+      ? { success: true, content: stripForbiddenNotIsPatterns(res.content ?? '') }
       : { success: false, error: res.error }
   })
 
@@ -767,7 +768,7 @@ function parseTimelineGeneration(content: string): Array<{
     }, { webContents: e.sender })
 
     return res.success
-      ? { success: true, content: res.content }
+      ? { success: true, content: stripForbiddenNotIsPatterns(res.content ?? '') }
       : { success: false, error: res.error }
   })
 

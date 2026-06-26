@@ -1,6 +1,7 @@
 import { coreSettingDAO, aiFavoriteDAO, writingStyleDAO } from '../db'
 import { STYLE_CORE_DIRECTIVE } from './writing-techniques'
 import { bodyWordCountBounds } from '../../shared/body-word-target'
+import { stripForbiddenNotIsPatterns } from '../../shared/normalize-body-text'
 import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../shared/style-reference-limits'
 import type { AiTraceIssue } from './ai-trace-detect'
 import { computeDocMetrics, computeHeuristicAiScore } from '../perplexity/heuristic-detect'
@@ -63,7 +64,7 @@ export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
   },
   {
     label: '禁机械对话标注',
-    rule: '禁止"他说，""她问。""XX说。"等裸对话标注。对话标注必须附带动作、神态、语气或环境描写，或省略标注让上下文暗示说话人。人类网文作者用"说道/问道"并搭配修饰语（"缓缓的说道""冷冷问道"），绝不会写"他说，""她问。"',
+    rule: '禁止"他说，""她问。""XX说。"等裸对话标注。禁止把人物动作插入同一段对话中间，尤其不要写「“前半句。”人物动作，“后半句。”」；动作必须放在对话前一段或后一段，或让完整台词单独成段。对话标注必须附带动作、神态、语气或环境描写，或省略标注让上下文暗示说话人',
     demo: {
       before: '"我先走了。"他说，"猫爬架放这儿。"\n"它们平时不这样。"她说。\n"秦浩？"林晚问。',
       after: '"我先走了。"他把猫爬架往墙角一搁，"放这儿。"\n"它们平时不这样。"她蹲下去戳了戳猫肚子。\n"秦浩？"林晚皱起了眉。'
@@ -272,14 +273,17 @@ function demoConflictsWithRules(demo: { before: string; after: string }, rules: 
 
 const HUMAN_WRITING_META = [
   '【去AI痕迹——外部检测器最敏感的特征】',
-  'A. 禁止"电影镜头链"式描写：不要写"他转身→目光落在…上→嘴角微微上扬→缓缓开口"这类逐帧分镜。',
+  'A. 每段最多只能有 1 个中文句号“。”，连续动作、因果递进和并列描写用逗号串联，或直接换段。',
+  'B. 禁止“不是A，而是B”“不是A，是B”“这不是A，这是B”句式，必须改成直接叙述、动作呈现或删掉前半句。',
+  'C. 禁止把人物动作插入同一段对话中间，不写「“前半句。”人物动作，“后半句。”」；动作另起一段，完整台词单独成段。',
+  'D. 禁止"电影镜头链"式描写：不要写"他转身→目光落在…上→嘴角微微上扬→缓缓开口"这类逐帧分镜。',
   '   用一句复合句概括动作，或省略中间过程直接写结果。',
-  'B. 禁止书面连接词：然而、因此、此外、与此同时、不仅如此、尽管如此等。',
+  'E. 禁止书面连接词：然而、因此、此外、与此同时、不仅如此、尽管如此等。',
   '   直接删除或用口语词替代（"结果""谁知""这下"）。',
-  'C. 禁止机械对话标注（"他说，""她问。"）——改为附带动作/神态/语气的标注，或省略标注。',
-  'D. 禁止模板情感句（"心中涌起一股…""眼中闪过一丝…"）删除或改为具体动作。',
-  'E. 禁止总结收束句（"这一刻他明白了…""或许这便是…"）直接删除。',
-  'F. 词汇选择偏口语/低频/方言化：多用具象冷门词，少用标准书面语。',
+  'F. 禁止机械对话标注（"他说，""她问。"）——改为附带动作/神态/语气的标注，或省略标注。',
+  'G. 禁止模板情感句（"心中涌起一股…""眼中闪过一丝…"）删除或改为具体动作。',
+  'H. 禁止总结收束句（"这一刻他明白了…""或许这便是…"）直接删除。',
+  'I. 词汇选择偏口语/低频/方言化：多用具象冷门词，少用标准书面语。',
   '   叙述中每 300 字至少掺入 1 个具体的、不常见的细节词。',
   '目标：写出来的东西像一个赶稿的人类作者写的有精彩有糙段，有灵光一闪也有平铺直叙。'
 ].join('\n')
@@ -327,7 +331,7 @@ export function formatBuiltinAntiAiRulesForPrompt(): string {
 }
 
 const STYLE_CONFLICT_RULE_PATTERN = /怪诞|品牌名|方言|粗话|跑题|词汇意外性|不属于这个语境/
-const BODY_GENERATION_LIGHT_RULE_PATTERN = /连接词|模板化|模板情感|解释腔|总结式段尾|口语化|电影镜头链|镜头调度|机械对话标注|裸对话标注|裸标注/
+const BODY_GENERATION_LIGHT_RULE_PATTERN = /连接词|模板化|模板情感|解释腔|总结式段尾|口语化|电影镜头链|镜头调度|机械对话标注|裸对话标注|裸标注|句号|不是.*(?:而是|是)|对话.*动作|动作.*对话/
 
 function pickBodyGenerationRules(rules: string[]): string[] {
   const picked = rules.filter(rule =>
@@ -535,6 +539,28 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
           detail: `含机械对话标注 ${mechCount} 处（${mechExamples.join('、')}），应附带动作/神态/语气描写`,
           count: mechCount
         })
+      }
+    }
+
+    if (/不是.*(?:而是|是)/.test(rule)) {
+      const stripped = stripForbiddenNotIsPatterns(content)
+      if (stripped !== content) {
+        const removed = content.length - stripped.length
+        violations.push({ rule, detail: `正则命中并可删除“不是…是/而是”句式，预计删除 ${removed} 个字符`, count: removed })
+      }
+    }
+
+    if (/每段.*句号|句号.*每段|一段.*句号/.test(rule)) {
+      const badCount = content.split(/\n+/).filter(line => (line.match(/。/g) ?? []).length > 1).length
+      if (badCount > 0) {
+        violations.push({ rule, detail: `有 ${badCount} 段包含超过 1 个句号`, count: badCount })
+      }
+    }
+
+    if (/对话.*动作|动作.*对话|人物动作插入/.test(rule)) {
+      const n = (content.match(/["“「][^"”」\n]{1,80}[。！？]["”」][^\n"“「]{1,40}[，,]["“「]/g) ?? []).length
+      if (n > 0) {
+        violations.push({ rule, detail: `含动作插入对话中间的夹心结构 × ${n}`, count: n })
       }
     }
 
@@ -909,6 +935,8 @@ export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
       else rules.push('禁止"电影镜头链"式描写：不要逐帧写动作（"目光落在→嘴角上扬→缓缓开口"），用一句复合句概括或省略中间过程')
     } else if (issue.type === 'connector' && issue.examples[0]) {
       rules.push(`避免过度使用连接词「${issue.examples[0]}」，同词整章不超过 1 次`)
+    } else if (issue.type === 'template' && /不是|而是/.test(issue.label)) {
+      rules.push('禁止“不是A，而是B”“不是A，是B”“这不是A，这是B”句式，必须改成直接叙述、动作呈现或删掉前半句')
     } else if (issue.type === 'template' && issue.examples[0]) {
       rules.push(`禁止使用模板化表达「${issue.examples[0]}」及同类 AI 腔句式`)
     } else if (issue.type === 'closure_summary') {
@@ -925,6 +953,10 @@ export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
     } else if (issue.type === 'mechanical_dialogue_tag') {
       const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁机械对话标注')
       if (preset) rules.push(preset.rule)
+    } else if (issue.type === 'multiple_periods_per_paragraph') {
+      rules.push('每段最多只能有 1 个中文句号“。”，连续动作、因果递进和并列描写用逗号串联，或直接换段')
+    } else if (issue.type === 'dialogue_action_sandwich') {
+      rules.push('禁止把人物动作插入同一段对话中间，尤其不要写「“前半句。”人物动作，“后半句。”」；动作另起一段，完整台词单独成段')
     } else if (issue.type === 'emotional_saturation' || issue.type === 'no_emotional_rest') {
       const preset = DEEP_ANTI_AI_PRESETS.find(p => p.label === '叙述温度起伏')
       if (preset) rules.push(preset.rule)

@@ -137,7 +137,7 @@ const BUILTIN_PATTERN_ENTRIES: Array<{ source: string; target: string }> = [
   { source: '或许...这便是...', target: '' },
 
   // ── 句式模板 ──
-  { source: '不是...而是', target: '与其说{1}不如说{2}' },
+  { source: '不是...而是', target: '{2}|{1}不重要，{2}' },
   { source: '虽然...但是', target: '{1}归{1}，可{2}|就算{1}，{2}' },
 ]
 

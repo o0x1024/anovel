@@ -231,7 +231,7 @@ const PRESET_GENERAL: WordTablePreset = {
     // ── 句式模板 ──
     { type: 'pattern', source: '他的目光...落在...上', target: '他瞄了一眼{2}|他看向{2}|他盯着{2}' },
     { type: 'pattern', source: '一股...涌上心头', target: '{1}冒了上来|心里一阵{1}|一阵{1}油然而生' },
-    { type: 'pattern', source: '不是...而是', target: '与其说{1}不如说{2}|说到底是{2}' },
+    { type: 'pattern', source: '不是...而是', target: '{2}|{1}不重要，{2}' },
     { type: 'pattern', source: '虽然...但是', target: '固然{1}，但{2}|{1}归{1}，可{2}' },
     { type: 'pattern', source: '不仅...而且', target: '不但{1}，更{2}|{1}不说，{2}也' },
     { type: 'pattern', source: '正是因为...所以', target: '因为{1}，这才{2}|就是{1}，所以{2}' },

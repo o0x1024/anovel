@@ -1,3 +1,5 @@
+import { stripForbiddenNotIsPatterns } from '../../shared/normalize-body-text'
+
 export interface AiTraceIssue {
   type: string
   label: string
@@ -15,7 +17,8 @@ export interface AiTraceReport {
 const CONNECTOR_PATTERNS = ['然而', '因此', '总的来说', '与此同时', '不仅如此', '此外', '综上', '尽管如此', '值得注意的是', '总而言之']
 const TEMPLATE_PATTERNS = [
   '心中涌起一股', '眼中闪过一丝', '嘴角微微上扬', '不禁', '仿佛', '宛如',
-  '在这个', '随着', '逐渐'
+  '在这个', '随着', '逐渐',
+  '不是', '而是'
 ]
 
 const FILM_SHOT_PATTERNS: RegExp[] = [
@@ -40,6 +43,28 @@ const MECHANICAL_DIALOGUE_TAG_PATTERNS: RegExp[] = [
   /["""][\u4e00-\u9fff]{1,4}问[，。！？\n]/g,
 ]
 
+
+function detectMultiplePeriodsPerParagraph(text: string): { count: number; examples: string[] } {
+  const paragraphs = text.split(/\n+/).map(p => p.trim()).filter(Boolean)
+  const examples: string[] = []
+  let count = 0
+  for (const p of paragraphs) {
+    const n = (p.match(/。/g) ?? []).length
+    if (n > 1) {
+      count++
+      if (examples.length < 3) examples.push(p.slice(0, 50))
+    }
+  }
+  return { count, examples }
+}
+
+function detectDialogueActionSandwich(text: string): { count: number; examples: string[] } {
+  const matches = text.match(/["“「][^"”」\n]{1,80}[。！？]["”」][^\n"“「]{1,40}[，,]["“「]/g) ?? []
+  return {
+    count: matches.length,
+    examples: matches.slice(0, 3).map(m => m.slice(0, 60))
+  }
+}
 
 function detectMechanicalDialogueTags(text: string): { count: number; examples: string[] } {
   let totalHits = 0
@@ -251,6 +276,17 @@ export function detectAiTraces(content: string): AiTraceReport {
     }
   }
 
+  const strippedNotIs = stripForbiddenNotIsPatterns(text)
+  if (strippedNotIs !== text) {
+    issues.push({
+      type: 'template',
+      label: '禁用句式“不是…是/而是”',
+      severity: 'warning',
+      count: Math.max(1, text.length - strippedNotIs.length),
+      examples: ['不是…是…', '不是…而是…']
+    })
+  }
+
   for (const pat of TEMPLATE_PATTERNS) {
     const matches = text.match(new RegExp(pat, 'g')) ?? []
     if (matches.length >= 1) {
@@ -294,6 +330,28 @@ export function detectAiTraces(content: string): AiTraceReport {
       severity: 'warning',
       count: closureTotal,
       examples: ['这一刻他明白了…', '或许这便是…']
+    })
+  }
+
+  const paragraphPeriodResult = detectMultiplePeriodsPerParagraph(text)
+  if (paragraphPeriodResult.count >= 1) {
+    issues.push({
+      type: 'multiple_periods_per_paragraph',
+      label: `单段多句号（${paragraphPeriodResult.count}段）— 每段最多 1 个句号`,
+      severity: 'warning',
+      count: paragraphPeriodResult.count,
+      examples: paragraphPeriodResult.examples
+    })
+  }
+
+  const sandwichDialogue = detectDialogueActionSandwich(text)
+  if (sandwichDialogue.count >= 1) {
+    issues.push({
+      type: 'dialogue_action_sandwich',
+      label: `动作插入对话中间（${sandwichDialogue.count}处）— 夹心对话结构`,
+      severity: 'warning',
+      count: sandwichDialogue.count,
+      examples: sandwichDialogue.examples
     })
   }
 
@@ -445,13 +503,16 @@ export const AI_TRACE_POLISH_PROMPT = [
   '',
   '【改写原则】',
   '1. 仅修改命中的问题句：连接词堆叠、模板化情绪句、明显解释腔、机械对话标注。',
-  '2. 修复机械对话标注：“他说，”“她问。”等裸标注，改为附带动作/神态/语气的写法。',
+  '2. 修复机械对话标注：“他说，”“她问。”等裸标注，改为附带动作/神态/语气的写法；但不要把动作插进同一段对话中间。',
   '   ✗ “走吧。”他说。→ ✓ “走吧。”他头也不回的说道。',
   '   ✗ “真的？”她问。→ ✓ “真的？”她皱了下眉。',
   '   也可省略标注让对话自然衔接，或用动作段代替说话标签。',
   '3. 修复电报式短句连发：连续3句以上≤10字的断句（“抬起头。看着他。没说话。”），合并或修改打破机械节奏。',
   '4. 修复平行否定结构：“没X，也没Y”“不X，也不Y”，改为不对称表达或只保留一个否定。',
   '5. 修复动词回声：相邻句中同一动词重复（“盯着…盯了”），换用近义词或省略重复。',
+  '6. 修复单段多句号：每段最多保留 1 个“。”，多余句号改逗号、分号或拆成新段。',
+  '7. 修复“不是A，而是B”“不是A，是B”“这不是A，这是B”：删除该句式，改成直接叙述或动作呈现。',
+  '8. 修复动作插入对话中间：把动作移到对话前后独立成段，完整台词单独成段。',
   '',
   '【输出格式 — 严格遵守，只输出 JSON，不要有任何其他文字】',
   '{"patches": [{"find": "需要修改的原文精确片段", "replace": "修改后的片段"}]}',

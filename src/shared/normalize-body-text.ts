@@ -2,13 +2,34 @@
 export const BODY_PARAGRAPH_SPACING_RULE =
   ''
 
+const CLOSING_QUOTES = '"”」』'
+
+const FORBIDDEN_NOT_IS_PATTERNS: RegExp[] = [
+  /，?这不是[^。！？；，\n]{1,40}，?这是/g,
+  /，?那不是[^。！？；，\n]{1,40}，?那是/g,
+  /，?不是[^。！？；，\n]{1,40}，?而是/g,
+  /，?不是[^。！？；，\n]{1,40}，?是/g
+]
+
+export function stripForbiddenNotIsPatterns(text: string): string {
+  let result = text
+  for (const pattern of FORBIDDEN_NOT_IS_PATTERNS) {
+    result = result.replace(pattern, '')
+  }
+  return result
+    .replace(/，{2,}/g, '，')
+    .replace(/^[，；、\s]+/gm, '')
+    .replace(/([。！？；])，/g, '$1')
+    .replace(/，([。！？；])/g, '$1')
+}
+
 /**
  * 修复 AI 生成文本中「用句号代替逗号」的问题。
  * 当连续短句共享主语（后句省略主语）且语义连贯时，将中间的句号替换为逗号。
  */
 export function fixPeriodAsComma(text: string): string {
   const lines = text.split('\n')
-  return lines.map(line => fixPeriodAsCommaInLine(line)).join('\n')
+  return lines.map(line => limitPeriodsPerParagraph(fixPeriodAsCommaInLine(line))).join('\n')
 }
 
 function fixPeriodAsCommaInLine(line: string): string {
@@ -58,6 +79,31 @@ function shouldMergeWithComma(cur: string, next: string): boolean {
   return true
 }
 
+function limitPeriodsPerParagraph(line: string): string {
+  if (!line.trim()) return line
+  const periodIndexes = [...line.matchAll(/。/g)].map(match => match.index ?? 0)
+  if (periodIndexes.length <= 1) return line
+
+  const keepIndex = choosePeriodToKeep(line, periodIndexes)
+  let result = ''
+  let last = 0
+  for (const index of periodIndexes) {
+    result += line.slice(last, index)
+    result += index === keepIndex ? '。' : '，'
+    last = index + 1
+  }
+  result += line.slice(last)
+  return result
+}
+
+function choosePeriodToKeep(line: string, periodIndexes: number[]): number {
+  for (let i = periodIndexes.length - 1; i >= 0; i--) {
+    const nextChar = line[periodIndexes[i] + 1]
+    if (!nextChar || !CLOSING_QUOTES.includes(nextChar)) return periodIndexes[i]
+  }
+  return periodIndexes[periodIndexes.length - 1]
+}
+
 function isDialogue(s: string): boolean {
   return /[""「『【]/.test(s)
 }
@@ -81,6 +127,7 @@ export function normalizeBodyParagraphSpacing(text: string): string {
 
   result = result.replace(/^#{1,3}\s*第?\s*[0-9一二三四五六七八九十百千万]+章[^\n]*\n+/m, '')
   result = result.replace(/\r\n/g, '\n')
+  result = stripForbiddenNotIsPatterns(result)
   result = result.replace(/\n{3,}/g, '\n')
   result = result.replace(/\n\n+/g, '\n')
   result = fixPeriodAsComma(result)
