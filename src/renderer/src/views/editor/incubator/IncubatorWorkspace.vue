@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, watch, provide, inject, toRef } from 'vue'
+import { ref, reactive, computed, onMounted, onActivated, onUnmounted, watch, provide, inject, toRef } from 'vue'
 import SeedPanel from './SeedPanel.vue'
 import StorylineComposerPanel from './StorylineComposerPanel.vue'
 import CandidatePoolPanel from './CandidatePoolPanel.vue'
@@ -31,7 +31,7 @@ const seedText = ref('')
 const rightTab = ref<'candidates' | 'scores' | 'analysis'>('candidates')
 const analysisRef = ref<InstanceType<typeof IncubatorAnalysisPanel> | null>(null)
 const seedPanelRef = ref<InstanceType<typeof SeedPanel> | null>(null)
-const storylineRef = ref<InstanceType<typeof StorylineComposerPanel> | null>(null)
+const storylineRef = ref<(InstanceType<typeof StorylineComposerPanel> & { clearLocalDrafts?: () => void }) | null>(null)
 const workType = ref<string | null>(null)
 
 const activeSlotKeys = computed(() => getSlotKeysForWorkType(workType.value))
@@ -67,7 +67,20 @@ async function loadWorkData() {
   await analysisRef.value?.loadSavedResults()
 }
 
-onMounted(() => void loadWorkData())
+function onGoalProgress(payload: unknown) {
+  const ev = payload as { workId?: number; message?: string; phase?: string }
+  if (ev.workId !== props.workId) return
+  if (ev.message?.includes('回填') || ev.phase === 'incubate_outline') {
+    void loadWorkData()
+  }
+}
+
+onMounted(() => {
+  window.anovel.on('goal:progress', onGoalProgress)
+  void loadWorkData()
+})
+onActivated(() => void loadWorkData())
+onUnmounted(() => window.anovel.off('goal:progress', onGoalProgress))
 
 watch(() => props.workId, () => void loadWorkData())
 
@@ -87,6 +100,7 @@ const previewOpen = ref(false)
 const previewSections = ref<PreviewSection[]>([])
 const previewLoading = ref(false)
 const titleIntroLoading = ref(false)
+const clearingSlots = ref(false)
 const titleIntroOptions = ref<TitleIntroOption[]>([])
 const titleIntroError = ref('')
 
@@ -98,6 +112,16 @@ const hasPreviewContent = computed(() => {
   const slotContents = storylineRef.value?.getSlotContentsForPreview?.()
   if (slotContents && slotKeys.some(key => slotContents[key]?.trim())) return true
   const slots = ws?.activeDraftSlots ?? []
+  return slotKeys.some(key =>
+    slots.some(s => s.slotKey === key && s.content.trim())
+  )
+})
+
+const hasSlotContent = computed(() => {
+  const slotKeys = getSlotKeysForWorkType(workType.value)
+  const slotContents = storylineRef.value?.getSlotContentsForPreview?.()
+  if (slotContents && slotKeys.some(key => slotContents[key]?.trim())) return true
+  const slots = incubator.workspace.value?.activeDraftSlots ?? []
   return slotKeys.some(key =>
     slots.some(s => s.slotKey === key && s.content.trim())
   )
@@ -243,10 +267,40 @@ async function applyTitleIntro(option: TitleIntroOption) {
   titleIntroOptions.value = []
   alert('已应用书名和简介')
 }
+
+async function clearAllSlots() {
+  if (clearingSlots.value) return
+  if (!confirm('确定清空所有大岗槽位内容吗？创作种子、候选池和版本记录不会被删除。')) return
+  clearingSlots.value = true
+  try {
+    storylineRef.value?.clearLocalDrafts?.()
+    for (const key of activeSlotKeys.value) {
+      await incubator.updateSlotContent(key, '')
+    }
+    titleIntroOptions.value = []
+    await incubator.refresh()
+    await nav?.refreshProgress()
+  } finally {
+    clearingSlots.value = false
+  }
+}
 </script>
 
 <template>
   <div class="flex flex-wrap justify-end gap-2 mb-3">
+    <button
+      type="button"
+      class="btn btn-outline btn-error btn-sm gap-1.5"
+      :disabled="!hasSlotContent || clearingSlots"
+      @click="clearAllSlots"
+    >
+      <font-awesome-icon
+        :icon="clearingSlots ? 'spinner' : 'trash-can'"
+        :spin="clearingSlots"
+        class="w-3.5 h-3.5"
+      />
+      {{ clearingSlots ? '清空中...' : '清空槽位' }}
+    </button>
     <button
       type="button"
       class="btn btn-outline btn-secondary btn-sm gap-1.5"

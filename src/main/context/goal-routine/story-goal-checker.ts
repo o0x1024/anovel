@@ -11,9 +11,11 @@ import { getWritingStats } from '../writing-stats'
 import { loadWritingPlan } from '../writing-plan'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { volumeChapterDAO } from '../../db'
+import { modelService } from '../../model'
+import { extractJsonText } from '../parse-json-extract'
 
 export interface StoryGoalConfig {
-  /** 用户自由文字目标（题材/风格/情节要求）——驱动生成，checker 不直接判定但记录 */
+  /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
   goalDescription: string
   /** 完成度：所有节拍都有正文 */
   requireAllBeatsContent: boolean
@@ -29,17 +31,20 @@ export interface StoryGoalConfig {
   checkAntiAiRules: boolean
   /** 轮次硬上限（文章强调整必须封顶） */
   maxTurns: number
+  /** 语义验收：用户创作目标匹配度下限（0=不卡） */
+  goalMatchMin: number
 }
 
 export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   goalDescription: '',
   requireAllBeatsContent: true,
   targetTotalWords: null,
-  qualityMin: 70,
+  qualityMin: 85,
   checkConsistencyGate: true,
-  aiPercentMax: 20,
+  aiPercentMax: 10,
   checkAntiAiRules: true,
-  maxTurns: 30
+  maxTurns: 60,
+  goalMatchMin: 85
 }
 
 export interface GoalCheckResult {
@@ -58,7 +63,20 @@ export interface GoalCheckResult {
   // 去AI
   aiPercent: number
   antiAiViolations: number
+  goalMatchScore: number
+  goalMatchReason: string
+  chapterDiagnostics: GoalChapterDiagnostic[]
   reasons: string[]
+}
+
+export interface GoalChapterDiagnostic {
+  chapterId: number
+  title: string
+  wordCount: number
+  qualityScore: number
+  qualityHardFail: boolean
+  gateBlockers: number
+  aiLikeChars: number
 }
 
 /** 拼接作品全章节正文，供整文检测 */
@@ -68,6 +86,52 @@ function collectFullBody(workId: number): string {
     .map(c => c.content?.trim())
     .filter(Boolean)
     .join('\n\n')
+}
+
+async function assessGoalMatch(
+  workId: number,
+  goalDescription: string,
+  fullBody: string,
+  signal?: AbortSignal
+): Promise<{ score: number; reason: string }> {
+  const goal = goalDescription.trim()
+  if (!goal) return { score: 100, reason: '' }
+  if (!fullBody.trim()) return { score: 0, reason: '尚无正文，无法验收创作目标' }
+  if (signal?.aborted) throw new Error('已取消')
+
+  const res = await modelService.chat(
+    {
+      workId,
+      step: 'goal_semantic_check',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false,
+      systemPrompt: [
+        '你是短故事终审编辑。判断正文是否满足用户创作目标，只输出 JSON。',
+        'score 为 0-100 的整数，reason 用一句话说明最关键的匹配或偏离。',
+        '格式：{"score":80,"reason":"..."}'
+      ].join('\n'),
+      prompt: [
+        `【用户创作目标】\n${goal}`,
+        `【待验收正文】\n${fullBody.slice(0, 16000)}`
+      ].join('\n\n')
+    },
+    { stream: false, signal }
+  )
+
+  if (!res.success || !res.content?.trim()) {
+    return { score: 0, reason: res.error || '创作目标语义验收失败' }
+  }
+
+  try {
+    const json = extractJsonText(res.content.trim()) ?? res.content.trim()
+    const parsed = JSON.parse(json) as Record<string, unknown>
+    const rawScore = Number(parsed.score)
+    const score = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0
+    const reason = String(parsed.reason ?? '').trim() || '未返回原因'
+    return { score, reason }
+  } catch {
+    return { score: 0, reason: '创作目标语义验收解析失败' }
+  }
 }
 
 /**
@@ -82,6 +146,15 @@ export async function checkStoryGoal(
   const reasons: string[] = []
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const fullBody = collectFullBody(workId)
+  const chapterDiagnostics: GoalChapterDiagnostic[] = chapters.map(ch => ({
+    chapterId: ch.id,
+    title: ch.title,
+    wordCount: ch.word_count || 0,
+    qualityScore: -1,
+    qualityHardFail: false,
+    gateBlockers: 0,
+    aiLikeChars: 0
+  }))
 
   // ---- 1. 完成度：节拍 ----
   const total = chapters.length
@@ -112,8 +185,13 @@ export async function checkStoryGoal(
       for (const ch of chapters) {
         if (signal?.aborted) throw new Error('已取消')
         const res = await diagnoseChapterQualityAi(workId, ch.id, ch.content ?? '')
+        const diag = chapterDiagnostics.find(d => d.chapterId === ch.id)
         if (res.success && typeof res.scoreTotal === 'number') {
           scores.push(res.scoreTotal)
+          if (diag) {
+            diag.qualityScore = res.scoreTotal
+            diag.qualityHardFail = !!res.hardFail
+          }
           if (res.hardFail) anyHardFail = true
         }
       }
@@ -143,6 +221,8 @@ export async function checkStoryGoal(
       if (!ch.content?.trim()) continue
       const gate = runConsistencyGate(workId, ch.id, ch.content)
       gateBlockers += gate.blockers.length
+      const diag = chapterDiagnostics.find(d => d.chapterId === ch.id)
+      if (diag) diag.gateBlockers = gate.blockers.length
     }
     if (gateBlockers > 0) {
       reasons.push(`一致性门禁 ${gateBlockers} 项阻塞`)
@@ -177,6 +257,23 @@ export async function checkStoryGoal(
     }
   }
 
+  let goalMatchScore = config.goalDescription.trim() ? 0 : 100
+  let goalMatchReason = ''
+  if (config.goalMatchMin > 0 && config.goalDescription.trim() && content > 0 && content === total) {
+    try {
+      const match = await assessGoalMatch(workId, config.goalDescription, fullBody, signal)
+      goalMatchScore = match.score
+      goalMatchReason = match.reason
+      if (goalMatchScore < config.goalMatchMin) {
+        reasons.push(`创作目标匹配度 ${goalMatchScore} 低于下限 ${config.goalMatchMin}：${goalMatchReason}`)
+      }
+    } catch (e) {
+      if (signal?.aborted) throw e
+      goalMatchReason = e instanceof Error ? e.message : String(e)
+      reasons.push(`创作目标语义验收失败：${goalMatchReason}`)
+    }
+  }
+
   const met = reasons.length === 0
   return {
     met,
@@ -190,6 +287,9 @@ export async function checkStoryGoal(
     gateBlockers,
     aiPercent,
     antiAiViolations,
+    goalMatchScore,
+    goalMatchReason,
+    chapterDiagnostics,
     reasons
   }
 }

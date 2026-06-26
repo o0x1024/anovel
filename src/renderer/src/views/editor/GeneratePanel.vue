@@ -1351,7 +1351,7 @@ async function copyCompleteStory() {
   try {
     const fullText = chapters.value
       .filter(ch => ch.content && ch.content.trim() !== '')
-      .map(ch => ch.content)
+      .map((ch, index) => [`第${index + 1}章 ${ch.title.trim()}`, ch.content?.trim()].filter(Boolean).join('\n\n'))
       .join('\n\n')
     
     if (!fullText) {

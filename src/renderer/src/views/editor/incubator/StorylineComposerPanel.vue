@@ -536,11 +536,21 @@ async function undo() {
   if (ok) emit('saved')
 }
 
+function clearLocalDrafts(): void {
+  for (const key of Object.keys(slotSaveTimers) as IncubatorSlotKey[]) {
+    const timer = slotSaveTimers[key]
+    if (timer) clearTimeout(timer)
+    delete slotSaveTimers[key]
+  }
+  slotDrafts.value = {}
+  slotSaveState.value = {}
+}
+
 function getSlotContentsForPreview(): Record<IncubatorSlotKey, string> {
   return Object.fromEntries(slots.value.map(s => [s.key, s.content])) as Record<IncubatorSlotKey, string>
 }
 
-defineExpose({ getSlotContentsForPreview })
+defineExpose({ getSlotContentsForPreview, clearLocalDrafts })
 </script>
 
 <template>

@@ -49,7 +49,7 @@ import { getConditionRules, setConditionRules } from './context/condition-rules'
 import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTrace, checkAntiAiRuleViolations, stripEmDashes, getWorkReferenceText, setWorkReferenceText, getAllAntiAiPresets, getCustomAntiAiPresets, setCustomAntiAiPresets, type AntiAiPreset } from './context/anti-ai-rules'
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { autoRewriteBody } from './context/lab/body-auto-rewrite'
-import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning } from './context/goal-routine/story-goal-routine'
+import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning, type Phase } from './context/goal-routine/story-goal-routine'
 import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
 import { exportWorkContent } from './context/export-content'
@@ -376,8 +376,8 @@ export function registerIpcHandlers(): void {
     })
   })
 
-  ipcMain.handle('export:content', (_e, workId: number, title: string, format: 'markdown' | 'txt' | 'html', scope?: { volumeId?: number; chapterId?: number }) =>
-    exportWorkContent(workId, title, format, scope))
+  ipcMain.handle('export:content', (_e, workId: number, title: string, format: 'markdown' | 'txt' | 'html', scope?: { volumeId?: number; chapterId?: number }, mode?: 'full' | 'body') =>
+    exportWorkContent(workId, title, format, scope, mode ?? 'full'))
 
   // ==================== 核心设定 ====================
   ipcMain.handle('setting:listByWork', (_e, workId: number) => coreSettingDAO.listByWork(workId))
@@ -449,6 +449,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
     void runStoryGoalLoop(workId, config ?? {}, e.sender).catch((err) => {
       appLogger.error('goal_routine', '目标循环启动失败', { workId, error: String(err) })
+    })
+    return true
+  })
+  ipcMain.handle('goal:resume', (e, workId: number, forcePhase?: string) => {
+    void runStoryGoalLoop(workId, {}, e.sender, true, forcePhase as Phase | undefined).catch((err) => {
+      appLogger.error('goal_routine', '目标循环续跑失败', { workId, error: String(err) })
     })
     return true
   })

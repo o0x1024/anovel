@@ -7,17 +7,28 @@
  * 仅轻量 humanize（不掺重的 autoRewrite）——去AI 由 checker 判定、fix 阶段针对性处理。
  */
 import { modelService } from '../../model'
-import { volumeChapterDAO } from '../../db'
+import { volumeChapterDAO, foreshadowingDAO } from '../../db'
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
-import { STORY_BODY_GENERATION_SYSTEM } from '../../../shared/body-generation-prompt'
+import { STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../shared/body-generation-prompt'
 import { humanizeText } from '../humanize-text'
 import { loadWritingPlan } from '../writing-plan'
+import {
+  MEMORY_EXTRACT_SYSTEM_PROMPT,
+  FORESHADOWING_RESOLVE_SYSTEM_PROMPT,
+  parseMemoryExtract,
+  applyMemoryExtract,
+  parseForeshadowingResolutions,
+  applyForeshadowingResolutions
+} from '../memory-extract'
+import { clearChapterMemoryBeforeExtract } from '../memory-cleanup'
+import { appLogger } from '../../logger/app-logger'
 
 export interface BeatGenResult {
   success: boolean
   content: string
   wordCount: number
+  memoryExtracted?: { planted: number; resolved: number; snapshots: number; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
 
@@ -102,6 +113,9 @@ export async function generateBeatBody(
 
   let content = normalizeModelBodyOutput(response.content.trim(), 'body_generation')
 
+  const { cleanedContent, intensity } = extractEmotionIntensity(content)
+  content = cleanedContent
+
   // 仅轻量 humanize（正则级），不掺重的 autoRewrite
   try {
     content = humanizeText(content)
@@ -113,8 +127,99 @@ export async function generateBeatBody(
   volumeChapterDAO.updateChapterWithVersion(chapterId, {
     content,
     word_count: wordCount,
-    status: 'completed'
+    status: 'completed',
+    ...(intensity != null ? { emotion_intensity: intensity } : {})
   })
 
-  return { success: true, content, wordCount }
+  // 提取叙事记忆体（伏笔种植 + 角色快照）+ AI 伏笔回收检测
+  let memoryExtracted: BeatGenResult['memoryExtracted']
+  try {
+    memoryExtracted = await extractNarrativeMemoryAfterGeneration(workId, chapterId, content, signal)
+  } catch (e) {
+    appLogger.warn('goal_routine', '叙事记忆提取失败（不阻断生成）', {
+      workId, chapterId, error: e instanceof Error ? e.message : String(e)
+    })
+  }
+
+  return { success: true, content, wordCount, memoryExtracted }
+}
+
+async function extractNarrativeMemoryAfterGeneration(
+  workId: number,
+  chapterId: number,
+  content: string,
+  signal?: AbortSignal
+): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
+  if (signal?.aborted) return { planted: 0, resolved: 0, snapshots: 0, foreshadowingResolved: 0, foreshadowingPartial: 0 }
+
+  // 1. 提取伏笔种植 + 角色快照
+  const memRes = await modelService.chat(
+    {
+      prompt: content,
+      systemPrompt: MEMORY_EXTRACT_SYSTEM_PROMPT,
+      workId,
+      chapterId,
+      step: 'memory_extract',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false
+    },
+    { stream: false, signal }
+  )
+
+  let planted = 0
+  let snapshots = 0
+  if (memRes.success && memRes.content?.trim()) {
+    const extracted = parseMemoryExtract(memRes.content)
+    clearChapterMemoryBeforeExtract(workId, chapterId)
+    const result = applyMemoryExtract(workId, chapterId, extracted)
+    planted = result.planted
+    snapshots = result.snapshots
+  }
+
+  // 2. AI 伏笔回收检测
+  let foreshadowingResolved = 0
+  let foreshadowingPartial = 0
+  const pending = foreshadowingDAO.listPending(workId)
+  if (pending.length > 0) {
+    if (signal?.aborted) return { planted, resolved: 0, snapshots, foreshadowingResolved, foreshadowingPartial }
+    const pendingList = pending.map(p =>
+      `- [id:${p.id}] depth:${p.depth ?? 'normal'} 描述：${p.description}`
+    ).join('\n')
+    const resolveRes = await modelService.chat(
+      {
+        prompt: [
+          '【待回收伏笔列表】',
+          pendingList,
+          '',
+          '【本章内容】',
+          content.slice(0, 8000)
+        ].join('\n'),
+        systemPrompt: FORESHADOWING_RESOLVE_SYSTEM_PROMPT,
+        workId,
+        chapterId,
+        step: 'foreshadowing_resolve',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false
+      },
+      { stream: false, signal }
+    )
+    if (resolveRes.success && resolveRes.content?.trim()) {
+      const parsed = parseForeshadowingResolutions(resolveRes.content)
+      const applied = applyForeshadowingResolutions(workId, chapterId, parsed)
+      foreshadowingResolved = applied.resolved
+      foreshadowingPartial = applied.partial
+    }
+  }
+
+  appLogger.info('goal_routine', '叙事记忆已更新', {
+    workId, chapterId, planted, snapshots, foreshadowingResolved, foreshadowingPartial
+  })
+
+  return {
+    planted,
+    resolved: 0,
+    snapshots,
+    foreshadowingResolved,
+    foreshadowingPartial
+  }
 }
