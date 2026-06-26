@@ -8,6 +8,7 @@ interface Work {
   coverImage: string | null
   novelLength: string | null
   targetTotalWords: number | null
+  targetChapters: number | null
   wordsPerChapter: number | null
   updateTime: string
   createTime: string

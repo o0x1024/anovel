@@ -34,6 +34,21 @@ function workRefKey(ref: AssistantWorkReference): string {
 
 const attachedWorkKeys = computed(() => props.attachedWorks.map(workRefKey))
 
+const query = ref('')
+
+function optionSearchText(option: AssistantModelOption): string {
+  const label = option.provider_label ?? ASSISTANT_MODEL_LABELS[option.model_type] ?? option.model_type
+  return `${label} ${option.model_type} ${option.model_name}`.toLowerCase()
+}
+
+const filteredFlatOptions = computed(() => {
+  const q = query.value.trim().toLowerCase()
+  if (!q) return props.modelOptions
+  return props.modelOptions.filter(opt => optionSearchText(opt).includes(q))
+})
+
+const showGrouped = computed(() => !query.value.trim())
+
 const groupedModelOptions = computed(() => {
   const order: string[] = []
   const groups = new Map<string, AssistantModelOption[]>()
@@ -292,46 +307,94 @@ function onKeydown(event: KeyboardEvent) {
               tabindex="0"
               class="btn btn-ghost btn-xs h-7 min-h-7 px-2 gap-1 text-base-content/70 hover:text-base-content max-w-[240px]"
               title="切换模型"
+              @click="query = ''"
             >
               <font-awesome-icon icon="server" class="w-3 h-3 opacity-60 shrink-0" />
               <span class="truncate text-xs">{{ currentModelLabel }}</span>
               <font-awesome-icon icon="chevron-down" class="w-2.5 h-2.5 opacity-40 shrink-0" />
             </label>
-            <ul
+            <div
               tabindex="0"
-              class="dropdown-content menu menu-sm bg-base-100 rounded-box z-20 min-w-[280px] w-max max-w-[min(100vw-2rem,380px)] p-1 shadow border border-base-300 mb-1 max-h-72 overflow-y-auto"
+              class="dropdown-content bg-base-100 rounded-box z-20 min-w-[280px] w-max max-w-[min(100vw-2rem,380px)] shadow border border-base-300 mb-1 overflow-hidden"
             >
-              <li>
-                <button
-                  type="button"
-                  class="whitespace-nowrap"
-                  :class="{ active: !modelType }"
-                  @click="selectGlobalDefault"
-                >
-                  全局默认
-                </button>
-              </li>
-              <template v-for="group in groupedModelOptions" :key="group.modelType">
-                <li class="menu-title px-3 pt-2 pb-0.5 pointer-events-none">
-                  <span class="text-[11px] font-semibold tracking-wide text-base-content/45 uppercase">
-                    {{ group.providerLabel }}
-                  </span>
-                </li>
-                <li v-for="option in group.options" :key="`${option.model_type}:${option.model_name}`">
+              <div class="p-2 border-b border-base-300/60">
+                <label class="input input-bordered input-xs flex items-center gap-2 w-full">
+                  <font-awesome-icon icon="magnifying-glass" class="w-3 h-3 opacity-40 shrink-0" />
+                  <input
+                    v-model="query"
+                    type="text"
+                    class="grow bg-transparent text-xs min-w-0"
+                    placeholder="搜索模型…"
+                    autofocus
+                    @keydown.escape.prevent="query = ''"
+                    @keydown.enter.prevent="filteredFlatOptions[0] && selectModel(filteredFlatOptions[0])"
+                  />
+                </label>
+                <p class="text-[11px] text-base-content/40 mt-1 px-0.5">
+                  共 {{ modelOptions.length }} 个，匹配 {{ filteredFlatOptions.length }} 个
+                </p>
+              </div>
+              <ul class="menu menu-sm max-h-60 overflow-y-auto p-1">
+                <li v-if="!showGrouped">
                   <button
                     type="button"
-                    class="whitespace-nowrap font-mono text-xs"
-                    :class="{ active: isOptionActive(option) }"
-                    @click="selectModel(option)"
+                    class="whitespace-nowrap"
+                    :class="{ active: !modelType }"
+                    @click="selectGlobalDefault"
                   >
-                    {{ option.model_name }}
+                    全局默认
                   </button>
                 </li>
-              </template>
-              <li v-if="!modelOptions.length" class="disabled">
-                <span class="text-base-content/40 text-xs px-3 py-2 whitespace-normal">请先在设置中启用模型并刷新目录</span>
-              </li>
-            </ul>
+                <template v-if="showGrouped">
+                  <li>
+                    <button
+                      type="button"
+                      class="whitespace-nowrap"
+                      :class="{ active: !modelType }"
+                      @click="selectGlobalDefault"
+                    >
+                      全局默认
+                    </button>
+                  </li>
+                  <template v-for="group in groupedModelOptions" :key="group.modelType">
+                    <li class="menu-title px-3 pt-2 pb-0.5 pointer-events-none">
+                      <span class="text-[11px] font-semibold tracking-wide text-base-content/45 uppercase">
+                        {{ group.providerLabel }}
+                      </span>
+                    </li>
+                    <li v-for="option in group.options" :key="`${option.model_type}:${option.model_name}`">
+                      <button
+                        type="button"
+                        class="whitespace-nowrap font-mono text-xs"
+                        :class="{ active: isOptionActive(option) }"
+                        @click="selectModel(option)"
+                      >
+                        {{ option.model_name }}
+                      </button>
+                    </li>
+                  </template>
+                </template>
+                <template v-else>
+                  <li v-for="option in filteredFlatOptions" :key="`${option.model_type}:${option.model_name}`">
+                    <button
+                      type="button"
+                      class="whitespace-nowrap text-xs gap-2"
+                      :class="{ active: isOptionActive(option) }"
+                      @click="selectModel(option)"
+                    >
+                      <span class="text-base-content/45 shrink-0">{{ option.provider_label ?? ASSISTANT_MODEL_LABELS[option.model_type] ?? option.model_type }}</span>
+                      <span class="font-mono">{{ option.model_name }}</span>
+                    </button>
+                  </li>
+                </template>
+                <li v-if="!modelOptions.length" class="disabled">
+                  <span class="text-base-content/40 text-xs px-3 py-2 whitespace-normal">请先在设置中启用模型并刷新目录</span>
+                </li>
+                <li v-if="modelOptions.length && filteredFlatOptions.length === 0">
+                  <span class="text-base-content/40 text-xs px-3 py-2">无匹配模型</span>
+                </li>
+              </ul>
+            </div>
           </div>
 
           <button

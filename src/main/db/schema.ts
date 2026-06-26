@@ -19,6 +19,7 @@ export function initSchema(): void {
       cover_image VARCHAR(200),
       novel_length VARCHAR(10) DEFAULT 'medium',
       target_total_words INTEGER,
+      target_chapters INTEGER,
       words_per_chapter INTEGER,
       step_temperature_json TEXT,
       work_type VARCHAR(20) DEFAULT 'novel',

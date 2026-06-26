@@ -1,5 +1,6 @@
 /** 篇幅类型 — 新建作品时选择，驱动目标总字数与建议章数 */
-export type NovelLength = 'short' | 'medium' | 'long'
+export type PresetNovelLength = 'short' | 'medium' | 'long'
+export type NovelLength = PresetNovelLength | 'custom'
 
 export const DEFAULT_WORDS_PER_CHAPTER = 4000
 
@@ -11,7 +12,7 @@ export interface NovelLengthPreset {
   wordsPerChapter: number
 }
 
-export const NOVEL_LENGTH_PRESETS: Record<NovelLength, NovelLengthPreset> = {
+export const NOVEL_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> = {
   short: {
     label: '短篇小说',
     description: '单线快节奏，适合集中爆发',
@@ -35,7 +36,7 @@ export const NOVEL_LENGTH_PRESETS: Record<NovelLength, NovelLengthPreset> = {
   }
 }
 
-export const STORY_LENGTH_PRESETS: Record<NovelLength, NovelLengthPreset> = {
+export const STORY_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> = {
   short: {
     label: '短篇故事',
     description: '快速聚焦单一事件或冲突，篇幅较短',
@@ -59,11 +60,11 @@ export const STORY_LENGTH_PRESETS: Record<NovelLength, NovelLengthPreset> = {
   }
 }
 
-export function getPresetsForType(workType?: string): Record<NovelLength, NovelLengthPreset> {
+export function getPresetsForType(workType?: string): Record<PresetNovelLength, NovelLengthPreset> {
   return workType === 'story' ? STORY_LENGTH_PRESETS : NOVEL_LENGTH_PRESETS
 }
 
-export const DEFAULT_NOVEL_LENGTH: NovelLength = 'medium'
+export const DEFAULT_NOVEL_LENGTH: PresetNovelLength = 'medium'
 
 export const TARGET_WORD_PRESETS = [
   200_000, 300_000, 400_000, 500_000, 600_000, 700_000,
@@ -73,7 +74,7 @@ export const TARGET_WORD_PRESETS = [
 /** 每章目标字数选项 — 章节规划与正文生成共用 */
 export const WORDS_PER_CHAPTER_PRESETS = [2000, 2500, 3000, 3500, 4000, 4500, 5000] as const
 
-export function novelLengthSummary(length: NovelLength, workType?: string): string {
+export function novelLengthSummary(length: PresetNovelLength, workType?: string): string {
   const p = getPresetsForType(workType)[length]
   const wan = p.targetTotalWords / 10_000
   const label = wan < 1 ? `${p.targetTotalWords} 字` : (Number.isInteger(wan) ? `${wan} 万字` : `${wan.toFixed(1)} 万字`)
@@ -82,15 +83,17 @@ export function novelLengthSummary(length: NovelLength, workType?: string): stri
   return `${label} · 约 ${p.suggestedChapters} ${unit} · ${perUnitLabel} ${p.wordsPerChapter} 字`
 }
 
-export function planFromNovelLength(length: NovelLength, workType?: string): {
-  novelLength: NovelLength
+export function planFromNovelLength(length: PresetNovelLength, workType?: string): {
+  novelLength: PresetNovelLength
   targetTotalWords: number
+  targetChapters: number
   wordsPerChapter: number
 } {
   const p = getPresetsForType(workType)[length]
   return {
     novelLength: length,
     targetTotalWords: p.targetTotalWords,
+    targetChapters: p.suggestedChapters,
     wordsPerChapter: p.wordsPerChapter
   }
 }

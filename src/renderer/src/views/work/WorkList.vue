@@ -5,7 +5,8 @@ import {
   DEFAULT_NOVEL_LENGTH,
   getPresetsForType,
   novelLengthSummary,
-  type NovelLength
+  type NovelLength,
+  type PresetNovelLength
 } from '../../../../shared/writing-plan-presets'
 import {
   WORK_COVER_ACCEPT,
@@ -102,6 +103,7 @@ interface Work {
   cover_image: string | null
   novel_length: string | null
   target_total_words: number | null
+  target_chapters: number | null
   stat_total_words: number
   stat_chapter_count: number
   stat_completed_count: number
@@ -156,6 +158,9 @@ const showCreateDialog = ref(false)
 const showEditDialog = ref(false)
 const newWork = ref({ title: '', description: '', genre: '', tags: '' })
 const newNovelLength = ref<NovelLength>(DEFAULT_NOVEL_LENGTH)
+const customTargetTotalWords = ref(workType === 'story' ? 30_000 : 800_000)
+const customTargetChapters = ref(workType === 'story' ? 10 : 200)
+const customWordsPerChapter = ref(workType === 'story' ? 3000 : 4000)
 const editWork = ref({
   id: 0,
   title: '',
@@ -386,21 +391,55 @@ onActivated(async () => {
 
 const novelLengthOptions = computed(() => {
   const presets = getPresetsForType(workType)
-  return (Object.keys(presets) as NovelLength[]).map(key => ({
+  return (Object.keys(presets) as PresetNovelLength[]).map(key => ({
     key,
     ...presets[key],
     summary: novelLengthSummary(key, workType)
   }))
 })
 
+const chapterUnit = computed(() => workType === 'story' ? '拍' : '章')
+const customLengthSummary = computed(() => `${formatWords(customTargetTotalWords.value)} · ${customTargetChapters.value} ${chapterUnit.value} · 每${chapterUnit.value} ${customWordsPerChapter.value} 字`)
+
+function normalizeCreatePlan() {
+  const targetTotalWords = Math.max(1, Math.round(Number(customTargetTotalWords.value) || 1))
+  const targetChapters = Math.max(1, Math.round(Number(customTargetChapters.value) || 1))
+  const wordsPerChapter = Math.max(1, Math.round(Number(customWordsPerChapter.value) || Math.ceil(targetTotalWords / targetChapters)))
+  return { targetTotalWords, targetChapters, wordsPerChapter }
+}
+
+function syncCustomWordsPerChapter() {
+  const targetTotalWords = Math.max(1, Math.round(Number(customTargetTotalWords.value) || 1))
+  const targetChapters = Math.max(1, Math.round(Number(customTargetChapters.value) || 1))
+  customWordsPerChapter.value = Math.max(1, Math.round(targetTotalWords / targetChapters))
+}
+
+function syncCustomTargetTotalWords() {
+  const targetChapters = Math.max(1, Math.round(Number(customTargetChapters.value) || 1))
+  const wordsPerChapter = Math.max(1, Math.round(Number(customWordsPerChapter.value) || 1))
+  customTargetTotalWords.value = targetChapters * wordsPerChapter
+}
+
+function resetCreateForm() {
+  newWork.value = { title: '', description: '', genre: '', tags: '' }
+  newNovelLength.value = DEFAULT_NOVEL_LENGTH
+  customTargetTotalWords.value = workType === 'story' ? 30_000 : 800_000
+  customTargetChapters.value = workType === 'story' ? 10 : 200
+  customWordsPerChapter.value = workType === 'story' ? 3000 : 4000
+}
+
 async function createWork() {
   if (!newWork.value.title.trim()) return
+  const customPlan = newNovelLength.value === 'custom' ? normalizeCreatePlan() : null
   creating.value = true
   try {
     const id = await window.anovel.invoke('work:create', {
       title: newWork.value.title.trim(),
       description: newWork.value.description.trim() || undefined,
       novelLength: newNovelLength.value,
+      targetTotalWords: customPlan?.targetTotalWords,
+      targetChapters: customPlan?.targetChapters,
+      wordsPerChapter: customPlan?.wordsPerChapter,
       workType: workType,
       genre: newWork.value.genre.trim() || undefined,
       tags: tagsToStorage(newWork.value.tags) || undefined
@@ -415,8 +454,7 @@ async function createWork() {
       }
     }
     showCreateDialog.value = false
-    newWork.value = { title: '', description: '', genre: '', tags: '' }
-    newNovelLength.value = DEFAULT_NOVEL_LENGTH
+    resetCreateForm()
     clearPendingCover()
     await reloadWorks()
     router.push(editorPath(id))
@@ -836,7 +874,7 @@ function progressPct(work: Work): number {
 
     <!-- 新建作品弹窗 -->
     <dialog :class="['modal modal-bottom sm:modal-middle', showCreateDialog && 'modal-open']">
-      <div class="modal-box border border-base-300/80 shadow-2xl p-6 rounded-2xl">
+      <div class="modal-box border border-base-300/80 shadow-2xl p-6 rounded-2xl max-w-2xl">
         <div class="flex items-center gap-3 mb-5">
           <div class="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center text-primary">
             <font-awesome-icon icon="plus" class="text-lg" />
@@ -949,6 +987,58 @@ function progressPct(work: Work): number {
                   <div class="text-sm font-semibold">{{ opt.label }}</div>
                   <div class="text-xs text-base-content/50 mt-0.5">{{ opt.description }}</div>
                   <div class="text-xs text-primary/80 mt-1">建议 {{ opt.summary }}</div>
+                </div>
+              </label>
+              <label
+                class="flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors"
+                :class="newNovelLength === 'custom' ? 'border-primary bg-primary/5' : 'border-base-300 hover:border-base-content/20'"
+              >
+                <input
+                  v-model="newNovelLength"
+                  type="radio"
+                  name="novelLength"
+                  class="radio radio-primary radio-sm mt-0.5"
+                  value="custom"
+                />
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm font-semibold">自定义篇幅</div>
+                  <div class="text-xs text-base-content/50 mt-0.5">由你设置总字数、{{ chapterUnit }}数和每{{ chapterUnit }}字数</div>
+                  <div class="text-xs text-primary/80 mt-1">当前 {{ customLengthSummary }}</div>
+                  <div v-if="newNovelLength === 'custom'" class="grid grid-cols-3 gap-2 mt-3">
+                    <label class="form-control">
+                      <span class="label-text text-[11px] text-base-content/50">目标总字数</span>
+                      <input
+                        v-model.number="customTargetTotalWords"
+                        type="number"
+                        min="1"
+                        step="1000"
+                        class="input input-bordered input-sm w-full rounded-lg"
+                        @change="syncCustomWordsPerChapter"
+                      />
+                    </label>
+                    <label class="form-control">
+                      <span class="label-text text-[11px] text-base-content/50">目标{{ chapterUnit }}数</span>
+                      <input
+                        v-model.number="customTargetChapters"
+                        type="number"
+                        min="1"
+                        step="1"
+                        class="input input-bordered input-sm w-full rounded-lg"
+                        @change="syncCustomWordsPerChapter"
+                      />
+                    </label>
+                    <label class="form-control">
+                      <span class="label-text text-[11px] text-base-content/50">每{{ chapterUnit }}字数</span>
+                      <input
+                        v-model.number="customWordsPerChapter"
+                        type="number"
+                        min="1"
+                        step="100"
+                        class="input input-bordered input-sm w-full rounded-lg"
+                        @change="syncCustomTargetTotalWords"
+                      />
+                    </label>
+                  </div>
                 </div>
               </label>
             </div>

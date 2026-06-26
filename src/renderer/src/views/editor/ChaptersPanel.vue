@@ -46,6 +46,25 @@ interface ParsedChapter {
   characters?: string | null
 }
 
+interface OutlineDiagnosisIssue {
+  chapter_id: number
+  severity?: string
+  type?: string
+  evidence?: string
+  problem?: string
+  fix_reason?: string
+}
+
+interface OutlineDiagnosisPatch {
+  chapter_id: number
+  outline?: string
+  beat_role?: string | null
+  foreshadow_target?: string | null
+  next_hook?: string | null
+  pov_mode?: string | null
+  characters?: string | null
+}
+
 const volumes = ref<{ id: number; name: string; description?: string | null }[]>([])
 const chapters = ref<Chapter[]>([])
 const selectedVolume = ref<number | null>(null)
@@ -714,6 +733,11 @@ function sanitizeJsonString(str: string): string {
   return result
 }
 
+function chapterLabel(chapterId: number): string {
+  const ch = chapters.value.find(c => c.id === chapterId)
+  return ch ? `${ch.title} (#${ch.id})` : `#${chapterId}`
+}
+
 function parseDiagnosisResult(raw: string) {
   let text = raw.trim()
   const match = text.match(/```(?:json)?\s*([\s\S]*?)```/)
@@ -732,24 +756,44 @@ function parseDiagnosisResult(raw: string) {
   try {
     const parsed = JSON.parse(text)
     if (parsed && typeof parsed === 'object' && 'revised_chapters' in parsed) {
+      const issues = Array.isArray(parsed.issues) ? parsed.issues as OutlineDiagnosisIssue[] : []
+      const revisedChapters = Array.isArray(parsed.revised_chapters) ? parsed.revised_chapters as OutlineDiagnosisPatch[] : []
       let reportStr = parsed.report ? String(parsed.report) : ''
-      if (!reportStr && Array.isArray(parsed.revised_chapters)) {
-        reportStr = '### 大纲修订补丁预览\n\n请点击右上角 **“应用 AI 修复”** 按钮直接将以下修改应用至对应的章节大纲中：\n\n'
-        parsed.revised_chapters.forEach((ch: any) => {
-          reportStr += `#### 针对第 ${ch.chapter_id} 章的修改\n`
-          if (ch.outline) reportStr += `**优化后大纲：**\n${ch.outline}\n\n`
-          if (ch.beat_role) reportStr += `- **节拍角色：** ${ch.beat_role}\n`
-          if (ch.foreshadow_target) reportStr += `- **铺垫目标：** ${ch.foreshadow_target}\n`
-          if (ch.next_hook) reportStr += `- **章末钩子：** ${ch.next_hook}\n`
-          if (ch.pov_mode) reportStr += `- **视角模式：** ${ch.pov_mode}\n`
-          if (ch.characters) reportStr += `- **出场角色：** ${ch.characters}\n`
-          reportStr += '\n---\n\n'
-        })
+      if (!reportStr) {
+        const summary = parsed.summary ? String(parsed.summary) : '大纲诊断结果'
+        reportStr = `### ${summary}\n\n`
+        if (issues.length > 0) {
+          reportStr += '#### 诊断问题\n\n'
+          issues.forEach((issue, idx) => {
+            reportStr += `${idx + 1}. **${chapterLabel(Number(issue.chapter_id))}**`
+            if (issue.severity) reportStr += ` · ${issue.severity}`
+            if (issue.type) reportStr += ` · ${issue.type}`
+            reportStr += '\n'
+            if (issue.evidence) reportStr += `   - 证据：${issue.evidence}\n`
+            if (issue.problem) reportStr += `   - 问题：${issue.problem}\n`
+            if (issue.fix_reason) reportStr += `   - 修复理由：${issue.fix_reason}\n`
+          })
+          reportStr += '\n'
+        }
+        if (revisedChapters.length > 0) {
+          reportStr += '#### 大纲修订补丁预览\n\n请点击右上角 **“应用 AI 修复”** 将以下修改应用到对应章节。\n\n'
+          revisedChapters.forEach(ch => {
+            reportStr += `##### ${chapterLabel(Number(ch.chapter_id))}\n`
+            if (ch.outline) reportStr += `**优化后大纲：**\n${ch.outline}\n\n`
+            if (ch.beat_role) reportStr += `- **节拍角色：** ${ch.beat_role}\n`
+            if (ch.foreshadow_target) reportStr += `- **铺垫目标：** ${ch.foreshadow_target}\n`
+            if (ch.next_hook) reportStr += `- **章末钩子：** ${ch.next_hook}\n`
+            if (ch.pov_mode) reportStr += `- **视角模式：** ${ch.pov_mode}\n`
+            if (ch.characters) reportStr += `- **出场角色：** ${ch.characters}\n`
+            reportStr += '\n---\n\n'
+          })
+        }
       }
-      
+
       return {
         report: reportStr,
-        revised_chapters: Array.isArray(parsed.revised_chapters) ? parsed.revised_chapters : null
+        issues,
+        revised_chapters: revisedChapters.length > 0 ? revisedChapters : null
       }
     }
   } catch (e) {
@@ -757,6 +801,7 @@ function parseDiagnosisResult(raw: string) {
   }
   return {
     report: raw,
+    issues: [],
     revised_chapters: null
   }
 }
@@ -787,7 +832,15 @@ async function runOutlineDiagnosis() {
     let promptContext = ''
     if (diagnosisScope.value === 'volume') {
       const vol = volumes.value.find(v => v.id === selectedVolume.value)
-      const chaptersText = chapters.value.map(c => `${c.title}：\n${c.outline || '（暂无大纲）'}`).join('\n\n')
+      const chaptersText = chapters.value.map(c => [
+        `- chapter_id: ${c.id}`,
+        `  title: ${c.title}`,
+        `  beat_role: ${c.beat_role || ''}`,
+        `  foreshadow_target: ${c.foreshadow_target || ''}`,
+        `  next_hook: ${c.next_hook || ''}`,
+        `  characters: ${c.characters || ''}`,
+        `  outline: ${c.outline || '（暂无大纲）'}`
+      ].join('\n')).join('\n\n')
       promptContext = [
         `当前分卷：${vol?.name || ''}`,
         vol?.description ? `分卷说明：${vol.description}` : '',
@@ -814,7 +867,17 @@ async function runOutlineDiagnosis() {
             currentVolName = c.volume_name
             header = `\n### 分卷：${currentVolName}\n`
           }
-          return `${header}- ${c.title}：\n${c.outline || '（暂无大纲）'}`
+          return [
+            header,
+            `- chapter_id: ${c.id}`,
+            `  title: ${c.title}`,
+            `  volume: ${c.volume_name}`,
+            `  beat_role: ${c.beat_role || ''}`,
+            `  foreshadow_target: ${c.foreshadow_target || ''}`,
+            `  next_hook: ${c.next_hook || ''}`,
+            `  characters: ${c.characters || ''}`,
+            `  outline: ${c.outline || '（暂无大纲）'}`
+          ].filter(Boolean).join('\n')
         }).join('\n')
         
       promptContext = [
@@ -830,51 +893,69 @@ async function runOutlineDiagnosis() {
           currentVolName = c.volume_name
           header = `\n### 分卷：${currentVolName}\n`
         }
-        return `${header}- ${c.title}：\n${c.outline || '（暂无大纲）'}`
+        return [
+          header,
+          `- chapter_id: ${c.id}`,
+          `  title: ${c.title}`,
+          `  volume: ${c.volume_name}`,
+          `  beat_role: ${c.beat_role || ''}`,
+          `  foreshadow_target: ${c.foreshadow_target || ''}`,
+          `  next_hook: ${c.next_hook || ''}`,
+          `  characters: ${c.characters || ''}`,
+          `  outline: ${c.outline || '（暂无大纲）'}`
+        ].filter(Boolean).join('\n')
       }).join('\n')
       
       promptContext = `【全书分卷与章节大纲列表】\n${chaptersText}`
     }
 
-    const basePrompt = workType.value === 'story' ? [
-      '你是犀利、资深的番茄短故事主编，擅长发现大纲中的节奏拖沓、爽点不足、情节注水以及人设世界观冲突。',
-      '短故事要求剧情极度紧凑、起步即冲刺、爽点一个接一个。请用最严苛的标准对作者提供的节拍大纲进行诊断。',
-      '如果发现平淡过渡、节奏缓慢或冲突不够尖锐的地方，请大胆指出并直接在 revised_chapters 中重写优化。',
-      '请必须严格按照以下 JSON 格式输出，禁止包含 markdown 代码块外壳 (如 ```json) 或任何前后置文字：',
-      '{',
-      '  "revised_chapters": ['
-    ] : [
-      '你是犀利、资深的网文总编辑，擅长发现大纲中的逻辑漏洞、剧情合理性问题以及人设世界观冲突。',
-      '请对作者提供的章节大纲列表进行深入诊断，并与作品的「核心设定」（人设、世界观规则、核心冲突、金手指等）进行联动对比。',
-      '请必须严格按照以下 JSON 格式输出，禁止包含 markdown 代码块外壳 (如 ```json) 或任何前后置文字：',
-      '{',
-      '  "revised_chapters": ['
-    ]
+    const roleLine = workType.value === 'story'
+      ? '你是犀利、资深的番茄短故事主编，擅长发现节拍大纲中的节奏拖沓、爽点不足、情绪钩子不足以及人设世界观冲突。'
+      : '你是犀利、资深的网文总编辑，擅长发现章节大纲中的逻辑漏洞、设定冲突、期待感断裂、钩子不足和节奏注水。'
 
     const systemPrompt = [
-      ...basePrompt,
+      roleLine,
+      '请对输入的大纲做结构化诊断，并在必要时给出可直接应用的章节大纲补丁。',
+      '【输出格式 - 必须严格遵守】',
+      '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
+      '{',
+      '  "summary": "一句话总结整体大纲状态",',
+      '  "issues": [',
       '    {',
-      '      "chapter_id": 章节标题中的章节序号（数字，如标题为"第10章 ……"则填10）,',
-      '      "outline": "修改优化后的完整章节大纲文本（不要写任何批注，保持直接可用）",',
-      '      "beat_role": "A/B/C/transition 中的一个或空字符串",',
-      '      "foreshadow_target": "修改建议的铺垫目标或空字符串",',
-      '      "next_hook": "修改建议的章末钩子或空字符串",',
-      '      "pov_mode": "修改建议的视角模式，可选项为: third_limited(限知)/first(第一人称)/omniscient(全知) 或空字符串",',
-      '      "characters": "修改建议的出场角色列表，如：韩立,南宫婉（逗号分隔）或空字符串"',
+      '      "chapter_id": 123,',
+      '      "severity": "high|medium|low",',
+      '      "type": "logic|setting|pacing|hook|character|continuity|density|expectation|other",',
+      '      "evidence": "引用或概括现有大纲中的具体证据，必须能定位问题",',
+      '      "problem": "具体问题，不要泛泛而谈",',
+      '      "fix_reason": "为什么这样修能提升连贯性、爽点、期待感或追读"',
+      '    }',
+      '  ],',
+      '  "revised_chapters": [',
+      '    {',
+      '      "chapter_id": 123,',
+      '      "outline": "修改优化后的完整章节大纲文本（直接可用，不写批注）",',
+      '      "beat_role": "A|B|C|transition 或空字符串",',
+      '      "foreshadow_target": "修改后的铺垫目标或空字符串",',
+      '      "next_hook": "修改后的章末钩子或空字符串",',
+      '      "pov_mode": "third_limited|first|omniscient 或空字符串",',
+      '      "characters": "出场角色名，逗号分隔，或空字符串"',
       '    }',
       '  ]',
       '}',
-      '【注意事项】',
-      '1. 核心约束：本系统暂不支持自动合并、拆分或删除章节。因此，**绝对禁止**提出结构性破坏建议。所有的剧情压缩、延展或节奏调整，都必须在**保持原有章节数和原有 chapter_id 不变**的前提下，通过修改现有每一章的内部大纲（outline）来实现。',
-      '2. revised_chapters 数组中仅包含你需要进行修复和调整的章节。未指出逻辑或剧情硬伤的章节无需放入该数组中。',
-      '3. 拒绝说明报告：不要输出任何形式的整体报告、概述或修改意见！你必须将所有发现的逻辑漏洞、设定冲突、爽点缺失等问题，**直接通过重写该章大纲文本（outline）来解决**。输出必须是只包含 revised_chapters 的干净 JSON。',
+      '【硬性规则】',
+      '1. chapter_id 必须使用输入里给出的数据库 ID，禁止从标题推断，禁止输出不存在的 ID。',
+      '2. 不支持自动合并、拆分、删除、重排章节；修复必须保持原章节数量和 chapter_id 不变。',
+      '3. issues 必须先给证据，再给问题，再给修复理由；没有证据的问题不要输出。',
+      '4. revised_chapters 只包含需要修复的章节；没有硬伤或收益不明确的章节不要放入。',
+      '5. 补丁必须解决对应 issues，不要只做文风润色。',
+      '6. 若全书/本卷无明显问题，输出空数组："issues": [], "revised_chapters": []。',
       '【诊断维度】',
-      '1. 【逻辑与设定合理性】：检测整体剧情因果关系是否成立，是否存在吃设定、时间线错乱或跨章跨卷矛盾。',
-      '2. 【期待感与目标拉扯】：检测主角目标是否明确，阻力是否有效，是否建立充足期待感并得到良好的延迟满足（核心爽点）。',
-      '3. 【章末钩子与悬念】：检测关键章节结尾是否留有悬念、反转、未解之谜或危机，以此保证读者的追读率。',
-      '4. 【人物高光与共情】：检测角色是否过于工具化，是否做出符合人设的抉择，是否具备高光时刻并能引发读者强烈的情绪共鸣。',
-      '5. 【情节密度与情绪刺激】：检测主线推进效率，是否存在连续的无效过渡或注水灌水，剧情起伏波折与情绪刺激是否到位。',
-      '6. 【遗漏与改进建议】：评估是否有未考虑到的地方，并给出具体的改进建议和详细修复步骤。'
+      '1. 逻辑与设定合理性：因果、时间线、能力边界、世界观规则是否自洽。',
+      '2. 期待感与目标拉扯：主角目标、阻力、延迟满足、爽点承诺是否连续。',
+      '3. 章末钩子与悬念：关键章节是否有反转、危机、未解谜题或强追读点。',
+      '4. 人物高光与共情：角色行动是否符合人设，是否有可记忆的高光/情绪爆点。',
+      '5. 情节密度与节奏：是否连续过渡、注水、重复信息，是否缺少推进。',
+      '6. 连续性与跨卷衔接：伏笔、铺垫、前后卷承接是否断裂或冲突。'
     ].join('\n')
 
     const res = await chat(promptContext, systemPrompt, 'chapter_outline_diagnose', {
@@ -911,24 +992,16 @@ async function applyAiFixes(revisedChapters: any[]) {
     if (diagnosisScope.value === 'cross' || diagnosisScope.value === 'all') {
       searchChapters = await window.anovel.invoke('chapter:listByWork', props.workId) as Chapter[]
     }
-    
-    const resolveChapterId = (idOrNo: any): number | null => {
-      const num = Number(idOrNo)
-      if (isNaN(num)) return null
-      const numMatch = searchChapters.find(c => {
-        const match = c.title.match(/^第\s*(\d+)\s*章/)
-        return match && Number(match[1]) === num
-      })
-      if (numMatch) return numMatch.id
-      const directMatch = searchChapters.find(c => c.id === num)
-      if (directMatch) return directMatch.id
-      return null
-    }
+    const allowedChapterIds = new Set(searchChapters.map(c => c.id))
 
     let successCount = 0
-    for (const item of revisedChapters) {
-      const chId = resolveChapterId(item.chapter_id)
-      if (!chId) continue
+    let skippedCount = 0
+    for (const item of revisedChapters as OutlineDiagnosisPatch[]) {
+      const chId = Number(item.chapter_id)
+      if (!Number.isInteger(chId) || !allowedChapterIds.has(chId)) {
+        skippedCount++
+        continue
+      }
       
       const currentCh = await window.anovel.invoke('chapter:get', chId) as Chapter
       if (!currentCh) continue
@@ -947,6 +1020,10 @@ async function applyAiFixes(revisedChapters: any[]) {
       if (item.next_hook !== undefined) fields.next_hook = item.next_hook || null
       if (item.pov_mode !== undefined) fields.pov_mode = item.pov_mode || null
       if (item.characters !== undefined) fields.characters = item.characters || null
+      if (Object.keys(fields).length === 0) {
+        skippedCount++
+        continue
+      }
       
       await window.anovel.invoke('chapter:update', chId, fields)
       
@@ -967,8 +1044,10 @@ async function applyAiFixes(revisedChapters: any[]) {
     }
     await nav?.refreshProgress()
     await refreshPlan()
+    await window.anovel.invoke('setting:upsert', props.workId, currentDiagnosisKey.value, '')
+    await loadSavedDiagnoses()
     
-    alert(`成功应用了 ${successCount} 个章节的大纲修复！旧内容均已存入各自章节的「版本历史」。`)
+    alert(`成功应用了 ${successCount} 个${noun}的大纲修复！旧内容均已存入各自${noun}的「版本历史」。${skippedCount ? ` 跳过 ${skippedCount} 个无效补丁。` : ''}`)
   } catch (e) {
     alert('应用修复失败: ' + String(e))
   } finally {

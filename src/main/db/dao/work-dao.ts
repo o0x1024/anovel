@@ -12,6 +12,7 @@ export interface WorkRow {
   cover_image: string | null
   novel_length: string | null
   target_total_words: number | null
+  target_chapters: number | null
   words_per_chapter: number | null
   step_temperature_json: string | null
   work_type: string | null
@@ -30,6 +31,7 @@ export interface WorkCreateInput {
   cover_image?: string
   novelLength?: string
   targetTotalWords?: number
+  targetChapters?: number
   wordsPerChapter?: number
   workType?: string
   status?: string
@@ -86,10 +88,10 @@ export class WorkDAO extends BaseDAO {
   /** 创建新作品 */
   create(input: WorkCreateInput): number {
     return this.insert(
-      `INSERT INTO works (title, description, cover_image, novel_length, target_total_words, words_per_chapter, work_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO works (title, description, cover_image, novel_length, target_total_words, target_chapters, words_per_chapter, work_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [input.title, input.description ?? null, input.cover_image ?? null,
-        input.novelLength ?? 'medium', input.targetTotalWords ?? null, input.wordsPerChapter ?? null, input.workType ?? 'novel']
+        input.novelLength ?? 'medium', input.targetTotalWords ?? null, input.targetChapters ?? null, input.wordsPerChapter ?? null, input.workType ?? 'novel']
     )
   }
 
@@ -103,6 +105,7 @@ export class WorkDAO extends BaseDAO {
     if (input.cover_image !== undefined) { fields.push('cover_image = ?'); values.push(input.cover_image) }
     if (input.novelLength !== undefined) { fields.push('novel_length = ?'); values.push(input.novelLength) }
     if (input.targetTotalWords !== undefined) { fields.push('target_total_words = ?'); values.push(input.targetTotalWords) }
+    if (input.targetChapters !== undefined) { fields.push('target_chapters = ?'); values.push(input.targetChapters) }
     if (input.wordsPerChapter !== undefined) { fields.push('words_per_chapter = ?'); values.push(input.wordsPerChapter) }
     if (input.workType !== undefined) { fields.push('work_type = ?'); values.push(input.workType) }
     if (input.status !== undefined) { fields.push('status = ?'); values.push(input.status) }

@@ -3,6 +3,7 @@ import { ref, computed, watch, onMounted } from 'vue'
 import {
   type WritingPlanStatus,
   type NovelLength,
+  type PresetNovelLength,
   getPresetsForType,
   getTargetWordPresets,
   getWordsPerChapterPresets,
@@ -18,6 +19,7 @@ const status = ref<WritingPlanStatus | null>(null)
 const saving = ref(false)
 const novelLength = ref<NovelLength>('medium')
 const targetTotalWords = ref(800_000)
+const targetChapters = ref(200)
 const wordsPerChapter = ref(4000)
 const expanded = ref(false)
 
@@ -28,14 +30,14 @@ const plannedVerb = computed(() => workType.value === 'story' ? '已拆解' : '�
 const planTitle = computed(() => workType.value === 'story' ? '节拍规划' : '章节规划')
 const planDescription = computed(() => {
   if (workType.value === 'story') {
-    return '按短故事目标字数与每拍字数设定节奏基线，自动推导目标总拍数并引导拆解进度'
+    return '按短故事目标字数、目标拍数与每拍字数设定节奏基线，引导拆解进度'
   }
-  return '按篇幅类型设定目标总字数；默认每章约 4000 字，反推全书与各卷章数'
+  return '按目标总字数、目标章数与每章字数设定全书节奏，可自由编辑修改'
 })
 
 const novelLengthOptions = computed(() => {
   const presets = getPresetsForType(workType.value)
-  return (Object.keys(presets) as NovelLength[]).map(key => ({
+  return (Object.keys(presets) as PresetNovelLength[]).map(key => ({
     key,
     label: presets[key].label,
     summary: novelLengthSummary(key, workType.value)
@@ -61,8 +63,10 @@ const summaryLine = computed(() => {
 
 const collapsedSummary = computed(() => {
   if (summaryLine.value) return summaryLine.value
-  return novelLengthSummary(novelLength.value, workType.value)
+  if (novelLength.value === 'custom') return `${formatWordCount(targetTotalWords.value)} · ${targetChapters.value} ${chapterUnit.value} · ${perChapterLabel.value} ${wordsPerChapter.value} 字`
+  return selectedNovelLengthSummary.value
 })
+const selectedNovelLengthSummary = computed(() => novelLength.value === 'custom' ? '' : novelLengthSummary(novelLength.value, workType.value))
 
 onMounted(loadStatus)
 
@@ -71,6 +75,7 @@ watch(() => props.workId, loadStatus)
 async function loadStatus() {
   status.value = await window.anovel.invoke('writingPlan:getStatus', props.workId) as WritingPlanStatus
   targetTotalWords.value = status.value.plan.targetTotalWords
+  targetChapters.value = status.value.plan.targetChapters
   wordsPerChapter.value = status.value.plan.wordsPerChapter
   novelLength.value = status.value.plan.novelLength
   emit('status-change', status.value)
@@ -78,9 +83,13 @@ async function loadStatus() {
 
 async function applyNovelLength() {
   if (saving.value) return
+  if (novelLength.value === 'custom') {
+    await savePlan()
+    return
+  }
   saving.value = true
   try {
-    await window.anovel.invoke('writingPlan:applyNovelLength', props.workId, novelLength.value)
+    await window.anovel.invoke('writingPlan:applyNovelLength', props.workId, novelLength.value as PresetNovelLength)
     await loadStatus()
     emit('updated')
   } finally {
@@ -90,17 +99,36 @@ async function applyNovelLength() {
 
 async function savePlan() {
   if (saving.value) return
+  targetTotalWords.value = Math.max(1, Math.round(Number(targetTotalWords.value) || 1))
+  targetChapters.value = Math.max(1, Math.round(Number(targetChapters.value) || 1))
+  wordsPerChapter.value = Math.max(1, Math.round(Number(wordsPerChapter.value) || 1))
   saving.value = true
   try {
     await window.anovel.invoke('writingPlan:update', props.workId, {
       targetTotalWords: targetTotalWords.value,
-      wordsPerChapter: wordsPerChapter.value
+      targetChapters: targetChapters.value,
+      wordsPerChapter: wordsPerChapter.value,
+      novelLength: 'custom'
     })
     await loadStatus()
     emit('updated')
   } finally {
     saving.value = false
   }
+}
+
+function syncWordsPerChapter() {
+  targetTotalWords.value = Math.max(1, Math.round(Number(targetTotalWords.value) || 1))
+  targetChapters.value = Math.max(1, Math.round(Number(targetChapters.value) || 1))
+  wordsPerChapter.value = Math.max(1, Math.round(targetTotalWords.value / targetChapters.value))
+  savePlan()
+}
+
+function syncTargetTotalWords() {
+  targetChapters.value = Math.max(1, Math.round(Number(targetChapters.value) || 1))
+  wordsPerChapter.value = Math.max(1, Math.round(Number(wordsPerChapter.value) || 1))
+  targetTotalWords.value = targetChapters.value * wordsPerChapter.value
+  savePlan()
 }
 
 defineExpose({ reload: loadStatus })
@@ -147,36 +175,64 @@ defineExpose({ reload: loadStatus })
           class="select select-bordered select-sm w-32"
           @change="applyNovelLength"
         >
+          <option v-if="novelLength === 'custom'" value="custom">自定义</option>
           <option v-for="opt in novelLengthOptions" :key="opt.key" :value="opt.key">
             {{ opt.label }}
           </option>
         </select>
       </label>
-      <p v-if="novelLengthOptions.length" class="text-xs text-base-content/50 pb-2 max-w-md">
-        {{ novelLengthSummary(novelLength, workType) }}
+      <p v-if="novelLength === 'custom'" class="text-xs text-base-content/50 pb-2 max-w-md">
+        自定义：{{ formatWordCount(targetTotalWords) }} · {{ targetChapters }} {{ chapterUnit }} · {{ perChapterLabel }} {{ wordsPerChapter }} 字
+      </p>
+      <p v-else-if="novelLengthOptions.length" class="text-xs text-base-content/50 pb-2 max-w-md">
+        {{ selectedNovelLengthSummary }}
       </p>
     </div>
 
     <div class="flex flex-wrap gap-3 items-end">
       <label class="form-control">
         <span class="label-text text-xs text-base-content/50">目标总字数</span>
-        <select
+        <input
           v-model.number="targetTotalWords"
-          class="select select-bordered select-sm w-36"
-          @change="savePlan"
-        >
+          type="number"
+          min="1"
+          step="1000"
+          :list="`targetWordPresets-${workId}`"
+          class="input input-bordered input-sm w-36"
+          @change="syncWordsPerChapter"
+          @keyup.enter="syncWordsPerChapter"
+        />
+        <datalist :id="`targetWordPresets-${workId}`">
           <option v-for="n in targetWordPresets" :key="n" :value="n">{{ formatWordCount(n) }}</option>
-        </select>
+        </datalist>
+      </label>
+      <label class="form-control">
+        <span class="label-text text-xs text-base-content/50">目标{{ chapterUnit }}数</span>
+        <input
+          v-model.number="targetChapters"
+          type="number"
+          min="1"
+          step="1"
+          class="input input-bordered input-sm w-28"
+          @change="syncWordsPerChapter"
+          @keyup.enter="syncWordsPerChapter"
+        />
       </label>
       <label class="form-control">
         <span class="label-text text-xs text-base-content/50">{{ perChapterLabel }}</span>
-        <select
+        <input
           v-model.number="wordsPerChapter"
-          class="select select-bordered select-sm w-28"
-          @change="savePlan"
-        >
+          type="number"
+          min="1"
+          step="100"
+          :list="`wordsPerChapterPresets-${workId}`"
+          class="input input-bordered input-sm w-28"
+          @change="syncTargetTotalWords"
+          @keyup.enter="syncTargetTotalWords"
+        />
+        <datalist :id="`wordsPerChapterPresets-${workId}`">
           <option v-for="n in wordsPerChapterPresets" :key="n" :value="n">{{ n }} 字</option>
-        </select>
+        </datalist>
       </label>
       <div v-if="status" class="text-xs pb-2 text-base-content/60">
         ≈ <span class="font-medium text-base-content">{{ status.suggestedTotalChapters }}</span> {{ chapterUnit }}

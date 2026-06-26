@@ -214,6 +214,9 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
   if (hasTable(db, 'works') && !hasColumn(db, 'works', 'target_total_words')) {
     db.exec(`ALTER TABLE works ADD COLUMN target_total_words INTEGER`)
   }
+  if (hasTable(db, 'works') && !hasColumn(db, 'works', 'target_chapters')) {
+    db.exec(`ALTER TABLE works ADD COLUMN target_chapters INTEGER`)
+  }
   if (hasTable(db, 'works') && !hasColumn(db, 'works', 'words_per_chapter')) {
     db.exec(`ALTER TABLE works ADD COLUMN words_per_chapter INTEGER`)
   }
@@ -230,10 +233,11 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
           const validLengths = ['short', 'medium', 'long']
           const novelLength = validLengths.includes(plan.novelLength) ? plan.novelLength : 'medium'
           const targetWords = typeof plan.targetTotalWords === 'number' ? Math.round(plan.targetTotalWords) : null
+          const targetChapters = typeof plan.targetChapters === 'number' ? Math.round(plan.targetChapters) : null
           const wpc = typeof plan.wordsPerChapter === 'number' ? Math.round(plan.wordsPerChapter) : null
           db.prepare(
-            `UPDATE works SET novel_length = ?, target_total_words = ?, words_per_chapter = ? WHERE id = ?`
-          ).run(novelLength, targetWords, wpc, row.work_id)
+            `UPDATE works SET novel_length = ?, target_total_words = ?, target_chapters = ?, words_per_chapter = ? WHERE id = ?`
+          ).run(novelLength, targetWords, targetChapters, wpc, row.work_id)
         }
       } catch { /* 跳过损坏的 JSON */ }
     }

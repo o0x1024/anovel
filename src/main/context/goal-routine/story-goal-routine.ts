@@ -91,8 +91,8 @@ async function ensureBeats(
 
   const plan = loadWritingPlan(workId)
   const wpc = plan.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER
-  const suggestedCount = plan.targetTotalWords > 0
-    ? Math.max(3, Math.ceil(plan.targetTotalWords / wpc))
+  const suggestedCount = plan.targetChapters > 0
+    ? Math.max(1, Math.round(plan.targetChapters))
     : 5
 
   const vol = volumes[0]

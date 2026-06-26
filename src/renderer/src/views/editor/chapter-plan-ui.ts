@@ -5,7 +5,7 @@ import {
   type NovelLength
 } from '../../../../shared/writing-plan-presets'
 
-export type { NovelLength, NovelLengthPreset } from '../../../../shared/writing-plan-presets'
+export type { NovelLength, PresetNovelLength, NovelLengthPreset } from '../../../../shared/writing-plan-presets'
 export {
   NOVEL_LENGTH_PRESETS,
   STORY_LENGTH_PRESETS,
@@ -21,6 +21,7 @@ export {
 export interface WritingPlan {
   novelLength: NovelLength
   targetTotalWords: number
+  targetChapters: number
   wordsPerChapter: number
   workType?: string
 }

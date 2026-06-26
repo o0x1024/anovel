@@ -62,7 +62,7 @@ import {
   applyNovelLengthPreset,
   suggestBatchChapterCount
 } from './context/writing-plan'
-import type { NovelLength } from '../../shared/writing-plan-presets'
+import type { NovelLength, PresetNovelLength } from '../../shared/writing-plan-presets'
 import {
   deleteWorkCoverFile,
   pickAndSetWorkCover,
@@ -79,9 +79,14 @@ export function registerIpcHandlers(): void {
   // ==================== 作品 ====================
   ipcMain.handle('work:list', (_e, workType?: string) => workDAO.list(workType))
   ipcMain.handle('work:get', (_e, id: number) => workDAO.getById(id))
-  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; workType?: string }) => {
+  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; workType?: string }) => {
     const id = workDAO.create(input)
-    initWritingPlanForWork(id, input.novelLength ?? 'medium')
+    initWritingPlanForWork(id, {
+      novelLength: input.novelLength ?? 'medium',
+      targetTotalWords: input.targetTotalWords,
+      targetChapters: input.targetChapters,
+      wordsPerChapter: input.wordsPerChapter
+    })
     if (input.workType === 'story') {
       const volumeId = volumeChapterDAO.createVolume(id, '正文', '短故事主线剧情')
       volumeChapterDAO.createChapter(volumeId, '正文', '短故事正文内容')
@@ -169,9 +174,9 @@ export function registerIpcHandlers(): void {
     volumeChapterDAO.reorderVolumes(orderedIds))
 
   ipcMain.handle('writingPlan:get', (_e, workId: number) => loadWritingPlan(workId))
-  ipcMain.handle('writingPlan:update', (_e, workId: number, input: { targetTotalWords?: number; wordsPerChapter?: number; novelLength?: NovelLength }) =>
+  ipcMain.handle('writingPlan:update', (_e, workId: number, input: { targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; novelLength?: NovelLength }) =>
     saveWritingPlan(workId, input))
-  ipcMain.handle('writingPlan:applyNovelLength', (_e, workId: number, novelLength: NovelLength) =>
+  ipcMain.handle('writingPlan:applyNovelLength', (_e, workId: number, novelLength: PresetNovelLength) =>
     applyNovelLengthPreset(workId, novelLength))
   ipcMain.handle('writingPlan:getStatus', (_e, workId: number) => getWritingPlanStatus(workId))
   ipcMain.handle('writingPlan:suggestBatchCount', (_e, workId: number, volumeId: number) => {

@@ -66,6 +66,7 @@ export interface EditorNav {
   goToStep: (key: WorkflowStepKey) => void
   goToPanel?: (key: string) => void
   refreshProgress: () => Promise<void>
+  refreshWork?: () => Promise<void>
   stepProgress: Ref<WorkStepProgress | null>
   quickIdeaTrigger: Ref<number>
 }

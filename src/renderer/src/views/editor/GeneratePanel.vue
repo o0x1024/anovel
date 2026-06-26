@@ -213,6 +213,12 @@ const autoRewrite = ref(false)
 const humanizing = ref(false)
 const styleRewriting = ref(false)
 const autoOptimizeConfig = ref<AutoOptimizeConfig>({ ...DEFAULT_AUTO_OPTIMIZE_CONFIG })
+const autoOptimizeUnlimited = computed({
+  get: () => autoOptimizeConfig.value.maxIterations <= 0,
+  set: (v: boolean) => {
+    autoOptimizeConfig.value.maxIterations = v ? 0 : (autoOptimizeConfig.value.maxIterations > 0 ? autoOptimizeConfig.value.maxIterations : 3)
+  }
+})
 const autoOptimizing = ref(false)
 const autoOptimizeMsg = ref('')
 const autoOptimizeModalOpen = ref(false)
@@ -634,13 +640,6 @@ async function generateBody() {
       result.value = content
     }
     if (content) {
-      if (autoOptimizeConfig.value.enabled) {
-        const optimized = await runAutoOptimize(content)
-        if (optimized !== content) {
-          content = optimized
-          result.value = content
-        }
-      }
       cacheBodyContent(chapterId, content)
       if (selectedChapterId.value === chapterId) {
         await runPostGenerateChecks(content)
@@ -893,8 +892,12 @@ async function runAutoOptimize(content: string): Promise<string> {
   autoOptimizeMsg.value = ''
 
   try {
-    for (let i = 1; i <= config.maxIterations; i++) {
-      autoOptimizeMsg.value = `自动优化中（第 ${i}/${config.maxIterations} 轮）…`
+    const unlimited = config.maxIterations <= 0
+    const max = unlimited ? Infinity : config.maxIterations
+
+    for (let i = 1; i <= max; i++) {
+      const roundLabel = unlimited ? `第 ${i} 轮` : `第 ${i}/${config.maxIterations} 轮`
+      autoOptimizeMsg.value = `自动优化中（${roundLabel}）…`
 
       const diagRes = await window.anovel.invoke(
         'quality:diagnoseAI',
@@ -912,7 +915,7 @@ async function runAutoOptimize(content: string): Promise<string> {
       }
 
       if (!diagRes.success) {
-        autoOptimizeMsg.value = `第 ${i} 轮诊断失败：${diagRes.error}`
+        autoOptimizeMsg.value = `${roundLabel} 诊断失败：${diagRes.error}`
         break
       }
 
@@ -920,7 +923,7 @@ async function runAutoOptimize(content: string): Promise<string> {
       const hardFail = diagRes.hardFail ?? false
 
       if (config.stopOnHardFail && hardFail) {
-        autoOptimizeMsg.value = `第 ${i} 轮总分 ${scoreTotal}，硬失败，停止优化`
+        autoOptimizeMsg.value = `${roundLabel} 总分 ${scoreTotal}，硬失败，停止优化`
         break
       }
 
@@ -940,7 +943,7 @@ async function runAutoOptimize(content: string): Promise<string> {
         autoOptimizeMsg.value = `总分 ${scoreTotal} 已达目标，但存在低于 ${Math.round(config.minSubScoreRatio * 100)}% 的小项，继续优化`
       }
 
-      if (i === config.maxIterations) {
+      if (!unlimited && i === config.maxIterations) {
         autoOptimizeMsg.value = `已达最大轮次，当前总分 ${scoreTotal}（目标 ${config.targetTotalScore}）`
         break
       }
@@ -959,7 +962,7 @@ async function runAutoOptimize(content: string): Promise<string> {
       }
 
       if (!diagRes.report) {
-        autoOptimizeMsg.value = `第 ${i} 轮无诊断报告，停止优化`
+        autoOptimizeMsg.value = `${roundLabel} 无诊断报告，停止优化`
         break
       }
 
@@ -974,7 +977,7 @@ async function runAutoOptimize(content: string): Promise<string> {
       if (fixRes.success && fixRes.content) {
         currentContent = fixRes.content
       } else {
-        autoOptimizeMsg.value = `第 ${i} 轮优化失败：${fixRes.error || '未知错误'}`
+        autoOptimizeMsg.value = `${roundLabel} 优化失败：${fixRes.error || '未知错误'}`
         break
       }
     }
@@ -1963,15 +1966,24 @@ async function copyCompleteStory() {
           </div>
         </label>
 
-        <label class="flex items-center justify-between gap-2 text-sm">
-          <span>最大优化轮次</span>
-          <select v-model.number="autoOptimizeConfig.maxIterations" class="select select-bordered select-xs w-20">
-            <option :value="1">1 轮</option>
-            <option :value="2">2 轮</option>
-            <option :value="3">3 轮</option>
-            <option :value="5">5 轮</option>
-          </select>
-        </label>
+        <div class="space-y-2">
+          <label class="flex items-center justify-between gap-2 text-sm">
+            <span>最大优化轮次</span>
+            <input
+              v-model.number="autoOptimizeConfig.maxIterations"
+              type="number"
+              min="1"
+              max="99"
+              step="1"
+              class="input input-bordered input-xs w-28 text-center"
+              :disabled="autoOptimizeUnlimited"
+            />
+          </label>
+          <label class="flex items-center gap-2 text-sm cursor-pointer">
+            <input v-model="autoOptimizeUnlimited" type="checkbox" class="checkbox checkbox-xs checkbox-primary" />
+            <span>不限轮次</span>
+          </label>
+        </div>
 
         <label class="flex items-center gap-2 text-sm cursor-pointer">
           <input v-model="autoOptimizeConfig.stopOnHardFail" type="checkbox" class="checkbox checkbox-xs checkbox-primary" />

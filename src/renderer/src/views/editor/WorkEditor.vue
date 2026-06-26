@@ -173,6 +173,10 @@ async function refreshProgress() {
   stepProgress.value = await window.anovel.invoke('work:getStepProgress', workId.value) as WorkStepProgress
 }
 
+async function refreshWork() {
+  work.value = await window.anovel.invoke('work:get', workId.value) as WorkInfo
+}
+
 function goToStep(key: WorkflowStepKey) {
   currentStep.value = key
 }
@@ -185,6 +189,7 @@ provide(editorNavKey, {
   goToStep,
   goToPanel,
   refreshProgress,
+  refreshWork,
   stepProgress,
   quickIdeaTrigger
 })
@@ -220,7 +225,7 @@ onMounted(async () => {
   window.anovel.on('app:openExport', onOpenExport)
   window.anovel.on('app:writerBlock', triggerWriterBlock)
   try {
-    work.value = await window.anovel.invoke('work:get', workId.value) as WorkInfo
+    await refreshWork()
     await reloadStyleOptions()
     await refreshProgress()
     const globalDefault = await window.anovel.invoke('model:getGlobalDefault') as { provider: string | null }
@@ -375,56 +380,58 @@ async function doExport() {
         </div>
       </div>
 
-      <div class="px-3 mb-3 text-xs font-bold text-base-content/40 uppercase tracking-wider">
-        创作步骤
-      </div>
-      <ul class="menu menu-sm rounded-box w-full px-1 flex-1 overflow-y-auto scrollbar-thin">
-        <li v-for="step in workflowSteps" :key="step.key">
-          <button
-            type="button"
-            :class="{ 'menu-active': currentStep === step.key }"
-            @click="currentStep = step.key"
-          >
-            <font-awesome-icon :icon="step.icon" class="w-4 h-4 opacity-80" />
-            <span class="flex-1 text-left">{{ step.label }}</span>
-            <span
-              v-if="stepStatusBadge(step.key) === 'done'"
-              class="badge badge-success badge-xs"
-              title="已完成"
-            >✓</span>
-            <span
-              v-else-if="stepStatusBadge(step.key) === 'review'"
-              class="badge badge-info badge-xs"
-              title="待自检"
-            >!</span>
-            <span
-              v-else-if="stepStatusBadge(step.key) === 'ready'"
-              class="badge badge-warning badge-xs"
-              title="可进行"
-            >·</span>
-          </button>
-        </li>
-      </ul>
-
-      <div class="mt-4 pt-4 border-t border-base-300/70 flex flex-col min-h-0 flex-1">
-        <div class="px-3 mb-3 text-xs font-bold text-base-content/40 uppercase tracking-wider shrink-0">
-          工具
+      <div class="flex-1 min-h-0 overflow-y-auto scrollbar-thin pb-3">
+        <div class="px-3 mb-3 text-xs font-bold text-base-content/40 uppercase tracking-wider">
+          创作步骤
         </div>
-        <ul class="menu menu-sm rounded-box w-full px-1 flex-1 overflow-y-auto scrollbar-thin">
-          <li v-for="step in utilitySteps" :key="step.key">
+        <ul class="menu menu-sm rounded-box w-full px-1">
+          <li v-for="step in workflowSteps" :key="step.key">
             <button
               type="button"
               :class="{ 'menu-active': currentStep === step.key }"
               @click="currentStep = step.key"
             >
               <font-awesome-icon :icon="step.icon" class="w-4 h-4 opacity-80" />
-              {{ step.label }}
+              <span class="flex-1 text-left">{{ step.label }}</span>
+              <span
+                v-if="stepStatusBadge(step.key) === 'done'"
+                class="badge badge-success badge-xs"
+                title="已完成"
+              >✓</span>
+              <span
+                v-else-if="stepStatusBadge(step.key) === 'review'"
+                class="badge badge-info badge-xs"
+                title="待自检"
+              >!</span>
+              <span
+                v-else-if="stepStatusBadge(step.key) === 'ready'"
+                class="badge badge-warning badge-xs"
+                title="可进行"
+              >·</span>
             </button>
           </li>
         </ul>
-      </div>
 
-      <ConditionRulesPanel :work-id="workId" />
+        <div class="mt-4 pt-4 border-t border-base-300/70">
+          <div class="px-3 mb-3 text-xs font-bold text-base-content/40 uppercase tracking-wider shrink-0">
+            工具
+          </div>
+          <ul class="menu menu-sm rounded-box w-full px-1">
+            <li v-for="step in utilitySteps" :key="step.key">
+              <button
+                type="button"
+                :class="{ 'menu-active': currentStep === step.key }"
+                @click="currentStep = step.key"
+              >
+                <font-awesome-icon :icon="step.icon" class="w-4 h-4 opacity-80" />
+                {{ step.label }}
+              </button>
+            </li>
+          </ul>
+        </div>
+
+        <ConditionRulesPanel :work-id="workId" class="mt-3" />
+      </div>
 
       <div class="mt-auto px-4 pt-4 border-t border-base-300/60 space-y-2 shrink-0">
         <button
