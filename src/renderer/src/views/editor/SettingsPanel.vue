@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, inject, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onActivated, inject, watch, nextTick } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -332,9 +332,6 @@ const characterCardsRef = ref<{ expandPanel?: () => void; load?: () => Promise<v
 const qualityPanelRef = ref<{ load?: () => Promise<void> } | null>(null)
 
 const workType = ref<string | null>(null)
-window.anovel.invoke('work:get', props.workId).then(w => {
-  workType.value = (w as { work_type?: string })?.work_type ?? null
-})
 
 const editingMeta = computed(() =>
   settingTypes.value.find(st => st.type === editingType.value) ?? null
@@ -357,21 +354,29 @@ function openSettingsPreview() {
   previewOpen.value = true
 }
 
-onMounted(() => {
-  void loadCoreSettings()
-})
+async function loadCoreSettings() {
+  coreSettings.value = await window.anovel.invoke('setting:listByWork', props.workId) as never[]
+}
+
+async function reloadPanelData() {
+  const w = await window.anovel.invoke('work:get', props.workId)
+  workType.value = (w as { work_type?: string })?.work_type ?? null
+  await loadCoreSettings()
+  await characterCardsRef.value?.load?.()
+  await qualityPanelRef.value?.load?.()
+}
+
+onMounted(() => void reloadPanelData())
+onActivated(() => void reloadPanelData())
 
 watch(
   () => props.workId,
   () => {
     genHints.value = ''
     hintsDialogType.value = null
+    void reloadPanelData()
   }
 )
-
-async function loadCoreSettings() {
-  coreSettings.value = await window.anovel.invoke('setting:listByWork', props.workId) as never[]
-}
 
 function bindVersionRef(type: SettingType, el: Element | ComponentPublicInstance | null) {
   if (el && typeof el === 'object' && 'load' in el) {

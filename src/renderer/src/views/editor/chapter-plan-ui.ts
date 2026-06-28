@@ -1,9 +1,5 @@
-import {
-  NOVEL_LENGTH_PRESETS,
-  STORY_LENGTH_PRESETS,
-  getPresetsForType,
-  type NovelLength
-} from '../../../../shared/writing-plan-presets'
+import { volumePlanCountLabel } from '../../../../shared/work-terminology'
+import type { NovelLength } from '../../../../shared/writing-plan-presets'
 
 export type { NovelLength, PresetNovelLength, NovelLengthPreset } from '../../../../shared/writing-plan-presets'
 export {
@@ -55,9 +51,7 @@ export function formatWordCount(n: number): string {
 }
 
 export function volumePlanLabel(vol: VolumePlanStatus, workType?: string): string {
-  const unit = workType === 'story' ? '拍' : '章'
-  if (vol.suggestedChapters <= 0) return `${vol.chapterCount} ${unit}`
-  return `${vol.chapterCount}/${vol.suggestedChapters} ${unit}`
+  return volumePlanCountLabel(vol.chapterCount, vol.suggestedChapters, workType)
 }
 
 export function novelLengthLabel(length: NovelLength, workType?: string): string {

@@ -133,14 +133,15 @@ export function useAssistantChat(conversationId: Ref<number | null>) {
     text: string,
     documentIds: number[] = [],
     documents: Array<{ id: number; title: string }> = [],
-    workReferences: AssistantWorkReference[] = []
+    workReferences: AssistantWorkReference[] = [],
+    knowledgeNoteIds: number[] = []
   ) {
     if (!conversationId.value || !text.trim() || sending.value) return
     const plainDocIds = toPlainDocumentIds(documentIds)
     const plainWorkRefs = toPlainWorkReferences(workReferences)
     localMessageSeq += 1
     const localUserMessageId = -localMessageSeq
-    const hasAttachments = plainDocIds.length > 0 || plainWorkRefs.length > 0
+    const hasAttachments = plainDocIds.length > 0 || plainWorkRefs.length > 0 || knowledgeNoteIds.length > 0
     const metadata: Record<string, unknown> = {}
     if (plainDocIds.length) {
       metadata.documentIds = plainDocIds
@@ -150,6 +151,9 @@ export function useAssistantChat(conversationId: Ref<number | null>) {
     }
     if (plainWorkRefs.length) {
       metadata.workReferences = plainWorkRefs
+    }
+    if (knowledgeNoteIds.length) {
+      metadata.knowledgeNoteIds = knowledgeNoteIds
     }
     messages.value.push({
       id: localUserMessageId,
@@ -168,7 +172,8 @@ export function useAssistantChat(conversationId: Ref<number | null>) {
         conversationId.value,
         text.trim(),
         plainDocIds,
-        plainWorkRefs
+        plainWorkRefs,
+        knowledgeNoteIds
       )
     } catch (e) {
       messages.value = messages.value.filter(m => m.id !== localUserMessageId)

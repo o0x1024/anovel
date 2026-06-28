@@ -45,7 +45,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         body,
         {
           headers: openAICompatibleAuthHeaders(options?.modelType ?? 'openai', apiKey),
-          timeout: 120000,
+          timeout: 240000,
           signal: options?.signal
         }
       )
@@ -120,7 +120,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         {
           headers: openAICompatibleAuthHeaders(options?.modelType ?? 'openai', apiKey),
           responseType: 'stream',
-          timeout: 120000,
+          timeout: 240000,
           signal: options?.signal
         }
       )
@@ -277,7 +277,7 @@ export class GeminiAdapter implements ModelAdapter {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
       const response = await axios.post(url, body, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 120000,
+        timeout: 240000,
         signal: options?.signal
       })
 
@@ -335,7 +335,7 @@ export class GeminiAdapter implements ModelAdapter {
       const response = await axios.post(url, body, {
         headers: { 'Content-Type': 'application/json' },
         responseType: 'stream',
-        timeout: 120000,
+        timeout: 240000,
         signal: options?.signal
       })
 
@@ -434,7 +434,7 @@ export class AnthropicAdapter implements ModelAdapter {
 
       const response = await axios.post(url, body, {
         headers,
-        timeout: 120000,
+        timeout: 240000,
         signal: options?.signal
       })
 
@@ -497,7 +497,7 @@ export class AnthropicAdapter implements ModelAdapter {
       const response = await axios.post(url, { ...body, stream: true }, {
         headers,
         responseType: 'stream',
-        timeout: 120000,
+        timeout: 240000,
         signal: options?.signal
       })
 

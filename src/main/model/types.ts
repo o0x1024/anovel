@@ -68,6 +68,8 @@ export interface ModelRequest {
     excludeCoreTypes?: string[]
     volumeOutlineMode?: 'full' | 'compact' | 'names_only'
     currentVolumeId?: number
+    /** idea 字段注入模式：full=完整 / goal_only=仅创作目标 */
+    ideaMode?: 'full' | 'goal_only'
   }
   /** 是否注入叙事记忆体（伏笔/快照/时间线），正文生成默认 true */
   enrichNarrativeMemory?: boolean

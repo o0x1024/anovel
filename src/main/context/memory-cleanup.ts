@@ -1,13 +1,28 @@
-import { foreshadowingDAO, characterSnapshotDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO } from '../db'
 
 export interface MemoryCleanupResult {
   snapshotsRemoved: number
   foreshadowingRemoved: number
   payoffsReverted: number
+  timelineRemoved?: number
 }
 
 function normalizeDesc(desc: string): string {
   return desc.replace(/\s/g, '').slice(0, 16)
+}
+
+export function resolveWorkIdForChapter(chapterId: number): number | null {
+  const ch = volumeChapterDAO.getChapter(chapterId)
+  if (!ch) return null
+  const row = volumeChapterDAO.get<{ work_id: number }>(
+    'SELECT work_id FROM volumes WHERE id = ?',
+    [ch.volume_id]
+  )
+  return row?.work_id ?? null
+}
+
+export function isEmptyChapterContent(value: unknown): boolean {
+  return value === null || value === undefined || (typeof value === 'string' && value.trim() === '')
 }
 
 /**
@@ -18,6 +33,15 @@ export function clearChapterMemoryBeforeExtract(workId: number, chapterId: numbe
   const foreshadowingRemoved = foreshadowingDAO.deleteByPlantChapter(workId, chapterId)
   const snapshotsRemoved = characterSnapshotDAO.deleteByChapter(chapterId)
   return { snapshotsRemoved, foreshadowingRemoved, payoffsReverted }
+}
+
+/**
+ * 清空某章正文时：撤销本章伏笔回收、删除本章埋设的伏笔与角色快照、删除本章时间线事件。
+ */
+export function clearChapterNarrativeMemory(workId: number, chapterId: number): MemoryCleanupResult {
+  const timelineRemoved = timelineDAO.deleteByChapter(workId, chapterId)
+  const result = clearChapterMemoryBeforeExtract(workId, chapterId)
+  return { ...result, timelineRemoved }
 }
 
 /**

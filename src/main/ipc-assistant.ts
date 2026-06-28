@@ -134,13 +134,15 @@ export function registerAssistantIpcHandlers(): void {
     conversationId: number,
     userText: string,
     documentIds?: number[],
-    workReferences?: AssistantWorkReference[]
+    workReferences?: AssistantWorkReference[],
+    knowledgeNoteIds?: number[]
   ) => runAssistantChat(
     e.sender,
     conversationId,
     userText,
     documentIds ?? [],
-    workReferences ?? []
+    workReferences ?? [],
+    knowledgeNoteIds ?? []
   ))
 
   ipcMain.handle('assistant:editAndResend', async (
@@ -149,14 +151,16 @@ export function registerAssistantIpcHandlers(): void {
     messageId: number,
     newText: string,
     documentIds?: number[],
-    workReferences?: AssistantWorkReference[]
+    workReferences?: AssistantWorkReference[],
+    knowledgeNoteIds?: number[]
   ) => editAndResendAssistantChat(
     e.sender,
     conversationId,
     messageId,
     newText,
     documentIds,
-    workReferences
+    workReferences,
+    knowledgeNoteIds
   ))
 
   ipcMain.handle('assistant:cancelChat', (_e, conversationId: number) =>

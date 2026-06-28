@@ -21,7 +21,7 @@ import {
   ADJUST_WORDS_EXPAND_PROMPT,
   ADJUST_WORDS_COMPRESS_PROMPT
 } from './context/chapter-quality'
-import { stripForbiddenNotIsPatterns } from '../shared/normalize-body-text'
+import { stripDeterministicAiPatterns, stripForbiddenNotIsPatterns } from '../shared/normalize-body-text'
 
 const QUALITY_PATCH_SYSTEM_PROMPT = [
   '你是文字编辑，只输出修复指令 JSON，绝不输出全文。',
@@ -252,11 +252,14 @@ export async function diagnoseChapterQualityAi(
   content: string,
   modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number },
   sender?: import('electron').WebContents
-): Promise<{ success: boolean; error?: string; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: unknown }> {
+): Promise<{ success: boolean; error?: string; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: unknown; preprocessedContent?: string }> {
   const gate = diagnoseChapterQuality(workId, chapterId, content)
   const styleCtx = buildStyleDiagnosisContext(workId)
   const workInfo = workDAO.getById(workId)
   const isStory = workInfo?.work_type === 'story'
+
+  const preprocessedContent = stripDeterministicAiPatterns(content)
+  const diagnosisContent = preprocessedContent
 
   const basePrompt = isStory ? STORY_QUALITY_AI_SYSTEM_PROMPT : QUALITY_AI_SYSTEM_PROMPT
   const systemPrompt = styleCtx
@@ -265,10 +268,10 @@ export async function diagnoseChapterQualityAi(
 
   const resolvedWordTarget = modelOpts?.wordTarget ?? loadWritingPlan(workId).wordsPerChapter
   const anchorSection = buildAnchorDiagnosisSection(workId, chapterId)
-  const sections = [content]
+  const sections = [diagnosisContent]
   if (resolvedWordTarget > 0) {
     const { min, max } = bodyWordCountBounds(resolvedWordTarget)
-    const actualChars = countWords(content)
+    const actualChars = countWords(diagnosisContent)
     const deviation = Math.round(((actualChars - resolvedWordTarget) / resolvedWordTarget) * 100)
     const deviationLabel = deviation > 25 ? '严重超标' : deviation > 10 ? '轻微超标' : deviation < -25 ? '严重不足' : deviation < -10 ? '轻微不足' : '达标'
     sections.push(
@@ -333,7 +336,8 @@ export async function diagnoseChapterQualityAi(
     scoreTotal: reconciled.scoreTotal,
     hardFail: reconciled.hardFail,
     cappedByGate: reconciled.capped,
-    scoreBreakdown
+    scoreBreakdown,
+    ...(preprocessedContent !== content ? { preprocessedContent } : {})
   }
 }
 
@@ -736,11 +740,11 @@ function parseTimelineGeneration(content: string): Array<{
       thinkingEnabled: modelOpts?.thinkingEnabled
     }, { webContents: e.sender })
     return res.success
-      ? { success: true, content: stripForbiddenNotIsPatterns(res.content ?? '') }
+      ? { success: true, content: stripDeterministicAiPatterns(res.content ?? '') }
       : { success: false, error: res.error }
   })
 
-  ipcMain.handle('quality:adjustWordCount', async (e, workId: number, content: string, action: 'expand' | 'compress', modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number }) => {
+  ipcMain.handle('quality:adjustWordCount', async (e, workId: number, content: string, action: 'expand' | 'compress', modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number; chapterId?: number }) => {
     if (!content?.trim()) return { success: false, error: '章节内容为空，无法调整字数。' }
     
     const systemPrompt = action === 'expand' ? ADJUST_WORDS_EXPAND_PROMPT : ADJUST_WORDS_COMPRESS_PROMPT
@@ -748,9 +752,22 @@ function parseTimelineGeneration(content: string): Array<{
     const wordTargetSection = resolvedWordTarget > 0
       ? `\n【目标字数】将字数调整至：约 ${resolvedWordTarget} 字（允许 ±10%，即 ${bodyWordCountBounds(resolvedWordTarget).min}–${bodyWordCountBounds(resolvedWordTarget).max} 字）\n`
       : ''
+
+    const contextSections: string[] = []
+
+    const workCtx = buildWorkContext(workId, { includeCoreSettings: true, includeIdea: true, ideaMode: 'goal_only' })
+    if (workCtx.text) contextSections.push(workCtx.text)
+
+    if (modelOpts?.chapterId) {
+      const chapter = volumeChapterDAO.getChapter(modelOpts.chapterId)
+      if (chapter?.outline?.trim()) {
+        contextSections.push(`【本章大纲】\n${chapter.outline.trim()}`)
+      }
+    }
     
     const prompt = [
       wordTargetSection,
+      ...contextSections.length > 0 ? [contextSections.join('\n\n'), ''] : [],
       '【原文】',
       content
     ].join('\n')
@@ -768,7 +785,7 @@ function parseTimelineGeneration(content: string): Array<{
     }, { webContents: e.sender })
 
     return res.success
-      ? { success: true, content: stripForbiddenNotIsPatterns(res.content ?? '') }
+      ? { success: true, content: stripDeterministicAiPatterns(res.content ?? '') }
       : { success: false, error: res.error }
   })
 
@@ -882,7 +899,12 @@ function parseTimelineGeneration(content: string): Array<{
       patchedText = nextText
       applied.push(patch)
     }
-    return { success: true, patchedText, appliedCount: applied.length, patches: applied }
+    return {
+      success: true,
+      patchedText: stripDeterministicAiPatterns(patchedText),
+      appliedCount: applied.length,
+      patches: applied
+    }
   })
 
   // ==================== 自动优化配置 ====================

@@ -13,6 +13,13 @@ export function bodyWordCountBounds(target: number): { min: number; max: number 
   }
 }
 
+/** 全篇目标总字数是否在 ±10% 容差内（target ≤ 0 表示不校验） */
+export function isTotalWordCountInTargetRange(actual: number, target: number): boolean {
+  if (target <= 0) return true
+  const { min, max } = bodyWordCountBounds(target)
+  return actual >= min && actual <= max
+}
+
 /** 正文生成 user prompt 中的目标字数行（精确中心值，避免区间下限锚定） */
 export function formatBodyWordTargetLine(target: number): string {
   const { min, max } = bodyWordCountBounds(target)

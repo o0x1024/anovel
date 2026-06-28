@@ -624,6 +624,19 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     }
   } catch { /* 已存在 */ }
 
+  // V3.6: 知识库（轻量笔记）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge_notes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title VARCHAR(200) NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      tags_json TEXT,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `)
+
   // V3.6: 主线槽位重构 — hook→opening, ending_structure→ending; rhythm_curve 降级为派生分析（非槽位）
   try {
     if (hasTable(db, 'incubator_storyline_draft_slots')) {

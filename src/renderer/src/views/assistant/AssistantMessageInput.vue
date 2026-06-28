@@ -16,7 +16,7 @@ const modelType = defineModel<string | null>('modelType', { default: null })
 const modelName = defineModel<string | null>('modelName', { default: null })
 
 const emit = defineEmits<{
-  send: [text: string, documentIds: number[], workReferences: AssistantWorkReference[]]
+  send: [text: string, documentIds: number[], workReferences: AssistantWorkReference[], knowledgeNoteIds: number[]]
   cancel: []
   docsCleared: []
   worksCleared: []
@@ -99,6 +99,12 @@ const MAX_INPUT_LINES = 3
 const uploadError = ref('')
 const showDocPicker = ref(false)
 const libraryDocs = ref<{ id: number; title: string; char_count: number }[]>([])
+
+const showKbPicker = ref(false)
+const kbNotes = ref<{ id: number; title: string; content: string }[]>([])
+const attachedKbNoteIds = ref<number[]>([])
+const attachedKbNotes = ref<{ id: number; title: string }[]>([])
+const kbSearchQuery = ref('')
 
 watch(attachedDocIds, (ids) => {
   if (ids.length === 0) emit('docsCleared')
@@ -185,14 +191,40 @@ function onWorkPicked(ref: AssistantWorkReference) {
   emit('workAttached', ref)
 }
 
+async function loadKbNotes() {
+  const keyword = kbSearchQuery.value.trim()
+  if (keyword) {
+    kbNotes.value = await window.anovel.invoke('kb:search', keyword) as typeof kbNotes.value
+  } else {
+    kbNotes.value = await window.anovel.invoke('kb:list') as typeof kbNotes.value
+  }
+  showKbPicker.value = true
+}
+
+function pickKbNote(note: { id: number; title: string; content: string }) {
+  if (!attachedKbNoteIds.value.includes(note.id)) {
+    attachedKbNoteIds.value = [...attachedKbNoteIds.value, note.id]
+    attachedKbNotes.value = [...attachedKbNotes.value, { id: note.id, title: note.title || note.content.slice(0, 30) }]
+  }
+  showKbPicker.value = false
+}
+
+function removeKbNote(id: number) {
+  attachedKbNoteIds.value = attachedKbNoteIds.value.filter(x => x !== id)
+  attachedKbNotes.value = attachedKbNotes.value.filter(x => x.id !== id)
+}
+
 function submit() {
   const text = draft.value.trim()
   if (!text) return
   const docIds = [...attachedDocIds.value]
   const workRefs = [...props.attachedWorks]
+  const kbIds = [...attachedKbNoteIds.value]
   draft.value = ''
-  emit('send', text, docIds, workRefs)
+  emit('send', text, docIds, workRefs, kbIds)
   attachedDocIds.value = []
+  attachedKbNoteIds.value = []
+  attachedKbNotes.value = []
   emit('docsCleared')
   emit('worksCleared')
   nextTick(resizeTextarea)
@@ -210,7 +242,7 @@ function onKeydown(event: KeyboardEvent) {
   <div class="border-t border-base-300 px-4 py-3 shrink-0 bg-base-100">
     <p v-if="uploadError" class="text-xs text-error mb-2">{{ uploadError }}</p>
 
-    <div v-if="attachedDocs.length || attachedWorks.length" class="flex flex-wrap gap-2 mb-2">
+    <div v-if="attachedDocs.length || attachedWorks.length || attachedKbNotes.length" class="flex flex-wrap gap-2 mb-2">
       <div
         v-for="doc in attachedDocs"
         :key="`doc-${doc.id}`"
@@ -243,6 +275,24 @@ function onKeydown(event: KeyboardEvent) {
           class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] leading-none text-error border border-error/20 bg-error/10 hover:bg-error/20 shrink-0"
           title="移除引用"
           @click="removeWork(work)"
+        >
+          ×
+        </button>
+      </div>
+      <div
+        v-for="note in attachedKbNotes"
+        :key="`kb-${note.id}`"
+        class="inline-flex items-center gap-1.5 rounded-md border border-warning/30 bg-warning/5 px-2 py-1 text-xs text-base-content/80 max-w-full"
+      >
+        <span class="inline-flex items-center justify-center w-4 h-4 rounded-sm bg-warning/15 shrink-0">
+          <font-awesome-icon icon="lightbulb" class="w-2.5 h-2.5 text-warning" />
+        </span>
+        <span class="truncate max-w-[220px]" :title="note.title">{{ note.title }}</span>
+        <button
+          type="button"
+          class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] leading-none text-error border border-error/20 bg-error/10 hover:bg-error/20 shrink-0"
+          title="移除知识笔记"
+          @click="removeKbNote(note.id)"
         >
           ×
         </button>
@@ -292,14 +342,23 @@ function onKeydown(event: KeyboardEvent) {
           >
             <font-awesome-icon icon="book" class="w-3.5 h-3.5" />
           </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content"
+            title="从知识库选择"
+            :disabled="sending"
+            @click="loadKbNotes"
+          >
+            <font-awesome-icon icon="lightbulb" class="w-3.5 h-3.5" />
+          </button>
         </div>
 
         <div class="flex items-center gap-2 min-w-0">
           <span
-            v-if="attachedDocs.length || attachedWorks.length"
+            v-if="attachedDocs.length || attachedWorks.length || attachedKbNotes.length"
             class="hidden sm:inline text-[11px] text-base-content/40 tabular-nums shrink-0"
           >
-            {{ attachedDocs.length + attachedWorks.length }} 个引用
+            {{ attachedDocs.length + attachedWorks.length + attachedKbNotes.length }} 个引用
           </span>
 
           <div class="dropdown dropdown-top dropdown-end shrink min-w-0">
@@ -464,6 +523,49 @@ function onKeydown(event: KeyboardEvent) {
       </div>
     </div>
     <form method="dialog" class="modal-backdrop" @click="showDocPicker = false">
+      <button type="button">close</button>
+    </form>
+  </dialog>
+
+  <dialog :class="['modal', { 'modal-open': showKbPicker }]">
+    <div class="modal-box max-w-md">
+      <div class="flex items-center justify-between mb-3 gap-2">
+        <h3 class="font-bold text-lg">从知识库选择</h3>
+      </div>
+      <div class="mb-3">
+        <input
+          v-model="kbSearchQuery"
+          type="text"
+          class="input input-bordered input-sm w-full"
+          placeholder="搜索知识笔记..."
+          @input="loadKbNotes"
+        />
+      </div>
+      <ul v-if="kbNotes.length" class="space-y-1 max-h-60 overflow-y-auto">
+        <li v-for="note in kbNotes" :key="note.id">
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm w-full justify-start text-left"
+            :class="{ 'btn-disabled opacity-60': attachedKbNoteIds.includes(note.id) }"
+            :disabled="attachedKbNoteIds.includes(note.id)"
+            @click="pickKbNote(note)"
+          >
+            <span class="truncate">{{ note.title || note.content.slice(0, 40) }}</span>
+            <span
+              v-if="attachedKbNoteIds.includes(note.id)"
+              class="badge badge-success badge-xs ml-2 shrink-0"
+            >
+              已添加
+            </span>
+          </button>
+        </li>
+      </ul>
+      <p v-else class="text-sm text-base-content/40 py-4 text-center">知识库为空</p>
+      <div class="modal-action">
+        <button type="button" class="btn btn-ghost btn-sm" @click="showKbPicker = false; kbSearchQuery = ''">关闭</button>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop" @click="showKbPicker = false; kbSearchQuery = ''">
       <button type="button">close</button>
     </form>
   </dialog>

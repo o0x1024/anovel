@@ -7,6 +7,7 @@ import {
 } from '../../../../shared/style-step-rules'
 import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../../../shared/style-reference-limits'
 import type { StyleAnalysisResult } from '../../../../shared/assistant-types'
+import { toPlainForIpc } from '../../../../shared/ipc-plain'
 
 interface Style {
   id: number
@@ -243,7 +244,7 @@ async function saveAiAnalysis() {
   aiSaving.value = true
   aiError.value = ''
   try {
-    const id = await window.anovel.invoke('assistant:exportStyle', aiAnalysis.value) as number
+    const id = await window.anovel.invoke('assistant:exportStyle', toPlainForIpc(aiAnalysis.value)) as number
     selectedId.value = id
     panelMode.value = 'detail'
     await loadStyles()

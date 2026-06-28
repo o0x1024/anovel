@@ -447,13 +447,20 @@ export function collectPromptSections(
       workCtxOptions = {
         ...workCtxOptions,
         volumeOutlineMode: workCtxOptions.volumeOutlineMode ?? 'compact',
-        currentVolumeId: workCtxOptions.currentVolumeId ?? ch?.volume_id
+        currentVolumeId: workCtxOptions.currentVolumeId ?? ch?.volume_id,
+        ideaMode: workCtxOptions.ideaMode ?? 'goal_only'
       }
     }
     if (hasWorldviewSection) {
       workCtxOptions = {
         ...workCtxOptions,
         excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'worldview']
+      }
+    }
+    if (isBodyStep) {
+      workCtxOptions = {
+        ...workCtxOptions,
+        excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'pleasure_engine']
       }
     }
     const ctx = buildWorkContext(workId, workCtxOptions)

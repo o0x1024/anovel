@@ -11,6 +11,7 @@ import {
   volumePlanLabel,
   novelLengthSummary
 } from './chapter-plan-ui'
+import { isStoryWorkType, workUnitLabels } from '../../../../shared/work-terminology'
 
 const props = defineProps<{ workId: number; selectedVolumeId?: number | null }>()
 const emit = defineEmits<{ updated: []; 'status-change': [WritingPlanStatus] }>()
@@ -24,10 +25,11 @@ const wordsPerChapter = ref(4000)
 const expanded = ref(false)
 
 const workType = computed(() => status.value?.plan.workType || 'novel')
-const chapterUnit = computed(() => workType.value === 'story' ? '拍' : '章')
-const perChapterLabel = computed(() => workType.value === 'story' ? '每拍字数' : '每章字数')
-const plannedVerb = computed(() => workType.value === 'story' ? '已拆解' : '已规划')
-const planTitle = computed(() => workType.value === 'story' ? '节拍规划' : '章节规划')
+const labels = computed(() => workUnitLabels(workType.value))
+const chapterUnit = computed(() => labels.value.short)
+const perChapterLabel = computed(() => labels.value.perUnitWords)
+const plannedVerb = computed(() => labels.value.plannedVerb)
+const planTitle = computed(() => labels.value.planTitle)
 const planDescription = computed(() => {
   if (workType.value === 'story') {
     return '按短故事目标字数、目标拍数与每拍字数设定节奏基线，引导拆解进度'
@@ -236,8 +238,8 @@ defineExpose({ reload: loadStatus })
       </label>
       <div v-if="status" class="text-xs pb-2 text-base-content/60">
         ≈ <span class="font-medium text-base-content">{{ status.suggestedTotalChapters }}</span> {{ chapterUnit }}
-        <span v-if="status.volumes.length">
-          · 每{{ workType === 'story' ? '分卷' : '卷' }}约
+        <span v-if="!isStoryWorkType(workType) && status.volumes.length">
+          · 每卷约
           <span class="font-medium">{{ Math.ceil(status.suggestedTotalChapters / status.volumes.length) }}</span>
           {{ chapterUnit }}
         </span>
@@ -252,7 +254,7 @@ defineExpose({ reload: loadStatus })
     </div>
 
     <div
-      v-if="selectedVolumeStatus"
+      v-if="selectedVolumeStatus && !isStoryWorkType(workType)"
       class="mt-3 pt-3 border-t border-base-300/50 flex flex-wrap items-center gap-2 text-xs"
     >
       <span class="text-base-content/50">当前分卷</span>
@@ -264,7 +266,7 @@ defineExpose({ reload: loadStatus })
         {{ volumePlanLabel(selectedVolumeStatus, workType) }}
       </span>
       <span v-if="selectedVolumeStatus.gap > 0" class="text-warning">
-        建议再{{ workType === 'story' ? '拆解' : '规划' }} {{ selectedVolumeStatus.gap }} {{ chapterUnit }}
+        建议再{{ labels.planVerb }} {{ selectedVolumeStatus.gap }} {{ chapterUnit }}
       </span>
       <span v-else class="text-success">当前{{ chapterUnit }}数已达建议量</span>
     </div>

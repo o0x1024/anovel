@@ -53,7 +53,7 @@ export const STORY_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> 
   },
   long: {
     label: '长篇故事',
-    description: '人物关系更为复杂，支持多章节深度展现',
+    description: '人物关系更为复杂，支持多节拍深度展现',
     targetTotalWords: 60_000,
     suggestedChapters: 15,
     wordsPerChapter: 4000

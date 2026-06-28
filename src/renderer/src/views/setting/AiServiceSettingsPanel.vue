@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import SearchableModelSelect from '../../components/SearchableModelSelect.vue'
+import StepModelOverridesEditor from '../../components/StepModelOverridesEditor.vue'
 import {
   BUILTIN_PROVIDERS,
   PROTOCOL_OPTIONS,
@@ -114,6 +115,7 @@ let globalDefaultSaveTimer: ReturnType<typeof setTimeout> | null = null
 let genParamsSaveTimer: ReturnType<typeof setTimeout> | null = null
 
 const selectedType = ref('deepseek')
+const stepModelExpanded = ref(false)
 const selectedConfig = computed(() => configs.value.find(c => c.model_type === selectedType.value))
 
 const providerViews = computed((): ProviderView[] => {
@@ -1217,6 +1219,32 @@ function onProtocolChange(protocol: ProviderProtocol) {
     </div>
 
     <VolcengineImageSettings class="mt-6" @toast="(type, message) => showToast(type, message)" />
+
+    <!-- 步骤模型分配 -->
+    <div class="card bg-base-100 shadow-sm border border-base-300/60 mt-6">
+      <div
+        class="card-body p-5 cursor-pointer select-none"
+        :class="{ 'pb-2': stepModelExpanded }"
+        @click="stepModelExpanded = !stepModelExpanded"
+      >
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-lg bg-accent/10 flex items-center justify-center text-accent shrink-0">
+            <font-awesome-icon icon="sliders" class="text-base" />
+          </div>
+          <div class="flex-1 min-w-0">
+            <h4 class="font-semibold">步骤模型分配</h4>
+            <p class="text-xs text-base-content/50">为不同创作步骤指定独立的 AI 模型，未配置的步骤自动使用全局默认</p>
+          </div>
+          <font-awesome-icon
+            :icon="stepModelExpanded ? 'chevron-up' : 'chevron-down'"
+            class="w-4 h-4 text-base-content/40 shrink-0"
+          />
+        </div>
+      </div>
+      <div v-if="stepModelExpanded" class="px-5 pb-5">
+        <StepModelOverridesEditor />
+      </div>
+    </div>
 
     <!-- 添加自定义提供商弹窗 -->
     <dialog :class="['modal', { 'modal-open': showAddModal }]">

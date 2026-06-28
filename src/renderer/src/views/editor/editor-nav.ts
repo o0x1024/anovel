@@ -81,19 +81,19 @@ export const NEXT_STEP_LABELS: Record<WorkflowStepKey, string> = {
   generate: ''
 }
 
-export function getWorkflowStepOrder(workType?: string | null): WorkflowStepKey[] {
-  if (workType === 'story') {
-    return ['incubator', 'settings', 'chapters', 'generate']
-  }
-  return ['incubator', 'settings', 'volumes', 'chapters', 'generate']
-}
-
 export function getNextStepLabel(current: WorkflowStepKey, workType?: string | null): string {
   if (workType === 'story') {
     if (current === 'settings') return '进入节拍大纲'
     if (current === 'chapters') return '进入正文生成'
   }
   return NEXT_STEP_LABELS[current]
+}
+
+export function getWorkflowStepOrder(workType?: string | null): WorkflowStepKey[] {
+  if (workType === 'story') {
+    return ['incubator', 'settings', 'chapters', 'generate']
+  }
+  return ['incubator', 'settings', 'volumes', 'chapters', 'generate']
 }
 
 export function getNextStep(current: WorkflowStepKey, workType?: string | null): WorkflowStepKey | null {

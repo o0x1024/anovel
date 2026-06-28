@@ -10,6 +10,7 @@ import { modelService } from '../../model'
 import { volumeChapterDAO, foreshadowingDAO } from '../../db'
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
+import { formatBodyPromptLines } from '../../../shared/work-terminology'
 import { STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../shared/body-generation-prompt'
 import { humanizeText } from '../humanize-text'
 import { loadWritingPlan } from '../writing-plan'
@@ -23,6 +24,7 @@ import {
 } from '../memory-extract'
 import { clearChapterMemoryBeforeExtract } from '../memory-cleanup'
 import { appLogger } from '../../logger/app-logger'
+import { withGoalLoopModelOptions } from './story-goal-model'
 
 export interface BeatGenResult {
   success: boolean
@@ -52,19 +54,19 @@ function buildBodyPrompt(
   if (!ch) return null
   const volumes = volumeChapterDAO.listVolumes(workId)
   const vol = volumes.find(v => v.id === ch.volume_id)
-  return [
-    goalDescription?.trim()
-      ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本节拍时贯彻该目标（题材/风格/情节走向）。`
-      : '',
-    extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
-    `分卷：${vol?.name || ''}`,
-    vol?.description ? `分卷说明：${vol.description}` : '',
-    `章节：${ch.title}`,
-    formatBodyWordTargetLine(wordTarget),
-    ch.outline
-      ? `章节大纲（本章内容指引，非叙事起点；须先衔接上一章结尾再自然展开）：\n${ch.outline}`
-      : '（暂无章节大纲，请尽量根据作品上下文创作）'
-  ].filter(Boolean).join('\n\n')
+  return formatBodyPromptLines('story', {
+    volDescription: vol?.description,
+    chapterTitle: ch.title,
+    outline: ch.outline,
+    wordTargetLine: formatBodyWordTargetLine(wordTarget)
+  }).concat(
+    [
+      goalDescription?.trim()
+        ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本节拍时贯彻该目标（题材/风格/情节走向）。`
+        : '',
+      extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : ''
+    ].filter(Boolean)
+  ).join('\n\n')
 }
 
 /**
@@ -89,7 +91,7 @@ export async function generateBeatBody(
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
   const response = await modelService.chat(
-    {
+    withGoalLoopModelOptions(workId, {
       prompt,
       systemPrompt: STORY_BODY_GENERATION_SYSTEM,
       step: 'body_generation',
@@ -103,7 +105,7 @@ export async function generateBeatBody(
       chapterId,
       volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
       enrichNarrativeMemory: true
-    },
+    }),
     { stream: false, signal }
   )
 
@@ -154,7 +156,7 @@ async function extractNarrativeMemoryAfterGeneration(
 
   // 1. 提取伏笔种植 + 角色快照
   const memRes = await modelService.chat(
-    {
+    withGoalLoopModelOptions(workId, {
       prompt: content,
       systemPrompt: MEMORY_EXTRACT_SYSTEM_PROMPT,
       workId,
@@ -162,7 +164,7 @@ async function extractNarrativeMemoryAfterGeneration(
       step: 'memory_extract',
       enrichWorkContext: false,
       enrichNarrativeMemory: false
-    },
+    }),
     { stream: false, signal }
   )
 
@@ -186,7 +188,7 @@ async function extractNarrativeMemoryAfterGeneration(
       `- [id:${p.id}] depth:${p.depth ?? 'normal'} 描述：${p.description}`
     ).join('\n')
     const resolveRes = await modelService.chat(
-      {
+      withGoalLoopModelOptions(workId, {
         prompt: [
           '【待回收伏笔列表】',
           pendingList,
@@ -200,7 +202,7 @@ async function extractNarrativeMemoryAfterGeneration(
         step: 'foreshadowing_resolve',
         enrichWorkContext: false,
         enrichNarrativeMemory: false
-      },
+      }),
       { stream: false, signal }
     )
     if (resolveRes.success && resolveRes.content?.trim()) {

@@ -1,7 +1,7 @@
 import { coreSettingDAO, aiFavoriteDAO, writingStyleDAO } from '../db'
 import { STYLE_CORE_DIRECTIVE } from './writing-techniques'
 import { bodyWordCountBounds } from '../../shared/body-word-target'
-import { stripForbiddenNotIsPatterns } from '../../shared/normalize-body-text'
+import { stripDeterministicAiPatterns, stripForbiddenNotIsPatterns } from '../../shared/normalize-body-text'
 import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../shared/style-reference-limits'
 import type { AiTraceIssue } from './ai-trace-detect'
 import { computeDocMetrics, computeHeuristicAiScore } from '../perplexity/heuristic-detect'
@@ -84,6 +84,14 @@ export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
     demo: {
       before: '向外旋开15度，在第十七厘米的位置，上方三毫米处。',
       after: '向外旋开一条窄缝，差不多在中间偏上一点的位置。'
+    }
+  },
+  {
+    label: '禁形容词回环递进',
+    rule: '禁止"X很Y，Y得连Z都W"式回环递进，以及"声音/语气/声线很平/稳/淡/冷"等假装冷静的人设标签。发现即删，不要换成同类写法',
+    demo: {
+      before: '她声音很平，平得连我自己都有点意外。"走吧。"',
+      after: '"走吧。"'
     }
   }
 ]
@@ -578,6 +586,17 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
       }
     }
 
+    if (/形容词回环|很Y，Y得连|语气很平|声音很平/.test(rule)) {
+      const stripped = stripDeterministicAiPatterns(content)
+      if (stripped !== content) {
+        violations.push({
+          rule,
+          detail: '含"X很Y，Y得连Z都W"或"声音/语气很平/稳"等假装冷静的标签句，应直接删除',
+          count: 1
+        })
+      }
+    }
+
     if (/修辞密度|比喻/.test(rule) && !/陈词/.test(rule)) {
       const metaphors = countMetaphors(content)
       const totalChars = content.replace(/\s/g, '').length
@@ -949,6 +968,9 @@ export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
       if (preset) rules.push(preset.rule)
     } else if (issue.type === 'low_burstiness' || issue.type === 'no_short_sentences') {
       const preset = DEEP_ANTI_AI_PRESETS.find(p => p.label === '句长突发性')
+      if (preset) rules.push(preset.rule)
+    } else if (issue.type === 'escalated_adjective_echo') {
+      const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁形容词回环递进')
       if (preset) rules.push(preset.rule)
     } else if (issue.type === 'mechanical_dialogue_tag') {
       const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁机械对话标注')

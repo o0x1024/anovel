@@ -122,3 +122,10 @@ export interface AssistantWorkReference {
   chapterId?: number | null
   title: string
 }
+
+/** 知识库笔记条目 */
+export interface KnowledgeNoteRef {
+  id: number
+  title: string
+  content: string
+}

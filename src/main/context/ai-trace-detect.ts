@@ -1,4 +1,4 @@
-import { stripForbiddenNotIsPatterns } from '../../shared/normalize-body-text'
+import { stripForbiddenNotIsPatterns, stripEscalatedAdjectivePatterns } from '../../shared/normalize-body-text'
 
 export interface AiTraceIssue {
   type: string
@@ -256,6 +256,33 @@ function detectVerbEcho(text: string): { count: number; examples: string[] } {
   return { count: total, examples }
 }
 
+/**
+ * 形容词回环递进："X很Y，Y得连Z都W" / "我语气很平，"
+ * AI 用此句式给主角贴"冷静克制"人设，发现应直接删除。
+ */
+function detectEscalatedAdjectiveEcho(text: string): { count: number; examples: string[] } {
+  const before = text
+  const after = stripEscalatedAdjectivePatterns(text)
+  if (before === after) return { count: 0, examples: [] }
+
+  const patterns: RegExp[] = [
+    /[^，。！？\n""「『]{0,12}很(平|稳|淡|冷|轻|慢|沉)[，,]\1得连[^。！？\n]+[。！？]?/g,
+    /我(?:的)?(?:声音|语气|声线)?很(平|稳|淡|冷|轻|慢)[，,][^。！？\n]*/g,
+    /(?:声音|语气|声线|笔(?:触|画)|手|指)[^。！？\n]{0,6}很(平|稳|淡|冷)[，,]\1得连[^。！？\n]+/g
+  ]
+
+  let total = 0
+  const examples: string[] = []
+  for (const pat of patterns) {
+    const matches = text.match(pat) ?? []
+    total += matches.length
+    for (const m of matches) {
+      if (examples.length < 3) examples.push(m.slice(0, 30))
+    }
+  }
+  return { count: Math.max(total, 1), examples }
+}
+
 export function detectAiTraces(content: string): AiTraceReport {
   const issues: AiTraceIssue[] = []
   const text = content.trim()
@@ -435,6 +462,19 @@ export function detectAiTraces(content: string): AiTraceReport {
     })
   }
 
+  const adjEcho = detectEscalatedAdjectiveEcho(text)
+  if (adjEcho.count >= 1) {
+    issues.push({
+      type: 'escalated_adjective_echo',
+      label: `形容词回环递进（${adjEcho.count}处）— "X很Y，Y得连Z都W" / "语气很平"`,
+      severity: 'warning',
+      count: adjEcho.count,
+      examples: adjEcho.examples.length > 0
+        ? adjEcho.examples
+        : ['声音很平，平得连…', '我语气很平，']
+    })
+  }
+
   const metaphor = detectMetaphorDensity(text)
   if (metaphor.per500 > 1.2) {
     issues.push({
@@ -510,9 +550,10 @@ export const AI_TRACE_POLISH_PROMPT = [
   '3. 修复电报式短句连发：连续3句以上≤10字的断句（“抬起头。看着他。没说话。”），合并或修改打破机械节奏。',
   '4. 修复平行否定结构：“没X，也没Y”“不X，也不Y”，改为不对称表达或只保留一个否定。',
   '5. 修复动词回声：相邻句中同一动词重复（“盯着…盯了”），换用近义词或省略重复。',
-  '6. 修复单段多句号：每段最多保留 1 个“。”，多余句号改逗号、分号或拆成新段。',
-  '7. 修复“不是A，而是B”“不是A，是B”“这不是A，这是B”：删除该句式，改成直接叙述或动作呈现。',
-  '8. 修复动作插入对话中间：把动作移到对话前后独立成段，完整台词单独成段。',
+  '6. 修复形容词回环递进：“X很Y，Y得连Z都W”“我语气很平，”等假装冷静的标签句，直接删除，不要换成同类模板。',
+  '7. 修复单段多句号：每段最多保留 1 个“。”，多余句号改逗号、分号或拆成新段。',
+  '8. 修复“不是A，而是B”“不是A，是B”“这不是A，这是B”：删除该句式，改成直接叙述或动作呈现。',
+  '9. 修复动作插入对话中间：把动作移到对话前后独立成段，完整台词单独成段。',
   '',
   '【输出格式 — 严格遵守，只输出 JSON，不要有任何其他文字】',
   '{"patches": [{"find": "需要修改的原文精确片段", "replace": "修改后的片段"}]}',

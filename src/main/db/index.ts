@@ -59,3 +59,5 @@ export {
   incubatorStateDAO
 } from './dao/incubator'
 export { aigcWordtableDAO } from './dao/aigc-wordtable-dao'
+export { knowledgeNoteDAO } from './dao/knowledge-note-dao'
+export type { KnowledgeNoteRow, KnowledgeNoteCreateInput, KnowledgeNoteUpdateInput } from './dao/knowledge-note-dao'

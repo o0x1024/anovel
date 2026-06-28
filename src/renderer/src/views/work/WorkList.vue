@@ -398,7 +398,9 @@ const novelLengthOptions = computed(() => {
   }))
 })
 
-const chapterUnit = computed(() => workType === 'story' ? '拍' : '章')
+import { workUnitLabels } from '../../../../shared/work-terminology'
+
+const chapterUnit = computed(() => workUnitLabels(workType).short)
 const customLengthSummary = computed(() => `${formatWords(customTargetTotalWords.value)} · ${customTargetChapters.value} ${chapterUnit.value} · 每${chapterUnit.value} ${customWordsPerChapter.value} 字`)
 
 function normalizeCreatePlan() {

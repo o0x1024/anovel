@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onActivated, onUnmounted, watch, computed, inject, nextTick } from 'vue'
 import { useStyleChangeSync } from '../../composables/useStyleChangeSync'
-import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
+import { useBodyGenerationModel, useDiagnosisModel } from '../../composables/useBodyGenerationModel'
 import { useToast } from '../../composables/useToast'
 import { useModelChat } from './useModelChat'
 import PanelTitle from '../../components/PanelTitle.vue'
@@ -20,8 +20,8 @@ import { editorNavKey } from './editor-nav'
 import { toPlainForIpc } from '../../../../shared/ipc-plain'
 import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine, countWords } from '../../../../shared/body-word-target'
+import { formatBodyPromptLines, workUnitLabels } from '../../../../shared/work-terminology'
 import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../../shared/body-generation-prompt'
-import { WORDS_PER_CHAPTER_PRESETS } from '../../../../shared/writing-plan-presets'
 import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../../shared/auto-optimize-config'
 import type { AutoOptimizeConfig } from '../../../../shared/auto-optimize-config'
 import {
@@ -43,6 +43,7 @@ import {
 const props = defineProps<{ workId: number }>()
 const nav = inject(editorNavKey)
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
+const { modelParams: diagModelParams } = useDiagnosisModel(() => props.workId)
 
 interface Chapter {
   id: number
@@ -60,7 +61,6 @@ const selectedVolume = ref<number | null>(null)
 const selectedChapterId = ref<number | null>(null)
 const workType = ref<string | null>(null)
 const wordTarget = ref(4000)
-const wordOptions = WORDS_PER_CHAPTER_PRESETS
 
 const currentPage = ref(1)
 const pageSize = 10
@@ -277,6 +277,7 @@ function pickSelectedChapterId(fallbackId: number | null): number | null {
 }
 
 const bodySystemPrompt = computed(() => workType.value === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM)
+const bodyLabels = computed(() => workUnitLabels(workType.value))
 
 watch(wordTarget, async (value) => {
   if (selectedChapterId.value) await refreshBudgetPreview(selectedChapterId.value)
@@ -485,13 +486,13 @@ async function refreshBudgetPreview(chapterId: number) {
     return
   }
   const vol = volumes.value.find(v => v.id === ch.volume_id)
-  const prompt = [
-    `分卷：${vol?.name || ''}`,
-    vol?.description ? `分卷说明：${vol.description}` : '',
-    `章节：${ch.title}`,
-    buildWordTargetLine(),
-    ch.outline ? `章节大纲（本章内容指引，非叙事起点；须先衔接上一章结尾再自然展开）：\n${ch.outline}` : '（暂无章节大纲，请尽量根据作品上下文创作）'
-  ].filter(Boolean).join('\n\n')
+  const prompt = formatBodyPromptLines(workType.value, {
+    volName: vol?.name,
+    volDescription: vol?.description,
+    chapterTitle: ch.title,
+    outline: ch.outline,
+    wordTargetLine: buildWordTargetLine()
+  }).join('\n\n')
 
   const report = await window.anovel.invoke('context:estimateBudget', {
     prompt,
@@ -596,13 +597,13 @@ async function generateBody() {
   if (!ch) return
 
   const vol = volumes.value.find(v => v.id === ch.volume_id)
-  const prompt = [
-    `分卷：${vol?.name || ''}`,
-    vol?.description ? `分卷说明：${vol.description}` : '',
-    `章节：${ch.title}`,
-    buildWordTargetLine(),
-    ch.outline ? `章节大纲（本章内容指引，非叙事起点；须先衔接上一章结尾再自然展开）：\n${ch.outline}` : '（暂无章节大纲，请尽量根据作品上下文创作）'
-  ].filter(Boolean).join('\n\n')
+  const prompt = formatBodyPromptLines(workType.value, {
+    volName: vol?.name,
+    volDescription: vol?.description,
+    chapterTitle: ch.title,
+    outline: ch.outline,
+    wordTargetLine: buildWordTargetLine()
+  }).join('\n\n')
 
   lastPrompt.value = prompt
   critiqueResult.value = null
@@ -775,7 +776,7 @@ async function styleRewrite() {
     // ====== Step 1: AI 诊断 ======
     const [gate, diagRes] = await Promise.all([
       window.anovel.invoke('quality:diagnose', props.workId, chId, result.value),
-      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, result.value, { ...bodyModelParams(), wordTarget: wordTarget.value })
+      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, result.value, { ...diagModelParams(), wordTarget: wordTarget.value })
     ])
     qualityResult.value = gate as QualityResult
     const aiRes = diagRes as {
@@ -785,11 +786,15 @@ async function styleRewrite() {
       hardFail?: boolean
       cappedByGate?: boolean
       scoreBreakdown?: QualityAiMetrics['breakdown']
+      preprocessedContent?: string
       error?: string
     }
     if (!aiRes.success) {
       showToast('error', aiRes.error || 'AI 诊断失败')
       return
+    }
+    if (aiRes.preprocessedContent) {
+      result.value = aiRes.preprocessedContent
     }
     qualityAiReport.value = aiRes.report || ''
     if (typeof aiRes.scoreTotal === 'number' && typeof aiRes.hardFail === 'boolean') {
@@ -856,7 +861,7 @@ async function styleRewrite() {
       showToast('error', 'AI 诊断未返回报告，无法进行修改')
       return
     }
-    const fixRes = await window.anovel.invoke('quality:applyFixes', props.workId, result.value, qualityAiReport.value, { ...bodyModelParams(), wordTarget: wordTarget.value }) as {
+    const fixRes = await window.anovel.invoke('quality:applyFixes', props.workId, result.value, qualityAiReport.value, { wordTarget: wordTarget.value }) as {
       success: boolean
       content?: string
       error?: string
@@ -904,7 +909,7 @@ async function runAutoOptimize(content: string): Promise<string> {
         props.workId,
         selectedChapterId.value,
         currentContent,
-        { ...bodyModelParams(), wordTarget: wordTarget.value }
+        { ...diagModelParams(), wordTarget: wordTarget.value }
       ) as {
         success: boolean
         report?: string
@@ -971,7 +976,7 @@ async function runAutoOptimize(content: string): Promise<string> {
         props.workId,
         currentContent,
         diagRes.report,
-        { ...bodyModelParams(), wordTarget: wordTarget.value }
+        { wordTarget: wordTarget.value }
       ) as { success: boolean; content?: string; error?: string }
 
       if (fixRes.success && fixRes.content) {
@@ -1034,7 +1039,7 @@ async function runDualChannelCritique() {
       props.workId,
       result.value,
       selectedChapterId.value,
-      bodyModelParams()
+      diagModelParams()
     ) as CritiqueResult & { success?: boolean; error?: string }
     if (res.success) {
       critiqueResult.value = res
@@ -1058,7 +1063,7 @@ async function runQualityAI() {
     const chId = selectedChapterId.value
     const [gate, res] = await Promise.all([
       window.anovel.invoke('quality:diagnose', props.workId, chId, result.value),
-      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, result.value, { ...bodyModelParams(), wordTarget: wordTarget.value })
+      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, result.value, { ...diagModelParams(), wordTarget: wordTarget.value })
     ])
     qualityResult.value = gate as QualityResult
     const aiRes = res as {
@@ -1068,9 +1073,13 @@ async function runQualityAI() {
       hardFail?: boolean
       cappedByGate?: boolean
       scoreBreakdown?: QualityAiMetrics['breakdown']
+      preprocessedContent?: string
       error?: string
     }
     if (aiRes.success) {
+      if (aiRes.preprocessedContent) {
+        updateGeneratedContent(aiRes.preprocessedContent)
+      }
       qualityAiReport.value = aiRes.report || ''
       if (typeof aiRes.scoreTotal === 'number' && typeof aiRes.hardFail === 'boolean') {
         qualityAiMetrics.value = {
@@ -1139,7 +1148,7 @@ async function applyDiagnosisFixes() {
       alert('请先运行 AI 诊断')
       return
     }
-    const res = await window.anovel.invoke('quality:applyFixes', props.workId, result.value, qualityAiReport.value, { ...bodyModelParams(), wordTarget: wordTarget.value }) as {
+    const res = await window.anovel.invoke('quality:applyFixes', props.workId, result.value, qualityAiReport.value, { wordTarget: wordTarget.value }) as {
       success: boolean
       content?: string
       error?: string
@@ -1163,7 +1172,7 @@ async function applyCritiqueFixes() {
   if (!result.value || !critiqueResult.value || applyingCritiqueFixes.value) return
   applyingCritiqueFixes.value = true
   try {
-    const res = await window.anovel.invoke('critique:applyFixes', props.workId, result.value, critiqueResult.value, bodyModelParams()) as {
+    const res = await window.anovel.invoke('critique:applyFixes', props.workId, result.value, critiqueResult.value) as {
       success: boolean
       content?: string
       error?: string
@@ -1182,7 +1191,7 @@ async function adjustWordCount(action: 'expand' | 'compress') {
   if (!result.value || !selectedChapterId.value || adjustingWordCount.value) return
   adjustingWordCount.value = true
   try {
-    const res = await window.anovel.invoke('quality:adjustWordCount', props.workId, result.value, action, { ...bodyModelParams(), wordTarget: wordTarget.value }) as {
+    const res = await window.anovel.invoke('quality:adjustWordCount', props.workId, result.value, action, { wordTarget: wordTarget.value, chapterId: selectedChapterId.value }) as {
       success: boolean
       content?: string
       error?: string
@@ -1245,41 +1254,54 @@ async function extractNarrativeMemory(chapterId: number, content: string) {
 
 async function saveToChapter() {
   const ch = selectedChapter.value
-  if (!ch || !result.value) return
+  if (!ch) return
 
-  const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
-  gateResult.value = gate
-  if (!gate.passed) {
-    const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
-    if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
-  } else if (gate.warnings.length > 0) {
-    const msg = gate.warnings.slice(0, 5).join('\n')
-    if (!confirm(`保存前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续保存？`)) return
+  const isClearing = !result.value.trim()
+
+  if (!isClearing) {
+    const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
+    gateResult.value = gate
+    if (!gate.passed) {
+      const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
+      if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
+    } else if (gate.warnings.length > 0) {
+      const msg = gate.warnings.slice(0, 5).join('\n')
+      if (!confirm(`保存前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续保存？`)) return
+    }
   }
 
   savingChapter.value = true
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   try {
-    // 使用 AI 生成时提取的情绪强度（如有），否则尝试从文本中解析
-    const intensity = pendingEmotionIntensity.value ?? extractEmotionIntensity(result.value).intensity
-    pendingEmotionIntensity.value = null
-
     const wordCount = countWords(result.value)
-    // 版本快照由 chapter:update IPC 自动创建（修改 content 时自动存档）
     const updateFields: Record<string, unknown> = {
       content: result.value,
       word_count: wordCount,
       status: 'draft'
     }
-    if (intensity != null) updateFields.emotion_intensity = intensity
+    if (!isClearing) {
+      const intensity = pendingEmotionIntensity.value ?? extractEmotionIntensity(result.value).intensity
+      if (intensity != null) updateFields.emotion_intensity = intensity
+    }
+    pendingEmotionIntensity.value = null
     await window.anovel.invoke('chapter:update', ch.id, updateFields)
     const idx = chapters.value.findIndex(c => c.id === ch.id)
     if (idx >= 0) {
-      chapters.value[idx] = { ...chapters.value[idx], content: result.value, word_count: wordCount }
+      chapters.value[idx] = {
+        ...chapters.value[idx],
+        content: result.value || null,
+        word_count: wordCount
+      }
     }
     clearCachedBodyContent(ch.id)
     await nav?.refreshProgress()
+
+    if (isClearing) {
+      await loadNarrativeMemory(ch.id)
+      showToast('success', '已清空本章正文及关联叙事记忆')
+      return
+    }
 
     const fp = await window.anovel.invoke('fingerprint:checkDeviation', props.workId, ch.id, result.value) as {
       success?: boolean
@@ -1295,7 +1317,7 @@ async function saveToChapter() {
   }
 
   const updateMemory = confirm(
-    '正文已保存。\n\n是否从本章提取叙事记忆（伏笔、角色快照）？\n\n确定后将调用 AI 分析本章并更新记忆体，供后续章节生成使用。'
+    `正文已保存。\n\n是否从本${bodyLabels.value.short}提取叙事记忆（伏笔、角色快照）？\n\n确定后将调用 AI 分析并更新记忆体，供后续${bodyLabels.value.full}生成使用。`
   )
   if (updateMemory) {
     await extractNarrativeMemory(ch.id, result.value)
@@ -1345,13 +1367,83 @@ async function copyBodyContent() {
 }
 
 const isExportingStory = ref(false)
+const clearingAllBody = ref(false)
+
+const hasAnyBodyContent = computed(() => {
+  if (result.value.trim()) return true
+  return chapters.value.some(ch => {
+    const cached = getCachedBodyContent(ch.id)
+    return Boolean(ch.content?.trim() || cached?.trim())
+  })
+})
+
+function resetBodyEditorDiagnostics() {
+  critiqueResult.value = null
+  qualityResult.value = null
+  qualityAiReport.value = ''
+  qualityAiMetrics.value = null
+  worldviewViolations.value = []
+  gateResult.value = null
+  memoryExtractMsg.value = ''
+  fingerprintMsg.value = ''
+  antiAiViolations.value = []
+  humanizeHint.value = ''
+  humanizeMsg.value = ''
+  humanizeStats.value = null
+  pendingEmotionIntensity.value = null
+  crossChapterIssues.value = []
+  crossChapterScanHint.value = ''
+  crossChapterScanMsg.value = ''
+}
+
+async function clearAllBodyContent() {
+  if (clearingAllBody.value || !hasAnyBodyContent.value) return
+
+  const contentBeatCount = chapters.value.filter(ch => {
+    const cached = getCachedBodyContent(ch.id)
+    return Boolean(ch.content?.trim() || cached?.trim())
+  }).length
+
+  if (!confirm(`确定要清空所有节拍的正文内容吗？${contentBeatCount} 个节拍有正文，节拍大纲不会被删除。`)) return
+  if (!confirm('此操作不可撤销，将永久删除全部正文内容。请再次确认是否继续？')) return
+
+  clearingAllBody.value = true
+  try {
+    for (const ch of chapters.value) {
+      const cached = getCachedBodyContent(ch.id)
+      if (ch.content?.trim() || cached?.trim()) {
+        await window.anovel.invoke('chapter:update', ch.id, {
+          content: '',
+          word_count: 0
+        })
+      }
+      clearCachedBodyContent(ch.id)
+    }
+
+    chapters.value = chapters.value.map(ch => ({
+      ...ch,
+      content: null,
+      word_count: 0
+    }))
+    result.value = ''
+    resetBodyEditorDiagnostics()
+    if (selectedChapterId.value) {
+      await loadNarrativeMemory(selectedChapterId.value)
+    }
+    await nav?.refreshProgress()
+    showToast('success', '已清空全部正文及关联叙事记忆')
+  } finally {
+    clearingAllBody.value = false
+  }
+}
+
 async function copyCompleteStory() {
   if (chapters.value.length === 0) return
   isExportingStory.value = true
   try {
     const fullText = chapters.value
       .filter(ch => ch.content && ch.content.trim() !== '')
-      .map((ch, index) => [`第${index + 1}章 ${ch.title.trim()}`, ch.content?.trim()].filter(Boolean).join('\n\n'))
+      .map(ch => ch.content!.trim())
       .join('\n\n')
     
     if (!fullText) {
@@ -1374,7 +1466,7 @@ async function copyCompleteStory() {
     <PanelTitle icon="pen-nib" title="正文生成" />
 
     <div v-if="volumes.length === 0" class="text-center py-12 text-base-content/40">
-      <p>请先创建分卷和章节</p>
+      <p>{{ workType === 'story' ? '系统准备中，请稍候…' : '请先创建分卷和章节' }}</p>
     </div>
 
     <template v-else>
@@ -1402,8 +1494,8 @@ async function copyCompleteStory() {
       >
         <div class="card bg-base-200 border border-base-300 shadow-sm p-3 flex flex-col min-h-0 max-h-[70vh] xl:max-h-none">
           <div class="flex items-center justify-between gap-2 mb-2 shrink-0">
-            <h4 class="font-semibold text-sm">{{ workType === 'story' ? '创作节拍' : '章节' }}</h4>
-            <span class="text-xs text-base-content/40">{{ chapters.length }} {{ workType === 'story' ? '拍' : '章' }}</span>
+            <h4 class="font-semibold text-sm">{{ bodyLabels.sidebarListTitle }}</h4>
+            <span class="text-xs text-base-content/40">{{ chapters.length }} {{ bodyLabels.short }}</span>
           </div>
           <div class="shrink-0 overflow-y-auto space-y-1 min-h-0 max-h-[calc(100vh-18rem)] -mx-1 px-1 mb-3">
             <button
@@ -1456,7 +1548,7 @@ async function copyCompleteStory() {
             <div class="collapse-content text-xs space-y-2 pb-2">
               <template v-if="selectedChapter">
                 <div>
-                  <span class="text-base-content/50">章节大纲</span>
+                  <span class="text-base-content/50">{{ bodyLabels.outline }}</span>
                   <p class="mt-0.5 whitespace-pre-wrap text-base-content/70 max-h-24 overflow-auto">
                     {{ selectedChapter.outline || '（暂无大纲）' }}
                   </p>
@@ -1513,7 +1605,7 @@ async function copyCompleteStory() {
             </div>
           </details>
 
-          <div v-if="workType === 'story'" class="shrink-0 mt-3">
+          <div v-if="workType === 'story'" class="shrink-0 mt-3 space-y-2">
             <button
               type="button"
               class="btn btn-primary btn-block btn-sm gap-2"
@@ -1523,23 +1615,40 @@ async function copyCompleteStory() {
               <font-awesome-icon :icon="isExportingStory ? 'spinner' : 'copy'" :spin="isExportingStory" class="w-3.5 h-3.5" />
               {{ isExportingStory ? '合并复制中...' : '一键合并并复制全文' }}
             </button>
+            <button
+              type="button"
+              class="btn btn-outline btn-error btn-block btn-sm gap-2"
+              :disabled="clearingAllBody || !hasAnyBodyContent"
+              @click="clearAllBodyContent"
+            >
+              <font-awesome-icon :icon="clearingAllBody ? 'spinner' : 'trash-can'" :spin="clearingAllBody" class="w-3.5 h-3.5" />
+              {{ clearingAllBody ? '清空中...' : '清空所有正文' }}
+            </button>
           </div>
         </div>
 
         <div class="card bg-base-200 border border-base-300 shadow-sm p-4 min-w-0 flex flex-col min-h-0">
           <template v-if="selectedChapter">
-            <div class="flex flex-wrap items-center gap-2 mb-3 shrink-0">
-              <h4 class="font-semibold text-base min-w-0 truncate flex-1">
-                {{ workType === 'story' ? '整篇正文' : selectedChapter.title }}
+            <div class="flex items-center gap-2 mb-1 shrink-0">
+              <h4 class="font-semibold text-base min-w-0 truncate">
+                {{ workType === 'story' ? bodyLabels.wholeBodyTitle : selectedChapter.title }}
               </h4>
-              <span class="text-xs text-base-content/40">{{ contentWordCount.toLocaleString() }} 字</span>
-              <label class="text-xs text-base-content/50">目标</label>
-              <select v-model="wordTarget" class="select select-bordered select-xs w-24">
-                <option v-for="w in wordOptions" :key="w" :value="w">{{ w }} 字</option>
-              </select>
+              <span class="text-xs text-base-content/40">{{ contentWordCount.toLocaleString() }} /</span>
+              <input
+                :value="wordTarget"
+                type="text"
+                inputmode="numeric"
+                class="input input-bordered input-xs shrink-0 text-center"
+                style="width: 4rem;"
+                title="目标字数（500-20000）"
+                @change="(e: Event) => { const v = parseInt((e.target as HTMLInputElement).value) || 4000; wordTarget = Math.max(500, Math.min(20000, Math.round(v / 100) * 100)); (e.target as HTMLInputElement).value = String(wordTarget) }"
+              />
+              <span class="text-xs text-base-content/40">字</span>
               <span v-if="wordRange.recommended < wordTarget" class="text-xs text-warning" :title="`根据大纲密度，建议 ${wordRange.min}-${wordRange.max} 字`">
                 建议 ≤{{ wordRange.recommended }}
               </span>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 mb-3 shrink-0">
               <div class="join join-horizontal">
                 <button
                   type="button"
@@ -1578,7 +1687,7 @@ async function copyCompleteStory() {
               </button>
               <button
                 class="btn btn-outline btn-primary btn-sm gap-1"
-                :disabled="!result.trim() || savingChapter || extractingMemory"
+                :disabled="!selectedChapter || savingChapter || extractingMemory"
                 @click="saveToChapter"
               >
                 <font-awesome-icon
@@ -1922,7 +2031,7 @@ async function copyCompleteStory() {
           </template>
 
           <p v-else class="text-sm text-base-content/40 italic flex-1 flex items-center justify-center">
-            请从左侧选择章节
+            {{ bodyLabels.selectHint }}
           </p>
         </div>
       </div>

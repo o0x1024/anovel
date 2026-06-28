@@ -5,6 +5,12 @@ import { assistantModelLabel, ASSISTANT_MODEL_LABELS } from '../services/assista
 import { isSameBodyModelOption } from '../composables/useBodyGenerationModel'
 import { useModelConfigChangeSync } from '../composables/useModelConfigChangeSync'
 
+const props = withDefaults(defineProps<{
+  label?: string
+}>(), {
+  label: ''
+})
+
 const modelType = defineModel<string | null>('modelType', { default: null })
 const modelName = defineModel<string | null>('modelName', { default: null })
 
@@ -63,7 +69,7 @@ const currentLabel = computed(() => {
     opt.model_type === type && opt.model_name === (effectiveName.value ?? '')
   ) ?? modelOptions.value.find(opt => opt.model_type === type)
   return assistantModelLabel(type, effectiveName.value, {
-    showProvider: true,
+    showProvider: !props.label,
     providerLabel: active?.provider_label
   })
 })
@@ -177,9 +183,10 @@ watch(modelOptions, () => {
       class="select select-bordered select-xs w-auto max-w-full text-left inline-flex items-center gap-1.5 min-h-0 h-8 px-3"
       :class="{ 'opacity-50 cursor-not-allowed': loading || modelOptions.length === 0 }"
       :disabled="loading || modelOptions.length === 0"
-      :title="currentLabel"
+      :title="props.label ? `${props.label}：${currentLabel}` : currentLabel"
       @click="open ? closeDropdown() : openDropdown()"
     >
+      <span v-if="props.label" class="text-xs whitespace-nowrap text-base-content/50">{{ props.label }}:</span>
       <span class="text-xs whitespace-nowrap">{{ currentLabel }}</span>
       <font-awesome-icon
         :icon="open ? 'chevron-up' : 'chevron-down'"

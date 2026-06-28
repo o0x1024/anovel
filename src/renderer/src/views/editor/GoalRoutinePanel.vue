@@ -1,7 +1,18 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
+import {
+  GOAL_ROUTINE_PHASE_ORDER,
+  GOAL_ROUTINE_PHASE_LABELS,
+  goalRoutinePhaseLabel,
+  isGoalRoutinePhase,
+  type GoalRoutinePhase
+} from '../../../../shared/goal-routine-phases'
+import { formatDbUtcAsLocal } from '../../../../shared/local-datetime'
+import { isTotalWordCountInTargetRange } from '../../../../shared/body-word-target'
 
 const props = defineProps<{ workId: number }>()
+const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const CONFIG_STORAGE_KEY = 'goalRoutineConfig'
 
@@ -10,8 +21,8 @@ interface GoalConfig {
   requireAllBeatsContent: boolean
   targetTotalWords: number | null
   qualityMin: number
+  diagnoseBodyAfterGeneration: boolean
   checkConsistencyGate: boolean
-  aiPercentMax: number
   checkAntiAiRules: boolean
   maxTurns: number
   goalMatchMin: number
@@ -22,8 +33,8 @@ const DEFAULT_CONFIG: GoalConfig = {
   requireAllBeatsContent: true,
   targetTotalWords: null,
   qualityMin: 85,
+  diagnoseBodyAfterGeneration: true,
   checkConsistencyGate: true,
-  aiPercentMax: 10,
   checkAntiAiRules: true,
   maxTurns: 60,
   goalMatchMin: 85
@@ -51,7 +62,6 @@ interface GoalState {
   turn_count: number
   max_turns: number
   current_phase: string | null
-  last_ai_percent: number | null
   last_quality_score: number | null
   goal_met: number
   update_time: string
@@ -67,7 +77,6 @@ interface GoalCheckResult {
   qualityScore: number
   qualityHardFail: boolean
   gateBlockers: number
-  aiPercent: number
   antiAiViolations: number
   goalMatchScore: number
   goalMatchReason: string
@@ -80,7 +89,6 @@ interface GoalTurn {
   phase: string | null
   action: string | null
   target_chapter_id: number | null
-  ai_percent_after: number | null
   score: number | null
   summary: string | null
   create_time: string
@@ -121,42 +129,49 @@ const statusBadge = computed(() => {
   return map[s ?? 'idle'] ?? 'badge-ghost'
 })
 
-const phaseMap: Record<string, string> = {
-  incubate_outline: '孵化大纲',
-  incubator_gate: '孵化门禁',
-  freeze_storyline: '冻结版本',
-  materialize_settings: '核心设定',
-  generate_character_cards: '主角人设卡',
-  generate_title_hook: '书名导语',
-  overall_self_check: '整体自检',
-  generate_beats: '节拍大纲',
-  draft_body: '正文生成',
-  goal_check: '目标验收',
-  repair_plan: '修复计划',
-  repair_execute: '执行修复'
-}
+const phaseMap = GOAL_ROUTINE_PHASE_LABELS
 
-const phaseLabel = computed(() => {
-  const phase = state.value?.current_phase
-  return phase ? (phaseMap[phase] ?? phase) : '-'
-})
+const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_phase))
 
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
   const s = state.value?.status
-  return s === 'paused' || s === 'cancelled' || (s === 'running' && !running.value)
+  if (!s || s === 'goal_met' || s === 'timeout') return false
+  if (running.value && s === 'running') return false
+  return s === 'paused' || s === 'cancelled'
+    || (s === 'running' && !running.value)
 })
+
+const resumeLabel = computed(() =>
+  state.value?.status === 'timeout' ? '继续运行' : '断点续跑'
+)
 
 const canContinueRepair = computed(() => {
   const s = state.value
-  if (!s) return false
-  if (running.value) return false
-  const finished = s.status === 'goal_met' || s.status === 'timeout' || s.status === 'cancelled' || s.status === 'error'
-  if (!finished) return false
-  if (s.goal_met) return false
-  if ((s.turn_count ?? 0) >= (s.max_turns ?? 0)) return false
-  return true
+  if (!s || running.value || s.goal_met) return false
+  const repairPhases = ['goal_check', 'repair_plan', 'repair_execute']
+  return (s.status === 'timeout' || s.status === 'paused')
+    && repairPhases.includes(s.current_phase ?? '')
 })
+
+const resumeFromPhase = ref<GoalRoutinePhase>('incubate_outline')
+const phasePickerTouched = ref(false)
+
+const showResumePhasePicker = computed(() => {
+  if (running.value) return false
+  const s = state.value
+  if (!s || s.goal_met) return false
+  if (s.status === 'paused' || s.status === 'cancelled' || s.status === 'timeout') return true
+  return (s.turn_count ?? 0) > 0 && Boolean(s.current_phase)
+})
+
+function syncResumePhaseFromState(): void {
+  if (phasePickerTouched.value) return
+  const phase = state.value?.current_phase
+  if (phase && isGoalRoutinePhase(phase)) {
+    resumeFromPhase.value = phase
+  }
+}
 const visibleTurns = computed(() => {
   const ev = liveTurn.value
   if (!ev || ev.status !== 'running') return turns.value
@@ -168,10 +183,9 @@ const visibleTurns = computed(() => {
     phase: ev.phase,
     action: 'running',
     target_chapter_id: null,
-    ai_percent_after: null,
     score: null,
     summary: ev.message,
-    create_time: ''
+    create_time: new Date().toISOString()
   }, ...turns.value]
 })
 
@@ -182,10 +196,9 @@ const dimStatus = computed(() => {
   const cfg = config.value
   return {
     beats: c.totalBeats > 0 && c.contentBeats === c.totalBeats,
-    words: cfg.targetTotalWords === null || cfg.targetTotalWords <= 0 || c.totalWords >= (c.targetWords || cfg.targetTotalWords),
+    words: isTotalWordCountInTargetRange(c.totalWords, c.targetWords),
     quality: c.qualityScore >= 0 && !c.qualityHardFail && c.qualityScore >= cfg.qualityMin,
     gate: c.gateBlockers === 0,
-    ai: c.aiPercent <= cfg.aiPercentMax,
     antiAi: c.antiAiViolations === 0,
     goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin
   }
@@ -199,25 +212,49 @@ async function refreshState() {
   state.value = res.state
   turns.value = res.turns
   running.value = await window.anovel.invoke('goal:isRunning', props.workId) as boolean
+  syncResumePhaseFromState()
 }
 
-async function start() {
-  if (running.value) return
-  running.value = true
-  lastStatus.value = 'running'
-  lastMessage.value = '目标循环启动…'
-  liveTurn.value = null
-  await window.anovel.invoke('goal:start', props.workId, {
+function goalInvokePayload() {
+  return {
     goalDescription: config.value.goalDescription,
     requireAllBeatsContent: config.value.requireAllBeatsContent,
     targetTotalWords: config.value.targetTotalWords,
     qualityMin: config.value.qualityMin,
+    diagnoseBodyAfterGeneration: config.value.diagnoseBodyAfterGeneration,
     checkConsistencyGate: config.value.checkConsistencyGate,
-    aiPercentMax: config.value.aiPercentMax,
     checkAntiAiRules: config.value.checkAntiAiRules,
     maxTurns: config.value.maxTurns,
-    goalMatchMin: config.value.goalMatchMin
-  })
+    goalMatchMin: config.value.goalMatchMin,
+    ...bodyModelParams()
+  }
+}
+
+function resumeInvokePayload() {
+  const payload = goalInvokePayload()
+  if (isGoalRoutinePhase(resumeFromPhase.value)) {
+    return { ...payload, forcePhase: resumeFromPhase.value }
+  }
+  return payload
+}
+
+function resumeStartMessage(): string {
+  const label = goalRoutinePhaseLabel(resumeFromPhase.value)
+  if (state.value?.status === 'timeout') return `从「${label}」继续运行…`
+  if (canResume.value) return `从「${label}」断点续跑…`
+  return '目标循环启动…'
+}
+
+async function start() {
+  if (running.value) return
+  const useResumePayload = showResumePhasePicker.value
+  const payload = useResumePayload ? resumeInvokePayload() : goalInvokePayload()
+  const message = useResumePayload ? resumeStartMessage() : '目标循环启动…'
+  running.value = true
+  lastStatus.value = 'running'
+  lastMessage.value = message
+  liveTurn.value = null
+  await window.anovel.invoke('goal:start', props.workId, payload)
   await refreshState()
 }
 
@@ -228,22 +265,21 @@ async function cancel() {
 
 async function resume() {
   if (running.value) return
+  const payload = resumeInvokePayload()
+  const message = resumeStartMessage()
   running.value = true
   lastStatus.value = 'running'
-  lastMessage.value = '断点续跑启动…'
+  lastMessage.value = message
   liveTurn.value = null
-  await window.anovel.invoke('goal:resume', props.workId)
+  await window.anovel.invoke('goal:resume', props.workId, payload)
   await refreshState()
 }
 
 async function continueRepair() {
   if (running.value) return
-  running.value = true
-  lastStatus.value = 'running'
-  lastMessage.value = '继续修复启动…'
-  liveTurn.value = null
-  await window.anovel.invoke('goal:resume', props.workId, 'goal_check')
-  await refreshState()
+  resumeFromPhase.value = 'goal_check'
+  phasePickerTouched.value = true
+  await resume()
 }
 
 function onProgress(payload: unknown) {
@@ -267,6 +303,7 @@ onUnmounted(() => {
 
 watch(() => props.workId, () => {
   config.value = loadConfig()
+  phasePickerTouched.value = false
   void refreshState()
 })
 
@@ -324,6 +361,14 @@ watch(config, saveConfig, { deep: true })
 
         <div class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-3">
           <p class="text-xs font-bold text-base-content/70">质量验收</p>
+          <label class="flex items-center justify-between gap-3 text-xs cursor-pointer">
+            <span>正文生成后 AI 诊断</span>
+            <input v-model="config.diagnoseBodyAfterGeneration" type="checkbox" :disabled="running"
+              class="checkbox checkbox-xs checkbox-primary" />
+          </label>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">
+            开启后每节拍正文生成完会立即诊断并尝试修复；关闭则跳过，直接进入下一节拍生成。
+          </p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>质量分下限</span>
             <div class="flex items-center gap-1.5">
@@ -349,14 +394,6 @@ watch(config, saveConfig, { deep: true })
 
         <div class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-3">
           <p class="text-xs font-bold text-base-content/70">去 AI 味</p>
-          <label class="flex items-center justify-between gap-3 text-xs">
-            <span>AI 特征上限</span>
-            <div class="flex items-center gap-1.5">
-              <input v-model.number="config.aiPercentMax" type="number" min="0" max="100"
-                :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
-              <span class="text-base-content/40">%</span>
-            </div>
-          </label>
           <label class="flex items-center justify-between gap-3 text-xs cursor-pointer">
             <span>anti-AI 规则零违规</span>
             <input v-model="config.checkAntiAiRules" type="checkbox" :disabled="running"
@@ -375,14 +412,31 @@ watch(config, saveConfig, { deep: true })
         </div>
       </div>
 
+      <div v-if="showResumePhasePicker" class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-2">
+        <label class="text-xs font-bold text-base-content/70">续跑起始步骤</label>
+        <select
+          v-model="resumeFromPhase"
+          :disabled="running"
+          class="select select-bordered select-sm w-full rounded-lg"
+          @change="phasePickerTouched = true"
+        >
+          <option v-for="phase in GOAL_ROUTINE_PHASE_ORDER" :key="phase" :value="phase">
+            {{ GOAL_ROUTINE_PHASE_LABELS[phase] }}
+          </option>
+        </select>
+        <p class="text-[11px] text-base-content/40 leading-relaxed">
+          默认选中上次断点「{{ phaseLabel }}」。可改选任意步骤重新执行，已有内容不会被自动清除。
+        </p>
+      </div>
+
       <div class="flex gap-2 pt-2 border-t border-base-300/60">
         <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
-          启动目标循环
+          {{ state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环' }}
         </button>
         <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" @click="resume">
           <font-awesome-icon icon="forward" class="w-3.5 h-3.5" />
-          断点续跑
+          {{ resumeLabel }}
         </button>
         <button v-if="!running && canContinueRepair" class="btn btn-accent btn-sm gap-2" @click="continueRepair">
           <font-awesome-icon icon="wrench" class="w-3.5 h-3.5" />
@@ -443,13 +497,6 @@ watch(config, saveConfig, { deep: true })
             </div>
           </div>
           <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
-            <span class="text-base-content/50">AI 特征</span>
-            <div class="flex items-center justify-between gap-2">
-              <span class="font-mono">{{ lastCheck.aiPercent }}%</span>
-              <span class="badge badge-xs" :class="dimStatus.ai ? 'badge-success' : 'badge-error'">{{ dimStatus.ai ? '达标' : '未达' }}</span>
-            </div>
-          </div>
-          <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
             <span class="text-base-content/50">anti-AI 规则</span>
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono">{{ lastCheck.antiAiViolations }} 违规</span>
@@ -473,6 +520,7 @@ watch(config, saveConfig, { deep: true })
         <div v-for="t in visibleTurns" :key="t.id"
           class="flex items-start gap-2 text-xs py-1.5 border-b border-base-300/40 last:border-0">
           <span class="badge badge-xs badge-ghost shrink-0">#{{ t.turn_no }}</span>
+          <span class="text-base-content/40 shrink-0 tabular-nums">{{ formatDbUtcAsLocal(t.create_time) }}</span>
           <span class="badge badge-xs shrink-0" :class="t.id === -1 ? 'badge-primary' : 'badge-outline'">
             {{ t.id === -1 ? '运行中' : (t.action ?? t.phase) }}
           </span>

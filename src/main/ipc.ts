@@ -10,6 +10,7 @@ import { registerAiIpcHandlers } from './ai/register-ai-ipc'
 import { registerAssistantIpcHandlers } from './ipc-assistant'
 import { registerLabIpcHandlers } from './ipc-lab'
 import { registerNamesIpcHandlers } from './ipc-names'
+import { registerKnowledgeBaseIpcHandlers } from './ipc-knowledge-base'
 import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
@@ -49,7 +50,8 @@ import { getConditionRules, setConditionRules } from './context/condition-rules'
 import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTrace, checkAntiAiRuleViolations, stripEmDashes, getWorkReferenceText, setWorkReferenceText, getAllAntiAiPresets, getCustomAntiAiPresets, setCustomAntiAiPresets, type AntiAiPreset } from './context/anti-ai-rules'
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { autoRewriteBody } from './context/lab/body-auto-rewrite'
-import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning, type Phase } from './context/goal-routine/story-goal-routine'
+import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning, shouldResumeGoalLoop, type Phase } from './context/goal-routine/story-goal-routine'
+import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
 import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
 import { exportWorkContent } from './context/export-content'
@@ -70,6 +72,11 @@ import {
   setWorkCoverFromBase64
 } from './context/work-cover'
 import { pickAndImportManuscript } from './context/work-import'
+import {
+  clearChapterNarrativeMemory,
+  isEmptyChapterContent,
+  resolveWorkIdForChapter
+} from './context/memory-cleanup'
 import { getWorkBodyText } from './context/assistant/work-reference'
 
 /**
@@ -151,6 +158,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:update', (_e, id: number, fields: Record<string, unknown>) => {
     // 若修改了正文内容，自动创建历史快照
     if (fields.content !== undefined) {
+      if (isEmptyChapterContent(fields.content)) {
+        const workId = resolveWorkIdForChapter(id)
+        if (workId != null) {
+          clearChapterNarrativeMemory(workId, id)
+        }
+      }
       return volumeChapterDAO.updateChapterWithVersion(id, fields as Parameters<typeof volumeChapterDAO.updateChapterWithVersion>[1])
     }
     return volumeChapterDAO.updateChapter(id, fields as Parameters<typeof volumeChapterDAO.updateChapter>[1])
@@ -323,6 +336,13 @@ export function registerIpcHandlers(): void {
     }
   })
 
+  ipcMain.handle('model:getStepModelOverrides', () =>
+    appPreferenceDAO.getStepModelOverrides())
+  ipcMain.handle('model:setStepModelOverrides', (_e, overrides: Record<string, { provider: string; modelName: string; thinkingEnabled?: boolean }>) => {
+    appPreferenceDAO.setStepModelOverrides(overrides)
+    return appPreferenceDAO.getStepModelOverrides()
+  })
+
   // ==================== 锚点 ====================
   ipcMain.handle('anchor:listByWork', (_e, workId: number) => anchorDAO.listByWork(workId))
   ipcMain.handle('anchor:listActive', (_e, workId: number) => anchorDAO.listActiveByWork(workId))
@@ -447,13 +467,30 @@ export function registerIpcHandlers(): void {
 
   // ==================== 目标循环（goal routine）====================
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
-    void runStoryGoalLoop(workId, config ?? {}, e.sender).catch((err) => {
+    let forcePhase: Phase | undefined
+    let cfg: Record<string, unknown> = config ?? {}
+    if (config) {
+      const { forcePhase: fp, ...rest } = config
+      forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
+      cfg = rest
+    }
+    const resume = shouldResumeGoalLoop(workId) || Boolean(forcePhase)
+    void runStoryGoalLoop(workId, cfg, e.sender, resume, forcePhase).catch((err) => {
       appLogger.error('goal_routine', '目标循环启动失败', { workId, error: String(err) })
     })
     return true
   })
-  ipcMain.handle('goal:resume', (e, workId: number, forcePhase?: string) => {
-    void runStoryGoalLoop(workId, {}, e.sender, true, forcePhase as Phase | undefined).catch((err) => {
+  ipcMain.handle('goal:resume', (e, workId: number, options?: Record<string, unknown> | string) => {
+    let forcePhase: Phase | undefined
+    let config: Record<string, unknown> = {}
+    if (typeof options === 'string') {
+      forcePhase = isGoalRoutinePhase(options) ? options : undefined
+    } else if (options) {
+      const { forcePhase: fp, ...rest } = options
+      forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
+      config = rest
+    }
+    void runStoryGoalLoop(workId, config, e.sender, true, forcePhase).catch((err) => {
       appLogger.error('goal_routine', '目标循环续跑失败', { workId, error: String(err) })
     })
     return true
@@ -544,5 +581,8 @@ export function registerIpcHandlers(): void {
 
   // ==================== 名称库 ====================
   registerNamesIpcHandlers()
+
+  // ==================== 知识库 ====================
+  registerKnowledgeBaseIpcHandlers()
 
 }

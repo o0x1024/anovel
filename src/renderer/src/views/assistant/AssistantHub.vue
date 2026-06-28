@@ -179,9 +179,9 @@ function onWorkRemoved(key: string) {
   attachedWorks.value = attachedWorks.value.filter(w => workRefKey(w) !== key)
 }
 
-function onSendMessage(text: string, ids: number[], workRefs: AssistantWorkReference[]) {
+function onSendMessage(text: string, ids: number[], workRefs: AssistantWorkReference[], kbNoteIds: number[] = []) {
   const docs = attachedDocs.value.filter(doc => ids.includes(doc.id))
-  void send(text, ids, docs, workRefs)
+  void send(text, ids, docs, workRefs, kbNoteIds)
 }
 
 function openRoleManager() {

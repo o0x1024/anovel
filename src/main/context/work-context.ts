@@ -54,6 +54,13 @@ export interface WorkContextOptions {
   volumeOutlineMode?: 'full' | 'compact' | 'names_only'
   /** 正文生成时当前卷 ID，配合 compact 避免与 task prompt重复 */
   currentVolumeId?: number
+  /**
+   * idea 字段注入模式
+   * - full：完整注入（默认）
+   * - goal_only：仅保留创作目标摘要，剥离孵化器槽位原文
+   *   （槽位信息已由 core settings 以精炼展开版注入，避免双重注入）
+   */
+  ideaMode?: 'full' | 'goal_only'
 }
 
 export interface WorkContextResult {
@@ -81,8 +88,12 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
   const sections: Record<string, string> = {}
 
   if (includeIdea) {
-    const idea = byType.get('idea')?.trim()
-    if (idea) sections[SETTING_LABELS.idea] = idea
+    const raw = byType.get('idea')?.trim()
+    if (raw) {
+      sections[SETTING_LABELS.idea] = options.ideaMode === 'goal_only'
+        ? trimIdeaToGoal(raw)
+        : raw
+    }
   }
 
   if (includeIncubator) {
@@ -128,6 +139,18 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
   ].join('\n\n')
 
   return { text, sections: Object.fromEntries(Object.entries(sections)) }
+}
+
+/**
+ * 从 idea 全文中只保留标题和【创作目标】段，
+ * 去掉目标循环拼接的孵化器槽位（## 开头的子章节）。
+ * 这些槽位信息已由 core settings 以精炼展开版注入。
+ */
+function trimIdeaToGoal(idea: string): string {
+  const slotStart = idea.indexOf('\n## ')
+  if (slotStart < 0) return idea
+  const goalPart = idea.slice(0, slotStart).trim()
+  return goalPart || idea
 }
 
 function truncateChars(text: string, max: number): string {

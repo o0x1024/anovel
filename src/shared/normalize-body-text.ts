@@ -11,6 +11,35 @@ const FORBIDDEN_NOT_IS_PATTERNS: RegExp[] = [
   /，?不是[^。！？；，\n]{1,40}，?是/g
 ]
 
+/** AI 高频：X很Y，Y得连Z都W / 我语气很平， */
+const ESCALATED_ADJECTIVE_PATTERNS: RegExp[] = [
+  /[^，。！？\n""「『]{0,12}很(平|稳|淡|冷|轻|慢|沉)[，,]\1得连[^。！？\n]+[。！？]?/g,
+  /我(?:的)?(?:声音|语气|声线)?很(平|稳|淡|冷|轻|慢)[，,]/g,
+  /(?:^|[。！？\n""」』])\s*(?:声音|语气|声线|笔(?:触|画)|手|指|握)[^。！？\n]{0,6}很(平|稳|淡|冷)[，,]\1得连[^\n。！？]+[。！？]?/gm
+]
+
+export function stripEscalatedAdjectivePatterns(text: string): string {
+  let result = text
+  for (const pattern of ESCALATED_ADJECTIVE_PATTERNS) {
+    result = result.replace(pattern, '')
+  }
+  return result
+    .replace(/"([^"]*)""([^"]*)"/g, '"$1$2"')
+    .replace(/[，,]{2,}/g, '，')
+    .replace(/^[，；、\s]+/gm, '')
+    .replace(/([。！？；])[，,]/g, '$1')
+    .replace(/[，,]([。！？；])/g, '$1')
+}
+
+/** AI 诊断/修复阶段可直接删除的确定性句式（无需 LLM） */
+export function stripDeterministicAiPatterns(text: string): string {
+  return stripEscalatedAdjectivePatterns(stripForbiddenNotIsPatterns(text))
+}
+
+export function hasDeterministicAiPatterns(text: string): boolean {
+  return stripDeterministicAiPatterns(text) !== text
+}
+
 export function stripForbiddenNotIsPatterns(text: string): string {
   let result = text
   for (const pattern of FORBIDDEN_NOT_IS_PATTERNS) {
@@ -128,6 +157,7 @@ export function normalizeBodyParagraphSpacing(text: string): string {
   result = result.replace(/^#{1,3}\s*第?\s*[0-9一二三四五六七八九十百千万]+章[^\n]*\n+/m, '')
   result = result.replace(/\r\n/g, '\n')
   result = stripForbiddenNotIsPatterns(result)
+  result = stripEscalatedAdjectivePatterns(result)
   result = result.replace(/\n{3,}/g, '\n')
   result = result.replace(/\n\n+/g, '\n')
   result = fixPeriodAsComma(result)

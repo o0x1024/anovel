@@ -15,6 +15,7 @@ const navItems = [
   { path: '/assistant', icon: 'robot', label: 'AI 助手', section: 'intelligence' },
   { path: '/ai-lab', icon: 'flask', label: 'AI 实验室', section: 'intelligence' },
   { path: '/assistant-docs', icon: 'book', label: '文档库', section: 'intelligence' },
+  { path: '/knowledge-base', icon: 'lightbulb', label: '知识库', section: 'intelligence' },
   { path: '/setting', icon: 'cog', label: '系统设置', section: 'system' }
 ]
 

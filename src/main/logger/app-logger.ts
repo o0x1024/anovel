@@ -2,6 +2,7 @@ import { app } from 'electron'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { formatLocalDateTime, localDateString } from '../../shared/local-datetime'
 
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG'
 
@@ -23,11 +24,11 @@ function ensureLogDir(): string {
 }
 
 function todayFileName(): string {
-  return `anovel-${new Date().toISOString().slice(0, 10)}.log`
+  return `anovel-${localDateString()}.log`
 }
 
 function todayLlmFileName(): string {
-  return `anovel-llm-${new Date().toISOString().slice(0, 10)}.log`
+  return `anovel-llm-${localDateString()}.log`
 }
 
 function isLlmCategory(category: string): boolean {
@@ -44,7 +45,7 @@ function formatLine(
   message: string,
   meta?: Record<string, unknown>
 ): string {
-  const ts = new Date().toISOString()
+  const ts = formatLocalDateTime()
   const metaStr = meta && Object.keys(meta).length > 0 ? ` ${JSON.stringify(meta)}` : ''
   return `[${ts}] [${level}] [${category}] ${message}${metaStr}\n`
 }

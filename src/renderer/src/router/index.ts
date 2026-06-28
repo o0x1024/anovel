@@ -39,6 +39,11 @@ const router = createRouter({
       component: () => import('../views/assistant/AssistantDocLibrary.vue')
     },
     {
+      path: '/knowledge-base',
+      name: 'knowledge-base',
+      component: () => import('../views/assistant/KnowledgeBase.vue')
+    },
+    {
       path: '/ai-lab',
       name: 'ai-lab',
       component: () => import('../views/lab/AiLaboratory.vue')

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useStyleChangeSync } from '../../composables/useStyleChangeSync'
-import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import { useRoute, useRouter } from 'vue-router'
 import IncubatorPanel from './IncubatorPanel.vue'
 import SettingsPanel from './SettingsPanel.vue'
@@ -22,12 +21,13 @@ import MaterialsPanel from './MaterialsPanel.vue'
 import StyleStabilityPanel from './StyleStabilityPanel.vue'
 import ConditionRulesPanel from './ConditionRulesPanel.vue'
 import NameRegistryPanel from './NameRegistryPanel.vue'
-import BodyModelSelect from '../../components/BodyModelSelect.vue'
+import StepModelOverridesEditor from '../../components/StepModelOverridesEditor.vue'
 import {
   editorNavKey,
   type WorkflowStepKey,
   type WorkStepProgress
 } from './editor-nav'
+import { workUnitLabels } from '../../../../shared/work-terminology'
 import {
   defaultStyleEvolutionCurve,
   parseStyleEvolutionCurve,
@@ -74,16 +74,9 @@ const evolutionForm = ref<StyleEvolutionCurve>(defaultStyleEvolutionCurve())
 const evolutionSaving = ref(false)
 const quickIdeaTrigger = ref(0)
 
-const { bodyModelType, bodyModelName, bodyThinkingEnabled } = useBodyGenerationModel(() => workId.value)
-const globalDefaultProvider = ref<string | null>(null)
+const showStepModelDialog = ref(false)
 
-const effectiveModelType = computed(() => bodyModelType.value || globalDefaultProvider.value)
-const isDeepSeek = computed(() => effectiveModelType.value === 'deepseek')
-const thinkingOn = computed({
-  get: () => bodyThinkingEnabled.value !== false,
-  set: (val: boolean) => { bodyThinkingEnabled.value = val }
-})
-
+const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : 'novel'))
 const showExportModal = ref(false)
 const exportFormat = ref<'markdown' | 'txt' | 'html'>('markdown')
 const exportIncludeReport = ref(true)
@@ -228,8 +221,6 @@ onMounted(async () => {
     await refreshWork()
     await reloadStyleOptions()
     await refreshProgress()
-    const globalDefault = await window.anovel.invoke('model:getGlobalDefault') as { provider: string | null }
-    globalDefaultProvider.value = globalDefault.provider
   } catch (e) {
     console.error('加载失败:', e)
     router.push(backRoute.value)
@@ -478,20 +469,14 @@ async function doExport() {
           >
             进化
           </button>
-          <BodyModelSelect
-            v-model:model-type="bodyModelType"
-            v-model:model-name="bodyModelName"
-          />
           <button
-            v-if="isDeepSeek"
             type="button"
-            class="btn btn-xs"
-            :class="thinkingOn ? 'btn-primary' : 'btn-ghost'"
-            :title="thinkingOn ? '深度思考已开启' : '深度思考已关闭'"
-            @click="thinkingOn = !thinkingOn"
+            class="btn btn-ghost btn-xs gap-1.5"
+            title="按步骤配置不同 AI 模型"
+            @click="showStepModelDialog = true"
           >
-            <font-awesome-icon icon="brain" class="w-3 h-3" />
-            <span class="ml-1">深度思考</span>
+            <font-awesome-icon icon="sliders" class="w-3 h-3" />
+            <span>模型分配</span>
           </button>
         </div>
       </header>
@@ -567,6 +552,22 @@ async function doExport() {
     </form>
   </dialog>
 
+  <dialog :class="['modal', { 'modal-open': showStepModelDialog }]">
+    <div class="modal-box max-w-3xl max-h-[80vh]">
+      <h3 class="font-bold text-lg mb-1">模型分配</h3>
+      <p class="text-xs text-base-content/50 mb-4">为不同创作步骤指定独立的 AI 模型</p>
+      <div class="overflow-y-auto max-h-[calc(80vh-10rem)] pr-1">
+        <StepModelOverridesEditor />
+      </div>
+      <div class="modal-action">
+        <button type="button" class="btn btn-sm btn-primary" @click="showStepModelDialog = false">完成</button>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop">
+      <button type="button" @click="showStepModelDialog = false">close</button>
+    </form>
+  </dialog>
+
   <dialog :class="['modal', { 'modal-open': showExportModal }]">
     <div class="modal-box max-w-md">
       <h3 class="font-bold text-lg mb-4">导出作品</h3>
@@ -574,19 +575,19 @@ async function doExport() {
         <div>
           <label class="text-xs text-base-content/50">导出范围</label>
           <select v-model="exportScope" class="select select-bordered select-sm w-full mt-1">
-            <option value="work">全书</option>
-            <option value="volume">单卷</option>
-            <option value="chapter">单章</option>
+            <option value="work">{{ exportLabels.exportWhole }}</option>
+            <option v-if="!isStory" value="volume">单卷</option>
+            <option value="chapter">{{ exportLabels.exportSingleUnit }}</option>
           </select>
         </div>
-        <div v-if="exportScope === 'volume'">
+        <div v-if="exportScope === 'volume' && !isStory">
           <label class="text-xs text-base-content/50">选择分卷</label>
           <select v-model="exportVolumeId" class="select select-bordered select-sm w-full mt-1">
             <option v-for="v in exportVolumes" :key="v.id" :value="v.id">{{ v.name }}</option>
           </select>
         </div>
         <div v-if="exportScope === 'chapter'">
-          <label class="text-xs text-base-content/50">选择章节</label>
+          <label class="text-xs text-base-content/50">选择{{ exportLabels.full }}</label>
           <select v-model="exportChapterId" class="select select-bordered select-sm w-full mt-1">
             <option v-for="c in exportChapters" :key="c.id" :value="c.id">{{ c.title }}</option>
           </select>

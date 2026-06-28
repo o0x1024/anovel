@@ -19,6 +19,7 @@ import {
   isWorkScopedModelRequest,
   resolveWorkRequestTemperature
 } from '../context/work-step-temperature'
+import { stepAcceptsRequestModel } from '../../shared/step-model-config'
 
 /**
  * 模型服务 - 统一调用入口
@@ -53,7 +54,7 @@ export class ModelService {
         session.emitPhase('组装上下文', 'running')
       }
 
-      const config = this.selectModel(request.modelType, request.modelName)
+      const { config, stepOverrideThinking } = this.selectModelWithStep(request.modelType, request.modelName, request.step)
       if (!config) {
         const error = '没有可用的模型配置，请先在设置中配置并启用至少一个模型'
         appLogger.error('model', error, { step: request.step, workId: request.workId })
@@ -119,6 +120,10 @@ export class ModelService {
         frequencyPenalty: request.frequencyPenalty ?? stepDefaults.frequencyPenalty,
         presencePenalty: request.presencePenalty ?? stepDefaults.presencePenalty,
         topP: request.topP ?? stepDefaults.topP
+      }
+
+      if (enrichedRequest.thinkingEnabled === undefined && stepOverrideThinking !== undefined) {
+        enrichedRequest.thinkingEnabled = stepOverrideThinking
       }
 
       if (isDeepSeekProvider(config.model_type)) {
@@ -295,30 +300,62 @@ export class ModelService {
     }
   }
 
-  private selectModel(preferredType?: ModelType, preferredModelName?: string | null) {
-    if (preferredType) {
-      const config = modelConfigDAO.getByType(preferredType)
-      if (config && config.is_enabled && config.api_key) {
-        if (preferredModelName?.trim()) {
-          return { ...config, model_name: preferredModelName.trim() }
+  private selectModelWithStep(
+    preferredType?: ModelType,
+    preferredModelName?: string | null,
+    step?: string
+  ): { config: ReturnType<typeof modelConfigDAO.getByType> | null; stepOverrideThinking?: boolean } {
+    // 1. 步骤模型分配（设置页「模型分配」）
+    if (step) {
+      const overrides = appPreferenceDAO.getStepModelOverrides()
+      const override = overrides[step]
+      if (override) {
+        const config = modelConfigDAO.getByType(override.provider)
+        if (config && config.is_enabled && config.api_key) {
+          return {
+            config: { ...config, model_name: override.modelName },
+            stepOverrideThinking: override.thinkingEnabled
+          }
         }
-        return config
       }
     }
 
+    // 2. 作品编辑器槽位 / 调用方显式指定（仅限白名单 step）
+    if (preferredType && stepAcceptsRequestModel(step)) {
+      const config = modelConfigDAO.getByType(preferredType)
+      if (config && config.is_enabled && config.api_key) {
+        if (preferredModelName?.trim()) {
+          return { config: { ...config, model_name: preferredModelName.trim() } }
+        }
+        return { config }
+      }
+    }
+
+    // 3. 全局默认
     const global = appPreferenceDAO.getGlobalLlmDefault()
     if (global.provider) {
       const config = modelConfigDAO.getByType(global.provider)
       if (config && config.is_enabled && config.api_key) {
         if (global.modelName) {
-          return { ...config, model_name: global.modelName }
+          return { config: { ...config, model_name: global.modelName } }
         }
-        return config
+        return { config }
+      }
+    }
+
+    // 4. 非白名单 step 的兜底：仍尝试请求级模型（如助手手动选模）
+    if (preferredType) {
+      const config = modelConfigDAO.getByType(preferredType)
+      if (config && config.is_enabled && config.api_key) {
+        if (preferredModelName?.trim()) {
+          return { config: { ...config, model_name: preferredModelName.trim() } }
+        }
+        return { config }
       }
     }
 
     const allConfigs = modelConfigDAO.list()
-    return allConfigs.find(c => c.is_enabled && c.api_key) ?? null
+    return { config: allConfigs.find(c => c.is_enabled && c.api_key) ?? null }
   }
 
   private withNormalizedBody(

@@ -9,10 +9,17 @@ export const BUILTIN_STYLES_SEEDED_KEY = 'builtin_styles_seeded'
 const GENERATION_PARAMS_KEY = 'generation_params'
 const PERPLEXITY_API_CONFIG_KEY = 'perplexity_api_config'
 const AUTO_OPTIMIZE_CONFIG_KEY = 'auto_optimize_config'
+const STEP_MODEL_OVERRIDES_KEY = 'step_model_overrides'
 
 export interface GlobalLlmDefault {
   provider: string | null
   modelName: string | null
+}
+
+export interface StepModelOverride {
+  provider: string
+  modelName: string
+  thinkingEnabled?: boolean
 }
 
 export interface GenerationParams {
@@ -137,6 +144,47 @@ export class AppPreferenceDAO extends BaseDAO {
       }
     } catch {
       return { ...DEFAULT_AUTO_OPTIMIZE_CONFIG }
+    }
+  }
+
+  getStepModelOverrides(): Record<string, StepModelOverride> {
+    const raw = this.getPreference(STEP_MODEL_OVERRIDES_KEY)
+    if (!raw) return {}
+    try {
+      const parsed = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null) return {}
+      const result: Record<string, StepModelOverride> = {}
+      for (const [step, val] of Object.entries(parsed)) {
+        const v = val as Partial<StepModelOverride> | undefined
+        if (v && typeof v.provider === 'string' && typeof v.modelName === 'string') {
+          result[step] = {
+            provider: v.provider,
+            modelName: v.modelName,
+            ...(typeof v.thinkingEnabled === 'boolean' ? { thinkingEnabled: v.thinkingEnabled } : {})
+          }
+        }
+      }
+      return result
+    } catch {
+      return {}
+    }
+  }
+
+  setStepModelOverrides(overrides: Record<string, StepModelOverride>): void {
+    const clean: Record<string, StepModelOverride> = {}
+    for (const [step, val] of Object.entries(overrides)) {
+      if (val.provider && val.modelName) {
+        clean[step] = {
+          provider: val.provider,
+          modelName: val.modelName,
+          ...(typeof val.thinkingEnabled === 'boolean' ? { thinkingEnabled: val.thinkingEnabled } : {})
+        }
+      }
+    }
+    if (Object.keys(clean).length === 0) {
+      this.setPreference(STEP_MODEL_OVERRIDES_KEY, null)
+    } else {
+      this.setPreference(STEP_MODEL_OVERRIDES_KEY, JSON.stringify(clean))
     }
   }
 

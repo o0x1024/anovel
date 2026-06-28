@@ -108,7 +108,7 @@ export function buildAnalysisUserPrompt(
   if (characters && characters.length > 0) {
     sections.push(`【可选择的角色名称库（正文与设定必须使用此库中已有角色，禁止自行臆造名字）】\n角色：${characters.join('、')}\n（注意：若本分析涉及人物名称，请务必优先且只能从上述已知角色名称中进行挑选和关联，禁止自行生成或编造新角色名字）`)
   } else {
-    sections.push('【角色命名严格约束】\n涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代，若需提及配角与反派请统一使用"张某"、"李某"、"王某"等泛化代称。')
+    sections.push('【角色命名严格约束】\n涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代')
   }
   return sections.join('\n\n')
 }
@@ -451,7 +451,7 @@ export function buildDiagnoseApplyUserPrompt(
   if (characters && characters.length > 0) {
     parts.push('', '【可选择的角色名称库】', `角色：${characters.join('、')}`, '（注意：进行修复入槽动作时，涉及人物名称请务必优先且只能从上述已知角色名称中进行挑选和关联，禁止自行生成或编造新角色名字）')
   } else {
-    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代，若需提及配角与反派请统一使用"张某"、"李某"、"王某"等泛化代称。')
+    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代')
   }
   return parts.join('\n')
 }
@@ -501,7 +501,7 @@ export function buildGateCheckUserPrompt(
   if (characters && characters.length > 0) {
     parts.push('', '【角色名称库】', `角色：${characters.join('、')}`, '（涉及人物名称请务必从上述已知角色名称中挑选，禁止编造新角色名字）')
   } else {
-    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代，若需提及配角与反派请统一使用"张某"、"李某"、"王某"等泛化代称。')
+    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代')
   }
   if (userInstruction?.trim()) {
     parts.push('', '【用户的指导性意见/人工审查指令】', userInstruction.trim(), '（请务必优先且严格遵循上述人工意见与审查指令，对指定内容/逻辑开展针对性校验和修正判定）')
@@ -586,7 +586,7 @@ export function buildGateFixUserPrompt(
   if (characters && characters.length > 0) {
     parts.push('', '【可选择的角色名称库】', `角色：${characters.join('、')}`, '（注意：进行门禁自动修复时，涉及人物名称请务必优先且只能从上述已知角色名称中进行挑选和关联，禁止自行生成或编造新角色名字）')
   } else {
-    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代，若需提及配角与反派请统一使用"张某"、"李某"、"王某"等泛化代称。')
+    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代')
   }
   return parts.join('\n')
 }
@@ -627,7 +627,7 @@ export function buildTweakUserPrompt(
   if (characters && characters.length > 0) {
     parts.push('', '【可选择的角色名称库】', `角色：${characters.join('、')}`, '（注意：进行主线微调时，涉及人物名称请务必优先且只能从上述已知角色名称中进行挑选和关联，禁止自行生成或编造新角色名字）')
   } else {
-    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代，若需提及配角与反派请统一使用"张某"、"李某"、"王某"等泛化代称。')
+    parts.push('', '【角色命名严格约束】', '涉及人物名称时，禁止自行臆造具体人名。主角请统一使用"男主"、"女主"指代')
   }
   return parts.join('\n')
 }

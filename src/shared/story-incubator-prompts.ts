@@ -2,7 +2,7 @@ import { type IncubatorSlotKey } from './incubator-slots'
 import { INCUBATOR_ANTI_MEDIOCRITY } from './incubator-analysis-prompts'
 
 const JSON_ONLY = '【严格约束】\n只输出一个纯 JSON 对象，禁止使用 Markdown 格式（不要使用代码块标签），禁止输出任何标题、解释或 JSON 结构外的文字。'
-const CHARACTER_NAME_CONSTRAINT = '【角色命名严格约束】\n生成的大纲和所有方案内容中，绝对禁止出现具体的角色人名（无论中英文）。主角必须统一使用"男主"、"女主"指代，配角与反派必须统一使用"张某"、"李某"、"王某"、"张某某"等泛化代称。'
+const CHARACTER_NAME_CONSTRAINT = '【角色命名严格约束】\n生成的大纲和所有方案内容中，绝对禁止出现具体的角色人名（无论中英文）。主角必须统一使用"男主"、"女主"指代'
 
 function cardExpandExample(fields: string): string {
   return `示例：{"versions":[{"title":"方案A-方案名","summary":"${fields}"},{"title":"方案B-方案名","summary":"（内容结构与方案A相同，切入点不同）"},{"title":"方案C-方案名","summary":"（内容结构与方案A相同，切入点不同）"}]}`

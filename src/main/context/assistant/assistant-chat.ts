@@ -4,7 +4,8 @@ import {
   assistantDocumentDAO,
   assistantMessageDAO,
   assistantRoleDAO,
-  writingStyleDAO
+  writingStyleDAO,
+  knowledgeNoteDAO
 } from '../../db'
 import { resolveAssistantGlobalRoleId } from './global-role'
 import { modelService } from '../../model'
@@ -114,11 +115,24 @@ function buildDocumentContext(documentIds: number[]): string {
 
 function buildReferenceContext(
   documentIds: number[],
-  workReferences: AssistantWorkReference[] = []
+  workReferences: AssistantWorkReference[] = [],
+  knowledgeNoteIds: number[] = []
 ): string {
   const docContext = buildDocumentContext(documentIds)
   const workContext = buildWorkReferenceContext(workReferences)
-  return [docContext, workContext].filter(Boolean).join('\n\n').trim()
+  const kbContext = buildKnowledgeNoteContext(knowledgeNoteIds)
+  return [docContext, workContext, kbContext].filter(Boolean).join('\n\n').trim()
+}
+
+function buildKnowledgeNoteContext(noteIds: number[]): string {
+  const parts: string[] = []
+  for (const id of noteIds) {
+    const note = knowledgeNoteDAO.getById(id)
+    if (!note?.content?.trim()) continue
+    const label = note.title ? `【知识笔记：${note.title}】` : '【知识笔记】'
+    parts.push(`${label}\n${note.content.trim()}`)
+  }
+  return parts.join('\n\n')
 }
 
 function buildUserPrompt(
@@ -145,7 +159,8 @@ export async function runAssistantChat(
   conversationId: number,
   userText: string,
   documentIds: number[] = [],
-  workReferences: AssistantWorkReference[] = []
+  workReferences: AssistantWorkReference[] = [],
+  knowledgeNoteIds: number[] = []
 ): Promise<{ userMessageId: number; assistantMessageId: number }> {
   activeChats.get(conversationId)?.abort()
   const controller = new AbortController()
@@ -158,8 +173,11 @@ export async function runAssistantChat(
   const trimmed = userText.trim()
   if (!trimmed) throw new Error('消息不能为空')
 
-  const hasAttachments = documentIds.length > 0 || workReferences.length > 0
+  const hasAttachments = documentIds.length > 0 || workReferences.length > 0 || knowledgeNoteIds.length > 0
   const attachmentMetadata = buildAttachmentMetadata(documentIds, workReferences)
+  if (knowledgeNoteIds.length && attachmentMetadata) {
+    (attachmentMetadata as Record<string, unknown>).knowledgeNoteIds = knowledgeNoteIds
+  }
   const userMessageId = assistantMessageDAO.create({
     conversation_id: conversationId,
     role: 'user',
@@ -168,7 +186,7 @@ export async function runAssistantChat(
     metadata_json: attachmentMetadata ? JSON.stringify(attachmentMetadata) : null
   })
 
-  const docContext = buildReferenceContext(documentIds, workReferences)
+  const docContext = buildReferenceContext(documentIds, workReferences, knowledgeNoteIds)
   const rules: string[] = role.analysis_rules_json ? JSON.parse(role.analysis_rules_json) : []
   const workStyleAddon = buildWorkStyleAddonForAssistant(workReferences)
   const systemPrompt = [
@@ -338,7 +356,8 @@ export async function editAndResendAssistantChat(
   messageId: number,
   newText: string,
   documentIds?: number[],
-  workReferences?: AssistantWorkReference[]
+  workReferences?: AssistantWorkReference[],
+  knowledgeNoteIds?: number[]
 ): Promise<{ userMessageId: number; assistantMessageId: number }> {
   const msg = assistantMessageDAO.getById(messageId)
   if (!msg || msg.conversation_id !== conversationId) {
@@ -350,21 +369,24 @@ export async function editAndResendAssistantChat(
 
   let docIds = documentIds ?? []
   let workRefs = workReferences ?? []
+  let kbIds = knowledgeNoteIds ?? []
   if (msg.metadata_json) {
     try {
       const meta = JSON.parse(msg.metadata_json) as {
         documentIds?: number[]
         workReferences?: AssistantWorkReference[]
+        knowledgeNoteIds?: number[]
       }
       if (!docIds.length) docIds = meta.documentIds ?? []
       if (!workRefs.length) workRefs = meta.workReferences ?? []
+      if (!kbIds.length) kbIds = meta.knowledgeNoteIds ?? []
     } catch {
       // ignore malformed metadata
     }
   }
 
   assistantMessageDAO.deleteFromId(conversationId, messageId)
-  return runAssistantChat(sender, conversationId, newText, docIds, workRefs)
+  return runAssistantChat(sender, conversationId, newText, docIds, workRefs, kbIds)
 }
 
 export function exportStyleFromAnalysis(

@@ -13,6 +13,7 @@ import { editorNavKey } from './editor-nav'
 import { type WritingPlanStatus, volumePlanLabel, DEFAULT_WORDS_PER_CHAPTER } from './chapter-plan-ui'
 import { getPanelPage, setPanelPage } from '../../services/editorPanelPageState'
 import { outlineConstraintsForWordTarget } from '../../../../shared/outline-constraints'
+import { workUnitLabels } from '../../../../shared/work-terminology'
 
 const props = defineProps<{ workId: number }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
@@ -159,9 +160,9 @@ const batchSystemPrompt = computed(() => {
       '【输出格式 - 必须严格遵守】',
       '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
       'chapters 数组每一项为一个节拍（请勿输出“第X章”或“节拍X”字样，直接写节拍剧情标题即可）。',
-      `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。`,
+      `每拍字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本拍出场角色名数组）。`,
       'beat_role: A(爽点释放)/B(进行中)/C(铺垫)/transition(过渡)',
-      'foreshadow_target: 铺垫的下一节点；next_hook: 结尾悬念（仅写在 JSON 字段内，不要单独成章）。',
+      'foreshadow_target: 铺垫的下一节点；next_hook: 结尾悬念（仅写在 JSON 字段内，不要单独成拍）。',
       'characters: 从人设卡片或核心设定中选取本节拍实际出场角色。',
       `【长度】每项 plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每节拍目标 ${wpc} 字正文），禁止正文级长文。`,
       `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}`
@@ -218,6 +219,8 @@ function parsedChapterCharacterNames(ch: ParsedChapter): string[] {
 
 const selectedVolumeInfo = ref<{ id: number; name: string; description?: string | null } | null>(null)
 const workType = ref<string | null>(null)
+const unitLabels = computed(() => workUnitLabels(workType.value))
+const unitNoun = computed(() => unitLabels.value.full)
 
 async function reloadVolumes() {
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
@@ -304,9 +307,10 @@ watch(batchResult, async (content) => {
   }
   parsedChapters.value = await window.anovel.invoke('chapter:parseSuggestions', content) as ParsedChapter[]
   if (parsedChapters.value.length === 0) {
+    const unit = unitNoun.value
     batchParseHint.value = /"chapters"\s*:|第\s*\d+\s*章/.test(content)
-      ? '未能从生成结果中解析出章节，请确认末尾 JSON 完整，或点击「重新解析」重试'
-      : '生成结果中未识别到章节结构，请重新生成或检查 AI 是否输出了 JSON 代码块'
+      ? `未能从生成结果中解析出${unit}，请确认末尾 JSON 完整，或点击「重新解析」重试`
+      : `生成结果中未识别到${unit}结构，请重新生成或检查 AI 是否输出了 JSON 代码块`
     return
   }
 })
@@ -315,7 +319,7 @@ async function reparseBatchResult() {
   if (!batchResult.value) return
   parsedChapters.value = await window.anovel.invoke('chapter:parseSuggestions', batchResult.value) as ParsedChapter[]
   if (parsedChapters.value.length === 0) {
-    batchParseHint.value = '仍未解析到章节，请检查 JSON 是否完整、未被截断'
+    batchParseHint.value = `仍未解析到${unitNoun.value}，请检查 JSON 是否完整、未被截断`
   } else {
     batchParseHint.value = ''
   }
@@ -375,7 +379,7 @@ async function addChapter() {
 }
 
 async function deleteChapter(id: number, title: string) {
-  const noun = workType.value === 'story' ? '节拍' : '章节'
+  const noun = unitNoun.value
   if (!confirm(`删除${noun}「${title}」？`)) return
   await window.anovel.invoke('chapter:delete', id)
   await loadChapters(selectedVolume.value!)
@@ -406,7 +410,7 @@ function selectAllChapters() {
 async function batchDeleteChapters() {
   const count = batchSelectedIds.value.size
   if (count === 0) return
-  const noun = workType.value === 'story' ? '节拍' : '章节'
+  const noun = unitNoun.value
   if (!confirm(`确定删除选中的 ${count} 个${noun}？此操作不可撤销。`)) return
   for (const id of batchSelectedIds.value) {
     await window.anovel.invoke('chapter:delete', id)
@@ -455,7 +459,7 @@ async function saveChapterVersion() {
 
 async function restoreVersion(versionId: number) {
   const chId = editingChapterId.value || selectedChapterId.value
-  const noun = workType.value === 'story' ? '节拍' : '章节'
+  const noun = unitNoun.value
   if (!chId || !confirm(`恢复此版本将覆盖当前${noun}内容，确定继续？`)) return
   await window.anovel.invoke('chapter:versionRestore', chId, versionId)
   const updated = await window.anovel.invoke('chapter:get', chId) as Chapter
@@ -585,9 +589,12 @@ function renumberTitle(title: string, newNum: number): string {
 
 async function applyParsedChapters(mode: 'append' | 'replace') {
   if (!selectedVolume.value || parsedChapters.value.length === 0 || applyingChapters.value) return
-  const noun = workType.value === 'story' ? '节拍' : '章节'
+  const noun = unitNoun.value
   if (mode === 'replace') {
-    if (!confirm(`将替换当前分卷下 ${chapters.value.length} 个${noun}，确定继续？`)) return
+    const msg = workType.value === 'story'
+      ? `将替换全部 ${chapters.value.length} 个${noun}，确定继续？`
+      : `将替换当前分卷下 ${chapters.value.length} 个${noun}，确定继续？`
+    if (!confirm(msg)) return
   }
   applyingChapters.value = true
   try {
@@ -981,7 +988,7 @@ async function runOutlineDiagnosis() {
 
 async function applyAiFixes(revisedChapters: any[]) {
   if (!revisedChapters || revisedChapters.length === 0 || applyingAiFixId.value) return
-  const noun = workType.value === 'story' ? '节拍' : '章节'
+  const noun = unitNoun.value
   if (!confirm(`AI 建议修正其中的 ${revisedChapters.length} 个${noun}大纲，这会覆盖这些${noun}现有的大纲与元属性，并自动备份这些${noun}到各自的「版本历史」中。确定继续？`)) return
   
   applyingAiFixId.value = true
@@ -1064,7 +1071,7 @@ async function clearDiagnosisResult() {
 
 <template>
   <div class="w-full min-w-0">
-    <PanelTitle icon="list-ol" :title="workType === 'story' ? '节拍大纲' : '章节情节'" />
+    <PanelTitle icon="list-ol" :title="unitLabels.outlineStep" />
 
     <div v-if="volumes.length === 0" class="text-center py-16 text-base-content/40">
       <font-awesome-icon icon="book" class="text-4xl mb-3 opacity-30" />
@@ -1286,7 +1293,7 @@ async function clearDiagnosisResult() {
 
         <!-- AI 大纲诊断 -->
         <div class="card bg-base-200 border border-base-300 shadow-sm p-4 min-w-0 flex flex-col">
-          <h4 class="font-semibold text-sm mb-3">{{ workType === 'story' ? 'AI 节拍大纲诊断' : 'AI 章节大纲诊断' }}</h4>
+          <h4 class="font-semibold text-sm mb-3">AI {{ unitLabels.outline }}诊断</h4>
           <div class="flex flex-wrap gap-2 mb-3 items-center">
             <label v-if="workType !== 'story'" class="text-xs text-base-content/50">诊断范围</label>
             <select v-if="workType !== 'story'" v-model="diagnosisScope" class="select select-bordered select-sm w-36">
@@ -1330,7 +1337,7 @@ async function clearDiagnosisResult() {
       <div v-if="selectedVolume" class="flex gap-2 mb-6">
         <input
           v-model="newChapterTitle"
-          :placeholder="workType === 'story' ? '节拍标题' : '章节标题'"
+          :placeholder="`${unitLabels.full}标题`"
           class="input input-bordered flex-1"
           @keyup.enter="addChapter"
         />
@@ -1350,9 +1357,9 @@ async function clearDiagnosisResult() {
       <div v-else class="grid grid-cols-1 xl:grid-cols-[minmax(260px,320px)_1fr] gap-3 min-h-[480px]">
         <div class="card bg-base-200 border border-base-300 shadow-sm p-3 flex flex-col min-h-0 max-h-[70vh] xl:max-h-none">
           <div class="flex items-center justify-between gap-2 mb-2 shrink-0">
-            <h4 class="font-semibold text-sm">{{ workType === 'story' ? '节拍列表' : '章节列表' }}</h4>
+            <h4 class="font-semibold text-sm">{{ unitLabels.listTitle }}</h4>
             <div class="flex items-center gap-2">
-              <span class="text-xs text-base-content/40">{{ chapters.length }} {{ workType === 'story' ? '拍' : '章' }}</span>
+              <span class="text-xs text-base-content/40">{{ chapters.length }} {{ unitLabels.short }}</span>
               <button
                 type="button"
                 class="btn btn-outline btn-xs gap-1"
@@ -1505,7 +1512,7 @@ async function clearDiagnosisResult() {
               v-model="chapterOutline"
               rows="12"
               class="textarea textarea-bordered w-full resize-y min-h-[200px]"
-              :placeholder="workType === 'story' ? '节拍大纲...' : '章节大纲...'"
+              :placeholder="`${unitLabels.outline}...`"
             />
             <div class="flex items-center gap-2">
               <label class="text-xs text-base-content/50 shrink-0">情绪强度 (1-10)</label>
@@ -1558,7 +1565,7 @@ async function clearDiagnosisResult() {
                 v-if="chapterOutline.trim()"
                 :work-id="workId"
                 source-step="chapter_outline"
-                :source-label="workType === 'story' ? '节拍大纲' : '章节大纲'"
+                :source-label="unitLabels.outline"
                 :content="chapterOutline"
                 :source-input="lastAiContext"
                 size="xs"
@@ -1584,7 +1591,7 @@ async function clearDiagnosisResult() {
             <p v-else-if="loadingVersions" class="text-xs text-base-content/40 mt-2 shrink-0">加载版本...</p>
           </template>
           <p v-else class="text-sm text-base-content/40 italic flex-1 flex items-center justify-center">
-            请从左侧选择{{ workType === 'story' ? '节拍' : '章节' }}
+            请从左侧选择{{ unitLabels.full }}
           </p>
         </div>
       </div>

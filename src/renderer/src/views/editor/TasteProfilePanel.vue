@@ -128,7 +128,7 @@ const boundProfile = () => profiles.value.find(p => p.id === boundProfileId.valu
         <button class="btn btn-outline btn-primary btn-xs" @click="showCreate = !showCreate">新建档案</button>
         <button class="btn btn-outline btn-xs" :disabled="exporting" @click="exportProfile">导出 JSON</button>
         <button
-          v-if="profiles.length > 1 && boundProfileId"
+          v-if="boundProfileId"
           class="btn btn-outline btn-error btn-xs"
           @click="confirmDeleteProfile = true"
         >删除档案</button>

@@ -1,12 +1,12 @@
 export const STORY_QUALITY_AI_METRIC_DEFS = [
-  { key: 'ai_pattern_ratio', label: 'AI句式占比', max: 15 },
-  { key: 'hook_density', label: '钩子悬念密度', max: 15 },
-  { key: 'emotion_intensity', label: '情绪张力', max: 15 },
-  { key: 'pacing_speed', label: '节奏推进', max: 15 },
-  { key: 'scene_description_cap', label: '场景描写克制', max: 10 },
-  { key: 'dialogue_impact', label: '对话信息密度', max: 10 },
-  { key: 'outline_coverage', label: '大纲覆盖度', max: 10 },
-  { key: 'word_count', label: '字数达标', max: 10 }
+  { key: 'ai_pattern_ratio', label: 'AI句式占比', max: 100 },
+  { key: 'hook_density', label: '钩子悬念密度', max: 100 },
+  { key: 'emotion_intensity', label: '情绪张力', max: 100 },
+  { key: 'pacing_speed', label: '节奏推进', max: 100 },
+  { key: 'scene_description_cap', label: '场景描写克制', max: 100 },
+  { key: 'dialogue_impact', label: '对话信息密度', max: 100 },
+  { key: 'outline_coverage', label: '大纲覆盖度', max: 100 },
+  { key: 'word_count', label: '字数达标', max: 100 }
 ] as const
 
 export type StoryQualityAiMetricKey = (typeof STORY_QUALITY_AI_METRIC_DEFS)[number]['key']
@@ -167,12 +167,14 @@ export function parseStoryQualityAiScoreBreakdown(report: string): StoryQualityA
         })
       : []
 
-    let computedTotal = items.reduce((sum, it) => sum + it.score, 0)
+    const computedAvg = items.length > 0
+      ? Math.round(items.reduce((sum, it) => sum + it.score, 0) / items.length)
+      : 0
     let explicitTotal = parsed.scoreTotal ?? parsed.score_total
     if (typeof explicitTotal !== 'number') {
       explicitTotal = parseInt(explicitTotal, 10)
     }
-    const scoreTotal = Number.isFinite(explicitTotal) && explicitTotal > 0 ? explicitTotal : computedTotal
+    const scoreTotal = Number.isFinite(explicitTotal) && explicitTotal > 0 ? explicitTotal : computedAvg
 
     const hardFailRaw = parsed.hardFail ?? parsed.hard_fail
     const hardFail = typeof hardFailRaw === 'boolean' ? hardFailRaw : false

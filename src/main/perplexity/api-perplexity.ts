@@ -161,7 +161,7 @@ async function computeWholeCompletionsApi(
   if (model) body.model = model
 
   const response = await axios.post(`${apiBase}/completions`, body, {
-    timeout: 120000,
+    timeout: 240000,
     headers
   })
 
