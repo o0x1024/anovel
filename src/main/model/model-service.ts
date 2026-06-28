@@ -16,6 +16,10 @@ import {
   parseDeepSeekProviderOptions
 } from '../../shared/deepseek-api-params'
 import {
+  isDoubaoProvider,
+  parseDoubaoProviderOptions
+} from '../../shared/doubao-api-params'
+import {
   isWorkScopedModelRequest,
   resolveWorkRequestTemperature
 } from '../context/work-step-temperature'
@@ -130,6 +134,13 @@ export class ModelService {
         enrichedRequest.deepseekOptions = parseDeepSeekProviderOptions(config.provider_options_json)
         if (enrichedRequest.thinkingEnabled !== undefined) {
           enrichedRequest.deepseekOptions.thinkingEnabled = enrichedRequest.thinkingEnabled
+        }
+      }
+
+      if (isDoubaoProvider(config.model_type)) {
+        enrichedRequest.doubaoOptions = parseDoubaoProviderOptions(config.provider_options_json)
+        if (enrichedRequest.thinkingEnabled !== undefined) {
+          enrichedRequest.doubaoOptions.thinkingEnabled = enrichedRequest.thinkingEnabled
         }
       }
 

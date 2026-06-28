@@ -24,6 +24,7 @@ import {
   type CoreSettingType
 } from '../../../../shared/settings-types'
 import { editorNavKey } from './editor-nav'
+import { storyHotWordPromptSection } from '../../../../shared/story-hot-words'
 
 const props = defineProps<{ workId: number }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
@@ -42,7 +43,7 @@ const settingTypes = computed(() => {
         type: 'golden_finger' as const,
         label: '核心钩子与信息差',
         icon: 'star',
-        desc: '有特殊设定则填系统/弹幕/读心等金手指；纯情感向则填身份反差与信息差设计'
+        desc: '有特殊设定则填金手指；纯情感向则填身份反差与信息差设计'
       },
       {
         type: 'pleasure_engine' as const,
@@ -180,6 +181,8 @@ const aiSystemPrompts: Record<SettingType, string> = {
   ].join('\n')
 }
 
+const STORY_HOT_WORD_PROMPT = storyHotWordPromptSection()
+
 const aiSystemPromptsStory: Record<SettingType, string> = {
   protagonist: [
     '你是顶级的短故事人设设计师。请为以下短故事大纲设计具有极强吸引力的主角人设。',
@@ -195,10 +198,11 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 反差行为矩阵：平常状态 vs 爆发/面对冲突时的极致反差表现',
     '- 爽点爆发时机：第一章如何亮出态度？第三章如何小反转？',
     '- 主角金句：能够瞬间击中读者、表现主角态度的一两句经典台词',
-    '- 禁止任何叙事段落。'
+    '- 禁止任何叙事段落。',
+    STORY_HOT_WORD_PROMPT
   ].join('\n'),
   golden_finger: [
-    '你是顶级的短故事核心钩子设计师。请先判断以下故事是否包含特殊设定机制（系统、弹幕、读心、倒计时、穿越等金手指），再选择对应路径输出。',
+    '你是顶级的短故事核心钩子设计师。请先判断以下故事是否包含特殊设定机制，再选择对应路径输出。',
     '',
     '【路径 A：有特殊设定/金手指机制的故事】',
     '若故事存在超自然/特殊信息差设定，输出：',
@@ -211,7 +215,8 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '【通用要求】',
     '- 总字数 350-700 字',
     '- 必须说明该设计如何直接服务于主角的爽点爆发',
-    '- 禁止万能设定，限制条件是制造张力的核心工具'
+    '- 禁止万能设定，限制条件是制造张力的核心工具',
+    STORY_HOT_WORD_PROMPT
   ].join('\n'),
   pleasure_engine: [
     '你是顶级的短故事节奏与情绪设计大师。短故事完读率极度依赖“憋屈→清醒→反击→极致清算”的情绪曲线。',
@@ -224,7 +229,8 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 开篇憋屈点：要接地气、引发强烈共鸣（被网暴、被迫替嫁、被极品房东驱逐）',
     '- 黄金开局反击：主角在此立下鲜明人设，展开第一波反击，产生小高潮',
     '- 中点反转：剧情突变（如情夫身份揭晓、重生底牌脑洞引流），将情绪拉到最满',
-    '- 终局清算：给反派最彻底的善恶有报，让读者情绪彻底宣泄'
+    '- 终局清算：给反派最彻底的善恶有报，让读者情绪彻底宣泄',
+    STORY_HOT_WORD_PROMPT
   ].join('\n'),
   supporting_cast: [
     '你是顶级的短故事配角设计师。基于主角设定和主线信息，设计功能性配角。',
@@ -235,7 +241,8 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 用 Markdown 结构化输出：## 核心极品/反派角色 / ## 关键支持者/对照组 / ## 喜剧/信息传递功能工具人 / ## 关系演变与情绪宣泄点',
     '- 总字数 350-700 字',
     '- 核心极品角色：写明其极品行为、人性弱点，以及如何引发读者的“憋屈感”',
-    '- 关键支持者/对照组：如何通过和主角的互动衬托主角的睿智或反差'
+    '- 关键支持者/对照组：如何通过和主角的互动衬托主角的睿智或反差',
+    STORY_HOT_WORD_PROMPT
   ].join('\n'),
   world_pressure: '',
   conflict_engine: ''
@@ -320,8 +327,8 @@ const hintsDialogMeta = computed(() => {
     return {
       ...base,
       title: '核心钩子与信息差',
-      desc: '有特殊设定（系统/弹幕/读心等）填金手指方向；无特殊设定则描述身份反差或关键信息差设计。留空则 AI 自动判断并选择路径。',
-      placeholder: '例如：纯现实向，主角是假千金真大佬，信息差靠身份反差；或：有弹幕设定，每天只能看3条，内容关于今天最危险的人…'
+      desc: '有特殊设定填金手指方向；无特殊设定则描述身份反差或关键信息差设计。留空则 AI 自动判断并选择路径。',
+      placeholder: '例如：纯现实向，主角是假千金真大佬，信息差靠身份反差；'
     }
   }
   return base

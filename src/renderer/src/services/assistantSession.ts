@@ -52,6 +52,7 @@ export const ASSISTANT_MODEL_LABELS: Record<string, string> = {
   kimi: 'Kimi',
   mimo: 'MiMo AI',
   bailian: 'Bailian',
+  doubao: '豆包',
   gemini: 'Gemini',
   openai: 'OpenAI',
   anthropic: 'Anthropic'

@@ -17,7 +17,7 @@
  * 安全 guardrail：轮次硬上限、AbortController 可取消、每轮写轮次记忆、
  * 重启后由用户手动断点续跑（paused 态可恢复）。
  */
-import type { WebContents } from 'electron'
+import { BrowserWindow, type WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
 import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
@@ -56,7 +56,8 @@ import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { parseStoryQualityAiScoreBreakdown } from '../../../shared/story-quality-score'
 import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
 import { QUALITY_APPLY_FIXES_PROMPT } from '../chapter-quality'
-import { STYLE_REWRITE_INSTRUCTION } from '../anti-ai-rules'
+import { STYLE_REWRITE_INSTRUCTION, countEmDashes, stripEmDashes } from '../anti-ai-rules'
+import { runConsistencyGate } from '../consistency-gate'
 import {
   bindGoalLoopModelOpts,
   clearGoalLoopModelOpts,
@@ -70,6 +71,15 @@ import {
   isGoalRoutinePhase,
   type GoalRoutinePhase
 } from '../../../shared/goal-routine-phases'
+
+import {
+  normalizeStoryCategoryTags,
+  storyCategoryPromptSection,
+  storyCategoryTagsToStorage,
+  type StoryCategoryTags
+} from '../../../shared/story-category-tags'
+
+import { storyHotWordPromptSection } from '../../../shared/story-hot-words'
 
 export type Phase = GoalRoutinePhase
 
@@ -106,6 +116,7 @@ interface TitleHookCandidate {
   hook: string
   type?: string
   summary?: string
+  tags: StoryCategoryTags
 }
 
 const SLOT_PROMPT_KEYS: Record<IncubatorSlotKey, keyof typeof STORY_INCUBATOR_ANALYSIS_PROMPTS> = {
@@ -117,11 +128,13 @@ const SLOT_PROMPT_KEYS: Record<IncubatorSlotKey, keyof typeof STORY_INCUBATOR_AN
   ending: 'rhythm_ending',
   rhythm_ending: 'rhythm_ending'
 }
+const HOT_WORD_SECTION = storyHotWordPromptSection()
+
 const STORY_SETTING_PROMPTS: Record<(typeof STORY_SETTING_TYPES)[number], string> = {
-  protagonist: '你是顶级短故事人设设计师。基于主线大纲输出 Markdown：## 身份与反差标签 / ## 核心痛点与执念 / ## 反差行为矩阵 / ## 爽点爆发时机 / ## 主角金句与对抗姿态。',
-  golden_finger: '你是顶级短故事核心钩子设计师。判断故事是否需要特殊机制；没有机制则设计身份反差与信息差。输出 Markdown：## 设定名称与形态 / ## 信息差构建 / ## 限制与紧迫感 / ## 对核心冲突的推动作用。',
-  pleasure_engine: '你是顶级短故事节奏与爽点设计师。输出 Markdown：## 开篇憋屈/危机点 / ## 黄金开局爽感/反击 / ## 中点反转 / ## 终局极致爽感清算。必须明确每个爽点对应的节拍位置。',
-  supporting_cast: '你是顶级短故事配角设计师。输出 Markdown：## 核心极品/反派角色 / ## 关键支持者/对照组 / ## 喜剧或信息工具人 / ## 关系演变与情绪宣泄点。配角只写功能、冲突价值和记忆点。'
+  protagonist: ['你是顶级短故事人设设计师。基于主线大纲输出 Markdown：## 身份与反差标签 / ## 核心痛点与执念 / ## 反差行为矩阵 / ## 爽点爆发时机 / ## 主角金句与对抗姿态。', HOT_WORD_SECTION].join('\n\n'),
+  golden_finger: ['你是顶级短故事核心钩子设计师。判断故事是否需要特殊机制；没有机制则设计身份反差与信息差。输出 Markdown：## 设定名称与形态 / ## 信息差构建 / ## 限制与紧迫感 / ## 对核心冲突的推动作用。', HOT_WORD_SECTION].join('\n\n'),
+  pleasure_engine: ['你是顶级短故事节奏与爽点设计师。输出 Markdown：## 开篇憋屈/危机点 / ## 黄金开局爽感/反击 / ## 中点反转 / ## 终局极致爽感清算。必须明确每个爽点对应的节拍位置。', HOT_WORD_SECTION].join('\n\n'),
+  supporting_cast: ['你是顶级短故事配角设计师。输出 Markdown：## 核心极品/反派角色 / ## 关键支持者/对照组 / ## 喜剧或信息工具人 / ## 关系演变与情绪宣泄点。配角只写功能、冲突价值和记忆点。', HOT_WORD_SECTION].join('\n\n')
 }
 
 const activeLoops = new Map<number, AbortController>()
@@ -148,11 +161,14 @@ export function cancelAllGoalLoops(): void {
   activeLoops.clear()
 }
 
-function safeSend(sender: WebContents | undefined, channel: string, payload: unknown): void {
-  if (!sender || sender.isDestroyed()) return
-  try {
-    sender.send(channel, payload)
-  } catch { /* 接收方已销毁 */ }
+function broadcastProgress(channel: string, payload: unknown): void {
+  // 目标循环进度需要被所有窗口/视图感知（如作品列表、编辑器），所以广播到全部窗口
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    try {
+      win.webContents.send(channel, payload)
+    } catch { /* 接收方已销毁 */ }
+  }
 }
 
 function assertNotAborted(signal?: AbortSignal): void {
@@ -461,18 +477,20 @@ function parseTitleHookCandidates(content: string): TitleHookCandidate[] {
   const parsed = JSON.parse(jsonText) as { candidates?: unknown }
   if (!Array.isArray(parsed.candidates)) return []
   return parsed.candidates
-    .map(item => {
+    .map((item): TitleHookCandidate | null => {
       if (!item || typeof item !== 'object') return null
       const row = item as Record<string, unknown>
       const title = typeof row.title === 'string' ? row.title.trim() : ''
       const hook = typeof row.hook === 'string' ? row.hook.trim() : ''
       if (!title || !hook) return null
-      return {
+      const candidate: TitleHookCandidate = {
         title,
         hook,
-        type: typeof row.type === 'string' ? row.type.trim() : undefined,
-        summary: typeof row.summary === 'string' ? row.summary.trim() : undefined
+        tags: normalizeStoryCategoryTags(row.tags)
       }
+      if (typeof row.type === 'string') candidate.type = row.type.trim()
+      if (typeof row.summary === 'string') candidate.summary = row.summary.trim()
+      return candidate
     })
     .filter((x): x is TitleHookCandidate => x != null)
 }
@@ -491,7 +509,9 @@ async function generateTitleHook(
         '基于大纲孵化设定、章节大纲和创作目标，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的短故事书名与导语组合。',
         '书名必须强网感、直击人性弱点、带爽感/反差/悬念/场景刺激。',
         '导语 150-300 字，前三句爆发冲突，第一人称，强情绪，最后留悬念钩子。',
-        '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评"}]}'
+        storyHotWordPromptSection(),
+        storyCategoryPromptSection(),
+        '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评","tags":{"main_category":"主分类","plot":["情节分类"],"character":["角色分类"],"emotion":["情绪分类"],"setting":["背景分类"]}}]}'
       ].join('\n'),
       workId,
       step: 'story_title_hook_gen',
@@ -503,7 +523,12 @@ async function generateTitleHook(
   const candidates = parseTitleHookCandidates(res.content)
   if (candidates.length === 0) throw new Error('AI 返回成功，但未能解析书名导语候选')
   const picked = candidates[0]
-  workDAO.update(workId, { title: picked.title, description: picked.hook })
+  workDAO.update(workId, {
+    title: picked.title,
+    description: picked.hook,
+    genre: picked.tags.main_category || undefined,
+    tags: storyCategoryTagsToStorage(picked.tags)
+  })
   return picked
 }
 
@@ -611,6 +636,37 @@ async function ensureBeats(
   volumeChapterDAO.batchCreateChapters(volumeId, items, existing.length > 0 ? 'replace' : 'append')
   onProgress?.(`已回填 ${items.length} 个节拍到节拍大纲`)
   return { created: items.length }
+}
+
+interface EmDashCleanupResult {
+  chapters: number
+  replaced: number
+}
+
+function cleanupEmDashesAfterPassedGate(workId: number, mode: 'comma' | 'delete' = 'comma'): EmDashCleanupResult {
+  const chapters = volumeChapterDAO.listChaptersByWork(workId).filter(c => c.content?.trim())
+  let changedChapters = 0
+  let replaced = 0
+
+  for (const ch of chapters) {
+    const content = ch.content ?? ''
+    if (!content.trim()) continue
+    const gate = runConsistencyGate(workId, ch.id, content)
+    if (gate.blockers.length > 0) continue
+    const count = countEmDashes(content)
+    if (count <= 0) continue
+    const cleaned = stripEmDashes(content, mode)
+    if (cleaned === content) continue
+    volumeChapterDAO.updateChapterWithVersion(ch.id, {
+      content: cleaned,
+      word_count: cleaned.replace(/\s/g, '').length,
+      status: ch.status ?? 'completed'
+    })
+    changedChapters++
+    replaced += count
+  }
+
+  return { chapters: changedChapters, replaced }
 }
 
 /** draft 阶段：取下一个无正文节拍生成正文 */
@@ -806,7 +862,7 @@ function buildRepairPlan(workId: number, check: GoalCheckResult | undefined): Re
     return {
       action: 'expand',
       targetChapterIds: target ? [target.id] : [],
-      hint: '当前全篇总字数已超出目标上限。请重写本节拍并压缩：删除注水段落、冗余弹幕与重复描写，保留核心冲突，显著降低本节拍字数。'
+      hint: '当前全篇总字数已超出目标上限。请重写本节拍并压缩：删除注水段落、冗余内容与重复内容，保留核心冲突，显著降低本节拍字数。'
     }
   }
 
@@ -967,7 +1023,7 @@ export async function runStoryGoalLoop(
     const ev: GoalProgressEvent = {
       workId, turn, maxTurns: fullConfig.maxTurns, phase, status, check: lastCheck, message
     }
-    safeSend(sender, 'goal:progress', ev)
+    broadcastProgress('goal:progress', ev)
   }
 
   appLogger.info('goal_routine', '目标循环启动', { workId, config: fullConfig })
@@ -1086,13 +1142,15 @@ export async function runStoryGoalLoop(
                 workId, beat.id, fullConfig.qualityMin, controller.signal,
                 msg => emit(msg, 'running')
               )
+              const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma')
+              const cleanMsg = cleaned.replaced > 0 ? `；破折号已替换 ${cleaned.replaced} 处` : ''
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
                 target_chapter_id: beat.id,
                 score: diagResult.finalScore >= 0 ? diagResult.finalScore : null,
                 summary: diagResult.passed
-                  ? `「${beat.title}」诊断通过（${diagResult.finalScore}分，${diagResult.rounds}轮）`
-                  : `「${beat.title}」诊断未完全通过（${diagResult.finalScore}分，${diagResult.rounds}轮，不达标：${diagResult.failedMetrics.join('、')}）`
+                  ? `「${beat.title}」诊断通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
+                  : `「${beat.title}」诊断未完全通过（${diagResult.finalScore}分，${diagResult.rounds}轮，不达标：${diagResult.failedMetrics.join('、')}）${cleanMsg}`
               })
             }
 
@@ -1112,6 +1170,19 @@ export async function runStoryGoalLoop(
           })
 
           if (lastCheck.met) {
+            const cleanup = cleanupEmDashesAfterPassedGate(workId, 'comma')
+            if (cleanup.replaced > 0) {
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'deai',
+                summary: `门禁通过后自动替换破折号：${cleanup.chapters} 个节拍 ${cleanup.replaced} 处`
+              })
+              emit(`门禁通过后已自动替换破折号：${cleanup.chapters} 个节拍 ${cleanup.replaced} 处`, 'running')
+              lastCheck = await checkStoryGoal(workId, fullConfig, controller.signal)
+            }
+
             goalRoutineDAO.setStatus(workId, 'goal_met')
             emit(`目标达成：质量${lastCheck.qualityScore} · 目标匹配${lastCheck.goalMatchScore} · 节拍${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
             return

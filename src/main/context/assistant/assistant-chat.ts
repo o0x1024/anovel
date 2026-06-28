@@ -16,13 +16,14 @@ import { extractStyleAnalysisFromReply, stripJsonBlockFromDisplay } from './styl
 import { resolveStepStyleInjection } from '../style-step-rules'
 import { computeWorkChapterProgress, formatEvolutionPrompt } from '../style-evolution'
 import { extractWorkSummaryFromReply } from './work-summary-parser'
+import { extractPatchFixFromReply } from './patch-fix-parser'
 import type { ModelType } from '../../model/types'
 import type { StyleAnalysisResult, AssistantWorkReference } from './types'
 import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../../shared/style-reference-limits'
 
 const activeChats = new Map<number, AbortController>()
 
-const DEFAULT_ASSISTANT_SYSTEM_PROMPT = '你是一位写作助手，可以帮助用户解答写作、改稿与创作相关的问题。'
+const DEFAULT_ASSISTANT_SYSTEM_PROMPT = '你是 ANovel AI 助手，可以帮助用户解决和处理问题。'
 
 function buildWorkStyleAddonForAssistant(
   workReferences: AssistantWorkReference[]
@@ -288,6 +289,25 @@ export async function runAssistantChat(
         messageType = 'tool_result'
         if (!capabilities.includes('style_export') || displayContent === fullContent) {
           displayContent = stripJsonBlockFromDisplay(fullContent) || '作品导读完成，请查看下方卡片。'
+        }
+      }
+    }
+
+    if (capabilities.includes('patch_fix')) {
+      const patchFix = extractPatchFixFromReply(fullContent)
+      if (patchFix) {
+        metadata = {
+          ...(metadata ?? {}),
+          workReferences,
+          patchFix: {
+            ...patchFix,
+            report: stripJsonBlockFromDisplay(fullContent),
+            workReferences
+          }
+        }
+        messageType = 'tool_result'
+        if (displayContent === fullContent) {
+          displayContent = stripJsonBlockFromDisplay(fullContent) || '修复指令已生成，请查看下方卡片。'
         }
       }
     }

@@ -2,6 +2,10 @@ import {
   applyDeepSeekThinkingParams,
   type DeepSeekProviderOptions
 } from './deepseek-api-params'
+import {
+  applyDoubaoThinkingParams,
+  type DoubaoProviderOptions
+} from './doubao-api-params'
 import { isMimoModel } from './mimo-api-params'
 
 /** Kimi K2 系列（kimi-k2.6 / kimi-k2.5 等），参数约束见 platform.kimi.com/docs/api/models-overview */
@@ -18,6 +22,8 @@ export interface OpenAICompatGenerationParams {
   thinkingEnabled?: boolean
   /** DeepSeek 提供商专属：思考模式 */
   deepseekOptions?: DeepSeekProviderOptions
+  /** 豆包 / 火山方舟提供商专属：思考模式 */
+  doubaoOptions?: DoubaoProviderOptions
 }
 
 export function buildOpenAICompatibleBody(
@@ -61,13 +67,21 @@ export function buildOpenAICompatibleBody(
   if (request.deepseekOptions) {
     const optionsToApply = {
       ...request.deepseekOptions,
-      thinkingEnabled: request.thinkingEnabled !== undefined 
-        ? request.thinkingEnabled 
+      thinkingEnabled: request.thinkingEnabled !== undefined
+        ? request.thinkingEnabled
         : request.deepseekOptions.thinkingEnabled
     }
     applyDeepSeekThinkingParams(body, optionsToApply)
+  } else if (request.doubaoOptions) {
+    const optionsToApply = {
+      ...request.doubaoOptions,
+      thinkingEnabled: request.thinkingEnabled !== undefined
+        ? request.thinkingEnabled
+        : request.doubaoOptions.thinkingEnabled
+    }
+    applyDoubaoThinkingParams(body, optionsToApply)
   } else {
-    const isReasoningModel = /deepseek-(?:r1|chat|reasoner)|reasoner|reasoning|thinking|k1\.5|qwq/i.test(modelId)
+    const isReasoningModel = /deepseek-(?:r1|chat|reasoner)|doubao-.*thinking|reasoner|reasoning|thinking|k1\.5|qwq/i.test(modelId)
     if (isReasoningModel) {
       const thinkingEnabled = request.thinkingEnabled !== undefined
         ? request.thinkingEnabled

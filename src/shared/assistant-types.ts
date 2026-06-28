@@ -33,6 +33,27 @@ export interface WorkSummaryResult {
   warnings: string[]
 }
 
+export interface PatchFixPatch {
+  find: string
+  replace: string
+  reason?: string
+}
+
+export interface PatchFixSectionRewrite {
+  title: string
+  find_start: string
+  find_end: string
+  replacement: string
+  reason?: string
+}
+
+export interface PatchFixResult {
+  patches: PatchFixPatch[]
+  section_rewrites: PatchFixSectionRewrite[]
+  report?: string
+  workReferences?: AssistantWorkReference[]
+}
+
 export type AssistantMessageType = 'text' | 'attachment' | 'tool_result'
 export type AssistantMessageRole = 'user' | 'assistant' | 'system'
 

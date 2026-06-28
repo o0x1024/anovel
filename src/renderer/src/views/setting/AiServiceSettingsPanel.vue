@@ -37,6 +37,12 @@ import {
   resolveBailianApiBase,
   type BailianProviderOptions
 } from '../../../../shared/bailian-api-params'
+import {
+  DEFAULT_DOUBAO_PROVIDER_OPTIONS,
+  isDoubaoProvider,
+  parseDoubaoProviderOptions,
+  type DoubaoProviderOptions
+} from '../../../../shared/doubao-api-params'
 
 interface ModelConfig {
   model_type: string
@@ -198,12 +204,14 @@ const isGeminiProtocol = computed(() => selectedProtocol.value === 'gemini')
 const isDeepSeekProvider = computed(() => selectedType.value === 'deepseek')
 const isMimoProviderSelected = computed(() => isMimoProvider(selectedType.value))
 const isBailianProviderSelected = computed(() => isBailianProvider(selectedType.value))
+const isDoubaoProviderSelected = computed(() => isDoubaoProvider(selectedType.value))
 const isMimoApiMode = computed(() => mimoOptions.value.accessMode === 'api')
 const isMimoTokenPlanMode = computed(() => mimoOptions.value.accessMode === 'token_plan')
 
 const deepseekOptions = ref<DeepSeekProviderOptions>({ ...DEFAULT_DEEPSEEK_PROVIDER_OPTIONS })
 const mimoOptions = ref<MimoProviderOptions>({ ...DEFAULT_MIMO_PROVIDER_OPTIONS })
 const bailianOptions = ref<BailianProviderOptions>({ ...DEFAULT_BAILIAN_PROVIDER_OPTIONS })
+const doubaoOptions = ref<DoubaoProviderOptions>({ ...DEFAULT_DOUBAO_PROVIDER_OPTIONS })
 
 function loadDeepseekOptionsFromConfig(config: ModelConfig | undefined) {
   if (!config?.provider_options_json) {
@@ -219,6 +227,10 @@ function loadMimoOptionsFromConfig(config: ModelConfig | undefined) {
 
 function loadBailianOptionsFromConfig(config: ModelConfig | undefined) {
   bailianOptions.value = parseBailianProviderOptions(config?.provider_options_json, config?.api_base)
+}
+
+function loadDoubaoOptionsFromConfig(config: ModelConfig | undefined) {
+  doubaoOptions.value = parseDoubaoProviderOptions(config?.provider_options_json)
 }
 
 function applyMimoBaseFromOptions() {
@@ -237,6 +249,7 @@ watch(selectedType, () => {
   loadDeepseekOptionsFromConfig(selectedConfig.value)
   loadMimoOptionsFromConfig(selectedConfig.value)
   loadBailianOptionsFromConfig(selectedConfig.value)
+  loadDoubaoOptionsFromConfig(selectedConfig.value)
 }, { immediate: true })
 
 watch(deepseekOptions, () => {
@@ -262,6 +275,14 @@ watch(bailianOptions, () => {
   if (!config) return
   config.provider_options_json = JSON.stringify(bailianOptions.value)
   applyBailianBaseFromOptions()
+  scheduleAutoSave()
+}, { deep: true })
+
+watch(doubaoOptions, () => {
+  if (!ready.value || !isDoubaoProviderSelected.value) return
+  const config = selectedConfig.value
+  if (!config) return
+  config.provider_options_json = JSON.stringify(doubaoOptions.value)
   scheduleAutoSave()
 }, { deep: true })
 
@@ -414,6 +435,7 @@ async function loadConfigs() {
     loadDeepseekOptionsFromConfig(selectedConfig.value)
     loadMimoOptionsFromConfig(selectedConfig.value)
     loadBailianOptionsFromConfig(selectedConfig.value)
+    loadDoubaoOptionsFromConfig(selectedConfig.value)
   } catch (e) {
     showToast('error', '加载配置失败，显示默认值')
     console.error(e)
@@ -498,6 +520,13 @@ async function persistAllConfigs() {
           'model:setProviderOptions',
           config.model_type,
           config.provider_options_json ?? JSON.stringify(DEFAULT_BAILIAN_PROVIDER_OPTIONS)
+        )
+      }
+      if (config.model_type === 'doubao') {
+        await window.anovel.invoke(
+          'model:setProviderOptions',
+          config.model_type,
+          config.provider_options_json ?? JSON.stringify(DEFAULT_DOUBAO_PROVIDER_OPTIONS)
         )
       }
     }
@@ -1057,6 +1086,33 @@ function onProtocolChange(protocol: ProviderProtocol) {
                       思考模式开启时，温度、Top P、频率/存在惩罚参数不生效
                     </p>
                   </div>
+                </div>
+              </template>
+
+              <!-- 豆包 / 火山方舟思考模式 -->
+              <template v-if="isDoubaoProviderSelected">
+                <div class="border-t border-base-300/60 pt-4 space-y-4">
+                  <h5 class="text-xs font-bold text-base-content/60 uppercase tracking-wider">
+                    豆包深度思考
+                  </h5>
+
+                  <label class="flex items-center justify-between gap-3 cursor-pointer">
+                    <div>
+                      <span class="text-sm font-medium">启用深度思考</span>
+                      <p class="text-xs text-base-content/40 mt-0.5">
+                        推理模型（如 doubao-1.5-thinking / deepseek-r1）先思考再回答
+                      </p>
+                    </div>
+                    <input
+                      v-model="doubaoOptions.thinkingEnabled"
+                      type="checkbox"
+                      class="toggle toggle-primary toggle-sm"
+                    />
+                  </label>
+
+                  <p class="text-xs text-base-content/40">
+                    深度思考开启时，温度、Top P、频率/存在惩罚参数不生效
+                  </p>
                 </div>
               </template>
 

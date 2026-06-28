@@ -94,10 +94,6 @@ export function registerIpcHandlers(): void {
       targetChapters: input.targetChapters,
       wordsPerChapter: input.wordsPerChapter
     })
-    if (input.workType === 'story') {
-      const volumeId = volumeChapterDAO.createVolume(id, '正文', '短故事主线剧情')
-      volumeChapterDAO.createChapter(volumeId, '正文', '短故事正文内容')
-    }
     return id
   })
   ipcMain.handle('work:update', (_e, id: number, input: Record<string, unknown>) => workDAO.update(id, input))
@@ -502,6 +498,20 @@ export function registerIpcHandlers(): void {
     return { state: state ?? null, turns }
   })
   ipcMain.handle('goal:isRunning', (_e, workId: number) => isGoalLoopRunning(workId))
+
+  ipcMain.handle('goal:listAllStates', () => {
+    const rows = goalRoutineDAO.listAll()
+    return rows.map(r => ({
+      workId: r.work_id,
+      status: r.status,
+      turnCount: r.turn_count,
+      maxTurns: r.max_turns,
+      currentPhase: r.current_phase,
+      lastQualityScore: r.last_quality_score,
+      goalMet: Boolean(r.goal_met),
+      updateTime: r.update_time
+    }))
+  })
 
   ipcMain.handle('context:buildWork', (_e, workId: number, options?: Record<string, boolean>) =>
     buildWorkContext(workId, options ?? {}))

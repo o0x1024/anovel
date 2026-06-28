@@ -812,6 +812,25 @@ function parseTimelineGeneration(content: string): Array<{
     return null
   }
 
+  function fuzzyFindRange(content: string, find: string, from = 0): { index: number; length: number } | null {
+    if (!find?.trim()) return null
+    const exactIdx = content.indexOf(find, from)
+    if (exactIdx !== -1) return { index: exactIdx, length: find.length }
+
+    const escapedFind = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const pattern = escapedFind.trim().replace(/\s+/g, '\\s+')
+    try {
+      const regex = new RegExp(pattern, 'm')
+      const match = content.slice(from).match(regex)
+      if (match && match.index !== undefined) {
+        return { index: from + match.index, length: match[0].length }
+      }
+    } catch {
+      // 忽略无效的正则异常
+    }
+    return null
+  }
+
   // ==================== Patch 模式修复（精准替换，不重写全文） ====================
   ipcMain.handle('quality:applyPatches', async (e, workId: number, content: string, topIssues: QualityAiTopIssue[], modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number }) => {
     if (!content?.trim()) return { success: false, error: '原文为空' }
@@ -904,6 +923,21 @@ function parseTimelineGeneration(content: string): Array<{
       patchedText: stripDeterministicAiPatterns(patchedText),
       appliedCount: applied.length,
       patches: applied
+    }
+  })
+
+  ipcMain.handle('quality:applySectionRewrite', (_e, content: string, findStart: string, findEnd: string, replacement: string) => {
+    if (!content?.trim()) return { success: false, error: '原文为空' }
+    const start = fuzzyFindRange(content, findStart)
+    if (!start) return { success: false, error: '未能定位起始句' }
+    const end = fuzzyFindRange(content, findEnd, start.index + start.length)
+    if (!end) return { success: false, error: '未能定位结束句' }
+    const endIndex = end.index + end.length
+    if (endIndex <= start.index) return { success: false, error: '定位范围无效' }
+    const patchedText = content.slice(0, start.index) + replacement + content.slice(endIndex)
+    return {
+      success: true,
+      patchedText: stripDeterministicAiPatterns(patchedText)
     }
   })
 

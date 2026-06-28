@@ -54,6 +54,16 @@ export const BUILTIN_PROVIDERS: BuiltinProviderMeta[] = [
     color: 'text-info'
   },
   {
+    type: 'doubao',
+    label: '豆包',
+    description: '字节跳动豆包大模型，火山方舟 OpenAI 兼容接口，支持深度思考',
+    protocol: 'openai',
+    defaultBase: 'https://ark.cn-beijing.volces.com/api/v3',
+    defaultModel: 'doubao-pro-32k',
+    icon: 'fire',
+    color: 'text-error'
+  },
+  {
     type: 'gemini',
     label: 'Google Gemini',
     description: 'Google 多模态大模型，支持长上下文',

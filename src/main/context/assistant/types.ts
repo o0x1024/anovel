@@ -1,5 +1,9 @@
 export type {
   StyleAnalysisResult,
+  WorkSummaryResult,
+  PatchFixPatch,
+  PatchFixSectionRewrite,
+  PatchFixResult,
   AssistantMessageType,
   AssistantMessageRole,
   AssistantRoleRow,

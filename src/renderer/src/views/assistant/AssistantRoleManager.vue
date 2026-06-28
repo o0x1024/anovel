@@ -9,7 +9,8 @@ const ICON_OPTIONS = [
 
 const CAPABILITY_LABELS: Record<string, string> = {
   style_export: '文风分析卡片',
-  summary_export: '作品导读卡片'
+  summary_export: '作品导读卡片',
+  patch_fix: '正文修复卡片'
 }
 
 const roles = ref<AssistantRoleRow[]>([])

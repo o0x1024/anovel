@@ -224,14 +224,14 @@ const activeTab = ref<'facade' | 'pitfalls' | 'trends'>('facade')
         <div class="border border-base-300 rounded-lg p-3 bg-base-100/40">
           <div class="flex items-center gap-1.5 mb-1.5">
             <span class="badge badge-primary badge-sm">古言/脑洞</span>
-            <span class="font-bold text-base-content/90">信息差破局 (弹幕/系统/读心术)</span>
+            <span class="font-bold text-base-content/90">信息差破局</span>
           </div>
           <p class="text-base-content/60 leading-relaxed mb-2">
             传统宅斗、退婚或和亲题材的微创新。核心爽点在于**上帝视角**降维打击！
           </p>
           <div class="bg-base-200/50 p-2 rounded text-[11px] text-base-content/60">
             <span class="font-semibold text-primary">脑洞示例：</span>
-            陆砚臣第三次拿离婚协议砸我，态度冰冷。我正要提笔，忽然看到一行行红色弹幕。原来，发送者是十年后 35 岁的他，他正在为我得绝症去世的消息而疯狂刷屏哭求：【阿宁，求求你别签！】
+            陆砚臣第三次拿离婚协议砸我，态度冰冷。我正要提笔，忽然看到一行行红色金手指。原来，发送者是十年后 35 岁的他，他正在为我得绝症去世的消息而疯狂刷屏哭求：【阿宁，求求你别签！】
           </div>
         </div>
 

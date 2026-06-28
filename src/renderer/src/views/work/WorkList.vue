@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onActivated, computed, watch } from 'vue'
+import { ref, onMounted, onActivated, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   DEFAULT_NOVEL_LENGTH,
@@ -16,6 +16,12 @@ import {
   setWorkCoverFromFile,
   workCoverSrc
 } from '../../utils/workCover'
+import {
+  goalRoutinePhaseLabel,
+  type GoalRoutinePhase
+} from '../../../../shared/goal-routine-phases'
+import { workUnitLabels } from '../../../../shared/work-terminology'
+import { tagsArrayToStoryCategoryTags, storyCategoryTagsToStorage } from '../../../../shared/story-category-tags'
 
 const route = useRoute()
 const router = useRouter()
@@ -151,6 +157,10 @@ function tagsToStorage(input: string): string {
   const arr = input.split(/[,，]/).map(t => t.trim()).filter(Boolean)
   return JSON.stringify(arr)
 }
+function mergeGenreTagsToStorage(genre: string, input: string): string {
+  const arr = input.split(/[,，]/).map(t => t.trim()).filter(Boolean)
+  return storyCategoryTagsToStorage(tagsArrayToStoryCategoryTags([genre.trim(), ...arr].filter(Boolean)))
+}
 
 const works = ref<Work[]>([])
 const loading = ref(true)
@@ -215,6 +225,152 @@ const coverPickerTarget = ref<'create' | number | null>(null)
 const pendingCoverFile = ref<File | null>(null)
 const pendingCoverPreview = ref<string | null>(null)
 const viewMode = ref<WorkViewMode>(loadViewMode())
+
+// ==================== 目标循环进度（短故事列表全局感知）====================
+interface GoalProgressSummary {
+  workId: number
+  status: string
+  turn: number
+  maxTurns: number
+  phase: GoalRoutinePhase | string
+  message: string
+  updateTime: string
+}
+
+interface GoalProgressEvent {
+  workId: number
+  turn: number
+  maxTurns: number
+  phase: string
+  status: string
+  message: string
+}
+
+const goalProgressMap = ref<Map<number, GoalProgressSummary>>(new Map())
+
+const runningGoalCount = computed(() => {
+  let count = 0
+  for (const p of goalProgressMap.value.values()) {
+    if (p.status === 'running') count++
+  }
+  return count
+})
+
+function goalStatusBadgeClass(status: string): string {
+  const map: Record<string, string> = {
+    running: 'badge-primary',
+    paused: 'badge-warning',
+    goal_met: 'badge-success',
+    timeout: 'badge-warning',
+    cancelled: 'badge-ghost',
+    error: 'badge-error',
+    idle: 'badge-ghost'
+  }
+  return map[status] ?? 'badge-ghost'
+}
+
+function goalStatusLabel(status: string): string {
+  const map: Record<string, string> = {
+    running: '运行中',
+    paused: '已暂停',
+    goal_met: '已达成',
+    timeout: '轮次上限',
+    cancelled: '已取消',
+    error: '出错',
+    idle: '空闲'
+  }
+  return map[status] ?? status
+}
+
+function getWorkGoalProgress(workId: number): GoalProgressSummary | undefined {
+  return goalProgressMap.value.get(workId)
+}
+
+async function fetchAllGoalStates() {
+  if (workType !== 'story') return
+  try {
+    const rows = await window.anovel.invoke('goal:listAllStates') as Array<{
+      workId: number
+      status: string
+      turnCount: number
+      maxTurns: number
+      currentPhase: string | null
+      lastQualityScore: number | null
+      goalMet: boolean
+      updateTime: string
+    }>
+    const map = new Map<number, GoalProgressSummary>()
+    for (const r of rows) {
+      map.set(r.workId, {
+        workId: r.workId,
+        status: r.status,
+        turn: r.turnCount ?? 0,
+        maxTurns: r.maxTurns ?? 0,
+        phase: r.currentPhase ?? '',
+        message: r.goalMet ? '目标已达成' : (goalRoutinePhaseLabel(r.currentPhase) || ''),
+        updateTime: r.updateTime
+      })
+    }
+    goalProgressMap.value = map
+  } catch (e) {
+    console.error('加载目标循环状态失败:', e)
+  }
+}
+
+function onGoalProgress(payload: unknown) {
+  const ev = payload as GoalProgressEvent
+  if (!ev || typeof ev.workId !== 'number') return
+  goalProgressMap.value.set(ev.workId, {
+    workId: ev.workId,
+    status: ev.status,
+    turn: ev.turn,
+    maxTurns: ev.maxTurns,
+    phase: ev.phase,
+    message: ev.message,
+    updateTime: new Date().toISOString()
+  })
+  // 触发响应式更新
+  goalProgressMap.value = new Map(goalProgressMap.value)
+}
+
+async function startGoalLoop(workId: number) {
+  try {
+    await window.anovel.invoke('goal:start', workId, {})
+  } catch (e) {
+    alert(e instanceof Error ? e.message : '启动目标循环失败')
+  }
+}
+
+async function resumeGoalLoop(workId: number) {
+  try {
+    await window.anovel.invoke('goal:resume', workId, {})
+  } catch (e) {
+    alert(e instanceof Error ? e.message : '继续目标循环失败')
+  }
+}
+
+async function cancelGoalLoop(workId: number) {
+  try {
+    await window.anovel.invoke('goal:cancel', workId)
+  } catch (e) {
+    alert(e instanceof Error ? e.message : '取消目标循环失败')
+  }
+}
+
+function canStartGoalFromList(progress: GoalProgressSummary | undefined): boolean {
+  if (!progress) return true
+  return !progress.status || progress.status === 'idle' || progress.status === 'goal_met'
+}
+
+function canResumeGoalFromList(progress: GoalProgressSummary | undefined): boolean {
+  if (!progress) return false
+  return progress.status === 'paused' || progress.status === 'cancelled' || progress.status === 'timeout'
+}
+
+function canCancelGoalFromList(progress: GoalProgressSummary | undefined): boolean {
+  if (!progress) return false
+  return progress.status === 'running'
+}
 
 async function reloadWorks() {
   works.value = await window.anovel.invoke('work:list', workType) as Work[]
@@ -372,8 +528,10 @@ async function importManuscript() {
 }
 
 onMounted(async () => {
+  window.anovel.on('goal:progress', onGoalProgress)
   try {
     await reloadWorks()
+    await fetchAllGoalStates()
   } catch (e) {
     console.error('加载作品列表失败:', e)
   } finally {
@@ -384,9 +542,14 @@ onMounted(async () => {
 onActivated(async () => {
   try {
     await reloadWorks()
+    await fetchAllGoalStates()
   } catch (e) {
     console.error('刷新作品列表失败:', e)
   }
+})
+
+onUnmounted(() => {
+  window.anovel.off('goal:progress', onGoalProgress)
 })
 
 const novelLengthOptions = computed(() => {
@@ -397,8 +560,6 @@ const novelLengthOptions = computed(() => {
     summary: novelLengthSummary(key, workType)
   }))
 })
-
-import { workUnitLabels } from '../../../../shared/work-terminology'
 
 const chapterUnit = computed(() => workUnitLabels(workType).short)
 const customLengthSummary = computed(() => `${formatWords(customTargetTotalWords.value)} · ${customTargetChapters.value} ${chapterUnit.value} · 每${chapterUnit.value} ${customWordsPerChapter.value} 字`)
@@ -444,7 +605,7 @@ async function createWork() {
       wordsPerChapter: customPlan?.wordsPerChapter,
       workType: workType,
       genre: newWork.value.genre.trim() || undefined,
-      tags: tagsToStorage(newWork.value.tags) || undefined
+      tags: mergeGenreTagsToStorage(newWork.value.genre, newWork.value.tags) || undefined
     }) as number
     localStorage.setItem(`work:${id}:type`, workType)
     if (pendingCoverFile.value) {
@@ -554,7 +715,7 @@ async function saveWorkEdit() {
       description: editWork.value.description.trim() || null,
       status: editWork.value.status,
       genre: editWork.value.genre.trim() || null,
-      tags: tagsToStorage(editWork.value.tags)
+      tags: mergeGenreTagsToStorage(editWork.value.genre, editWork.value.tags)
     })
     await reloadWorks()
     closeEditDialog()
@@ -603,7 +764,16 @@ function progressPct(work: Work): number {
     <!-- 头部区域 -->
     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8 border-b border-base-300/60 pb-6">
       <div>
-        <h2 class="text-2xl font-extrabold tracking-tight">{{ t.pageTitle }}</h2>
+        <div class="flex items-center gap-3">
+          <h2 class="text-2xl font-extrabold tracking-tight">{{ t.pageTitle }}</h2>
+          <span
+            v-if="workType === 'story' && runningGoalCount > 0"
+            class="badge badge-primary badge-sm gap-1.5 animate-pulse"
+          >
+            <font-awesome-icon icon="rotate" class="w-3 h-3" />
+            {{ runningGoalCount }} 个目标循环运行中
+          </span>
+        </div>
         <p class="text-sm text-base-content/50 mt-1">{{ t.pageSubtitle }}</p>
       </div>
       <div class="flex flex-wrap items-center gap-2">
@@ -756,6 +926,63 @@ function progressPct(work: Work): number {
                 max="100"
               ></progress>
             </div>
+
+            <!-- 短故事目标循环进度 -->
+            <div v-if="workType === 'story' && getWorkGoalProgress(work.id)" class="mt-3 pt-3 border-t border-base-300/40">
+              <div class="flex items-center justify-between gap-2 mb-1.5">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <font-awesome-icon icon="rotate" class="w-3 h-3 text-base-content/40" :class="{ 'animate-spin': getWorkGoalProgress(work.id)!.status === 'running' }" />
+                  <span class="text-[11px] font-medium text-base-content/60 truncate">
+                    {{ goalRoutinePhaseLabel(getWorkGoalProgress(work.id)!.phase) }}
+                  </span>
+                </div>
+                <span class="badge badge-xs shrink-0" :class="goalStatusBadgeClass(getWorkGoalProgress(work.id)!.status)">
+                  {{ goalStatusLabel(getWorkGoalProgress(work.id)!.status) }}
+                </span>
+              </div>
+              <div v-if="getWorkGoalProgress(work.id)!.maxTurns > 0" class="mb-1.5">
+                <progress
+                  class="progress progress-accent w-full h-1"
+                  :value="getWorkGoalProgress(work.id)!.turn"
+                  :max="getWorkGoalProgress(work.id)!.maxTurns"
+                ></progress>
+                <div class="flex justify-between text-[10px] text-base-content/40 mt-0.5">
+                  <span>轮次 {{ getWorkGoalProgress(work.id)!.turn }} / {{ getWorkGoalProgress(work.id)!.maxTurns }}</span>
+                </div>
+              </div>
+              <p class="text-[11px] text-base-content/50 line-clamp-1" :title="getWorkGoalProgress(work.id)!.message">
+                {{ getWorkGoalProgress(work.id)!.message }}
+              </p>
+              <div class="flex gap-1.5 mt-2">
+                <button
+                  v-if="canStartGoalFromList(getWorkGoalProgress(work.id))"
+                  type="button"
+                  class="btn btn-primary btn-xs gap-1"
+                  @click.stop="startGoalLoop(work.id)"
+                >
+                  <font-awesome-icon icon="play" class="w-3 h-3" />
+                  启动目标循环
+                </button>
+                <button
+                  v-if="canResumeGoalFromList(getWorkGoalProgress(work.id))"
+                  type="button"
+                  class="btn btn-warning btn-xs gap-1"
+                  @click.stop="resumeGoalLoop(work.id)"
+                >
+                  <font-awesome-icon icon="forward" class="w-3 h-3" />
+                  继续
+                </button>
+                <button
+                  v-if="canCancelGoalFromList(getWorkGoalProgress(work.id))"
+                  type="button"
+                  class="btn btn-error btn-xs gap-1"
+                  @click.stop="cancelGoalLoop(work.id)"
+                >
+                  <font-awesome-icon icon="stop" class="w-3 h-3" />
+                  取消
+                </button>
+              </div>
+            </div>
           </div>
 
           <div class="flex items-center justify-between mt-4 pt-3 border-t border-base-300/40">
@@ -840,36 +1067,70 @@ function progressPct(work: Work): number {
               {{ formatWords(work.stat_total_words) }} · {{ work.stat_completed_count }}/{{ work.stat_chapter_count }} {{ t.unitLabel }}
             </span>
           </div>
+
+          <!-- 短故事目标循环进度 -->
+          <div v-if="workType === 'story' && getWorkGoalProgress(work.id)" class="flex items-center gap-2 mt-1.5">
+            <font-awesome-icon icon="rotate" class="w-3 h-3 text-base-content/40" :class="{ 'animate-spin': getWorkGoalProgress(work.id)!.status === 'running' }" />
+            <span class="badge badge-xs shrink-0" :class="goalStatusBadgeClass(getWorkGoalProgress(work.id)!.status)">
+              {{ goalStatusLabel(getWorkGoalProgress(work.id)!.status) }}
+            </span>
+            <span class="text-[10px] text-base-content/50 truncate max-w-[10rem]" :title="getWorkGoalProgress(work.id)!.message">
+              {{ goalRoutinePhaseLabel(getWorkGoalProgress(work.id)!.phase) }}
+              <template v-if="getWorkGoalProgress(work.id)!.maxTurns > 0">
+                · {{ getWorkGoalProgress(work.id)!.turn }} / {{ getWorkGoalProgress(work.id)!.maxTurns }}
+              </template>
+            </span>
+          </div>
         </div>
-        <span class="text-xs text-base-content/40 shrink-0 hidden md:flex items-center gap-1.5 w-28 justify-end">
-          <font-awesome-icon icon="clock" class="w-3 h-3 opacity-60" />
-          {{ formatDate(work.update_time) }}
-        </span>
-        <div class="flex gap-0.5 shrink-0" @click.stop>
-          <button
-            type="button"
-            class="btn btn-ghost btn-xs btn-square"
-            title="封面"
-            :disabled="coverBusy === work.id"
-            @click="openEditDialog(work)"
-          >
-            <font-awesome-icon icon="palette" class="w-3 h-3" />
-          </button>
-          <button type="button" class="btn btn-ghost btn-xs btn-square" title="编辑" @click="openEditDialog(work)">
-            <font-awesome-icon icon="edit" class="w-3 h-3" />
-          </button>
-          <button
-            type="button"
-            class="btn btn-ghost btn-xs btn-square"
-            title="备份"
-            :disabled="backupBusy === work.id"
-            @click="exportWork(work.id, work.title)"
-          >
-            <font-awesome-icon icon="download" class="w-3 h-3" />
-          </button>
-          <button type="button" class="btn btn-ghost btn-xs btn-square text-error" title="删除" @click="deleteWork(work.id, work.title)">
-            <font-awesome-icon icon="trash" class="w-3 h-3" />
-          </button>
+        <div class="flex flex-col items-end gap-1 shrink-0">
+          <span class="text-xs text-base-content/40 hidden md:flex items-center gap-1.5 w-28 justify-end">
+            <font-awesome-icon icon="clock" class="w-3 h-3 opacity-60" />
+            {{ formatDate(work.update_time) }}
+          </span>
+          <div class="flex gap-0.5" @click.stop>
+            <button
+              v-if="workType === 'story' && canResumeGoalFromList(getWorkGoalProgress(work.id))"
+              type="button"
+              class="btn btn-ghost btn-xs btn-square text-warning"
+              title="继续目标循环"
+              @click="resumeGoalLoop(work.id)"
+            >
+              <font-awesome-icon icon="forward" class="w-3 h-3" />
+            </button>
+            <button
+              v-if="workType === 'story' && canCancelGoalFromList(getWorkGoalProgress(work.id))"
+              type="button"
+              class="btn btn-ghost btn-xs btn-square text-error"
+              title="取消目标循环"
+              @click="cancelGoalLoop(work.id)"
+            >
+              <font-awesome-icon icon="stop" class="w-3 h-3" />
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs btn-square"
+              title="封面"
+              :disabled="coverBusy === work.id"
+              @click="openEditDialog(work)"
+            >
+              <font-awesome-icon icon="palette" class="w-3 h-3" />
+            </button>
+            <button type="button" class="btn btn-ghost btn-xs btn-square" title="编辑" @click="openEditDialog(work)">
+              <font-awesome-icon icon="edit" class="w-3 h-3" />
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs btn-square"
+              title="备份"
+              :disabled="backupBusy === work.id"
+              @click="exportWork(work.id, work.title)"
+            >
+              <font-awesome-icon icon="download" class="w-3 h-3" />
+            </button>
+            <button type="button" class="btn btn-ghost btn-xs btn-square text-error" title="删除" @click="deleteWork(work.id, work.title)">
+              <font-awesome-icon icon="trash" class="w-3 h-3" />
+            </button>
+          </div>
         </div>
       </div>
     </div>

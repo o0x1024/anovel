@@ -119,6 +119,12 @@ export class GoalRoutineDAO extends BaseDAO {
       [workId, limit]
     )
   }
+
+  listAll(): GoalRoutineStateRow[] {
+    return this.all<GoalRoutineStateRow>(
+      'SELECT * FROM goal_routine_states ORDER BY update_time DESC'
+    )
+  }
 }
 
 export const goalRoutineDAO = new GoalRoutineDAO()

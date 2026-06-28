@@ -8,7 +8,7 @@ import type { AiSessionHandle } from '../ai/ai-session-manager'
 import type { ProviderProtocol } from '../../shared/model-providers'
 
 /** 内置模型类型标识（兼容旧代码） */
-export type ModelType = 'deepseek' | 'kimi' | 'mimo' | 'bailian' | 'gemini' | 'openai' | 'anthropic' | (string & {})
+export type ModelType = 'deepseek' | 'kimi' | 'mimo' | 'bailian' | 'doubao' | 'gemini' | 'openai' | 'anthropic' | (string & {})
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
 
@@ -53,6 +53,8 @@ export interface ModelRequest {
   topP?: number
   /** DeepSeek 思考模式（由 model-service 从提供商配置注入） */
   deepseekOptions?: import('../../shared/deepseek-api-params').DeepSeekProviderOptions
+  /** 豆包 / 火山方舟思考模式（由 model-service 从提供商配置注入） */
+  doubaoOptions?: import('../../shared/doubao-api-params').DoubaoProviderOptions
   workId?: number                 // 用于自动注入锚点和文风
   step?: string                   // 创作步骤标识
   styleId?: number                // 文风ID（未指定时从作品绑定文风自动取第一个）

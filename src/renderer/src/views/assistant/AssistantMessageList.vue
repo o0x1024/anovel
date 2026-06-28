@@ -4,8 +4,9 @@ import { useStickToBottomScroll } from '../../composables/useStickToBottomScroll
 import MarkdownContent from '../../components/MarkdownContent.vue'
 import StyleAnalysisCard from './cards/StyleAnalysisCard.vue'
 import WorkSummaryCard from './cards/WorkSummaryCard.vue'
+import PatchFixCard from './cards/PatchFixCard.vue'
 import type { AssistantMessageView } from '../../composables/useAssistantChat'
-import type { StyleAnalysisResult, WorkSummaryResult, AssistantWorkReference } from '../../../../shared/assistant-types'
+import type { StyleAnalysisResult, WorkSummaryResult, AssistantWorkReference, PatchFixResult } from '../../../../shared/assistant-types'
 import { renderMarkdown } from '../../utils/renderMarkdown'
 
 const props = defineProps<{
@@ -30,6 +31,7 @@ let feedbackTimer: ReturnType<typeof setTimeout> | null = null
 function parseMetadata(metadataJson: string | null): {
   styleAnalysis?: StyleAnalysisResult
   workSummary?: WorkSummaryResult
+  patchFix?: PatchFixResult
   thinking?: string
   documentIds?: number[]
   documents?: Array<{ id: number; title: string }>
@@ -40,6 +42,7 @@ function parseMetadata(metadataJson: string | null): {
     return JSON.parse(metadataJson) as {
       styleAnalysis?: StyleAnalysisResult
       workSummary?: WorkSummaryResult
+      patchFix?: PatchFixResult
       thinking?: string
       documentIds?: number[]
       documents?: Array<{ id: number; title: string }>
@@ -278,6 +281,10 @@ defineExpose({ resetStickToBottom })
           <WorkSummaryCard
             v-if="parseMetadata(msg.metadata_json)?.workSummary"
             :summary="parseMetadata(msg.metadata_json)!.workSummary!"
+          />
+          <PatchFixCard
+            v-if="parseMetadata(msg.metadata_json)?.patchFix"
+            :fix-result="parseMetadata(msg.metadata_json)!.patchFix!"
           />
         </template>
       </div>

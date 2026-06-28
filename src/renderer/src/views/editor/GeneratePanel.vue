@@ -304,14 +304,6 @@ onMounted(async () => {
   workType.value = work?.work_type ?? null
 
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
-  if (volumes.value.length === 0 && workType.value === 'story') {
-    try {
-      const volId = await window.anovel.invoke('volume:create', props.workId, '正文', '短故事主线剧情') as number
-      volumes.value = [{ id: volId, name: '正文', description: '短故事主线剧情' }] as never[]
-    } catch (e) {
-      console.error('Failed to create default volume for story on mount', e)
-    }
-  }
 
   coreSettings.value = await window.anovel.invoke('setting:listByWork', props.workId) as never[]
   anchors.value = await window.anovel.invoke('anchor:listActive', props.workId) as never[]
@@ -338,14 +330,6 @@ async function reloadChapters() {
   if (!selectedVolume.value) return
   const oldSelectedId = selectedChapterId.value
   chapters.value = await window.anovel.invoke('chapter:list', selectedVolume.value) as never[]
-  if (chapters.value.length === 0 && workType.value === 'story') {
-    try {
-      await window.anovel.invoke('chapter:create', selectedVolume.value, '正文', '短故事正文内容')
-      chapters.value = await window.anovel.invoke('chapter:list', selectedVolume.value) as never[]
-    } catch (e) {
-      console.error('Failed to create default chapter for story', e)
-    }
-  }
   selectedChapterId.value = pickSelectedChapterId(oldSelectedId)
 }
 
@@ -355,14 +339,6 @@ watch(selectedVolume, async (v) => {
   saveCurrentPage()
   if (v) {
     chapters.value = await window.anovel.invoke('chapter:list', v) as never[]
-    if (chapters.value.length === 0 && workType.value === 'story') {
-      try {
-        await window.anovel.invoke('chapter:create', v, '正文', '短故事正文内容')
-        chapters.value = await window.anovel.invoke('chapter:list', v) as never[]
-      } catch (e) {
-        console.error('Failed to create default chapter for story', e)
-      }
-    }
     selectedChapterId.value = pickSelectedChapterId(null)
   } else {
     chapters.value = []
