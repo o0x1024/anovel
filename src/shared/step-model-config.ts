@@ -59,7 +59,8 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'volume_chapters_batch', label: '章节批量生成' },
       { step: 'volume_diagnose', label: '分卷诊断' },
       { step: 'volume_diagnose_fix', label: '分卷修复' },
-      { step: 'story_title_hook_gen', label: '标题与钩子' },
+      { step: 'story_title_hook_gen', label: '短故事标题与钩子' },
+      { step: 'novel_title_hook_gen', label: '小说标题与钩子' },
     ]
   },
   {

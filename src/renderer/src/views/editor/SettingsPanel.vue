@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onActivated, inject, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onActivated, onUnmounted, inject, watch, nextTick } from 'vue'
 import type { ComponentPublicInstance } from 'vue'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -12,6 +12,7 @@ import SettingsQualityPanel from './SettingsQualityPanel.vue'
 import StoryTitleAndHookGenerator from './StoryTitleAndHookGenerator.vue'
 import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import SectionsPreviewDialog, { type PreviewSection } from '../../components/SectionsPreviewDialog.vue'
+import SettingAssistantPanel from './SettingAssistantPanel.vue'
 import type { NameEntryRow } from '../../../../shared/name-registry-types'
 import { GENRE_TREE } from '../../../../shared/genre-worldview-config'
 import {
@@ -350,6 +351,296 @@ const hasAnyCoreSetting = computed(() =>
 
 const previewOpen = ref(false)
 const previewSections = ref<PreviewSection[]>([])
+const showMarkdownPreview = ref(true)
+const assistantPosition = ref<'bottom' | 'right'>('bottom')
+
+const editingMinimized = ref(false)
+const minimizedSettingType = ref<SettingType | null>(null)
+const minimizedSettingLabel = ref('')
+
+const OVERVIEW_STATE_KEY = 'anovel:overviewAssistant:state'
+
+function loadOverviewState() {
+  try {
+    const raw = localStorage.getItem(OVERVIEW_STATE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      return {
+        x: typeof parsed.x === 'number' ? parsed.x : undefined,
+        y: typeof parsed.y === 'number' ? parsed.y : undefined,
+        width: typeof parsed.width === 'number' ? parsed.width : undefined,
+        height: typeof parsed.height === 'number' ? parsed.height : undefined,
+        minimized: typeof parsed.minimized === 'boolean' ? parsed.minimized : undefined,
+        conversationId: typeof parsed.conversationId === 'number' ? parsed.conversationId : undefined
+      }
+    }
+  } catch {
+    // ignore malformed state
+  }
+  return {}
+}
+
+function saveOverviewState(state: {
+  x: number
+  y: number
+  width: number
+  height: number
+  minimized: boolean
+  conversationId: number | null
+}) {
+  try {
+    localStorage.setItem(OVERVIEW_STATE_KEY, JSON.stringify(state))
+  } catch {
+    // ignore storage errors
+  }
+}
+
+const savedState = loadOverviewState()
+const overviewAssistantOpen = ref(false)
+const overviewAssistantMinimized = ref(savedState.minimized ?? false)
+const overviewAssistantX = ref(savedState.x ?? 0)
+const overviewAssistantY = ref(savedState.y ?? 0)
+const overviewAssistantWidth = ref(
+  savedState.width ? Math.max(MIN_OVERVIEW_WIDTH, Math.min(MAX_OVERVIEW_WIDTH, savedState.width)) : 480
+)
+const overviewAssistantHeight = ref(
+  savedState.height ? Math.max(MIN_OVERVIEW_HEIGHT, Math.min(MAX_OVERVIEW_HEIGHT, savedState.height)) : 600
+)
+const overviewAssistantConversationId = ref<number | null>(savedState.conversationId ?? null)
+const isDraggingOverview = ref(false)
+const isResizingOverview = ref(false)
+let overviewDragStart = { x: 0, y: 0, left: 0, top: 0 }
+let overviewResizeStart = { x: 0, width: 480 }
+const MIN_OVERVIEW_WIDTH = 360
+const MAX_OVERVIEW_WIDTH = 900
+const MIN_OVERVIEW_HEIGHT = 320
+const MAX_OVERVIEW_HEIGHT = 900
+
+function clampOverviewPosition() {
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const currentHeight = overviewAssistantMinimized.value ? 44 : overviewAssistantHeight.value
+  overviewAssistantX.value = Math.max(0, Math.min(vw - overviewAssistantWidth.value, overviewAssistantX.value))
+  overviewAssistantY.value = Math.max(0, Math.min(vh - currentHeight, overviewAssistantY.value))
+}
+
+function openOverviewAssistant() {
+  if (!overviewAssistantOpen.value) {
+    overviewAssistantOpen.value = true
+    clampOverviewPosition()
+  } else {
+    overviewAssistantMinimized.value = false
+    clampOverviewPosition()
+  }
+}
+
+function closeOverviewAssistant() {
+  saveOverviewState({
+    x: overviewAssistantX.value,
+    y: overviewAssistantY.value,
+    width: overviewAssistantWidth.value,
+    height: overviewAssistantHeight.value,
+    minimized: overviewAssistantMinimized.value,
+    conversationId: overviewAssistantConversationId.value
+  })
+  overviewAssistantOpen.value = false
+}
+
+function toggleOverviewMinimize() {
+  overviewAssistantMinimized.value = !overviewAssistantMinimized.value
+  nextTick(() => clampOverviewPosition())
+}
+
+watch(
+  [overviewAssistantX, overviewAssistantY, overviewAssistantWidth, overviewAssistantHeight, overviewAssistantMinimized, overviewAssistantConversationId],
+  () => {
+    if (!overviewAssistantOpen.value) return
+    saveOverviewState({
+      x: overviewAssistantX.value,
+      y: overviewAssistantY.value,
+      width: overviewAssistantWidth.value,
+      height: overviewAssistantHeight.value,
+      minimized: overviewAssistantMinimized.value,
+      conversationId: overviewAssistantConversationId.value
+    })
+  },
+  { deep: true }
+)
+
+function startOverviewDrag(event: MouseEvent) {
+  event.preventDefault()
+  isDraggingOverview.value = true
+  overviewDragStart = {
+    x: event.clientX,
+    y: event.clientY,
+    left: overviewAssistantX.value,
+    top: overviewAssistantY.value
+  }
+  window.addEventListener('mousemove', onOverviewDrag)
+  window.addEventListener('mouseup', stopOverviewDrag)
+}
+
+function onOverviewDrag(event: MouseEvent) {
+  if (!isDraggingOverview.value) return
+  const dx = event.clientX - overviewDragStart.x
+  const dy = event.clientY - overviewDragStart.y
+  const nextX = overviewDragStart.left + dx
+  const nextY = overviewDragStart.top + dy
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const currentHeight = overviewAssistantMinimized.value ? 44 : overviewAssistantHeight.value
+  overviewAssistantX.value = Math.max(0, Math.min(vw - overviewAssistantWidth.value, nextX))
+  overviewAssistantY.value = Math.max(0, Math.min(vh - currentHeight, nextY))
+}
+
+function stopOverviewDrag() {
+  isDraggingOverview.value = false
+  window.removeEventListener('mousemove', onOverviewDrag)
+  window.removeEventListener('mouseup', stopOverviewDrag)
+}
+
+type ResizeDirection = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
+let overviewResizeDirection: ResizeDirection = 'se'
+let overviewResizeStartFull = { x: 0, y: 0, width: 480, height: 600, left: 0, top: 0 }
+
+function startOverviewResize(direction: ResizeDirection, event: MouseEvent) {
+  event.preventDefault()
+  event.stopPropagation()
+  isResizingOverview.value = true
+  overviewResizeDirection = direction
+  overviewResizeStartFull = {
+    x: event.clientX,
+    y: event.clientY,
+    width: overviewAssistantWidth.value,
+    height: overviewAssistantHeight.value,
+    left: overviewAssistantX.value,
+    top: overviewAssistantY.value
+  }
+  window.addEventListener('mousemove', onOverviewResize)
+  window.addEventListener('mouseup', stopOverviewResize)
+}
+
+function onOverviewResize(event: MouseEvent) {
+  if (!isResizingOverview.value) return
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const dir = overviewResizeDirection
+  const start = overviewResizeStartFull
+  const right = start.left + start.width
+  const bottom = start.top + start.height
+
+  let nextWidth = start.width
+  let nextHeight = start.height
+  let nextLeft = start.left
+  let nextTop = start.top
+
+  if (dir.includes('e')) {
+    nextWidth = Math.max(MIN_OVERVIEW_WIDTH, Math.min(MAX_OVERVIEW_WIDTH, Math.min(vw - nextLeft, event.clientX - nextLeft)))
+  }
+  if (dir.includes('w')) {
+    const targetLeft = Math.max(0, Math.min(right - MIN_OVERVIEW_WIDTH, event.clientX))
+    nextWidth = Math.max(MIN_OVERVIEW_WIDTH, Math.min(MAX_OVERVIEW_WIDTH, right - targetLeft))
+    nextLeft = right - nextWidth
+  }
+  if (dir.includes('s')) {
+    nextHeight = Math.max(MIN_OVERVIEW_HEIGHT, Math.min(MAX_OVERVIEW_HEIGHT, Math.min(vh - nextTop, event.clientY - nextTop)))
+  }
+  if (dir.includes('n')) {
+    const minTop = Math.max(0, bottom - MAX_OVERVIEW_HEIGHT)
+    const targetTop = Math.max(minTop, Math.min(bottom - MIN_OVERVIEW_HEIGHT, event.clientY))
+    nextHeight = Math.max(MIN_OVERVIEW_HEIGHT, Math.min(MAX_OVERVIEW_HEIGHT, bottom - targetTop))
+    nextTop = bottom - nextHeight
+  }
+
+  overviewAssistantWidth.value = nextWidth
+  overviewAssistantHeight.value = nextHeight
+  overviewAssistantX.value = nextLeft
+  overviewAssistantY.value = nextTop
+}
+
+function stopOverviewResize() {
+  isResizingOverview.value = false
+  window.removeEventListener('mousemove', onOverviewResize)
+  window.removeEventListener('mouseup', stopOverviewResize)
+}
+
+const overviewAssistantStyle = computed(() => ({
+  left: `${overviewAssistantX.value}px`,
+  top: `${overviewAssistantY.value}px`,
+  width: `${overviewAssistantWidth.value}px`,
+  height: overviewAssistantMinimized.value ? '44px' : `${overviewAssistantHeight.value}px`
+}))
+
+const dialogRef = ref<HTMLElement | null>(null)
+const dialogWidth = ref(1200)
+const dialogHeight = ref(700)
+const isResizingDialog = ref(false)
+let dialogResizeStart = { x: 0, y: 0, width: 1200, height: 700 }
+
+const dialogStyle = computed(() => ({
+  width: `${dialogWidth.value}px`,
+  height: `${dialogHeight.value}px`,
+  maxWidth: '95vw',
+  maxHeight: '95vh'
+}))
+
+const leftPanelRatio = ref(50)
+const isResizingHorizontal = ref(false)
+let horizontalResizeStart = { x: 0, ratio: 50 }
+
+const hasRightPanel = computed(() => {
+  if (assistantPosition.value === 'right') return true
+  return assistantPosition.value === 'bottom' && showMarkdownPreview.value
+})
+
+function startDialogResize(event: MouseEvent) {
+  event.preventDefault()
+  isResizingDialog.value = true
+  dialogResizeStart = {
+    x: event.clientX,
+    y: event.clientY,
+    width: dialogWidth.value,
+    height: dialogHeight.value
+  }
+  window.addEventListener('mousemove', onDialogResize)
+  window.addEventListener('mouseup', stopDialogResize)
+}
+
+function onDialogResize(event: MouseEvent) {
+  if (!isResizingDialog.value) return
+  const dx = event.clientX - dialogResizeStart.x
+  const dy = event.clientY - dialogResizeStart.y
+  dialogWidth.value = Math.max(800, Math.min(Math.round(window.innerWidth * 0.95), dialogResizeStart.width + dx))
+  dialogHeight.value = Math.max(420, Math.min(Math.round(window.innerHeight * 0.95), dialogResizeStart.height + dy))
+}
+
+function stopDialogResize() {
+  isResizingDialog.value = false
+  window.removeEventListener('mousemove', onDialogResize)
+  window.removeEventListener('mouseup', stopDialogResize)
+}
+
+function startHorizontalResize(event: MouseEvent) {
+  event.preventDefault()
+  isResizingHorizontal.value = true
+  horizontalResizeStart = { x: event.clientX, ratio: leftPanelRatio.value }
+  window.addEventListener('mousemove', onHorizontalResize)
+  window.addEventListener('mouseup', stopHorizontalResize)
+}
+
+function onHorizontalResize(event: MouseEvent) {
+  if (!isResizingHorizontal.value || !dialogRef.value) return
+  const rect = dialogRef.value.getBoundingClientRect()
+  const dx = event.clientX - horizontalResizeStart.x
+  const ratioDelta = (dx / rect.width) * 100
+  leftPanelRatio.value = Math.max(25, Math.min(75, horizontalResizeStart.ratio + ratioDelta))
+}
+
+function stopHorizontalResize() {
+  isResizingHorizontal.value = false
+  window.removeEventListener('mousemove', onHorizontalResize)
+  window.removeEventListener('mouseup', stopHorizontalResize)
+}
 
 function openSettingsPreview() {
   const sections: PreviewSection[] = []
@@ -373,8 +664,28 @@ async function reloadPanelData() {
   await qualityPanelRef.value?.load?.()
 }
 
-onMounted(() => void reloadPanelData())
-onActivated(() => void reloadPanelData())
+function onGoalProgress(payload: unknown) {
+  const ev = payload as { workId?: number; message?: string; phase?: string }
+  if (ev.workId !== props.workId) return
+  if (ev.message?.includes('核心设定') || ev.phase === 'materialize_settings') {
+    void loadCoreSettings()
+    void qualityPanelRef.value?.load?.()
+    void characterCardsRef.value?.load?.()
+  }
+}
+
+onMounted(() => {
+  window.anovel.on('goal:progress', onGoalProgress)
+  void reloadPanelData()
+})
+
+onActivated(() => {
+  void loadCoreSettings()
+  void qualityPanelRef.value?.load?.()
+  void characterCardsRef.value?.load?.()
+})
+
+onUnmounted(() => window.anovel.off('goal:progress', onGoalProgress))
 
 watch(
   () => props.workId,
@@ -504,18 +815,47 @@ function startEditSetting(type: SettingType, content?: string) {
 
 function cancelEdit() {
   editingType.value = null
+  editingMinimized.value = false
 }
 
 async function saveSetting() {
   const type = editingType.value
   if (!type) return
+  await saveSettingContent(type)
+  cancelEdit()
+}
+
+async function saveSettingContent(type: SettingType) {
   const content = getDraft(type).trim()
   await window.anovel.invoke('setting:upsert', props.workId, type, content)
-  cancelEdit()
   await loadCoreSettings()
   await refreshVersionHistory(type)
   await qualityPanelRef.value?.load?.()
   await nav?.refreshProgress()
+}
+
+function minimizeEditDialog() {
+  const type = editingType.value
+  if (!type) return
+  minimizedSettingType.value = type
+  minimizedSettingLabel.value = editingMeta.value?.label ?? ''
+  editingMinimized.value = true
+  void saveSettingContent(type)
+  cancelEdit()
+}
+
+function restoreEditDialog() {
+  const type = minimizedSettingType.value
+  if (!type) return
+  editingMinimized.value = false
+  startEditSetting(type)
+}
+
+async function onOverviewSlotApplied(slotType: string) {
+  await loadCoreSettings()
+  await qualityPanelRef.value?.load?.()
+  await nav?.refreshProgress()
+  void slotType
 }
 
 interface ModelChatIpcResult {
@@ -670,10 +1010,19 @@ async function clearAllSettings() {
           短故事核心设定。推荐填写顺序：主角与反差设定 → 核心钩子与信息差 → 情绪节奏与爽点 → 功能性配角 → 结构化人设卡片 → 爆款书名与导语。AI 生成会自动带入已填的依赖设定。
         </template>
         <template v-else>
-          六类核心设定构成网文的故事引擎。推荐按依赖顺序填充：主角 → 金手指 → 世界观压力 → 冲突引擎 → 爽点机制 → 配角功能组。AI 生成会自动带入已填的依赖设定。
+          六类核心设定构成网文的故事引擎。推荐按依赖顺序填充：主角 → 金手指 → 世界观压力 → 冲突引擎 → 爽点机制 → 配角功能组 → 结构化人设卡片 → 爆款书名与导语。AI 生成会自动带入已填的依赖设定。
         </template>
       </p>
       <div class="flex gap-2 shrink-0">
+        <button
+          type="button"
+          class="btn btn-outline btn-error btn-sm gap-1.5"
+          :disabled="!hasAnyCoreSetting"
+          @click="clearAllSettings"
+        >
+          <font-awesome-icon icon="trash-can" class="w-3.5 h-3.5" />
+          清空所有内容
+        </button>
         <button
           type="button"
           class="btn btn-outline btn-primary btn-sm gap-1.5"
@@ -685,12 +1034,11 @@ async function clearAllSettings() {
         </button>
         <button
           type="button"
-          class="btn btn-outline btn-error btn-sm gap-1.5"
-          :disabled="!hasAnyCoreSetting"
-          @click="clearAllSettings"
+          class="btn btn-primary btn-sm gap-1.5"
+          @click="openOverviewAssistant"
         >
-          <font-awesome-icon icon="trash-can" class="w-3.5 h-3.5" />
-          清空所有内容
+          <font-awesome-icon icon="robot" class="w-3.5 h-3.5" />
+          AI 助手
         </button>
       </div>
     </div>
@@ -762,7 +1110,6 @@ async function clearAllSettings() {
     </div>
 
     <StoryTitleAndHookGenerator
-      v-if="workType === 'story'"
       class="mt-4"
       :work-id="workId"
       @changed="onSettingContentChanged"
@@ -777,6 +1124,121 @@ async function clearAllSettings() {
     />
 
     <StepNavFooter step="settings" :work-id="workId" />
+
+    <teleport to="body">
+      <button
+        v-if="editingMinimized"
+        type="button"
+        class="fixed z-[90] bottom-6 right-6 btn btn-primary btn-sm shadow-lg gap-1.5 animate-bounce-in"
+        @click="restoreEditDialog"
+      >
+        <font-awesome-icon icon="window-maximize" class="w-3.5 h-3.5" />
+        继续编辑 · {{ minimizedSettingLabel }}
+      </button>
+    </teleport>
+
+    <teleport to="body">
+      <div
+        v-if="overviewAssistantOpen"
+        class="fixed z-[100] flex flex-col bg-base-100 rounded-lg shadow-2xl border border-base-300 overflow-hidden"
+        :style="overviewAssistantStyle"
+      >
+        <div
+          class="flex items-center justify-between gap-2 px-3 py-2 border-b border-base-300 bg-base-200/50 cursor-move select-none"
+          @mousedown="startOverviewDrag"
+        >
+          <div class="flex items-center gap-2 min-w-0">
+            <font-awesome-icon icon="robot" class="w-3.5 h-3.5 text-primary shrink-0" />
+            <span class="text-sm font-medium truncate">核心设定总览 AI 助手</span>
+          </div>
+          <div class="flex items-center gap-0.5 shrink-0">
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs btn-square w-6 h-6 min-h-0 p-0"
+              :title="overviewAssistantMinimized ? '展开' : '最小化'"
+              @click.stop="toggleOverviewMinimize"
+            >
+              <font-awesome-icon :icon="overviewAssistantMinimized ? 'window-maximize' : 'window-minimize'" class="w-3 h-3" />
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost btn-xs btn-square w-6 h-6 min-h-0 p-0"
+              title="关闭"
+              @click.stop="closeOverviewAssistant"
+            >
+              <font-awesome-icon icon="times" class="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-show="!overviewAssistantMinimized"
+          class="flex-1 min-h-0"
+        >
+          <SettingAssistantPanel
+            :work-id="workId"
+            setting-type="overview"
+            setting-label="核心设定总览"
+            position="right"
+            :available-slots="settingTypes.map(st => ({ type: st.type, label: st.label }))"
+            :initial-conversation-id="overviewAssistantConversationId"
+            @slot-applied="onOverviewSlotApplied"
+            @conversation-change="overviewAssistantConversationId = $event"
+          />
+        </div>
+
+        <template v-if="!overviewAssistantMinimized">
+          <div
+            class="absolute top-10 right-0 bottom-0 w-2 cursor-ew-resize z-10 group"
+            title="拖动调整右侧宽度"
+            @mousedown="startOverviewResize('e', $event)"
+          >
+            <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-0.5 h-10 rounded-full bg-base-content/20 group-hover:bg-primary/50" />
+          </div>
+          <div
+            class="absolute top-10 left-0 bottom-0 w-2 cursor-ew-resize z-10 group"
+            title="拖动调整左侧宽度"
+            @mousedown="startOverviewResize('w', $event)"
+          >
+            <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-0.5 h-10 rounded-full bg-base-content/20 group-hover:bg-primary/50" />
+          </div>
+          <div
+            class="absolute left-2 right-2 bottom-0 h-2 cursor-ns-resize z-10 group"
+            title="拖动调整底部高度"
+            @mousedown="startOverviewResize('s', $event)"
+          >
+            <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-10 h-0.5 rounded-full bg-base-content/20 group-hover:bg-primary/50" />
+          </div>
+          <div
+            class="absolute left-2 right-2 top-9 h-2 cursor-ns-resize z-10 group"
+            title="拖动调整顶部高度"
+            @mousedown="startOverviewResize('n', $event)"
+          >
+            <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-10 h-0.5 rounded-full bg-base-content/20 group-hover:bg-primary/50" />
+          </div>
+          <div
+            class="absolute -bottom-1 -right-1 w-4 h-4 cursor-nwse-resize z-20"
+            title="拖动调整右下角"
+            @mousedown="startOverviewResize('se', $event)"
+          />
+          <div
+            class="absolute -bottom-1 -left-1 w-4 h-4 cursor-nesw-resize z-20"
+            title="拖动调整左下角"
+            @mousedown="startOverviewResize('sw', $event)"
+          />
+          <div
+            class="absolute -top-1 -right-1 w-4 h-4 cursor-nesw-resize z-20"
+            title="拖动调整右上角"
+            @mousedown="startOverviewResize('ne', $event)"
+          />
+          <div
+            class="absolute -top-1 -left-1 w-4 h-4 cursor-nwse-resize z-20"
+            title="拖动调整左上角"
+            @mousedown="startOverviewResize('nw', $event)"
+          />
+        </template>
+      </div>
+    </teleport>
 
     <dialog :class="['modal', { 'modal-open': hintsDialogType !== null && !!hintsDialogMeta }]">
       <div v-if="hintsDialogMeta && hintsDialogType" class="modal-box max-w-lg">
@@ -867,13 +1329,51 @@ async function clearAllSettings() {
     />
 
     <dialog :class="['modal', { 'modal-open': editingType !== null }]">
-      <div v-if="editingMeta && editingType" class="modal-box w-[92vw] max-w-6xl h-[88vh] p-0 flex flex-col">
+      <div
+        v-if="editingMeta && editingType"
+        ref="dialogRef"
+        class="modal-box p-0 flex flex-col relative"
+        :style="dialogStyle"
+      >
         <div class="flex items-center justify-between gap-4 px-6 py-4 border-b border-base-300 shrink-0">
           <div class="flex items-center gap-2 min-w-0">
             <font-awesome-icon :icon="editingMeta.icon" class="w-4 h-4 text-primary shrink-0" />
             <h3 class="font-bold text-lg truncate">编辑 · {{ editingMeta.label }}</h3>
           </div>
-          <div class="flex gap-2 shrink-0">
+          <div class="flex gap-2 shrink-0 items-center">
+            <div class="flex items-center gap-1 mr-1">
+              <button
+                type="button"
+                class="btn btn-ghost btn-xs h-7 min-h-7 px-2 gap-1"
+                :class="showMarkdownPreview ? 'text-primary' : 'text-base-content/50'"
+                :title="showMarkdownPreview ? '隐藏 Markdown 预览' : '显示 Markdown 预览'"
+                @click="showMarkdownPreview = !showMarkdownPreview"
+              >
+                <font-awesome-icon :icon="showMarkdownPreview ? 'eye' : 'eye-slash'" class="w-3 h-3" />
+                <span class="hidden sm:inline">预览</span>
+              </button>
+              <div class="join">
+                <button
+                  type="button"
+                  class="join-item btn btn-xs h-7 min-h-7 px-2"
+                  :class="assistantPosition === 'bottom' ? 'btn-primary' : 'btn-ghost'"
+                  title="AI 助手显示在底部"
+                  @click="assistantPosition = 'bottom'"
+                >
+                  <font-awesome-icon icon="window-minimize" class="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  class="join-item btn btn-xs h-7 min-h-7 px-2"
+                  :class="assistantPosition === 'right' ? 'btn-primary' : 'btn-ghost'"
+                  title="AI 助手显示在右侧"
+                  @click="assistantPosition = 'right'"
+                >
+                  <font-awesome-icon icon="columns" class="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+
             <button
               type="button"
               class="btn btn-primary btn-sm gap-1"
@@ -891,6 +1391,15 @@ async function clearAllSettings() {
               :source-input="lastAiContext"
               size="sm"
             />
+            <button
+              type="button"
+              class="btn btn-outline btn-neutral btn-sm gap-1"
+              title="最小化编辑窗口"
+              @click="minimizeEditDialog"
+            >
+              <font-awesome-icon icon="window-minimize" class="w-3 h-3" />
+              最小化
+            </button>
             <button type="button" class="btn btn-outline btn-neutral btn-sm gap-1" @click="cancelEdit">
               <font-awesome-icon icon="times" class="w-3 h-3" />
               取消
@@ -898,8 +1407,11 @@ async function clearAllSettings() {
           </div>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-0 px-6 py-4 overflow-hidden">
-          <div class="flex flex-col min-h-0">
+        <div class="flex flex-1 min-h-0 overflow-hidden">
+          <div
+            class="flex flex-col min-h-0 px-6 py-4"
+            :style="{ width: hasRightPanel ? `${leftPanelRatio}%` : '100%' }"
+          >
             <p class="text-xs font-medium text-base-content/50 mb-2">编辑</p>
             <textarea
               :value="getDraft(editingType)"
@@ -908,16 +1420,56 @@ async function clearAllSettings() {
               @input="onDraftInput"
             />
           </div>
-          <div class="flex flex-col min-h-0">
+
+          <div
+            v-if="hasRightPanel"
+            class="w-1.5 shrink-0 cursor-col-resize flex items-center justify-center hover:bg-primary/30 active:bg-primary/50 transition-colors"
+            title="拖动调整左右宽度"
+            @mousedown="startHorizontalResize"
+          >
+            <div class="w-0.5 h-8 rounded-full bg-base-content/20" />
+          </div>
+
+          <div
+            v-if="assistantPosition === 'bottom' && showMarkdownPreview"
+            class="flex flex-col min-h-0 px-6 py-4"
+            :style="{ width: `${100 - leftPanelRatio}%` }"
+          >
             <p class="text-xs font-medium text-base-content/50 mb-2">Markdown 预览</p>
             <div class="rounded-lg border border-base-300/60 p-4 bg-base-100 flex-1 min-h-0 overflow-auto">
               <MarkdownContent v-if="getDraft(editingType).trim()" :content="getDraft(editingType)" size="sm" />
               <p v-else class="text-sm text-base-content/40 italic">输入内容后在此实时预览</p>
             </div>
           </div>
+
+          <div
+            v-if="assistantPosition === 'right'"
+            class="flex flex-col min-h-0 shrink-0 border-l border-base-300 bg-base-100"
+            :style="{ width: `${100 - leftPanelRatio}%`, minWidth: '420px' }"
+          >
+            <div
+              v-if="showMarkdownPreview"
+              class="flex flex-col min-h-0 flex-1 border-b border-base-300 px-4 py-3"
+            >
+              <p class="text-xs font-medium text-base-content/50 mb-2">Markdown 预览</p>
+              <div class="rounded-lg border border-base-300/60 p-3 bg-base-100 flex-1 min-h-0 overflow-auto">
+                <MarkdownContent v-if="getDraft(editingType).trim()" :content="getDraft(editingType)" size="sm" />
+                <p v-else class="text-sm text-base-content/40 italic">输入内容后在此实时预览</p>
+              </div>
+            </div>
+            <div class="flex-1 min-h-0">
+              <SettingAssistantPanel
+                :work-id="workId"
+                :setting-type="editingType"
+                :setting-label="editingMeta.label"
+                position="right"
+                @apply-suggestion="setDraft(editingType, $event)"
+              />
+            </div>
+          </div>
         </div>
 
-        <div v-if="getDraft(editingType).trim()" class="px-6 py-4 border-t border-base-300 shrink-0 overflow-auto max-h-48">
+        <div v-if="getDraft(editingType).trim() && assistantPosition === 'bottom'" class="px-6 py-4 border-t border-base-300 shrink-0 overflow-auto max-h-48">
           <AiInterventionBar
             :work-id="workId"
             :step="`settings_${editingType}`"
@@ -926,6 +1478,23 @@ async function clearAllSettings() {
             :regenerate-system-prompt="workType === 'story' ? aiSystemPromptsStory[editingType] : aiSystemPrompts[editingType]"
             @update:content="setDraft(editingType, $event)"
           />
+        </div>
+
+        <SettingAssistantPanel
+          v-if="assistantPosition === 'bottom'"
+          :work-id="workId"
+          :setting-type="editingType"
+          :setting-label="editingMeta.label"
+          position="bottom"
+          @apply-suggestion="setDraft(editingType, $event)"
+        />
+
+        <div
+          class="absolute bottom-1 right-1 w-5 h-5 cursor-nwse-resize z-50 flex items-end justify-end group"
+          title="拖动调整对话框大小"
+          @mousedown="startDialogResize"
+        >
+          <div class="w-3.5 h-3.5 border-r-2 border-b-2 border-base-content/30 rounded-br-sm group-hover:border-primary" />
         </div>
       </div>
       <form method="dialog" class="modal-backdrop bg-black/40" @click="cancelEdit">

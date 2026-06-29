@@ -160,9 +160,9 @@ export function registerV20IpcHandlers(): void {
   ipcMain.handle('export:qualityReport', (_e, workId: number, title: string) =>
     buildExportQualityReport(workId, title))
 
-  ipcMain.handle('export:contentWithReport', (_e, workId: number, title: string, format: 'markdown' | 'txt' | 'html', scope?: { volumeId?: number; chapterId?: number }, includeReport?: boolean) => {
-    const main = exportWorkContent(workId, title, format, scope)
-    if (!includeReport) return main
+  ipcMain.handle('export:contentWithReport', (_e, workId: number, title: string, format: 'markdown' | 'txt' | 'html', scope?: { volumeId?: number; chapterId?: number }, includeReport?: boolean, mode?: 'full' | 'body') => {
+    const main = exportWorkContent(workId, title, format, scope, mode ?? 'full')
+    if (!includeReport || mode === 'body') return main
     const report = buildExportQualityReport(workId, title)
     const separator = format === 'html'
       ? '<hr/><h1>整体质量报告</h1>'

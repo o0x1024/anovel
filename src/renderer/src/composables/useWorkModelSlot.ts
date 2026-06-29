@@ -117,15 +117,16 @@ export function useWorkModelSlot(slot: ModelSlotName, workIdSource: () => number
     setModel(null, null)
   }
 
-  /** Default thinkingEnabled per slot: body defaults to true, diagnosis defaults to true */
-  function modelParams(): { modelType?: string; modelName?: string; thinkingEnabled: boolean } {
+  /** Default thinkingEnabled per slot: null = 未设置（由步骤模型分配决定），true/false = 显式覆盖 */
+  function modelParams(): { modelType?: string; modelName?: string; thinkingEnabled?: boolean } {
     const state = getOrCreateState(slot, workId.value)
-    const result: { modelType?: string; modelName?: string; thinkingEnabled: boolean } = {
-      thinkingEnabled: state.thinkingEnabled.value ?? true
-    }
+    const result: { modelType?: string; modelName?: string; thinkingEnabled?: boolean } = {}
     if (state.modelType.value) {
       result.modelType = state.modelType.value
       result.modelName = state.modelName.value ?? undefined
+    }
+    if (state.thinkingEnabled.value !== null) {
+      result.thinkingEnabled = state.thinkingEnabled.value
     }
     return result
   }

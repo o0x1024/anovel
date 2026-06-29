@@ -93,6 +93,14 @@ export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
       before: '她声音很平，平得连我自己都有点意外。"走吧。"',
       after: '"走吧。"'
     }
+  },
+  {
+    label: '禁AI味心理反应模板',
+    rule: '禁止AI味心理与反应模板句：①"僵住类"夸张反应（整个人僵住了、僵在原地、身体僵住、僵在半空、动作僵在半空、笑僵在脸上）；②"精确秒数"反应（愣了三秒、愣了两秒、呆住三秒、沉默了几秒、停顿了三秒等用具体秒数量化情绪的写法）；③"裸心理标注"（她心想、他心想、心里想、暗想、暗道、心说等直接点明内心活动的标签，改为用动作、神态、对话或自由间接引语呈现内心）；④"瞳孔/呼吸骤变"等夸张生理反应（瞳孔一缩、瞳孔骤缩、瞳孔剧烈收缩、瞳孔微缩、呼吸一滞、呼吸停滞、呼吸一紧）。发现即删或改为具体的、克制的动作与感官细节',
+    demo: {
+      before: '听到这句话，她整个人僵住了。愣了三秒，她心想，他怎么会知道？瞳孔骤缩，呼吸一滞。',
+      after: '听到这句话，她握着杯子的手顿了一下。茶水晃出来，烫到指节。她没擦，也没说话。'
+    }
   }
 ]
 
@@ -291,7 +299,8 @@ const HUMAN_WRITING_META = [
   'F. 禁止机械对话标注（"他说，""她问。"）——改为附带动作/神态/语气的标注，或省略标注。',
   'G. 禁止模板情感句（"心中涌起一股…""眼中闪过一丝…"）删除或改为具体动作。',
   'H. 禁止总结收束句（"这一刻他明白了…""或许这便是…"）直接删除。',
-  'I. 词汇选择偏口语/低频/方言化：多用具象冷门词，少用标准书面语。',
+  'I. 禁止AI味心理/反应模板句：①"整个人僵住了""僵在原地""笑僵在脸上"等僵住类夸张反应；②"愣了三秒""沉默了几秒"等用具体秒数量化情绪的写法；③"她心想""他暗想""心说"等裸心理标注——改用动作、神态或自由间接引语呈现内心；④"瞳孔骤缩""瞳孔剧烈收缩""呼吸一滞"等夸张生理反应。发现即删或改为克制的具体动作。',
+  'J. 词汇选择偏口语/低频/方言化：多用具象冷门词，少用标准书面语。',
   '   叙述中每 300 字至少掺入 1 个具体的、不常见的细节词。',
   '目标：写出来的东西像一个赶稿的人类作者写的有精彩有糙段，有灵光一闪也有平铺直叙。'
 ].join('\n')
@@ -339,7 +348,7 @@ export function formatBuiltinAntiAiRulesForPrompt(): string {
 }
 
 const STYLE_CONFLICT_RULE_PATTERN = /怪诞|品牌名|方言|粗话|跑题|词汇意外性|不属于这个语境/
-const BODY_GENERATION_LIGHT_RULE_PATTERN = /连接词|模板化|模板情感|解释腔|总结式段尾|口语化|电影镜头链|镜头调度|机械对话标注|裸对话标注|裸标注|句号|不是.*(?:而是|是)|对话.*动作|动作.*对话/
+const BODY_GENERATION_LIGHT_RULE_PATTERN = /连接词|模板化|模板情感|解释腔|总结式段尾|口语化|电影镜头链|镜头调度|机械对话标注|裸对话标注|裸标注|句号|不是.*(?:而是|是)|对话.*动作|动作.*对话|AI味心理反应模板|僵住类|精确秒数|裸心理标注|瞳孔.*呼吸/
 
 function pickBodyGenerationRules(rules: string[]): string[] {
   const picked = rules.filter(rule =>
@@ -597,6 +606,36 @@ export function checkAntiAiRuleViolations(workId: number, content: string): Anti
       }
     }
 
+    if (/AI味心理反应模板|僵住类|精确秒数|裸心理标注|瞳孔.*呼吸/.test(rule)) {
+      const reactionPatterns: [RegExp, string][] = [
+        [/(?:整个人|身体|身子|动作|手指|指尖|手|笑|嘴角|脸上的笑|表情)僵在(?:原地|半空|脸上|原地不动)?/g, '僵住类反应'],
+        [/僵住了/g, '僵住类反应'],
+        [/(?:愣|呆|怔|停顿|沉默|僵)了(?:两|三|几|半)\s*秒/g, '精确秒数反应'],
+        [/(?:他|她|它)(?:心想|心里想|心说)/g, '裸心理标注'],
+        [/(?:暗想|暗道|心中暗想|心中暗道)/g, '裸心理标注'],
+        [/瞳孔(?:骤缩|剧烈收缩|微缩|骤然收缩|一缩|微微收缩|蓦然一缩)/g, '瞳孔骤变反应'],
+        [/呼吸(?:一滞|停滞|一紧|一窒|骤停)/g, '呼吸骤变反应'],
+      ]
+      const reactionExamples: string[] = []
+      let reactionCount = 0
+      for (const [pat, label] of reactionPatterns) {
+        const matches = content.match(pat) ?? []
+        if (matches.length > 0) {
+          reactionCount += matches.length
+          if (reactionExamples.length < 3) {
+            reactionExamples.push(`${label}「${matches[0]}」× ${matches.length}`)
+          }
+        }
+      }
+      if (reactionCount > 0) {
+        violations.push({
+          rule,
+          detail: `含AI味心理/反应模板句 ${reactionCount} 处（${reactionExamples.join('、')}），应删除或改为克制的具体动作`,
+          count: reactionCount
+        })
+      }
+    }
+
     if (/修辞密度|比喻/.test(rule) && !/陈词/.test(rule)) {
       const metaphors = countMetaphors(content)
       const totalChars = content.replace(/\s/g, '').length
@@ -815,6 +854,12 @@ export const STYLE_REWRITE_INSTRUCTION = [
   '【中危】消灭模板情感句和总结收束句：',
   '  禁用："心中涌起一股…""眼中闪过一丝…""一股…涌上心头"。',
   '  禁用段尾/章尾总结："这一刻他明白了…""或许这便是…""对于…而言…"。',
+  '  禁用AI味心理/反应模板句：',
+  '    "整个人僵住了""僵在原地""笑僵在脸上"等僵住类夸张反应；',
+  '    "愣了三秒""沉默了几秒"等用具体秒数量化情绪的写法；',
+  '    "她心想""他暗想""心说"等裸心理标注——改用动作、神态或自由间接引语；',
+  '    "瞳孔骤缩""瞳孔剧烈收缩""呼吸一滞"等夸张生理反应。',
+  '  发现即删或改为克制的具体动作与感官细节。',
   '',
   '【中危】消灭"短句强否定"收尾：',
   '  禁用：动作句后接逗号加"没/没有+动词"的短促结尾。',
@@ -984,6 +1029,9 @@ export function suggestRulesFromAiTrace(issues: AiTraceIssue[]): string[] {
       if (preset) rules.push(preset.rule)
       const restPreset = DEEP_ANTI_AI_PRESETS.find(p => p.label === '白开水段落')
       if (restPreset) rules.push(restPreset.rule)
+    } else if (issue.type === 'reaction_template') {
+      const preset = SURFACE_ANTI_AI_PRESETS.find(p => p.label === '禁AI味心理反应模板')
+      if (preset) rules.push(preset.rule)
     }
   }
   return [...new Set(rules)]

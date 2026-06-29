@@ -18,14 +18,29 @@ export class AssistantConversationDAO extends BaseDAO {
     )
   }
 
+  listByWorkAndSetting(workId: number, settingType: string): AssistantConversationRow[] {
+    return this.all<AssistantConversationRow>(
+      `SELECT * FROM assistant_conversations
+       WHERE work_id = ? AND setting_type = ?
+       ORDER BY update_time DESC, id DESC`,
+      [workId, settingType]
+    )
+  }
+
   create(input: AssistantConversationCreateInput): number {
     const documentIdsJson = input.document_ids?.length
       ? JSON.stringify(input.document_ids)
       : null
     return this.insert(
-      `INSERT INTO assistant_conversations (role_id, title, document_ids_json)
-       VALUES (?, ?, ?)`,
-      [input.role_id, input.title?.trim() || '新对话', documentIdsJson]
+      `INSERT INTO assistant_conversations (role_id, work_id, setting_type, title, document_ids_json)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        input.role_id,
+        input.work_id ?? null,
+        input.setting_type ?? null,
+        input.title?.trim() || '新对话',
+        documentIdsJson
+      ]
     )
   }
 

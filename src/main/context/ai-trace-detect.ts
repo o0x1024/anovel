@@ -30,6 +30,17 @@ const FILM_SHOT_PATTERNS: RegExp[] = [
   /四目相对/g,
 ]
 
+// AI 味心理/反应模板句：僵住类、精确秒数反应、裸心理标注、瞳孔/呼吸骤变
+const REACTION_TEMPLATE_PATTERNS: { pat: RegExp; label: string }[] = [
+  { pat: /(?:整个人|身体|身子|动作|手指|指尖|手|笑|嘴角|脸上的笑|表情)僵在(?:原地|半空|脸上|原地不动)?/g, label: '僵住类反应' },
+  { pat: /僵住了/g, label: '僵住类反应' },
+  { pat: /(?:愣|呆|怔|停顿|沉默|僵)了(?:两|三|几|半)\s*秒/g, label: '精确秒数反应' },
+  { pat: /(?:他|她|它)(?:心想|心里想|心说)/g, label: '裸心理标注' },
+  { pat: /(?:暗想|暗道|心中暗想|心中暗道)/g, label: '裸心理标注' },
+  { pat: /瞳孔(?:骤缩|剧烈收缩|微缩|骤然收缩|一缩|微微收缩|蓦然一缩)/g, label: '瞳孔骤变反应' },
+  { pat: /呼吸(?:一滞|停滞|一紧|一窒|骤停)/g, label: '呼吸骤变反应' },
+]
+
 // ---------------------------------------------------------------------------
 //  机械对话标注：AI 高频使用 "对话"他说，/ "对话"她问。 这种裸标注
 //  人类网文作者几乎不用，而是用 "说道/问道" 并附带动作、语气、神态描写
@@ -343,6 +354,27 @@ export function detectAiTraces(content: string): AiTraceReport {
       severity: 'warning',
       count: filmShotTotal,
       examples: filmShotExamples.length > 0 ? filmShotExamples : ['目光落在…上', '嘴角微微上扬', '缓缓开口']
+    })
+  }
+
+  let reactionTotal = 0
+  const reactionExamples: string[] = []
+  for (const { pat, label } of REACTION_TEMPLATE_PATTERNS) {
+    const matches = text.match(pat) ?? []
+    if (matches.length > 0) {
+      reactionTotal += matches.length
+      if (reactionExamples.length < 3) {
+        reactionExamples.push(`${label}「${matches[0]}」`)
+      }
+    }
+  }
+  if (reactionTotal >= 1) {
+    issues.push({
+      type: 'reaction_template',
+      label: `AI味心理/反应模板句（${reactionTotal}处）— "整个人僵住了""愣了三秒""她心想""瞳孔骤缩""呼吸一滞"`,
+      severity: 'warning',
+      count: reactionTotal,
+      examples: reactionExamples.length > 0 ? reactionExamples : ['整个人僵住了', '愣了三秒', '她心想', '瞳孔骤缩', '呼吸一滞']
     })
   }
 

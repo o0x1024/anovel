@@ -1,6 +1,7 @@
 import { coreSettingDAO, volumeChapterDAO, anchorDAO } from '../db'
 
 export type ExportFormat = 'markdown' | 'txt' | 'html'
+export type ExportContentMode = 'full' | 'body'
 
 const SETTING_LABELS: Record<string, string> = {
   idea: '故事方向',
@@ -54,6 +55,38 @@ function buildMarkdown(workId: number, title: string): string {
   return output
 }
 
+function buildBodyMarkdown(
+  workId: number,
+  title: string,
+  scope?: { volumeId?: number; chapterId?: number }
+): string {
+  if (scope?.chapterId) {
+    const ch = volumeChapterDAO.getChapter(scope.chapterId)
+    return ch?.content?.trim() ? `${ch.content.trim()}\n` : ''
+  }
+
+  if (scope?.volumeId) {
+    const chapters = volumeChapterDAO.listChapters(scope.volumeId)
+    return chapters
+      .sort((a, b) => a.sort - b.sort)
+      .map(ch => ch.content?.trim() || '')
+      .filter(Boolean)
+      .join('\n\n') + '\n'
+  }
+
+  const volumes = volumeChapterDAO.listVolumes(workId)
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const parts: string[] = []
+  for (const vol of volumes) {
+    const volChapters = chapters.filter(c => c.volume_id === vol.id).sort((a, b) => a.sort - b.sort)
+    for (const ch of volChapters) {
+      if (ch.content?.trim()) parts.push(ch.content.trim())
+    }
+  }
+  if (parts.length === 0) return `# ${title}\n\n`
+  return parts.join('\n\n') + '\n'
+}
+
 function markdownToTxt(md: string): string {
   return md
     .replace(/^#+\s+/gm, '')
@@ -81,18 +114,21 @@ export function exportWorkContent(
   workId: number,
   title: string,
   format: ExportFormat,
-  scope?: { volumeId?: number; chapterId?: number }
+  scope?: { volumeId?: number; chapterId?: number },
+  mode: ExportContentMode = 'full'
 ): { content: string; filename: string; mime: string } {
-  let md = buildMarkdown(workId, title)
+  let md = mode === 'body'
+    ? buildBodyMarkdown(workId, title, scope)
+    : buildMarkdown(workId, title)
 
-  if (scope?.chapterId) {
+  if (mode !== 'body' && scope?.chapterId) {
     const ch = volumeChapterDAO.getChapter(scope.chapterId)
     if (ch) {
       md = `# ${ch.title}\n\n`
       if (ch.outline?.trim()) md += `${ch.outline}\n\n`
       if (ch.content?.trim()) md += `${ch.content}\n\n`
     }
-  } else if (scope?.volumeId) {
+  } else if (mode !== 'body' && scope?.volumeId) {
     const vol = volumeChapterDAO.listVolumes(workId).find(v => v.id === scope.volumeId)
     const chapters = volumeChapterDAO.listChapters(scope.volumeId)
     if (vol) {
@@ -107,12 +143,13 @@ export function exportWorkContent(
   }
 
   const safeTitle = title.replace(/[/\\?%*:|"<>]/g, '_') || 'export'
+  const suffix = mode === 'body' ? '_纯正文' : ''
 
   if (format === 'txt') {
-    return { content: markdownToTxt(md), filename: `${safeTitle}.txt`, mime: 'text/plain;charset=utf-8' }
+    return { content: markdownToTxt(md), filename: `${safeTitle}${suffix}.txt`, mime: 'text/plain;charset=utf-8' }
   }
   if (format === 'html') {
-    return { content: markdownToHtml(md, title), filename: `${safeTitle}.html`, mime: 'text/html;charset=utf-8' }
+    return { content: markdownToHtml(md, title), filename: `${safeTitle}${suffix}.html`, mime: 'text/html;charset=utf-8' }
   }
-  return { content: md, filename: `${safeTitle}.md`, mime: 'text/markdown;charset=utf-8' }
+  return { content: md, filename: `${safeTitle}${suffix}.md`, mime: 'text/markdown;charset=utf-8' }
 }

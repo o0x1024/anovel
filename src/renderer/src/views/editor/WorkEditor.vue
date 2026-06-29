@@ -79,6 +79,7 @@ const showStepModelDialog = ref(false)
 const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : 'novel'))
 const showExportModal = ref(false)
 const exportFormat = ref<'markdown' | 'txt' | 'html'>('markdown')
+const exportContentMode = ref<'full' | 'body'>('full')
 const exportIncludeReport = ref(true)
 const exportScope = ref<'work' | 'volume' | 'chapter'>('work')
 const exportVolumeId = ref<number | null>(null)
@@ -321,7 +322,8 @@ async function doExport() {
       title,
       exportFormat.value,
       scope,
-      exportScope.value === 'work' && exportIncludeReport.value
+      exportScope.value === 'work' && exportContentMode.value === 'full' && exportIncludeReport.value,
+      exportContentMode.value
     ) as {
       content: string
       filename: string
@@ -593,6 +595,13 @@ async function doExport() {
           </select>
         </div>
         <div>
+          <label class="text-xs text-base-content/50">导出内容</label>
+          <select v-model="exportContentMode" class="select select-bordered select-sm w-full mt-1">
+            <option value="full">完整内容（设定/大纲/正文）</option>
+            <option value="body">纯正文</option>
+          </select>
+        </div>
+        <div>
           <label class="text-xs text-base-content/50">格式</label>
           <select v-model="exportFormat" class="select select-bordered select-sm w-full mt-1">
             <option value="markdown">Markdown (.md)</option>
@@ -600,7 +609,7 @@ async function doExport() {
             <option value="html">HTML (.html)</option>
           </select>
         </div>
-        <label v-if="exportScope === 'work'" class="flex items-center gap-2 cursor-pointer">
+        <label v-if="exportScope === 'work' && exportContentMode === 'full'" class="flex items-center gap-2 cursor-pointer">
           <input v-model="exportIncludeReport" type="checkbox" class="checkbox checkbox-sm checkbox-primary" />
           <span class="text-sm">附带整体质量报告</span>
         </label>

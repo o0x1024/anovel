@@ -54,6 +54,16 @@ export interface PatchFixResult {
   workReferences?: AssistantWorkReference[]
 }
 
+export interface SettingPatchItem {
+  slot: string
+  label: string
+  content: string
+}
+
+export interface SettingPatchResult {
+  settingPatches: SettingPatchItem[]
+}
+
 export type AssistantMessageType = 'text' | 'attachment' | 'tool_result'
 export type AssistantMessageRole = 'user' | 'assistant' | 'system'
 
@@ -83,6 +93,8 @@ export interface AssistantDocumentRow {
 export interface AssistantConversationRow {
   id: number
   role_id: number | null
+  work_id: number | null
+  setting_type: string | null
   title: string
   document_ids_json: string | null
   model_type: string | null
@@ -125,6 +137,8 @@ export interface AssistantDocumentCreateInput {
 
 export interface AssistantConversationCreateInput {
   role_id: number | null
+  work_id?: number | null
+  setting_type?: string | null
   title?: string
   document_ids?: number[]
 }

@@ -12,6 +12,10 @@ export class AssistantRoleDAO extends BaseDAO {
     return this.get<AssistantRoleRow>('SELECT * FROM assistant_roles WHERE id = ?', [id])
   }
 
+  getByName(name: string): AssistantRoleRow | undefined {
+    return this.get<AssistantRoleRow>('SELECT * FROM assistant_roles WHERE name = ?', [name])
+  }
+
   create(input: AssistantRoleCreateInput): number {
     return this.insert(
       `INSERT INTO assistant_roles

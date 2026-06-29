@@ -31,7 +31,7 @@ const editingPreset = ref<{ label: string; rule: string; before: string; after: 
 const editingPresetIndex = ref<number | null>(null)
 
 const presetGroups = computed<PresetGroup[]>(() => {
-  const surfaceLabels = ['禁模板情感句', '修辞去陈词', '禁总结式段尾', '对话口语化']
+  const surfaceLabels = ['禁模板情感句', '修辞去陈词', '禁总结式段尾', '对话口语化', '禁AI味心理反应模板']
   const surface = builtInPresets.value.filter(p => surfaceLabels.includes(p.label))
   const deep = builtInPresets.value.filter(p => !surfaceLabels.includes(p.label))
   const groups: PresetGroup[] = []

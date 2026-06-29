@@ -5,9 +5,19 @@ import {
   assistantMessageDAO,
   assistantRoleDAO,
   writingStyleDAO,
-  knowledgeNoteDAO
+  knowledgeNoteDAO,
+  coreSettingDAO,
+  workDAO,
+  volumeChapterDAO
 } from '../../db'
 import { resolveAssistantGlobalRoleId } from './global-role'
+import {
+  CORE_SETTING_TYPES,
+  CORE_SETTING_DEPENDENCIES,
+  getCoreSettingLabel,
+  isCoreSettingType,
+  type CoreSettingType
+} from '../../../shared/settings-types'
 import { modelService } from '../../model'
 import { extractStyleFingerprint } from '../style-fingerprint'
 import { sampleDocumentText } from './document-sampling'
@@ -24,6 +34,77 @@ import { MAX_STYLE_REFERENCE_TEXT_CHARS } from '../../../shared/style-reference-
 const activeChats = new Map<number, AbortController>()
 
 const DEFAULT_ASSISTANT_SYSTEM_PROMPT = '你是 ANovel AI 助手，可以帮助用户解决和处理问题。'
+const CORE_SETTING_ADVISOR_ROLE_NAME = '核心设定顾问'
+
+function buildWorkScaleInfoText(workId: number): string {
+  const work = workDAO.getById(workId)
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const totalChapters = chapters.length
+  const writtenChapters = chapters.filter(c => c.content?.trim()).length
+  const totalWords = chapters.reduce((sum, c) => sum + (c.word_count ?? 0), 0)
+  const avgWords = totalChapters > 0 ? Math.round(totalWords / totalChapters) : 0
+  const avgWrittenWords = writtenChapters > 0 ? Math.round(totalWords / writtenChapters) : 0
+
+  const lines: string[] = []
+  if (work?.target_total_words) lines.push(`目标总字数：${work.target_total_words.toLocaleString()} 字`)
+  if (work?.target_chapters) lines.push(`目标章节数：${work.target_chapters} 章`)
+  if (work?.words_per_chapter) lines.push(`目标每章字数：${work.words_per_chapter.toLocaleString()} 字`)
+  lines.push(`当前章节数：${totalChapters} 章`)
+  lines.push(`已写章节数：${writtenChapters} 章`)
+  lines.push(`当前正文字数：${totalWords.toLocaleString()} 字`)
+  if (avgWords > 0) lines.push(`含空章平均每章：${avgWords.toLocaleString()} 字`)
+  if (avgWrittenWords > 0) lines.push(`已写章平均每章：${avgWrittenWords.toLocaleString()} 字`)
+  return lines.map(l => `- ${l}`).join('\n')
+}
+
+function buildSettingContextAddon(workId: number, settingType: string): string {
+  const work = workDAO.getById(workId)
+  const isStory = work?.work_type === 'story'
+  const parts: string[] = []
+
+  if (work) {
+    parts.push(`【作品信息】\n标题：${work.title || '未命名'}\n类型：${isStory ? '短故事' : '长篇网文'}\n简介：${work.description || '暂无简介'}`)
+  }
+
+  parts.push(`【作品规模规划】\n请以下列规模为约束，确保设定与后续章节容量、节奏和字数规划相匹配：\n${buildWorkScaleInfoText(workId)}`)
+
+  if (settingType === 'overview') {
+    parts.push('【当前任务】从全局视角讨论、诊断并优化这部作品的全部核心设定。')
+    const allRows = coreSettingDAO.listByWork(workId)
+    const rowsByType = new Map(allRows.map(r => [r.type, r]))
+    const orderedTypes: CoreSettingType[] = isStory
+      ? ['protagonist', 'golden_finger', 'pleasure_engine', 'supporting_cast']
+      : CORE_SETTING_TYPES
+    let hasAny = false
+    for (const type of orderedTypes) {
+      const row = rowsByType.get(type)
+      if (!row?.content?.trim()) continue
+      hasAny = true
+      const label = getCoreSettingLabel(type, isStory)
+      parts.push(`【${label}】\n${row.content.trim()}`)
+    }
+    if (!hasAny) {
+      parts.push('（尚未填写任何核心设定内容）')
+    }
+    return parts.join('\n\n')
+  }
+
+  const targetLabel = isCoreSettingType(settingType)
+    ? getCoreSettingLabel(settingType, isStory)
+    : settingType
+  const targetRow = coreSettingDAO.getByType(workId, settingType)
+  parts.push(`【当前讨论设定：${targetLabel}】\n${targetRow?.content?.trim() || '（尚未填写内容）'}`)
+
+  const dependencies = (CORE_SETTING_DEPENDENCIES as Record<string, CoreSettingType[]>)[settingType] ?? []
+  for (const depType of dependencies) {
+    const depRow = coreSettingDAO.getByType(workId, depType)
+    if (!depRow?.content?.trim()) continue
+    const depLabel = getCoreSettingLabel(depType, isStory)
+    parts.push(`【依赖设定：${depLabel}】\n${depRow.content.trim()}`)
+  }
+
+  return parts.join('\n\n')
+}
 
 function buildWorkStyleAddonForAssistant(
   workReferences: AssistantWorkReference[]
@@ -59,6 +140,15 @@ function resolveAssistantRole(roleId: number | null) {
   const role = assistantRoleDAO.getById(roleId)
   if (!role) throw new Error('角色不存在')
   return role
+}
+
+function resolveAssistantRoleForConversation(settingType: string | null) {
+  if (!settingType) {
+    return resolveAssistantRole(resolveAssistantGlobalRoleId())
+  }
+  const advisor = assistantRoleDAO.getByName(CORE_SETTING_ADVISOR_ROLE_NAME)
+  if (advisor) return advisor
+  return resolveAssistantRole(resolveAssistantGlobalRoleId())
 }
 
 function safeParseObject(json: string | null): Record<string, unknown> {
@@ -169,7 +259,7 @@ export async function runAssistantChat(
 
   const conv = assistantConversationDAO.getById(conversationId)
   if (!conv) throw new Error('会话不存在')
-  const role = resolveAssistantRole(resolveAssistantGlobalRoleId())
+  const role = resolveAssistantRoleForConversation(conv.setting_type)
 
   const trimmed = userText.trim()
   if (!trimmed) throw new Error('消息不能为空')
@@ -190,10 +280,14 @@ export async function runAssistantChat(
   const docContext = buildReferenceContext(documentIds, workReferences, knowledgeNoteIds)
   const rules: string[] = role.analysis_rules_json ? JSON.parse(role.analysis_rules_json) : []
   const workStyleAddon = buildWorkStyleAddonForAssistant(workReferences)
+  const settingContextAddon = conv.setting_type && conv.work_id
+    ? `\n\n${buildSettingContextAddon(conv.work_id, conv.setting_type)}`
+    : ''
   const systemPrompt = [
     role.system_prompt,
     rules.length ? `\n【解析规则】\n${rules.map(r => `- ${r}`).join('\n')}` : '',
-    workStyleAddon
+    workStyleAddon,
+    settingContextAddon
   ].join('')
 
   const assistantMessageId = assistantMessageDAO.create({

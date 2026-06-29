@@ -1,4 +1,4 @@
-import { coreSettingDAO, workDAO } from '../db'
+import { coreSettingDAO, workDAO, volumeChapterDAO } from '../db'
 import { GENRE_TREE, getChecksByGenre, getGenreNode, isGenreId } from '../../shared/genre-worldview-config'
 import {
   CORE_SETTING_LABELS,
@@ -18,6 +18,34 @@ import {
 
 export type { CoreSettingType }
 export type CoreSettingGenerateType = CoreSettingType // 向后兼容旧调用
+
+function buildWorkScaleInfo(workId: number): string {
+  const work = workDAO.getById(workId)
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const totalChapters = chapters.length
+  const writtenChapters = chapters.filter(c => c.content?.trim()).length
+  const totalWords = chapters.reduce((sum, c) => sum + (c.word_count ?? 0), 0)
+  const avgWords = totalChapters > 0 ? Math.round(totalWords / totalChapters) : 0
+  const avgWrittenWords = writtenChapters > 0 ? Math.round(totalWords / writtenChapters) : 0
+
+  const parts: string[] = []
+  if (work) {
+    if (work.target_total_words) parts.push(`目标总字数：${work.target_total_words.toLocaleString()} 字`)
+    if (work.target_chapters) parts.push(`目标章节数：${work.target_chapters} 章`)
+    if (work.words_per_chapter) parts.push(`目标每章字数：${work.words_per_chapter.toLocaleString()} 字`)
+    if (work.novel_length) parts.push(`篇幅档位：${work.novel_length}`)
+  }
+  parts.push(`当前章节数：${totalChapters} 章`)
+  parts.push(`已写章节数：${writtenChapters} 章`)
+  parts.push(`当前正文字数：${totalWords.toLocaleString()} 字`)
+  if (avgWords > 0) parts.push(`含空章平均每章：${avgWords.toLocaleString()} 字`)
+  if (avgWrittenWords > 0) parts.push(`已写章平均每章：${avgWrittenWords.toLocaleString()} 字`)
+
+  return [
+    '请以下列作品规模信息为约束进行设计，确保设定与后续章节容量、节奏和字数规划相匹配：',
+    parts.map(p => `- ${p}`).join('\n')
+  ].join('\n')
+}
 
 export type GenreDetectMode = 'strict' | 'balanced' | 'loose'
 
@@ -462,6 +490,9 @@ export async function buildSettingsGenerationContext(
     const content = byType.get(depType)?.trim()
     if (content) deps[depType] = content
   }
+
+  // 作品规模规划（总字数、章节数、每章字数）
+  sections['作品规模规划'] = buildWorkScaleInfo(workId)
 
   // 按类型构建上下文
   switch (targetType) {

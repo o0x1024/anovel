@@ -24,6 +24,9 @@ const props = defineProps<{ workId: number }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 const emit = defineEmits<{ changed: [] }>()
 
+const workType = ref<string>('novel')
+const isStory = computed(() => workType.value === 'story')
+
 type TitleHookCandidate = {
   title: string
   hook: string
@@ -38,7 +41,9 @@ const candidates = ref<TitleHookCandidate[]>([])
 const workInfo = ref<{ title: string; description: string | null; genre: string | null; tags: string | null } | null>(null)
 
 async function loadWorkInfo() {
-  workInfo.value = await window.anovel.invoke('work:get', props.workId) as { title: string; description: string | null; genre: string | null; tags: string | null }
+  const w = await window.anovel.invoke('work:get', props.workId) as { title: string; description: string | null; genre: string | null; tags: string | null; work_type?: string }
+  workInfo.value = w
+  workType.value = w.work_type ?? 'novel'
 }
 
 const seedText = ref('')
@@ -115,7 +120,8 @@ async function generate() {
       activeDraftSlots: { slotKey: string, content: string }[] 
     }
     const workDetails = await window.anovel.invoke('work:get', props.workId) as { work_type?: string; genre?: string | null; tags?: string | null }
-    const workType = workDetails?.work_type || 'novel'
+    const wt = workDetails?.work_type || 'novel'
+    workType.value = wt
     const baseTags = parseStoryCategoryTagsFromWork(workDetails?.genre ?? workInfo.value?.genre, workDetails?.tags ?? workInfo.value?.tags)
 
     const slotsContext = incubatorState.activeDraftSlots
@@ -172,8 +178,10 @@ ${seedText.value.trim() || '（无额外补充）'}
     `.trim()
 
     const typeLabel = TEMPLATES.find(t => t.value === selectedType.value)?.label || '随机生成（混合所有风格）'
+    const channelLabel = isStory.value ? '短故事频道' : '小说频道'
+    const workTypeLabel = isStory.value ? '短故事' : '小说'
 
-    const systemPrompt = `你是番茄小说网短故事频道的顶流爆款编辑，深谙番茄短故事的爆款流量密码。你的核心任务是：基于番茄小说网爆款书名与导语的创作方法论，结合用户提供的大纲孵化设定、章节大纲以及核心要求，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的【短故事书名与导语】组合。
+    const systemPrompt = `你是番茄小说网${channelLabel}的顶流爆款编辑，深谙番茄${workTypeLabel}的爆款流量密码。你的核心任务是：基于番茄小说网爆款书名与导语的创作方法论，结合用户提供的大纲孵化设定、章节大纲以及核心要求，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的【${workTypeLabel}书名与导语】组合。
 
 【生成风格偏好】
 当前偏好的风格类型为：${typeLabel}。生成时请高度契合该类型的风格内核。
@@ -217,7 +225,7 @@ ${seedText.value.trim() || '（无额外补充）'}
 
 【导语写作规范】
 - 限制在 150-300 字，推荐第一人称叙述，语气鲜明（冷酷/嘲弄/笃定/轻松等，视题材而定），增强代入感。
-- 去除任何温吞的AI腔调，模拟番茄爆款短故事的真实文风。
+- 去除任何温吞的AI腔调，模拟番茄爆款${workTypeLabel}的真实文风。
 
 ${storyHotWordPromptSection()}
 
@@ -248,7 +256,7 @@ ${storyCategoryPromptSection()}
       prompt,
       systemPrompt,
       workId: props.workId,
-      step: 'story_title_hook_gen',
+      step: isStory.value ? 'story_title_hook_gen' : 'novel_title_hook_gen',
       enrichWorkContext: false,
       ...bodyModelParams()
     }) as ModelChatResult

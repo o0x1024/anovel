@@ -81,6 +81,8 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS assistant_conversations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       role_id INTEGER,
+      work_id INTEGER,
+      setting_type VARCHAR(30),
       title VARCHAR(200) NOT NULL DEFAULT '新对话',
       document_ids_json TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -108,6 +110,14 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     db.exec(`ALTER TABLE assistant_conversations ADD COLUMN model_name VARCHAR(100)`)
   }
 
+  if (hasTable(db, 'assistant_conversations') && !hasColumn(db, 'assistant_conversations', 'work_id')) {
+    db.exec(`ALTER TABLE assistant_conversations ADD COLUMN work_id INTEGER`)
+  }
+
+  if (hasTable(db, 'assistant_conversations') && !hasColumn(db, 'assistant_conversations', 'setting_type')) {
+    db.exec(`ALTER TABLE assistant_conversations ADD COLUMN setting_type VARCHAR(30)`)
+  }
+
   if (
     hasTable(db, 'assistant_conversations') &&
     isColumnNotNull(db, 'assistant_conversations', 'role_id')
@@ -116,6 +126,8 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       CREATE TABLE assistant_conversations_role_nullable (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         role_id INTEGER,
+        work_id INTEGER,
+        setting_type VARCHAR(30),
         title VARCHAR(200) NOT NULL DEFAULT '新对话',
         document_ids_json TEXT,
         model_type VARCHAR(20),
@@ -126,10 +138,10 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       );
 
       INSERT INTO assistant_conversations_role_nullable (
-        id, role_id, title, document_ids_json, model_type, model_name, create_time, update_time
+        id, role_id, work_id, setting_type, title, document_ids_json, model_type, model_name, create_time, update_time
       )
       SELECT
-        id, role_id, title, document_ids_json, model_type, model_name, create_time, update_time
+        id, role_id, work_id, setting_type, title, document_ids_json, model_type, model_name, create_time, update_time
       FROM assistant_conversations;
 
       DROP TABLE assistant_conversations;

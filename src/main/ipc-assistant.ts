@@ -92,12 +92,18 @@ export function registerAssistantIpcHandlers(): void {
 
   ipcMain.handle('assistant:convList', () => assistantConversationDAO.list())
   ipcMain.handle('assistant:convGet', (_e, id: number) => assistantConversationDAO.getById(id))
+  ipcMain.handle('assistant:convListByWorkSetting', (_e, workId: number, settingType: string) =>
+    assistantConversationDAO.listByWorkAndSetting(workId, settingType))
   ipcMain.handle('assistant:convCreate', (_e, input?: {
     title?: string
     documentIds?: number[]
+    workId?: number
+    settingType?: string
   }) => {
     const id = assistantConversationDAO.create({
       role_id: null,
+      work_id: input?.workId,
+      setting_type: input?.settingType,
       title: input?.title,
       document_ids: input?.documentIds
     })

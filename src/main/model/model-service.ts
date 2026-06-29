@@ -126,7 +126,7 @@ export class ModelService {
         topP: request.topP ?? stepDefaults.topP
       }
 
-      if (enrichedRequest.thinkingEnabled === undefined && stepOverrideThinking !== undefined) {
+      if (stepOverrideThinking !== undefined) {
         enrichedRequest.thinkingEnabled = stepOverrideThinking
       }
 
