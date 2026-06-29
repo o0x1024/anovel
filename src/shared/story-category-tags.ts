@@ -62,10 +62,30 @@ function cleanList(input: unknown, allowed: Set<string>): string[] {
   return [...new Set(input.filter((x): x is string => typeof x === 'string').map(x => x.trim()).filter(x => allowed.has(x)))]
 }
 
-export function normalizeStoryCategoryTags(input: unknown): StoryCategoryTags {
+export function inferStoryMainCategory(text: string): StoryMainCategory | '' {
+  if (!text || typeof text !== 'string') return ''
+  const normalized = text.toLowerCase()
+  let best: { value: StoryMainCategory; score: number } | null = null
+  for (const cat of STORY_MAIN_CATEGORIES) {
+    let score = 0
+    if (normalized.includes(cat.value.toLowerCase())) score += 10
+    const tokens = cat.desc.split(/[，,、；;。]+/).map(t => t.trim()).filter(Boolean)
+    for (const token of tokens) {
+      if (token.length >= 2 && normalized.includes(token.toLowerCase())) score += 2
+    }
+    if (score > 0 && (!best || score > best.score)) best = { value: cat.value, score }
+  }
+  return best?.value ?? ''
+}
+
+export function normalizeStoryCategoryTags(input: unknown, fallbackText?: string): StoryCategoryTags {
   if (!input || typeof input !== 'object') return { ...EMPTY_STORY_CATEGORY_TAGS }
   const row = input as Record<string, unknown>
-  const main = typeof row.main_category === 'string' && MAIN_SET.has(row.main_category.trim()) ? row.main_category.trim() : ''
+  let main = typeof row.main_category === 'string' && MAIN_SET.has(row.main_category.trim()) ? row.main_category.trim() : ''
+  if (!main && fallbackText) {
+    const inferred = inferStoryMainCategory(fallbackText)
+    if (inferred) main = inferred
+  }
   return {
     main_category: main,
     plot: cleanList(row.plot, PLOT_SET),
@@ -103,8 +123,9 @@ export function parseStoryCategoryTagsFromWork(genre?: string | null, tagsText?:
       rawTags = []
     }
   }
+  const mainFromTags = !genre ? rawTags.find(x => MAIN_SET.has(x)) ?? '' : ''
   return normalizeStoryCategoryTags({
-    main_category: genre ?? '',
+    main_category: genre ?? mainFromTags,
     plot: rawTags,
     character: rawTags,
     emotion: rawTags,
@@ -117,7 +138,7 @@ export function storyCategoryPromptSection(): string {
   return [
     '【作品分类标签要求】',
     '你需要同时为每个候选生成分类标签。只能从下列枚举中选择；没有对应项就返回空数组；不要新增、改写或解释标签。',
-    `主分类 main_category：必须且只能选择一个。可选：${main}`,
+    `主分类 main_category：必须且只能选择一个，且必须严格等于下列枚举值之一（禁止改写、缩写或编造）：${main}`,
     `情节分类 plot：可多选。可选：${STORY_PLOT_TAGS.join('、')}`,
     `角色分类 character：可多选。可选：${STORY_CHARACTER_TAGS.join('、')}`,
     `情绪分类 emotion：可多选。可选：${STORY_EMOTION_TAGS.join('、')}`,

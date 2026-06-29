@@ -17,6 +17,7 @@ import {
   detectConvergenceStalled
 } from './settings-quality-conclusion'
 import { parseRevisedAnchorsFromAi, type RevisedAnchor } from './parse-anchors'
+import { validateGoldenFinger, goldenFingerCrossSettingIssues } from './golden-finger-validation'
 
 export type { QualityConclusion, QualitySeverity, QualityVerdict }
 export {
@@ -361,24 +362,34 @@ export function hasSettingsQualityCheck(workId: number): boolean {
   return getSettingsQualityStatus(workId).canProceed
 }
 
+function getGoldenFingerHardIssues(workId: number): string[] {
+  const gfCheck = validateGoldenFinger(workId)
+  const crossIssues = goldenFingerCrossSettingIssues(workId, gfCheck.structured)
+  return [...gfCheck.issues, ...crossIssues]
+}
+
 export function formatQualityIssuesForContext(workId: number): string {
   const status = getSettingsQualityStatus(workId)
+  const gfIssues = getGoldenFingerHardIssues(workId)
   if (status.isStale) {
     return '【设定自检】报告已过期，请先重新运行设定质量自检后再继续生成。'
   }
-  if (!status.unresolvedIssues.length) return ''
+  const allIssues = [...gfIssues, ...status.unresolvedIssues]
+  if (!allIssues.length) return ''
   return [
     '【设定自检未决问题 - 生成时须主动规避】',
-    ...status.unresolvedIssues.map(i => `- ${i}`)
+    ...allIssues.map(i => `- ${i}`)
   ].join('\n')
 }
 
 /** 核心设定 AI 生成：仅注入未决 issue，过期占位不写入 prompt */
 export function formatQualityIssuesForGeneration(workId: number): string {
   const status = getSettingsQualityStatus(workId)
-  if (status.isStale || !status.unresolvedIssues.length) return ''
+  const gfIssues = getGoldenFingerHardIssues(workId)
+  if (status.isStale || (!gfIssues.length && !status.unresolvedIssues.length)) return ''
   return [
     '【设定自检未决问题 - 生成时须主动规避】',
+    ...gfIssues.map(i => `[硬性校验] ${i}`),
     ...status.unresolvedIssues.map(i => `- ${i}`)
   ].join('\n')
 }

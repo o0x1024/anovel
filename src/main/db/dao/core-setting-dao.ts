@@ -1,4 +1,5 @@
 import { BaseDAO } from './base-dao'
+import { parseGoldenFingerFromMarkdown } from '../../../shared/golden-finger-types'
 
 const MAX_VERSIONS = 10
 
@@ -7,6 +8,7 @@ export interface CoreSettingRow {
   work_id: number
   type: string
   content: string
+  structured_content: string | null
   create_time: string
   update_time?: string
 }
@@ -40,8 +42,13 @@ export class CoreSettingDAO extends BaseDAO {
     const row = this.getByType(workId, type)
     return {
       updateTime: row?.update_time ?? row?.create_time ?? null,
-      hasContent: !!row?.content?.trim()
+      hasContent: !!(row?.content?.trim() || row?.structured_content?.trim())
     }
+  }
+
+  getStructuredContent(workId: number, type: CoreSettingType): string | null {
+    const row = this.getByType(workId, type)
+    return row?.structured_content ?? null
   }
 
   listVersions(workId: number, type: CoreSettingType, limit = MAX_VERSIONS): CoreSettingVersionRow[] {
@@ -56,6 +63,11 @@ export class CoreSettingDAO extends BaseDAO {
 
   /** 更新或插入（每种类型只保留一条）；变更前自动保存版本快照 */
   upsert(workId: number, type: CoreSettingType, content: string): void {
+    if (type === 'golden_finger') {
+      const structured = parseGoldenFingerFromMarkdown(content)
+      this.upsertStructured(workId, type, content, JSON.stringify(structured))
+      return
+    }
     const existing = this.getByType(workId, type)
     if (existing) {
       if (existing.content !== content) {
@@ -69,6 +81,30 @@ export class CoreSettingDAO extends BaseDAO {
       this.insert(
         'INSERT INTO core_settings (work_id, type, content, update_time) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
         [workId, type, content]
+      )
+    }
+  }
+
+  /**
+   * 更新或插入结构化内容，同时保留 Markdown 渲染版本。
+   * 用于金手指等需要结构化校验与正文注入的设定。
+   */
+  upsertStructured(workId: number, type: CoreSettingType, content: string, structuredJson: string): void {
+    const existing = this.getByType(workId, type)
+    const hasContentChanged = existing ? existing.content !== content : true
+    const hasStructuredChanged = existing ? existing.structured_content !== structuredJson : true
+    if (existing) {
+      if (hasContentChanged || hasStructuredChanged) {
+        this.createVersion(workId, type, existing.content)
+      }
+      this.run(
+        'UPDATE core_settings SET content = ?, structured_content = ?, update_time = CURRENT_TIMESTAMP WHERE id = ?',
+        [content, structuredJson, existing.id]
+      )
+    } else {
+      this.insert(
+        'INSERT INTO core_settings (work_id, type, content, structured_content, update_time) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)',
+        [workId, type, content, structuredJson]
       )
     }
   }

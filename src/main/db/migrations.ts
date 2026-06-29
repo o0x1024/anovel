@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import { parseGoldenFingerFromMarkdown } from '../../shared/golden-finger-types'
 
 function hasColumn(db: Database.Database, table: string, column: string): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
@@ -40,6 +41,10 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     db.exec(
       `UPDATE core_settings SET update_time = COALESCE(create_time, CURRENT_TIMESTAMP) WHERE update_time IS NULL`
     )
+  }
+
+  if (hasTable(db, 'core_settings') && !hasColumn(db, 'core_settings', 'structured_content')) {
+    db.exec(`ALTER TABLE core_settings ADD COLUMN structured_content TEXT`)
   }
 
   db.exec(`
@@ -666,4 +671,18 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       db.exec(`UPDATE core_settings SET type = 'incubator_ending' WHERE type = 'incubator_ending_image'`)
     }
   } catch { /* 表可能不存在，跳过 */ }
+
+  // V3.7: 金手指结构化迁移（旧 Markdown 自动解析为 structured_content）
+  try {
+    if (hasTable(db, 'core_settings') && hasColumn(db, 'core_settings', 'structured_content')) {
+      const rows = db.prepare(
+        `SELECT id, content FROM core_settings WHERE type = 'golden_finger' AND (structured_content IS NULL OR structured_content = '') AND content IS NOT NULL AND content != ''`
+      ).all() as { id: number; content: string }[]
+      const update = db.prepare('UPDATE core_settings SET structured_content = ? WHERE id = ?')
+      for (const row of rows) {
+        const structured = parseGoldenFingerFromMarkdown(row.content)
+        update.run(JSON.stringify(structured), row.id)
+      }
+    }
+  } catch { /* 忽略解析失败 */ }
 }

@@ -11,8 +11,17 @@ import {
 import { formatDbUtcAsLocal } from '../../../../shared/local-datetime'
 import { isTotalWordCountInTargetRange } from '../../../../shared/body-word-target'
 
-const props = defineProps<{ workId: number }>()
+const props = defineProps<{ workId: number; workType?: 'novel' | 'story' }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
+
+const NOVEL_START_PHASE: GoalRoutinePhase = 'materialize_settings'
+const availablePhases = computed<GoalRoutinePhase[]>(() => {
+  if (props.workType === 'novel') {
+    const idx = GOAL_ROUTINE_PHASE_ORDER.indexOf(NOVEL_START_PHASE)
+    return idx >= 0 ? GOAL_ROUTINE_PHASE_ORDER.slice(idx) : GOAL_ROUTINE_PHASE_ORDER
+  }
+  return GOAL_ROUTINE_PHASE_ORDER
+})
 
 const CONFIG_STORAGE_KEY = 'goalRoutineConfig'
 
@@ -154,7 +163,7 @@ const canContinueRepair = computed(() => {
     && repairPhases.includes(s.current_phase ?? '')
 })
 
-const resumeFromPhase = ref<GoalRoutinePhase>('incubate_outline')
+const resumeFromPhase = ref<GoalRoutinePhase>(availablePhases.value[0] ?? 'incubate_outline')
 const phasePickerTouched = ref(false)
 
 const showResumePhasePicker = computed(() => {
@@ -165,12 +174,16 @@ const showResumePhasePicker = computed(() => {
   return (s.turn_count ?? 0) > 0 && Boolean(s.current_phase)
 })
 
+function normalizePhase(phase: string | null | undefined): GoalRoutinePhase {
+  if (phase && isGoalRoutinePhase(phase) && availablePhases.value.includes(phase)) {
+    return phase
+  }
+  return availablePhases.value[0] ?? NOVEL_START_PHASE
+}
+
 function syncResumePhaseFromState(): void {
   if (phasePickerTouched.value) return
-  const phase = state.value?.current_phase
-  if (phase && isGoalRoutinePhase(phase)) {
-    resumeFromPhase.value = phase
-  }
+  resumeFromPhase.value = normalizePhase(state.value?.current_phase)
 }
 const visibleTurns = computed(() => {
   const ev = liveTurn.value
@@ -420,7 +433,7 @@ watch(config, saveConfig, { deep: true })
           class="select select-bordered select-sm w-full rounded-lg"
           @change="phasePickerTouched = true"
         >
-          <option v-for="phase in GOAL_ROUTINE_PHASE_ORDER" :key="phase" :value="phase">
+          <option v-for="phase in availablePhases" :key="phase" :value="phase">
             {{ GOAL_ROUTINE_PHASE_LABELS[phase] }}
           </option>
         </select>

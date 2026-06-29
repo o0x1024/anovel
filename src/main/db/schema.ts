@@ -40,6 +40,7 @@ export function initSchema(): void {
       work_id INTEGER NOT NULL,
       type VARCHAR(20) NOT NULL,
       content TEXT NOT NULL,
+      structured_content TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );

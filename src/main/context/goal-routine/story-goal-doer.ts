@@ -34,6 +34,13 @@ export interface BeatGenResult {
   error?: string
 }
 
+export interface GenerateBeatBodyOptions {
+  signal?: AbortSignal
+  goalDescription?: string
+  extraHint?: string
+  workType?: 'novel' | 'story'
+}
+
 function countWords(s: string): number {
   return s.replace(/\s/g, '').length
 }
@@ -47,14 +54,16 @@ function buildBodyPrompt(
   chapterId: number,
   wordTarget: number,
   goalDescription?: string,
-  extraHint?: string
+  extraHint?: string,
+  workType: 'novel' | 'story' = 'story'
 ): string | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const ch = chapters.find(c => c.id === chapterId)
   if (!ch) return null
   const volumes = volumeChapterDAO.listVolumes(workId)
   const vol = volumes.find(v => v.id === ch.volume_id)
-  return formatBodyPromptLines('story', {
+  return formatBodyPromptLines(workType, {
+    volName: vol?.name,
     volDescription: vol?.description,
     chapterTitle: ch.title,
     outline: ch.outline,
@@ -62,7 +71,7 @@ function buildBodyPrompt(
   }).concat(
     [
       goalDescription?.trim()
-        ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本节拍时贯彻该目标（题材/风格/情节走向）。`
+        ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本${workType === 'story' ? '拍' : '章'}时贯彻该目标（题材/风格/情节走向）。`
         : '',
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : ''
     ].filter(Boolean)
@@ -70,23 +79,19 @@ function buildBodyPrompt(
 }
 
 /**
- * 为指定节拍生成正文：headless 生成 → humanize（仅轻量）→ 写库（带版本快照）。
+ * 为指定节拍/章节生成正文：headless 生成 → humanize（仅轻量）→ 写库（带版本快照）。
  * 不掺 autoRewrite；去AI 由 checker 判定、fix 阶段针对性处理。
- * @param signal 取消信号
- * @param goalDescription 用户创作目标
- * @param extraHint 额外修复提示（fix 阶段）
  */
 export async function generateBeatBody(
   workId: number,
   chapterId: number,
-  signal?: AbortSignal,
-  goalDescription?: string,
-  extraHint?: string
+  options: GenerateBeatBodyOptions = {}
 ): Promise<BeatGenResult> {
+  const { signal, goalDescription, extraHint, workType = 'story' } = options
   const plan = loadWritingPlan(workId)
   const wordTarget = plan.wordsPerChapter || 4000
-  const prompt = buildBodyPrompt(workId, chapterId, wordTarget, goalDescription, extraHint)
-  if (!prompt) return { success: false, content: '', wordCount: 0, error: '节拍不存在' }
+  const prompt = buildBodyPrompt(workId, chapterId, wordTarget, goalDescription, extraHint, workType)
+  if (!prompt) return { success: false, content: '', wordCount: 0, error: `${workType === 'story' ? '节拍' : '章节'}不存在` }
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 

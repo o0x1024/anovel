@@ -6,6 +6,7 @@ import { seedBuiltinStyles } from './db/seed'
 import { seedBuiltinMaterials } from './db/seed-materials'
 import { seedAssistantRoles } from './db/assistant-seed'
 import { cancelAllGoalLoops } from './context/goal-routine/story-goal-routine'
+import { cancelAllNovelGoalLoops } from './context/goal-routine/novel-goal-routine'
 import { registerIpcHandlers } from './ipc'
 import { appLogger } from './logger/app-logger'
 import { cleanupDuplicateNarrativeMemoryForAllWorks } from './context/memory-cleanup'
@@ -160,6 +161,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   try {
     cancelAllGoalLoops()
+    cancelAllNovelGoalLoops()
   } catch (e) {
     appLogger.warn('goal_routine', '关闭时中止目标循环失败', { error: String(e) })
   }

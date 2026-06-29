@@ -483,13 +483,15 @@ function parseTitleHookCandidates(content: string): TitleHookCandidate[] {
       const title = typeof row.title === 'string' ? row.title.trim() : ''
       const hook = typeof row.hook === 'string' ? row.hook.trim() : ''
       if (!title || !hook) return null
+      const summary = typeof row.summary === 'string' ? row.summary.trim() : ''
+      const fallbackText = [title, hook, summary].join('\n')
       const candidate: TitleHookCandidate = {
         title,
         hook,
-        tags: normalizeStoryCategoryTags(row.tags)
+        tags: normalizeStoryCategoryTags(row.tags, fallbackText)
       }
       if (typeof row.type === 'string') candidate.type = row.type.trim()
-      if (typeof row.summary === 'string') candidate.summary = row.summary.trim()
+      if (summary) candidate.summary = summary
       return candidate
     })
     .filter((x): x is TitleHookCandidate => x != null)
@@ -919,7 +921,7 @@ async function executeRepairPlan(
   for (const chapterId of plan.targetChapterIds) {
     assertNotAborted(signal)
     const ch = volumeChapterDAO.getChapter(chapterId)
-    const gen = await generateBeatBody(workId, chapterId, signal, goal, plan.hint)
+    const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, extraHint: plan.hint })
     if (!gen.success) throw new Error(gen.error || '修复生成失败')
     summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字`)
   }
@@ -1125,7 +1127,7 @@ export async function runStoryGoalLoop(
             phase = 'goal_check'
           } else {
             emit(`正在生成正文「${beat.title}」`, 'running')
-            const gen = await generateBeatBody(workId, beat.id, controller.signal, fullConfig.goalDescription)
+            const gen = await generateBeatBody(workId, beat.id, { signal: controller.signal, goalDescription: fullConfig.goalDescription })
             if (!gen.success) throw new Error(gen.error || '正文生成失败')
             const mem = gen.memoryExtracted
             const memMsg = mem ? ` · 记忆体：+${mem.planted}伏笔/${mem.snapshots}快照/${mem.foreshadowingResolved}回收` : ''

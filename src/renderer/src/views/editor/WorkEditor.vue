@@ -122,12 +122,9 @@ const utilitySteps = computed<StepDef[]>(() => {
     { key: 'stability', label: '文风稳定性', icon: 'fire' },
     { key: 'taste', label: '品味档案', icon: 'gem' },
     { key: 'images', label: 'AI 配图', icon: 'palette' },
-    { key: 'favorites', label: '收藏夹', icon: 'bookmark' }
+    { key: 'favorites', label: '收藏夹', icon: 'bookmark' },
+    { key: 'goal', label: '目标循环', icon: 'rotate' }
   ]
-  // 目标循环仅短故事暴露
-  if (isStory.value) {
-    base.push({ key: 'goal', label: '目标循环', icon: 'rotate' })
-  }
   return base
 })
 
@@ -486,7 +483,7 @@ async function doExport() {
       <div class="flex-1 overflow-auto px-3 py-3 sm:px-4 sm:py-4 scrollbar-thin">
         <div class="w-full min-w-0 animate-fade-in">
           <KeepAlive :key="workId" :max="Object.keys(panelComponents).length">
-            <component :is="activePanel" :work-id="workId" />
+            <component :is="activePanel" :work-id="workId" :work-type="isStory ? 'story' : 'novel'" />
           </KeepAlive>
         </div>
       </div>

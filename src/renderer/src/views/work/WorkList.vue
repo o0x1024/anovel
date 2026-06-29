@@ -183,7 +183,7 @@ const editWork = ref({
 
 // 列表筛选与排序
 const searchQuery = ref('')
-const statusFilter = ref<string>('')
+const statusFilter = ref<string>('ongoing')
 const genreFilter = ref<string>('')
 const sortKey = ref<'update' | 'create' | 'words' | 'progress'>('update')
 
@@ -287,7 +287,6 @@ function getWorkGoalProgress(workId: number): GoalProgressSummary | undefined {
 }
 
 async function fetchAllGoalStates() {
-  if (workType !== 'story') return
   try {
     const rows = await window.anovel.invoke('goal:listAllStates') as Array<{
       workId: number
@@ -928,7 +927,7 @@ function progressPct(work: Work): number {
             </div>
 
             <!-- 短故事目标循环进度 -->
-            <div v-if="workType === 'story' && getWorkGoalProgress(work.id)" class="mt-3 pt-3 border-t border-base-300/40">
+            <div v-if="getWorkGoalProgress(work.id)" class="mt-3 pt-3 border-t border-base-300/40">
               <div class="flex items-center justify-between gap-2 mb-1.5">
                 <div class="flex items-center gap-1.5 min-w-0">
                   <font-awesome-icon icon="rotate" class="w-3 h-3 text-base-content/40" :class="{ 'animate-spin': getWorkGoalProgress(work.id)!.status === 'running' }" />
@@ -1069,7 +1068,7 @@ function progressPct(work: Work): number {
           </div>
 
           <!-- 短故事目标循环进度 -->
-          <div v-if="workType === 'story' && getWorkGoalProgress(work.id)" class="flex items-center gap-2 mt-1.5">
+          <div v-if="getWorkGoalProgress(work.id)" class="flex items-center gap-2 mt-1.5">
             <font-awesome-icon icon="rotate" class="w-3 h-3 text-base-content/40" :class="{ 'animate-spin': getWorkGoalProgress(work.id)!.status === 'running' }" />
             <span class="badge badge-xs shrink-0" :class="goalStatusBadgeClass(getWorkGoalProgress(work.id)!.status)">
               {{ goalStatusLabel(getWorkGoalProgress(work.id)!.status) }}
@@ -1089,7 +1088,7 @@ function progressPct(work: Work): number {
           </span>
           <div class="flex gap-0.5" @click.stop>
             <button
-              v-if="workType === 'story' && canResumeGoalFromList(getWorkGoalProgress(work.id))"
+              v-if="canResumeGoalFromList(getWorkGoalProgress(work.id))"
               type="button"
               class="btn btn-ghost btn-xs btn-square text-warning"
               title="继续目标循环"
@@ -1098,7 +1097,7 @@ function progressPct(work: Work): number {
               <font-awesome-icon icon="forward" class="w-3 h-3" />
             </button>
             <button
-              v-if="workType === 'story' && canCancelGoalFromList(getWorkGoalProgress(work.id))"
+              v-if="canCancelGoalFromList(getWorkGoalProgress(work.id))"
               type="button"
               class="btn btn-ghost btn-xs btn-square text-error"
               title="取消目标循环"

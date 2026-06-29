@@ -74,12 +74,14 @@ function normalizeCandidate(raw: unknown): TitleHookCandidate | null {
   const title = typeof row.title === 'string' ? row.title.trim() : ''
   const hook = typeof row.hook === 'string' ? row.hook.trim() : ''
   if (!title || !hook) return null
+  const summary = typeof row.summary === 'string' ? row.summary.trim() : ''
+  const fallbackText = [title, hook, summary].join('\n')
   return {
     title,
     hook,
     type: typeof row.type === 'string' ? row.type.trim() : '',
-    summary: typeof row.summary === 'string' ? row.summary.trim() : '',
-    tags: normalizeStoryCategoryTags(row.tags)
+    summary,
+    tags: normalizeStoryCategoryTags(row.tags, fallbackText)
   }
 }
 

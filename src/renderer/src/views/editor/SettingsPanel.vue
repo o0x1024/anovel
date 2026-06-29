@@ -13,6 +13,7 @@ import StoryTitleAndHookGenerator from './StoryTitleAndHookGenerator.vue'
 import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import SectionsPreviewDialog, { type PreviewSection } from '../../components/SectionsPreviewDialog.vue'
 import SettingAssistantPanel from './SettingAssistantPanel.vue'
+import GoldenFingerStructuredEditor from './GoldenFingerStructuredEditor.vue'
 import type { NameEntryRow } from '../../../../shared/name-registry-types'
 import { GENRE_TREE } from '../../../../shared/genre-worldview-config'
 import {
@@ -91,20 +92,35 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '- 禁止写叙事段落或场景示例'
   ].join('\n'),
   golden_finger: [
-    '你是顶级的能力系统设计师。基于以下主角设定和故事信息，设计金手指系统。',
+    '你是顶级的能力系统设计师，专攻番茄网文爆款。基于以下主角设定和故事信息，设计金手指系统。',
     '若上下文含「用户补充要求」，须严格遵守。',
     '核心原则：',
     '- 限制比能力更重要——金手指应同时是优势来源和麻烦来源',
-    '- 好的金手指让读者理解「主角凭什么赢」和「主角为什么还不能赢」',
+    '- 好的金手指让读者 3 秒内理解「主角凭什么赢」和「主角为什么还不能赢」',
     '- 金手指决定了整本书的核心玩法，不是装饰性设定',
+    '- 番茄铁律：可视化指标 > 模糊描述；限制条件必须能写成进度条/数值',
     '输出要求：',
-    '- 用 Markdown 结构化输出：## 名称与形态 / ## 核心能力 / ## 获取方式与觉醒条件 / ## 限制条件 / ## 反噬机制 / ## 升级路径 / ## 信息差优势',
-    '- 总字数 400-800 字',
+    '- 用 Markdown 结构化输出，必须包含以下章节（缺项视为不合格）：',
+    '  ## 番茄一句话卖点',
+    '  ## 名称与形态',
+    '  ## 核心能力',
+    '  ## 获取方式与觉醒条件',
+    '  ## 限制条件',
+    '  ## 反噬机制',
+    '  ## 升级路径',
+    '  ## 信息差优势',
+    '  ## 副作用/负面绑定',
+    '  ## 禁用/红线场景',
+    '  ## 可视化限制指标（番茄核心）',
+    '  ## 前三章首次爽点场景',
+    '- 总字数 500-1000 字',
     '- 核心能力最多 3 个，宁可少而精——能力越多=越无聊',
     '- 限制条件要具体到数值或场景（冷却多久/消耗什么/什么情况下失效）',
     '- 反噬机制是冲突的自然来源，不能是"用多了会累"这种无效限制',
     '- 升级路径写明能力如何成长（等级/解锁新功能/融合进化）',
     '- 信息差优势：主角知道什么别人不知道的？这是智斗和反转的基础',
+    '- 可视化限制指标必须包含：当前等级/阶段、每次使用消耗、冷却时间、使用次数上限、进度条形态、越级/失效后果',
+    '- 前三章首次爽点场景必须具体：触发事件、金手指如何发挥作用、读者爽感来源',
     '- 禁止写"无敌""全能"类设计'
   ].join('\n'),
   pleasure_engine: [
@@ -203,20 +219,21 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     STORY_HOT_WORD_PROMPT
   ].join('\n'),
   golden_finger: [
-    '你是顶级的短故事核心钩子设计师。请先判断以下故事是否包含特殊设定机制，再选择对应路径输出。',
+    '你是顶级的短故事核心钩子设计师，深谙番茄短故事爆款逻辑。请先判断以下故事是否包含特殊设定机制，再选择对应路径输出。',
     '',
     '【路径 A：有特殊设定/金手指机制的故事】',
     '若故事存在超自然/特殊信息差设定，输出：',
-    '## 设定名称与形态 / ## 核心展现机制（如何融入日常冲突） / ## 信息差构建（主角知道什么/别人不知道什么） / ## 限制与紧迫感（避免万能导致失去张力） / ## 对核心冲突的推动作用',
+    '## 番茄一句话卖点 / ## 设定名称与形态 / ## 核心展现机制（如何融入日常冲突） / ## 信息差构建（主角知道什么/别人不知道什么） / ## 限制与紧迫感（避免万能导致失去张力） / ## 可视化限制指标（当前等级、每次消耗、冷却/次数、失效后果） / ## 对核心冲突的推动作用 / ## 前三章首次爽点场景',
     '',
     '【路径 B：纯情感/现实向故事（无金手指）】',
     '若故事无特殊设定机制，改为设计「身份反差与信息差」，输出：',
-    '## 身份反差设计（主角表面身份 vs 隐藏实力/背景） / ## 关键信息差（读者先知哪些、主角后知哪些、反派不知哪些） / ## 信息差释放节奏（何时揭晓、如何制造爽点） / ## 反差爆发场景（最能体现反差的1-2个关键场景设计）',
+    '## 番茄一句话卖点 / ## 身份反差设计（主角表面身份 vs 隐藏实力/背景） / ## 关键信息差（读者先知哪些、主角后知哪些、反派不知哪些） / ## 信息差释放节奏（何时揭晓、如何制造爽点） / ## 反差爆发场景（最能体现反差的1-2个关键场景设计） / ## 前三章首次爽点场景',
     '',
     '【通用要求】',
     '- 总字数 350-700 字',
     '- 必须说明该设计如何直接服务于主角的爽点爆发',
     '- 禁止万能设定，限制条件是制造张力的核心工具',
+    '- 前三章首次爽点场景必须具体到事件、动作、读者情绪落点',
     STORY_HOT_WORD_PROMPT
   ].join('\n'),
   pleasure_engine: [
@@ -353,6 +370,7 @@ const previewOpen = ref(false)
 const previewSections = ref<PreviewSection[]>([])
 const showMarkdownPreview = ref(true)
 const assistantPosition = ref<'bottom' | 'right'>('bottom')
+const structuredEditorOpen = ref(false)
 
 const editingMinimized = ref(false)
 const minimizedSettingType = ref<SettingType | null>(null)
@@ -1067,6 +1085,14 @@ async function clearAllSettings() {
               {{ aiLoadingByType[st.type] ? '生成中...' : 'AI 生成建议' }}
             </button>
             <button
+              v-if="st.type === 'golden_finger'"
+              class="btn btn-outline btn-accent btn-xs gap-1"
+              @click="structuredEditorOpen = true"
+            >
+              <font-awesome-icon icon="table-cells" class="w-3 h-3" />
+              结构化
+            </button>
+            <button
               class="btn btn-outline btn-primary btn-xs gap-1"
               @click="startEditSetting(st.type)"
             >
@@ -1509,5 +1535,22 @@ async function clearAllSettings() {
       empty-hint="尚未填写任何核心设定"
       @close="previewOpen = false"
     />
+
+    <dialog
+      :open="structuredEditorOpen"
+      class="modal modal-open"
+      @close="structuredEditorOpen = false"
+    >
+      <div class="modal-box max-w-3xl">
+        <GoldenFingerStructuredEditor
+          :work-id="workId"
+          @saved="async () => { structuredEditorOpen = false; await loadCoreSettings(); await qualityPanelRef?.load?.(); await nav?.refreshProgress(); }"
+          @cancel="structuredEditorOpen = false"
+        />
+      </div>
+      <form method="dialog" class="modal-backdrop bg-black/40" @click="structuredEditorOpen = false">
+        <button type="button">close</button>
+      </form>
+    </dialog>
   </div>
 </template>

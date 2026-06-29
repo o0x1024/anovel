@@ -51,6 +51,7 @@ import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTr
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { autoRewriteBody } from './context/lab/body-auto-rewrite'
 import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning, shouldResumeGoalLoop, type Phase } from './context/goal-routine/story-goal-routine'
+import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning, shouldResumeNovelGoalLoop } from './context/goal-routine/novel-goal-routine'
 import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
 import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
@@ -413,6 +414,7 @@ export function registerIpcHandlers(): void {
     }
     coreSettingDAO.upsert(workId, type, trimmed)
   })
+
   ipcMain.handle('setting:getConditionRules', (_e, workId: number) => getConditionRules(workId))
   ipcMain.handle('setting:setConditionRules', (_e, workId: number, rules: string[]) => {
     setConditionRules(workId, rules)
@@ -462,16 +464,25 @@ export function registerIpcHandlers(): void {
     autoRewriteBody(content))
 
   // ==================== 目标循环（goal routine）====================
+  function isNovelWork(workId: number): boolean {
+    return workDAO.getById(workId)?.work_type === 'novel'
+  }
+
+  function resolveGoalForcePhase(config?: Record<string, unknown>): { forcePhase?: Phase; cfg: Record<string, unknown> } {
+    if (!config) return { cfg: {} }
+    const { forcePhase: fp, ...rest } = config
+    const forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
+    return { forcePhase, cfg: rest }
+  }
+
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
-    let forcePhase: Phase | undefined
-    let cfg: Record<string, unknown> = config ?? {}
-    if (config) {
-      const { forcePhase: fp, ...rest } = config
-      forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
-      cfg = rest
-    }
-    const resume = shouldResumeGoalLoop(workId) || Boolean(forcePhase)
-    void runStoryGoalLoop(workId, cfg, e.sender, resume, forcePhase).catch((err) => {
+    const { forcePhase, cfg } = resolveGoalForcePhase(config)
+    const isNovel = isNovelWork(workId)
+    const resume = (isNovel ? shouldResumeNovelGoalLoop(workId) : shouldResumeGoalLoop(workId)) || Boolean(forcePhase)
+    const runner = isNovel
+      ? runNovelGoalLoop(workId, cfg, e.sender, resume, forcePhase)
+      : runStoryGoalLoop(workId, cfg, e.sender, resume, forcePhase)
+    void runner.catch((err) => {
       appLogger.error('goal_routine', '目标循环启动失败', { workId, error: String(err) })
     })
     return true
@@ -486,18 +497,26 @@ export function registerIpcHandlers(): void {
       forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
       config = rest
     }
-    void runStoryGoalLoop(workId, config, e.sender, true, forcePhase).catch((err) => {
+    const isNovel = isNovelWork(workId)
+    const runner = isNovel
+      ? runNovelGoalLoop(workId, config, e.sender, true, forcePhase)
+      : runStoryGoalLoop(workId, config, e.sender, true, forcePhase)
+    void runner.catch((err) => {
       appLogger.error('goal_routine', '目标循环续跑失败', { workId, error: String(err) })
     })
     return true
   })
-  ipcMain.handle('goal:cancel', (_e, workId: number) => cancelGoalLoop(workId))
+  ipcMain.handle('goal:cancel', (_e, workId: number) => {
+    return isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
+  })
   ipcMain.handle('goal:getState', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
     const turns = goalRoutineDAO.listTurns(workId, 30)
     return { state: state ?? null, turns }
   })
-  ipcMain.handle('goal:isRunning', (_e, workId: number) => isGoalLoopRunning(workId))
+  ipcMain.handle('goal:isRunning', (_e, workId: number) => {
+    return isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)
+  })
 
   ipcMain.handle('goal:listAllStates', () => {
     const rows = goalRoutineDAO.listAll()
