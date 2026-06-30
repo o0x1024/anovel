@@ -8,9 +8,9 @@
 export const CORE_SETTING_TYPES = [
   'protagonist',
   'golden_finger',
-  'pleasure_engine',
   'world_pressure',
   'conflict_engine',
+  'pleasure_engine',
   'supporting_cast'
 ] as const
 

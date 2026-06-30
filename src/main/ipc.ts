@@ -415,6 +415,20 @@ export function registerIpcHandlers(): void {
     coreSettingDAO.upsert(workId, type, trimmed)
   })
 
+  ipcMain.handle('setting:getStructured', (_e, workId: number, type: string) => {
+    const raw = coreSettingDAO.getStructuredContent(workId, type)
+    if (!raw) return null
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return null
+    }
+  })
+
+  ipcMain.handle('setting:upsertStructured', (_e, workId: number, type: string, content: string, structured: unknown) => {
+    coreSettingDAO.upsertStructured(workId, type, (content as string).trim(), JSON.stringify(structured))
+  })
+
   ipcMain.handle('setting:getConditionRules', (_e, workId: number) => getConditionRules(workId))
   ipcMain.handle('setting:setConditionRules', (_e, workId: number, rules: string[]) => {
     setConditionRules(workId, rules)

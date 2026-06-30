@@ -25,6 +25,12 @@ import {
   CORE_SETTING_FILL_ORDER,
   type CoreSettingType
 } from '../../../../shared/settings-types'
+import {
+  extractGoldenFingerFromAiContent,
+  goldenFingerStructuredPromptSection,
+  parseGoldenFingerFromMarkdown,
+  renderGoldenFingerMarkdown
+} from '../../../../shared/golden-finger-types'
 import { editorNavKey } from './editor-nav'
 import { storyHotWordPromptSection } from '../../../../shared/story-hot-words'
 
@@ -121,7 +127,8 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '- 信息差优势：主角知道什么别人不知道的？这是智斗和反转的基础',
     '- 可视化限制指标必须包含：当前等级/阶段、每次使用消耗、冷却时间、使用次数上限、进度条形态、越级/失效后果',
     '- 前三章首次爽点场景必须具体：触发事件、金手指如何发挥作用、读者爽感来源',
-    '- 禁止写"无敌""全能"类设计'
+    '- 禁止写"无敌""全能"类设计',
+    goldenFingerStructuredPromptSection()
   ].join('\n'),
   pleasure_engine: [
     '你是顶级的网文节奏与爽点设计大师。基于以下设定信息，设计全书的爽点机制。',
@@ -234,6 +241,8 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 必须说明该设计如何直接服务于主角的爽点爆发',
     '- 禁止万能设定，限制条件是制造张力的核心工具',
     '- 前三章首次爽点场景必须具体到事件、动作、读者情绪落点',
+    '无论选择路径 A 还是路径 B，在 Markdown 输出之后，都必须附加一个 JSON 代码块（标记为 json），字段与上述 schema 一致：',
+    goldenFingerStructuredPromptSection(),
     STORY_HOT_WORD_PROMPT
   ].join('\n'),
   pleasure_engine: [
@@ -366,11 +375,53 @@ const hasAnyCoreSetting = computed(() =>
   settingTypes.value.some(st => getSetting(st.type).trim())
 )
 
+const EDIT_DIALOG_STATE_KEY = 'anovel:editDialog:state'
+
+interface EditDialogState {
+  width?: number
+  height?: number
+  leftPanelRatio?: number
+  assistantPosition?: 'bottom' | 'right'
+  showMarkdownPreview?: boolean
+  conversations?: Record<string, number | null>
+}
+
+function loadEditDialogState(): EditDialogState {
+  try {
+    const raw = localStorage.getItem(EDIT_DIALOG_STATE_KEY)
+    if (raw) return JSON.parse(raw) as EditDialogState
+  } catch {
+    // ignore
+  }
+  return {}
+}
+
+const _savedDialogState = loadEditDialogState()
+
 const previewOpen = ref(false)
 const previewSections = ref<PreviewSection[]>([])
-const showMarkdownPreview = ref(true)
-const assistantPosition = ref<'bottom' | 'right'>('bottom')
+const showMarkdownPreview = ref(_savedDialogState.showMarkdownPreview ?? true)
+const assistantPosition = ref<'bottom' | 'right'>(_savedDialogState.assistantPosition ?? 'bottom')
 const structuredEditorOpen = ref(false)
+const editingAssistantConversationId = ref<number | null>(_savedDialogState.conversations?.['editing'] ?? null)
+
+function saveEditDialogState() {
+  try {
+    const state: EditDialogState = {
+      width: dialogWidth.value,
+      height: dialogHeight.value,
+      leftPanelRatio: leftPanelRatio.value,
+      assistantPosition: assistantPosition.value,
+      showMarkdownPreview: showMarkdownPreview.value,
+      conversations: {
+        editing: editingAssistantConversationId.value
+      }
+    }
+    localStorage.setItem(EDIT_DIALOG_STATE_KEY, JSON.stringify(state))
+  } catch {
+    // ignore
+  }
+}
 
 const editingMinimized = ref(false)
 const minimizedSettingType = ref<SettingType | null>(null)
@@ -590,8 +641,8 @@ const overviewAssistantStyle = computed(() => ({
 }))
 
 const dialogRef = ref<HTMLElement | null>(null)
-const dialogWidth = ref(1200)
-const dialogHeight = ref(700)
+const dialogWidth = ref(_savedDialogState.width ?? 1200)
+const dialogHeight = ref(_savedDialogState.height ?? 700)
 const isResizingDialog = ref(false)
 let dialogResizeStart = { x: 0, y: 0, width: 1200, height: 700 }
 
@@ -602,7 +653,7 @@ const dialogStyle = computed(() => ({
   maxHeight: '95vh'
 }))
 
-const leftPanelRatio = ref(50)
+const leftPanelRatio = ref(_savedDialogState.leftPanelRatio ?? 50)
 const isResizingHorizontal = ref(false)
 let horizontalResizeStart = { x: 0, ratio: 50 }
 
@@ -660,6 +711,52 @@ function stopHorizontalResize() {
   window.removeEventListener('mouseup', stopHorizontalResize)
 }
 
+watch(
+  [dialogWidth, dialogHeight, leftPanelRatio, assistantPosition, showMarkdownPreview, editingAssistantConversationId],
+  () => saveEditDialogState(),
+  { deep: true }
+)
+
+const structuredEditorRef = ref<HTMLElement | null>(null)
+const structuredEditorWidth = ref(1200)
+const structuredEditorHeight = ref(700)
+const isResizingStructuredEditor = ref(false)
+let structuredEditorResizeStart = { x: 0, y: 0, width: 1200, height: 700 }
+
+const structuredEditorStyle = computed(() => ({
+  width: `${structuredEditorWidth.value}px`,
+  height: `${structuredEditorHeight.value}px`,
+  maxWidth: '95vw',
+  maxHeight: '95vh'
+}))
+
+function startStructuredEditorResize(event: MouseEvent) {
+  event.preventDefault()
+  isResizingStructuredEditor.value = true
+  structuredEditorResizeStart = {
+    x: event.clientX,
+    y: event.clientY,
+    width: structuredEditorWidth.value,
+    height: structuredEditorHeight.value
+  }
+  window.addEventListener('mousemove', onStructuredEditorResize)
+  window.addEventListener('mouseup', stopStructuredEditorResize)
+}
+
+function onStructuredEditorResize(event: MouseEvent) {
+  if (!isResizingStructuredEditor.value) return
+  const dx = event.clientX - structuredEditorResizeStart.x
+  const dy = event.clientY - structuredEditorResizeStart.y
+  structuredEditorWidth.value = Math.max(800, Math.min(Math.round(window.innerWidth * 0.95), structuredEditorResizeStart.width + dx))
+  structuredEditorHeight.value = Math.max(420, Math.min(Math.round(window.innerHeight * 0.95), structuredEditorResizeStart.height + dy))
+}
+
+function stopStructuredEditorResize() {
+  isResizingStructuredEditor.value = false
+  window.removeEventListener('mousemove', onStructuredEditorResize)
+  window.removeEventListener('mouseup', stopStructuredEditorResize)
+}
+
 function openSettingsPreview() {
   const sections: PreviewSection[] = []
   for (const st of settingTypes.value) {
@@ -712,6 +809,11 @@ watch(
     hintsDialogType.value = null
     void reloadPanelData()
   }
+)
+
+watch(
+  [dialogWidth, dialogHeight, leftPanelRatio, assistantPosition, showMarkdownPreview, editingAssistantConversationId],
+  () => { saveEditDialogState() }
 )
 
 function bindVersionRef(type: SettingType, el: Element | ComponentPublicInstance | null) {
@@ -831,6 +933,10 @@ function startEditSetting(type: SettingType, content?: string) {
   setDraft(type, content ?? getSetting(type))
 }
 
+function startEditGoldenFinger() {
+  structuredEditorOpen.value = true
+}
+
 function cancelEdit() {
   editingType.value = null
   editingMinimized.value = false
@@ -845,6 +951,23 @@ async function saveSetting() {
 
 async function saveSettingContent(type: SettingType) {
   const content = getDraft(type).trim()
+  if (type === 'golden_finger') {
+    const extracted = extractGoldenFingerFromAiContent(content)
+    if (extracted) {
+      await window.anovel.invoke(
+        'setting:upsertStructured',
+        props.workId,
+        'golden_finger',
+        extracted.markdown,
+        extracted.structured
+      )
+      await loadCoreSettings()
+      await refreshVersionHistory(type)
+      await qualityPanelRef.value?.load?.()
+      await nav?.refreshProgress()
+      return
+    }
+  }
   await window.anovel.invoke('setting:upsert', props.workId, type, content)
   await loadCoreSettings()
   await refreshVersionHistory(type)
@@ -874,6 +997,16 @@ async function onOverviewSlotApplied(slotType: string) {
   await qualityPanelRef.value?.load?.()
   await nav?.refreshProgress()
   void slotType
+}
+
+async function onEditSlotApplied(slotType: string) {
+  await loadCoreSettings()
+  await qualityPanelRef.value?.load?.()
+  await nav?.refreshProgress()
+  if (editingType.value && editingType.value === slotType) {
+    const content = getSetting(slotType)
+    if (content) setDraft(editingType.value, content)
+  }
 }
 
 interface ModelChatIpcResult {
@@ -978,6 +1111,33 @@ async function runAiSuggest(
     }) as ModelChatIpcResult
 
     if (res.success) {
+      if (type === 'golden_finger') {
+        const extracted = extractGoldenFingerFromAiContent(res.content)
+        if (extracted) {
+          await window.anovel.invoke(
+            'setting:upsertStructured',
+            props.workId,
+            'golden_finger',
+            extracted.markdown,
+            extracted.structured
+          )
+        } else {
+          const parsed = parseGoldenFingerFromMarkdown(res.content)
+          const markdown = renderGoldenFingerMarkdown(parsed)
+          await window.anovel.invoke(
+            'setting:upsertStructured',
+            props.workId,
+            'golden_finger',
+            markdown,
+            parsed
+          )
+        }
+        await loadCoreSettings()
+        await qualityPanelRef.value?.load?.()
+        await nav?.refreshProgress()
+        structuredEditorOpen.value = true
+        return
+      }
       setDraft(type, res.content)
       editingType.value = type
     } else {
@@ -1056,7 +1216,7 @@ async function clearAllSettings() {
           @click="openOverviewAssistant"
         >
           <font-awesome-icon icon="robot" class="w-3.5 h-3.5" />
-          AI 助手
+          AI 总览助手
         </button>
       </div>
     </div>
@@ -1082,19 +1242,11 @@ async function clearAllSettings() {
                 :spin="!!aiLoadingByType[st.type]"
                 class="w-3 h-3"
               />
-              {{ aiLoadingByType[st.type] ? '生成中...' : 'AI 生成建议' }}
-            </button>
-            <button
-              v-if="st.type === 'golden_finger'"
-              class="btn btn-outline btn-accent btn-xs gap-1"
-              @click="structuredEditorOpen = true"
-            >
-              <font-awesome-icon icon="table-cells" class="w-3 h-3" />
-              结构化
+              {{ aiLoadingByType[st.type] ? '生成中...' : 'AI 生成初稿' }}
             </button>
             <button
               class="btn btn-outline btn-primary btn-xs gap-1"
-              @click="startEditSetting(st.type)"
+              @click="st.type === 'golden_finger' ? startEditGoldenFinger() : startEditSetting(st.type)"
             >
               <font-awesome-icon :icon="getSetting(st.type) ? 'edit' : 'plus'" class="w-3 h-3" />
               {{ getSetting(st.type) ? '编辑' : '添加' }}
@@ -1268,7 +1420,7 @@ async function clearAllSettings() {
 
     <dialog :class="['modal', { 'modal-open': hintsDialogType !== null && !!hintsDialogMeta }]">
       <div v-if="hintsDialogMeta && hintsDialogType" class="modal-box max-w-lg">
-        <h3 class="font-bold text-lg mb-1">{{ hintsDialogMeta.title }} · AI 生成</h3>
+        <h3 class="font-bold text-lg mb-1">{{ hintsDialogMeta.title }} · AI 生成初稿</h3>
         <p class="text-sm text-base-content/50 mb-4">{{ hintsDialogMeta.desc }}</p>
         <div v-if="hintsDialogType === 'world_pressure'" class="mb-3 space-y-2">
           <div class="flex items-end gap-2">
@@ -1489,7 +1641,10 @@ async function clearAllSettings() {
                 :setting-type="editingType"
                 :setting-label="editingMeta.label"
                 position="right"
+                :initial-conversation-id="editingAssistantConversationId"
                 @apply-suggestion="setDraft(editingType, $event)"
+                @conversation-change="editingAssistantConversationId = $event"
+                @slot-applied="onEditSlotApplied"
               />
             </div>
           </div>
@@ -1512,7 +1667,10 @@ async function clearAllSettings() {
           :setting-type="editingType"
           :setting-label="editingMeta.label"
           position="bottom"
+          :initial-conversation-id="editingAssistantConversationId"
           @apply-suggestion="setDraft(editingType, $event)"
+          @conversation-change="editingAssistantConversationId = $event"
+          @slot-applied="onEditSlotApplied"
         />
 
         <div
@@ -1538,15 +1696,28 @@ async function clearAllSettings() {
 
     <dialog
       :open="structuredEditorOpen"
-      class="modal modal-open"
+      :class="['modal', { 'modal-open': structuredEditorOpen }]"
       @close="structuredEditorOpen = false"
     >
-      <div class="modal-box max-w-3xl">
+      <div
+        v-if="structuredEditorOpen"
+        ref="structuredEditorRef"
+        class="modal-box max-w-none p-0 flex flex-col relative"
+        :style="structuredEditorStyle"
+      >
         <GoldenFingerStructuredEditor
           :work-id="workId"
+          class="flex-1 min-h-0"
           @saved="async () => { structuredEditorOpen = false; await loadCoreSettings(); await qualityPanelRef?.load?.(); await nav?.refreshProgress(); }"
           @cancel="structuredEditorOpen = false"
         />
+        <div
+          class="absolute bottom-1 right-1 w-5 h-5 cursor-nwse-resize z-50 flex items-end justify-end group"
+          title="拖动调整对话框大小"
+          @mousedown="startStructuredEditorResize"
+        >
+          <div class="w-3.5 h-3.5 border-r-2 border-b-2 border-base-content/30 rounded-br-sm group-hover:border-primary" />
+        </div>
       </div>
       <form method="dialog" class="modal-backdrop bg-black/40" @click="structuredEditorOpen = false">
         <button type="button">close</button>

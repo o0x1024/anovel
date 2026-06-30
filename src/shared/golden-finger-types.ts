@@ -96,30 +96,36 @@ export function normalizeGoldenFinger(value: Partial<GoldenFingerStructured>): G
     condition: u?.condition ?? '',
     unlocks: u?.unlocks ?? ''
   })
+  const safeStr = (v: unknown): string => {
+    if (typeof v === 'string') return v
+    if (Array.isArray(v)) return v.map(item => typeof item === 'string' ? item : String(item)).join('\n')
+    if (v != null && typeof v === 'object') return JSON.stringify(v)
+    return ''
+  }
   return {
-    nameAndForm: value.nameAndForm ?? '',
+    nameAndForm: safeStr(value.nameAndForm),
     abilities: (value.abilities ?? []).map(safeAbility),
-    acquisition: value.acquisition ?? '',
+    acquisition: safeStr(value.acquisition),
     limit: {
-      cooldown: value.limit?.cooldown ?? '',
-      cost: value.limit?.cost ?? '',
-      usageLimit: value.limit?.usageLimit ?? '',
-      invalidScenes: value.limit?.invalidScenes ?? ''
+      cooldown: safeStr(value.limit?.cooldown),
+      cost: safeStr(value.limit?.cost),
+      usageLimit: safeStr(value.limit?.usageLimit),
+      invalidScenes: safeStr(value.limit?.invalidScenes)
     },
-    backlash: value.backlash ?? '',
+    backlash: safeStr(value.backlash),
     upgrades: (value.upgrades ?? []).map(safeUpgrade),
-    infoAdvantage: value.infoAdvantage ?? '',
-    sideEffects: value.sideEffects ?? '',
-    forbiddenScenes: value.forbiddenScenes ?? '',
-    tagline: value.tagline ?? '',
-    firstPayoffScene: value.firstPayoffScene ?? '',
+    infoAdvantage: safeStr(value.infoAdvantage),
+    sideEffects: safeStr(value.sideEffects),
+    forbiddenScenes: safeStr(value.forbiddenScenes),
+    tagline: safeStr(value.tagline),
+    firstPayoffScene: safeStr(value.firstPayoffScene),
     visualMetric: {
-      currentLevel: value.visualMetric?.currentLevel ?? '',
-      costPerUse: value.visualMetric?.costPerUse ?? '',
-      cooldown: value.visualMetric?.cooldown ?? '',
-      usageCap: value.visualMetric?.usageCap ?? '',
-      progressBar: value.visualMetric?.progressBar ?? '',
-      failureScene: value.visualMetric?.failureScene ?? ''
+      currentLevel: safeStr(value.visualMetric?.currentLevel),
+      costPerUse: safeStr(value.visualMetric?.costPerUse),
+      cooldown: safeStr(value.visualMetric?.cooldown),
+      usageCap: safeStr(value.visualMetric?.usageCap),
+      progressBar: safeStr(value.visualMetric?.progressBar),
+      failureScene: safeStr(value.visualMetric?.failureScene)
     }
   }
 }
@@ -188,6 +194,156 @@ export function renderGoldenFingerMarkdown(gf: GoldenFingerStructured): string {
   if (gf.firstPayoffScene.trim()) lines.push('## 前三章首次爽点场景', gf.firstPayoffScene, '')
 
   return lines.join('\n').trim()
+}
+
+const GOLDEN_FINGER_KEY_MAP: Record<string, string> = {
+  名称与形态: 'nameAndForm',
+  设定名称: 'nameAndForm',
+  能力名称: 'nameAndForm',
+  核心能力: 'abilities',
+  能力: 'abilities',
+  获取方式: 'acquisition',
+  获取方式与觉醒条件: 'acquisition',
+  觉醒条件: 'acquisition',
+  限制条件: 'limit',
+  限制: 'limit',
+  反噬机制: 'backlash',
+  反噬: 'backlash',
+  代价机制: 'backlash',
+  升级路径: 'upgrades',
+  升级: 'upgrades',
+  信息差优势: 'infoAdvantage',
+  信息差: 'infoAdvantage',
+  副作用: 'sideEffects',
+  负面绑定: 'sideEffects',
+  禁用场景: 'forbiddenScenes',
+  红线场景: 'forbiddenScenes',
+  禁用: 'forbiddenScenes',
+  番茄一句话卖点: 'tagline',
+  一句话卖点: 'tagline',
+  卖点: 'tagline',
+  前三章首次爽点场景: 'firstPayoffScene',
+  首次爽点: 'firstPayoffScene',
+  爽点场景: 'firstPayoffScene',
+  可视化限制指标: 'visualMetric',
+  可视化指标: 'visualMetric'
+}
+
+const LIMIT_KEY_MAP: Record<string, string> = {
+  冷却: 'cooldown',
+  冷却时间: 'cooldown',
+  间隔: 'cooldown',
+  消耗: 'cost',
+  每次消耗: 'cost',
+  每次使用消耗: 'cost',
+  次数上限: 'usageLimit',
+  容量上限: 'usageLimit',
+  使用次数上限: 'usageLimit',
+  使用次数: 'usageLimit',
+  失效场景: 'invalidScenes'
+}
+
+const VISUAL_METRIC_KEY_MAP: Record<string, string> = {
+  当前等级: 'currentLevel',
+  等级: 'currentLevel',
+  阶段: 'currentLevel',
+  每次使用消耗: 'costPerUse',
+  每次消耗: 'costPerUse',
+  冷却时间: 'cooldown',
+  使用次数上限: 'usageCap',
+  进度条形态: 'progressBar',
+  进度条: 'progressBar',
+  越级后果: 'failureScene',
+  失效后果: 'failureScene',
+  越级: 'failureScene'
+}
+
+const ABILITY_KEY_MAP: Record<string, string> = {
+  能力名: 'name',
+  名称: 'name',
+  具体效果: 'effect',
+  效果: 'effect',
+  作用范围: 'scope',
+  范围: 'scope'
+}
+
+const UPGRADE_KEY_MAP: Record<string, string> = {
+  阶段名: 'stage',
+  阶段: 'stage',
+  升级条件: 'condition',
+  条件: 'condition',
+  解锁能力: 'unlocks',
+  解锁: 'unlocks'
+}
+
+function mapKeys(obj: Record<string, unknown>, keyMap: Record<string, string>): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(obj)) {
+    const mapped = keyMap[key] ?? key
+    result[mapped] = value
+  }
+  return result
+}
+
+function normalizeGoldenFingerKeys(input: Record<string, unknown>): Partial<GoldenFingerStructured> {
+  const mapped = mapKeys(input, GOLDEN_FINGER_KEY_MAP)
+
+  if (mapped.limit && typeof mapped.limit === 'object' && !Array.isArray(mapped.limit)) {
+    mapped.limit = mapKeys(mapped.limit as Record<string, unknown>, LIMIT_KEY_MAP)
+  }
+
+  if (mapped.visualMetric && typeof mapped.visualMetric === 'object' && !Array.isArray(mapped.visualMetric)) {
+    mapped.visualMetric = mapKeys(mapped.visualMetric as Record<string, unknown>, VISUAL_METRIC_KEY_MAP)
+  }
+
+  if (Array.isArray(mapped.abilities)) {
+    mapped.abilities = mapped.abilities.map(a => {
+      if (a && typeof a === 'object' && !Array.isArray(a)) {
+        return mapKeys(a as Record<string, unknown>, ABILITY_KEY_MAP)
+      }
+      return a
+    })
+  }
+
+  if (Array.isArray(mapped.upgrades)) {
+    mapped.upgrades = mapped.upgrades.map(u => {
+      if (u && typeof u === 'object' && !Array.isArray(u)) {
+        return mapKeys(u as Record<string, unknown>, UPGRADE_KEY_MAP)
+      }
+      return u
+    })
+  }
+
+  return mapped as Partial<GoldenFingerStructured>
+}
+
+export function extractGoldenFingerFromAiContent(
+  content: string
+): { markdown: string; structured: GoldenFingerStructured } | null {
+  const trimmed = content.trim()
+
+  let jsonText = ''
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
+  if (fencedMatch) {
+    jsonText = fencedMatch[1].trim()
+  } else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    jsonText = trimmed
+  } else {
+    const objectMatch = trimmed.match(/\{[\s\S]*\}/)
+    if (objectMatch) jsonText = objectMatch[0]
+  }
+
+  if (!jsonText) return null
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>
+    const withEnglishKeys = normalizeGoldenFingerKeys(parsed)
+    const structured = normalizeGoldenFinger(withEnglishKeys)
+    let markdown = fencedMatch ? trimmed.replace(fencedMatch[0], '').trim() : ''
+    if (!markdown) markdown = renderGoldenFingerMarkdown(structured)
+    return { markdown, structured }
+  } catch {
+    return null
+  }
 }
 
 function parseListItems(body: string): string[] {
@@ -352,5 +508,52 @@ export function goldenFingerStructuredPromptSection(): string {
     '}',
     'Markdown 正文用于展示；JSON 用于系统校验与正文生成注入。两者必须一致。'
   ].join('\n')
+}
+
+/**
+ * 合并两个金手指结构化数据。
+ * 原则：patch 中非空字段覆盖当前值；空字段保留当前值，避免部分 patch 把未提及的字段清空。
+ */
+export function mergeGoldenFinger(
+  current: GoldenFingerStructured,
+  patch: GoldenFingerStructured
+): GoldenFingerStructured {
+  const merged = normalizeGoldenFinger(current)
+
+  const scalarFields: Array<keyof Omit<GoldenFingerStructured, 'abilities' | 'upgrades' | 'limit' | 'visualMetric'>> = [
+    'nameAndForm', 'acquisition', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'tagline', 'firstPayoffScene'
+  ]
+  for (const key of scalarFields) {
+    const value = patch[key]
+    if (typeof value === 'string' && value.trim()) {
+      (merged as Record<string, string>)[key] = value.trim()
+    }
+  }
+
+  const limitKeys = Object.keys(merged.limit) as Array<keyof GoldenFingerLimit>
+  for (const key of limitKeys) {
+    if (patch.limit[key]?.trim()) {
+      merged.limit[key] = patch.limit[key]
+    }
+  }
+
+  const metricKeys = Object.keys(merged.visualMetric) as Array<keyof GoldenFingerVisualMetric>
+  for (const key of metricKeys) {
+    if (patch.visualMetric[key]?.trim()) {
+      merged.visualMetric[key] = patch.visualMetric[key]
+    }
+  }
+
+  const hasAbilities = patch.abilities.some(a => a.name.trim() || a.effect.trim())
+  if (hasAbilities) {
+    merged.abilities = patch.abilities.filter(a => a.name.trim() || a.effect.trim())
+  }
+
+  const hasUpgrades = patch.upgrades.some(u => u.stage.trim() || u.condition.trim() || u.unlocks.trim())
+  if (hasUpgrades) {
+    merged.upgrades = patch.upgrades.filter(u => u.stage.trim() || u.condition.trim() || u.unlocks.trim())
+  }
+
+  return merged
 }
 

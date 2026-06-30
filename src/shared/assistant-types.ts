@@ -58,6 +58,8 @@ export interface SettingPatchItem {
   slot: string
   label: string
   content: string
+  /** 金手指专用：结构化 JSON 数据，存在时优先于 content */
+  structuredContent?: unknown
 }
 
 export interface SettingPatchResult {
