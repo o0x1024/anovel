@@ -349,8 +349,11 @@ function syncResultFromCache(chapterId: number) {
   const ch = chapters.value.find(c => c.id === chapterId)
   const dbContent = ch?.content ?? ''
   const cached = getCachedBodyContent(chapterId)
-  if (cached === undefined || cached === dbContent) return
-  result.value = cached ? normalizeBodyParagraphSpacing(cached) : cached
+  if (cached !== undefined && cached !== dbContent) {
+    result.value = cached ? normalizeBodyParagraphSpacing(cached) : cached
+  } else {
+    result.value = dbContent ? normalizeBodyParagraphSpacing(dbContent) : dbContent
+  }
 }
 
 onActivated(async () => {

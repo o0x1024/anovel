@@ -7,11 +7,11 @@
  * 仅轻量 humanize（不掺重的 autoRewrite）——去AI 由 checker 判定、fix 阶段针对性处理。
  */
 import { modelService } from '../../model'
-import { volumeChapterDAO, foreshadowingDAO } from '../../db'
+import { volumeChapterDAO, foreshadowingDAO, workDAO, incubatorDraftSlotDAO } from '../../db'
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
 import { formatBodyPromptLines } from '../../../shared/work-terminology'
-import { STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../shared/body-generation-prompt'
+import { STORY_BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_OPENING_EXTRA, extractEmotionIntensity } from '../../../shared/body-generation-prompt'
 import { humanizeText } from '../humanize-text'
 import { loadWritingPlan } from '../writing-plan'
 import {
@@ -45,6 +45,24 @@ function countWords(s: string): number {
   return s.replace(/\s/g, '').length
 }
 
+/** 检测当前节拍是否为全篇第一节拍（按 sort 排序） */
+function isFirstBeat(workId: number, chapterId: number): boolean {
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  if (chapters.length === 0) return false
+  const sorted = [...chapters].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
+  return sorted[0]?.id === chapterId
+}
+
+/** 从孵化器读取「黄金开局」slot 内容 */
+function getOpeningSlotContent(workId: number): string {
+  return incubatorDraftSlotDAO.getActiveSlot(workId, 'opening')?.content?.trim() ?? ''
+}
+
+/** 读取作品的导语（description 字段，由 generateTitleHook 阶段写入） */
+function getWorkHook(workId: number): string {
+  return workDAO.getById(workId)?.description?.trim() ?? ''
+}
+
 /**
  * 构造用户提示。注入创作目标引导生成。
  * @param extraHint 额外修复提示（fix 阶段用，如"提升质量/扩写"）
@@ -62,6 +80,9 @@ function buildBodyPrompt(
   if (!ch) return null
   const volumes = volumeChapterDAO.listVolumes(workId)
   const vol = volumes.find(v => v.id === ch.volume_id)
+  const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
+  const openingSlot = firstBeat ? getOpeningSlotContent(workId) : ''
+  const hookText = firstBeat ? getWorkHook(workId) : ''
   return formatBodyPromptLines(workType, {
     volName: vol?.name,
     volDescription: vol?.description,
@@ -73,7 +94,9 @@ function buildBodyPrompt(
       goalDescription?.trim()
         ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本${workType === 'story' ? '拍' : '章'}时贯彻该目标（题材/风格/情节走向）。`
         : '',
-      extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : ''
+      extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
+      openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
+      hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致。` : ''
     ].filter(Boolean)
   ).join('\n\n')
 }
@@ -95,10 +118,15 @@ export async function generateBeatBody(
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
+  const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
+  const systemPrompt = firstBeat
+    ? STORY_BODY_GENERATION_SYSTEM + STORY_BODY_GENERATION_OPENING_EXTRA
+    : STORY_BODY_GENERATION_SYSTEM
+
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       prompt,
-      systemPrompt: STORY_BODY_GENERATION_SYSTEM,
+      systemPrompt,
       step: 'body_generation',
       workId,
       maxTokens: Math.max(2048, wordTarget * 2),

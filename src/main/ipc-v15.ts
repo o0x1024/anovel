@@ -286,6 +286,13 @@ export async function diagnoseChapterQualityAi(
     const logicCtx = buildContentLogicContext(workId, chapterId)
     if (logicCtx) sections.push('', logicCtx)
   }
+  if (isStory) {
+    const allChapters = volumeChapterDAO.listChaptersByWork(workId)
+    const sorted = [...allChapters].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
+    if (sorted[0]?.id === chapterId) {
+      sections.push('', '【本拍为全篇第一节拍 - 黄金开局，钩子强度要求最高，前300字无冲突直接切入即硬失败】')
+    }
+  }
   const prompt = sections.join('\n')
 
   const res = await modelService.chat({
