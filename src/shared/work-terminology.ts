@@ -110,9 +110,60 @@ export function formatMergedBodySectionTitle(
   index: number,
   title: string
 ): string {
-  const t = title.trim()
   if (isStoryWorkType(workType)) {
-    return t || `第${index + 1}拍`
+    return String(index + 1)
   }
-  return [`第${index + 1}章`, t].filter(Boolean).join(' ')
+  return [`第${index + 1}章`, title.trim()].filter(Boolean).join(' ')
+}
+
+/**
+ * 合并短故事全文：导语 + 编号节拍正文，格式对齐 docs/book/short.txt。
+ * - 导语（hook）独占开头，交待核心故事、留住读者
+ * - 各节拍以 1、2、3… 编号分隔，不展示节拍名
+ *
+ * @param hook 导语正文（work.description）
+ * @param beatContents 各节拍正文数组（已按顺序排列，空内容自动跳过）
+ */
+export function buildMergedStoryText(hook: string, beatContents: string[]): string {
+  const parts: string[] = []
+  const hookText = hook?.trim()
+  if (hookText) parts.push(hookText)
+  let beatIndex = 0
+  for (const content of beatContents) {
+    const text = content?.trim()
+    if (!text) continue
+    parts.push(String(beatIndex + 1))
+    parts.push(text)
+    beatIndex++
+  }
+  return parts.join('\n\n')
+}
+
+/**
+ * 短故事合并格式：导语在前，节拍以 1/2/3 编号分隔，不显示节拍名。
+ * 格式参考 docs/book/short.txt：
+ *   {导语}
+ *
+ *   1
+ *
+ *   {节拍1正文}
+ *
+ *   2
+ *
+ *   {节拍2正文}
+ */
+export function buildStoryMergedText(
+  hook: string | null | undefined,
+  beats: { content: string }[]
+): string {
+  const parts: string[] = []
+  const hookText = hook?.trim()
+  if (hookText) parts.push(hookText)
+  beats.forEach((beat, i) => {
+    const content = beat.content?.trim()
+    if (!content) return
+    parts.push(String(i + 1))
+    parts.push(content)
+  })
+  return parts.join('\n\n')
 }

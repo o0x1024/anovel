@@ -1,4 +1,5 @@
-import { coreSettingDAO, volumeChapterDAO, anchorDAO } from '../db'
+import { coreSettingDAO, volumeChapterDAO, anchorDAO, workDAO } from '../db'
+import { isStoryWorkType, buildMergedStoryText } from '../../shared/work-terminology'
 
 export type ExportFormat = 'markdown' | 'txt' | 'html'
 export type ExportContentMode = 'full' | 'body'
@@ -18,11 +19,18 @@ const SETTING_LABELS: Record<string, string> = {
 }
 
 function buildMarkdown(workId: number, title: string): string {
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? null
   const settings = coreSettingDAO.listByWork(workId)
   const volumes = volumeChapterDAO.listVolumes(workId)
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
 
   let output = `# ${title}\n\n`
+
+  if (isStoryWorkType(workType)) {
+    const hook = work?.description?.trim() ?? ''
+    if (hook) output += `${hook}\n\n`
+  }
 
   for (const s of settings) {
     if (s.content?.trim() && !s.type.startsWith('condition_')) {
@@ -39,16 +47,26 @@ function buildMarkdown(workId: number, title: string): string {
     output += '\n'
   }
 
-  for (const vol of volumes) {
-    const volChapters = chapters.filter(c => c.volume_id === vol.id).sort((a, b) => a.sort - b.sort)
-    if (volChapters.length === 0 && !vol.description) continue
-    output += `# ${vol.name}\n\n`
-    if (vol.description) output += `${vol.description}\n\n`
-    volChapters.forEach((ch, idx) => {
-      output += `## 第${idx + 1}章 ${ch.title}\n\n`
-      if (ch.outline?.trim()) output += `${ch.outline}\n\n`
-      if (ch.content?.trim()) output += `${ch.content}\n\n`
-    })
+  if (isStoryWorkType(workType)) {
+    const beatContents = chapters
+      .sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
+      .map(ch => ch.content?.trim() || '')
+      .filter(Boolean)
+    if (beatContents.length > 0) {
+      output += buildMergedStoryText('', beatContents) + '\n\n'
+    }
+  } else {
+    for (const vol of volumes) {
+      const volChapters = chapters.filter(c => c.volume_id === vol.id).sort((a, b) => a.sort - b.sort)
+      if (volChapters.length === 0 && !vol.description) continue
+      output += `# ${vol.name}\n\n`
+      if (vol.description) output += `${vol.description}\n\n`
+      volChapters.forEach((ch, idx) => {
+        output += `## 第${idx + 1}章 ${ch.title}\n\n`
+        if (ch.outline?.trim()) output += `${ch.outline}\n\n`
+        if (ch.content?.trim()) output += `${ch.content}\n\n`
+      })
+    }
   }
 
   output += `\n---\n导出工具：ANovel\n`
@@ -65,26 +83,37 @@ function buildBodyMarkdown(
     return ch?.content?.trim() ? `${ch.content.trim()}\n` : ''
   }
 
+  const work = workDAO.getById(workId)
+  const workType = work?.work_type ?? null
+  const hook = work?.description?.trim() ?? ''
+
   if (scope?.volumeId) {
     const chapters = volumeChapterDAO.listChapters(scope.volumeId)
-    return chapters
+    const beatContents = chapters
       .sort((a, b) => a.sort - b.sort)
       .map(ch => ch.content?.trim() || '')
       .filter(Boolean)
-      .join('\n\n') + '\n'
+    if (isStoryWorkType(workType)) {
+      return beatContents.length > 0 ? buildMergedStoryText(hook, beatContents) + '\n' : ''
+    }
+    return beatContents.join('\n\n') + '\n'
   }
 
   const volumes = volumeChapterDAO.listVolumes(workId)
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const parts: string[] = []
+  const beatContents: string[] = []
   for (const vol of volumes) {
     const volChapters = chapters.filter(c => c.volume_id === vol.id).sort((a, b) => a.sort - b.sort)
     for (const ch of volChapters) {
-      if (ch.content?.trim()) parts.push(ch.content.trim())
+      if (ch.content?.trim()) beatContents.push(ch.content.trim())
     }
   }
-  if (parts.length === 0) return `# ${title}\n\n`
-  return parts.join('\n\n') + '\n'
+  if (beatContents.length === 0) return `# ${title}\n\n`
+
+  if (isStoryWorkType(workType)) {
+    return buildMergedStoryText(hook, beatContents) + '\n'
+  }
+  return beatContents.join('\n\n') + '\n'
 }
 
 function markdownToTxt(md: string): string {
@@ -129,16 +158,27 @@ export function exportWorkContent(
       if (ch.content?.trim()) md += `${ch.content}\n\n`
     }
   } else if (mode !== 'body' && scope?.volumeId) {
+    const work = workDAO.getById(workId)
+    const workType = work?.work_type ?? null
     const vol = volumeChapterDAO.listVolumes(workId).find(v => v.id === scope.volumeId)
     const chapters = volumeChapterDAO.listChapters(scope.volumeId)
     if (vol) {
-      md = `# ${vol.name}\n\n`
-      if (vol.description) md += `${vol.description}\n\n`
-      chapters.forEach((ch, idx) => {
-        md += `## 第${idx + 1}章 ${ch.title}\n\n`
-        if (ch.outline?.trim()) md += `${ch.outline}\n\n`
-        if (ch.content?.trim()) md += `${ch.content}\n\n`
-      })
+      if (isStoryWorkType(workType)) {
+        const hook = work?.description?.trim() ?? ''
+        const beatContents = chapters
+          .sort((a, b) => a.sort - b.sort)
+          .map(ch => ch.content?.trim() || '')
+          .filter(Boolean)
+        md = buildMergedStoryText(hook, beatContents) + '\n'
+      } else {
+        md = `# ${vol.name}\n\n`
+        if (vol.description) md += `${vol.description}\n\n`
+        chapters.forEach((ch, idx) => {
+          md += `## 第${idx + 1}章 ${ch.title}\n\n`
+          if (ch.outline?.trim()) md += `${ch.outline}\n\n`
+          if (ch.content?.trim()) md += `${ch.content}\n\n`
+        })
+      }
     }
   }
 

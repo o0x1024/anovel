@@ -463,6 +463,27 @@ function buildSupportingCastContext(
   return parts.join('\n\n')
 }
 
+/** 主线设定：依赖全部前 6 类设定 + 主线孵化器，输出故事发展轨迹 */
+function buildMainPlotlineContext(
+  workId: number,
+  ideaRaw?: string,
+  deps?: Partial<Record<CoreSettingType, string>>,
+  isStory = false
+): string {
+  const parts: string[] = []
+  const storyline = buildDownstreamStorylineContext(workId, ideaRaw)
+  if (storyline) parts.push(storyline)
+
+  if (deps) {
+    for (const depType of CORE_SETTING_DEPENDENCIES.main_plotline) {
+      const content = deps[depType]
+      if (content) parts.push(`## ${getCoreSettingLabel(depType, isStory)}\n${content}`)
+    }
+  }
+
+  return parts.join('\n\n')
+}
+
 // ==================== 主入口 ====================
 
 /**
@@ -653,6 +674,28 @@ export async function buildSettingsGenerationContext(
           selfDraft
         ].join('\n\n')
       }
+      break
+    }
+
+    case 'main_plotline': {
+      const ctx = buildMainPlotlineContext(workId, ideaRaw, deps, isStory)
+      if (ctx) sections['主线故事线'] = ctx
+
+      // 依赖设定（已在 buildMainPlotlineContext 中注入，这里不重复）
+
+      const userHints = options.userHints?.trim()
+      if (userHints) sections['用户补充要求'] = userHints
+
+      const selfDraft = options.selfDraft?.trim()
+      if (selfDraft) {
+        sections[`当前${getCoreSettingLabel('main_plotline', isStory)}草稿`] = [
+          '（请在现有草稿基础上优化与补全）',
+          selfDraft
+        ].join('\n\n')
+      }
+
+      const qualityText = formatQualityIssuesForGeneration(workId)
+      if (qualityText) sections['设定自检约束'] = qualityText
       break
     }
   }

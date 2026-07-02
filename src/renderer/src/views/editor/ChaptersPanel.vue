@@ -97,11 +97,6 @@ const loadingVersions = ref(false)
 const planPanelRef = ref<{ reload: () => Promise<void> } | null>(null)
 const planStatus = ref<WritingPlanStatus | null>(null)
 const selectedChapterId = ref<number | null>(null)
-const batchCountOptions = computed(() =>
-  workType.value === 'story'
-    ? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    : [1, 2, 3, 4, 5, 6, 8, 10]
-)
 const storyBeatProgress = computed(() => {
   if (workType.value !== 'story' || !planStatus.value) return null
   const target = planStatus.value.suggestedTotalChapters
@@ -558,6 +553,8 @@ function buildVolumeContext(): string {
 
 async function aiBatchChapters() {
   if (!selectedVolume.value || batchLoading.value) return
+  const count = Math.max(1, Math.min(20, Math.floor(batchChapterCount.value) || 5))
+  batchChapterCount.value = count
   batchLoading.value = true
   batchResult.value = ''
   batchParseHint.value = ''
@@ -931,7 +928,7 @@ async function runOutlineDiagnosis() {
       '    {',
       '      "chapter_id": 123,',
       '      "severity": "high|medium|low",',
-      '      "type": "logic|setting|pacing|hook|character|continuity|density|expectation|other",',
+      '      "type": "logic|setting|pacing|hook|character|continuity|density|expectation|deviation|other",',
       '      "evidence": "引用或概括现有大纲中的具体证据，必须能定位问题",',
       '      "problem": "具体问题，不要泛泛而谈",',
       '      "fix_reason": "为什么这样修能提升连贯性、爽点、期待感或追读"',
@@ -962,7 +959,8 @@ async function runOutlineDiagnosis() {
       '3. 章末钩子与悬念：关键章节是否有反转、危机、未解谜题或强追读点。',
       '4. 人物高光与共情：角色行动是否符合人设，是否有可记忆的高光/情绪爆点。',
       '5. 情节密度与节奏：是否连续过渡、注水、重复信息，是否缺少推进。',
-      '6. 连续性与跨卷衔接：伏笔、铺垫、前后卷承接是否断裂或冲突。'
+      '6. 连续性与跨卷衔接：伏笔、铺垫、前后卷承接是否断裂或冲突。',
+      '7. 主线设定对齐：各章节情节是否与「主线设定」中的故事轨迹、关键转折点、阶段递进逻辑一致？是否存在偏离主线骨架的自由发挥或游离于主线之外的冗余支线？'
     ].join('\n')
 
     const res = await chat(promptContext, systemPrompt, 'chapter_outline_diagnose', {
@@ -1092,9 +1090,14 @@ async function clearDiagnosisResult() {
           </p>
           <div class="flex flex-wrap gap-2 mb-3 items-center">
             <label class="text-xs text-base-content/50">本次拆解</label>
-            <select v-model="batchChapterCount" class="select select-bordered select-sm w-24">
-              <option v-for="n in batchCountOptions" :key="n" :value="n">{{ n }} 拍</option>
-            </select>
+            <input
+              v-model.number="batchChapterCount"
+              type="number"
+              min="1"
+              max="20"
+              class="input input-bordered input-sm w-20 text-center"
+            />
+            <span class="text-xs text-base-content/50">拍</span>
             <button
               class="btn btn-outline btn-primary btn-sm gap-1"
               :disabled="batchLoading || !selectedVolume"
@@ -1204,9 +1207,14 @@ async function clearDiagnosisResult() {
           <h4 class="font-semibold text-sm mb-3">AI 批量生成本卷章节</h4>
           <div class="flex flex-wrap gap-2 mb-3 items-center">
             <label class="text-xs text-base-content/50">章节数</label>
-            <select v-model="batchChapterCount" class="select select-bordered select-sm w-24">
-              <option v-for="n in batchCountOptions" :key="n" :value="n">{{ n }} 章</option>
-            </select>
+            <input
+              v-model.number="batchChapterCount"
+              type="number"
+              min="1"
+              max="20"
+              class="input input-bordered input-sm w-20 text-center"
+            />
+            <span class="text-xs text-base-content/50">章</span>
             <button
               class="btn btn-outline btn-primary btn-sm gap-1"
               :disabled="batchLoading || !selectedVolume"

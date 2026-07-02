@@ -21,7 +21,7 @@ export interface WorkBackupBundle {
   anchors: { type: string; title: string; content: string; is_active: number }[]
   ideas: { type: string; content: string; tags: string | null }[]
   foreshadowing: { description: string; depth?: string | null; status: string; plant_location?: string | null }[]
-  snapshots: { character_name: string; chapter_sort: number; volume_sort: number; location?: string | null; mental_state?: string | null; known_info?: string | null }[]
+  snapshots: { character_name: string; chapter_sort: number; volume_sort: number; location?: string | null; mental_state?: string | null; known_info?: string | null; numeric_stats?: string | null }[]
   timeline: { event_name: string; event_description?: string | null; absolute_time?: string | null; relative_time?: string | null }[]
   favorites: { source_step: string; source_label: string; title?: string | null; content: string }[]
   stepTemperature?: WorkStepTemperatureConfig

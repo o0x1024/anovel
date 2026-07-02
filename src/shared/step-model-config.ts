@@ -44,6 +44,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'settings_world_pressure', label: '世界压力' },
       { step: 'settings_conflict_engine', label: '冲突引擎' },
       { step: 'settings_supporting_cast', label: '配角设计' },
+      { step: 'settings_main_plotline', label: '主线设定' },
       { step: 'settings_worldview', label: '世界观' },
       { step: 'settings_overall_check', label: '整体检查' },
       { step: 'settings_character_check', label: '角色检查' },

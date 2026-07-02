@@ -121,6 +121,15 @@ export function buildNarrativeMemorySections(
           s.relationship_changes ? `关系变化：${s.relationship_changes}` : '',
           s.ability_changes ? `能力/资源：${s.ability_changes}` : ''
         ].filter(Boolean)
+        if (s.numeric_stats) {
+          try {
+            const stats = JSON.parse(s.numeric_stats) as { name: string; value: string; unit?: string }[]
+            if (Array.isArray(stats) && stats.length > 0) {
+              const statsText = stats.map(st => `${st.name}:${st.value}${st.unit || ''}`).join('、')
+              parts.push(`数值状态：${statsText}`)
+            }
+          } catch { /* 忽略解析失败 */ }
+        }
         return `- ${parts.join(' | ')}`
       })
     ].join('\n')

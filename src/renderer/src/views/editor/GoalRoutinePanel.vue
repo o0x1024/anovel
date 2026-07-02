@@ -35,6 +35,7 @@ interface GoalConfig {
   checkAntiAiRules: boolean
   maxTurns: number
   goalMatchMin: number
+  previewRatio: number
 }
 
 const DEFAULT_CONFIG: GoalConfig = {
@@ -46,7 +47,8 @@ const DEFAULT_CONFIG: GoalConfig = {
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
-  goalMatchMin: 85
+  goalMatchMin: 85,
+  previewRatio: 0.3
 }
 
 function loadConfig(): GoalConfig {
@@ -89,6 +91,7 @@ interface GoalCheckResult {
   antiAiViolations: number
   goalMatchScore: number
   goalMatchReason: string
+  previewReport: string | null
   reasons: string[]
 }
 
@@ -217,6 +220,11 @@ const dimStatus = computed(() => {
   }
 })
 
+const previewRatioPct = computed({
+  get: () => Math.round(config.value.previewRatio * 100),
+  set: (v: number) => { config.value.previewRatio = Math.max(0.01, Math.min(0.95, v / 100)) }
+})
+
 async function refreshState() {
   const res = await window.anovel.invoke('goal:getState', props.workId) as {
     state: GoalState | null
@@ -239,6 +247,7 @@ function goalInvokePayload() {
     checkAntiAiRules: config.value.checkAntiAiRules,
     maxTurns: config.value.maxTurns,
     goalMatchMin: config.value.goalMatchMin,
+    previewRatio: config.value.previewRatio,
     ...bodyModelParams()
   }
 }
@@ -369,6 +378,14 @@ watch(config, saveConfig, { deep: true })
             <input v-model.number="config.targetTotalWords" type="number" min="0" step="1000"
               :disabled="running" placeholder="作品设定"
               class="input input-bordered input-xs w-28 rounded-lg text-right" />
+          </label>
+          <label class="flex items-center justify-between gap-3 text-xs">
+            <span>试读比例</span>
+            <div class="flex items-center gap-1.5">
+              <input v-model.number="previewRatioPct" type="number" min="1" max="95"
+                :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
+              <span class="text-base-content/40">%</span>
+            </div>
           </label>
         </div>
 
@@ -523,6 +540,16 @@ watch(config, saveConfig, { deep: true })
         <p v-if="lastMessage" class="text-xs text-base-content/50 pt-1">{{ lastMessage }}</p>
       </div>
       <p v-else class="text-xs text-base-content/40">尚未运行</p>
+    </div>
+
+    <!-- 试读卡点报告 -->
+    <div v-if="lastCheck?.previewReport" class="card bg-base-200 border border-base-300 shadow-sm p-5">
+      <div class="flex items-center gap-2 mb-3">
+        <font-awesome-icon icon="bookmark" class="w-4 h-4 text-primary shrink-0" />
+        <h4 class="font-semibold text-sm">试读卡点报告</h4>
+        <span class="badge badge-xs badge-primary ml-auto">目标 {{ previewRatioPct }}%</span>
+      </div>
+      <pre class="text-xs text-base-content/70 whitespace-pre-wrap font-mono leading-relaxed max-h-80 overflow-y-auto bg-base-100 rounded-lg p-3 border border-base-300/60">{{ lastCheck.previewReport }}</pre>
     </div>
 
     <!-- 轮次历史 -->

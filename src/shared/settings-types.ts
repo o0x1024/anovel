@@ -1,8 +1,10 @@
 /**
  * 核心设定类型定义（V3 重构）
  *
- * 从网文第一性原理出发，将核心设定重组为 6 类：
- * 主角设计 → 金手指 → 世界观压力 → 冲突升级 → 爽点机制 → 配角功能组
+ * 从网文第一性原理出发，将核心设定重组为 7 类：
+ * 主角设计 → 金手指 → 世界观压力 → 冲突升级 → 爽点机制 → 配角功能组 → 主线设定
+ * 前 6 类是静态元素（谁/什么世界/什么冲突），主线设定是动态轨迹（故事怎么走），
+ * 为分卷大纲提供骨架约束，避免 AI 自由发挥导致每次生成分卷不一致。
  */
 
 export const CORE_SETTING_TYPES = [
@@ -11,7 +13,8 @@ export const CORE_SETTING_TYPES = [
   'world_pressure',
   'conflict_engine',
   'pleasure_engine',
-  'supporting_cast'
+  'supporting_cast',
+  'main_plotline'
 ] as const
 
 export type CoreSettingType = (typeof CORE_SETTING_TYPES)[number]
@@ -29,7 +32,8 @@ export const CORE_SETTING_LABELS: Record<CoreSettingType, string> = {
   pleasure_engine: '爽点机制',
   world_pressure: '世界观压力规则',
   conflict_engine: '冲突升级引擎',
-  supporting_cast: '配角功能组'
+  supporting_cast: '配角功能组',
+  main_plotline: '主线设定'
 }
 
 export const STORY_SETTING_LABELS: Record<CoreSettingType, string> = {
@@ -38,7 +42,8 @@ export const STORY_SETTING_LABELS: Record<CoreSettingType, string> = {
   pleasure_engine: '情绪节奏与爽点',
   world_pressure: '世界观压力规则',
   conflict_engine: '冲突升级引擎',
-  supporting_cast: '功能性配角'
+  supporting_cast: '功能性配角',
+  main_plotline: '故事弧线'
 }
 
 export function getCoreSettingLabel(type: CoreSettingType, isStory: boolean): string {
@@ -51,7 +56,8 @@ export const CORE_SETTING_ICONS: Record<CoreSettingType, string> = {
   pleasure_engine: 'fire',
   world_pressure: 'scale-balanced',
   conflict_engine: 'arrows-spin',
-  supporting_cast: 'users'
+  supporting_cast: 'users',
+  main_plotline: 'route'
 }
 
 export const CORE_SETTING_DESCRIPTIONS: Record<CoreSettingType, string> = {
@@ -60,7 +66,8 @@ export const CORE_SETTING_DESCRIPTIONS: Record<CoreSettingType, string> = {
   pleasure_engine: '主要爽点类型、触发条件、频率设计、对抗设计与情绪节奏锚点',
   world_pressure: '核心铁律、权力结构、资源稀缺性、规则代价与对主角的压迫升级路径',
   conflict_engine: '对立双方的价值观冲突、不可调和点、三层赌注、升级机制与终局收束',
-  supporting_cast: '按催化剂/对照组/阻力/情感锚/信息/喜剧六种功能组织的配角群'
+  supporting_cast: '按催化剂/对照组/阻力/情感锚/信息/喜剧六种功能组织的配角群',
+  main_plotline: '故事从开局到终局的发展轨迹、关键转折点、阶段递进逻辑与伏笔布局——分卷大纲的骨架约束'
 }
 
 /** AI 生成时的依赖链：后面的类型依赖前面的类型 */
@@ -70,7 +77,8 @@ export const CORE_SETTING_DEPENDENCIES: Record<CoreSettingType, CoreSettingType[
   pleasure_engine: ['protagonist', 'golden_finger', 'conflict_engine'],
   world_pressure: ['protagonist', 'golden_finger'],
   conflict_engine: ['protagonist', 'world_pressure'],
-  supporting_cast: ['protagonist', 'conflict_engine']
+  supporting_cast: ['protagonist', 'conflict_engine'],
+  main_plotline: ['protagonist', 'golden_finger', 'world_pressure', 'conflict_engine', 'pleasure_engine', 'supporting_cast']
 }
 
 /** 推荐填充顺序 */
@@ -80,7 +88,8 @@ export const CORE_SETTING_FILL_ORDER: CoreSettingType[] = [
   'world_pressure',
   'conflict_engine',
   'pleasure_engine',
-  'supporting_cast'
+  'supporting_cast',
+  'main_plotline'
 ]
 
 /** 可独立生成（不依赖其他设定）的类型 */

@@ -19,6 +19,7 @@ interface Snapshot {
   known_info: string | null
   relationship_changes: string | null
   ability_changes: string | null
+  numeric_stats: string | null
 }
 
 interface ChapterOption {
@@ -37,7 +38,8 @@ const form = ref({
   mental_state: '',
   known_info: '',
   relationship_changes: '',
-  ability_changes: ''
+  ability_changes: '',
+  numeric_stats: ''
 })
 
 const selection = useListSelection(snapshots)
@@ -61,6 +63,19 @@ async function loadChapters() {
 
 async function createSnapshot() {
   if (!form.value.character_name.trim() || !form.value.chapter_id) return
+  let numericStatsJson: string | undefined
+  const raw = form.value.numeric_stats.trim()
+  if (raw) {
+    const entries = raw.split(/[\n;；]+/).map(line => {
+      const m = line.trim().match(/^([^:：]+)[：:]\s*(.+)$/)
+      if (!m) return null
+      const unitMatch = m[2].trim().match(/^(.+?)\s*[（(]([^)）]+)[)）]$/)
+      return unitMatch
+        ? { name: m[1].trim(), value: unitMatch[1].trim(), unit: unitMatch[2].trim() }
+        : { name: m[1].trim(), value: m[2].trim(), unit: '' }
+    }).filter((x): x is { name: string; value: string; unit: string } => x !== null)
+    if (entries.length > 0) numericStatsJson = JSON.stringify(entries)
+  }
   await window.anovel.invoke('snapshot:create', {
     work_id: props.workId,
     character_name: form.value.character_name.trim(),
@@ -69,7 +84,8 @@ async function createSnapshot() {
     mental_state: form.value.mental_state || undefined,
     known_info: form.value.known_info || undefined,
     relationship_changes: form.value.relationship_changes || undefined,
-    ability_changes: form.value.ability_changes || undefined
+    ability_changes: form.value.ability_changes || undefined,
+    numeric_stats: numericStatsJson
   })
   form.value = {
     character_name: '',
@@ -78,7 +94,8 @@ async function createSnapshot() {
     mental_state: '',
     known_info: '',
     relationship_changes: '',
-    ability_changes: ''
+    ability_changes: '',
+    numeric_stats: ''
   }
   showForm.value = false
   await loadSnapshots()
@@ -103,6 +120,17 @@ async function deleteAllSnapshots() {
 
 function chapterTitle(id: number) {
   return chapters.value.find(c => c.id === id)?.title ?? `#${id}`
+}
+
+function formatNumericStats(raw: string | null): string {
+  if (!raw) return ''
+  try {
+    const stats = JSON.parse(raw) as { name: string; value: string; unit?: string }[]
+    if (!Array.isArray(stats) || stats.length === 0) return ''
+    return stats.map(s => `${s.name}:${s.value}${s.unit || ''}`).join('、')
+  } catch {
+    return ''
+  }
 }
 
 const groupedEntries = computed(() => {
@@ -149,6 +177,7 @@ const groupedEntries = computed(() => {
       <textarea v-model="form.known_info" rows="2" class="textarea textarea-bordered textarea-sm w-full" placeholder="已知信息" />
       <input v-model="form.relationship_changes" class="input input-bordered input-sm w-full" placeholder="关系变化" />
       <input v-model="form.ability_changes" class="input input-bordered input-sm w-full" placeholder="能力/资源变化" />
+      <textarea v-model="form.numeric_stats" rows="2" class="textarea textarea-bordered textarea-sm w-full" placeholder="数值状态（每行一条，格式：属性名:数值(单位)，如 体力:50、信用度:87点）" />
       <button class="btn btn-primary btn-sm" :disabled="!form.character_name.trim()" @click="createSnapshot">保存</button>
     </div>
 
@@ -178,6 +207,7 @@ const groupedEntries = computed(() => {
             <p v-if="snap.location" class="text-base-content/70">📍 {{ snap.location }}</p>
             <p v-if="snap.mental_state" class="text-base-content/70">心理：{{ snap.mental_state }}</p>
             <p v-if="snap.known_info" class="text-base-content/60 text-xs mt-1">{{ snap.known_info }}</p>
+            <p v-if="formatNumericStats(snap.numeric_stats)" class="text-base-content/70 text-xs mt-1">📊 {{ formatNumericStats(snap.numeric_stats) }}</p>
           </div>
         </div>
       </div>

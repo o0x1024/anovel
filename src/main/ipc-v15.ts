@@ -22,6 +22,8 @@ import {
   ADJUST_WORDS_COMPRESS_PROMPT
 } from './context/chapter-quality'
 import { stripDeterministicAiPatterns, stripForbiddenNotIsPatterns } from '../shared/normalize-body-text'
+import { CORE_SETTING_TYPES, getCoreSettingLabel } from '../shared/settings-types'
+import { formatGoldenFingerConstraints, loadGoldenFingerStructured } from './context/golden-finger-validation'
 
 const QUALITY_PATCH_SYSTEM_PROMPT = [
   '你是文字编辑，只输出修复指令 JSON，绝不输出全文。',
@@ -222,20 +224,54 @@ function buildContentLogicContext(workId: number, chapterId: number): string | n
     }
   }
 
-  const coreSettings = coreSettingDAO.listByWork(workId)
-  const charSetting = coreSettings.find(s => s.type === 'character')
-  const worldSetting = coreSettings.find(s => s.type === 'worldview')
-  const coreLines: string[] = []
-  if (charSetting?.content?.trim()) {
-    const trimmed = charSetting.content.trim()
-    coreLines.push(trimmed.length > 600 ? trimmed.slice(0, 600) + '…' : trimmed)
+  const workInfo = workDAO.getById(workId)
+  const isStory = workInfo?.work_type === 'story'
+
+  const snapshotNames = characterSnapshotDAO.listCharacterNames(workId)
+  const snapshots = snapshotNames
+    .map(name => characterSnapshotDAO.getLatest(workId, name))
+    .filter((s): s is NonNullable<typeof s> => !!s)
+  if (snapshots.length > 0) {
+    const snapshotLines = snapshots.map(s => {
+      const parts = [
+        `角色：${s.character_name}`,
+        s.location ? `位置：${s.location}` : '',
+        s.mental_state ? `心理：${s.mental_state}` : '',
+        s.known_info ? `已知信息：${s.known_info}` : '',
+        s.relationship_changes ? `关系变化：${s.relationship_changes}` : '',
+        s.ability_changes ? `能力/资源：${s.ability_changes}` : ''
+      ].filter(Boolean)
+      if (s.numeric_stats) {
+        try {
+          const stats = JSON.parse(s.numeric_stats) as { name: string; value: string; unit?: string }[]
+          if (Array.isArray(stats) && stats.length > 0) {
+            const statsText = stats.map(st => `${st.name}:${st.value}${st.unit || ''}`).join('、')
+            parts.push(`数值状态：${statsText}`)
+          }
+        } catch { /* 忽略解析失败 */ }
+      }
+      return `- ${parts.join(' | ')}`
+    })
+    sections.push(`【角色状态快照 — 正文须与此一致，不得矛盾】\n${snapshotLines.join('\n')}`)
   }
-  if (worldSetting?.content?.trim()) {
-    const trimmed = worldSetting.content.trim()
-    coreLines.push(trimmed.length > 600 ? trimmed.slice(0, 600) + '…' : trimmed)
+
+  const coreSettings = coreSettingDAO.listByWork(workId)
+  const byType = new Map(coreSettings.map(s => [s.type, s.content]))
+  const coreLines: string[] = []
+  for (const type of CORE_SETTING_TYPES) {
+    const content = byType.get(type)?.trim()
+    if (!content) continue
+    if (type === 'golden_finger') {
+      const structured = loadGoldenFingerStructured(workId)
+      const constraints = formatGoldenFingerConstraints(structured)
+      coreLines.push(constraints)
+      continue
+    }
+    const label = getCoreSettingLabel(type, isStory)
+    coreLines.push(`【${label}】\n${content}`)
   }
   if (coreLines.length) {
-    sections.push(`【核心设定摘要】\n${coreLines.join('\n\n')}`)
+    sections.push(`【核心设定 — 供设定一致性诊断参考】\n${coreLines.join('\n\n')}`)
   }
 
   if (sections.length === 0) return null
@@ -282,10 +318,8 @@ export async function diagnoseChapterQualityAi(
     )
   }
   if (anchorSection) sections.push('', anchorSection)
-  if (!isStory) {
-    const logicCtx = buildContentLogicContext(workId, chapterId)
-    if (logicCtx) sections.push('', logicCtx)
-  }
+  const logicCtx = buildContentLogicContext(workId, chapterId)
+  if (logicCtx) sections.push('', logicCtx)
   if (isStory) {
     const allChapters = volumeChapterDAO.listChaptersByWork(workId)
     const sorted = [...allChapters].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))

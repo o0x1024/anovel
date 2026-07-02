@@ -230,6 +230,7 @@ export function initSchema(): void {
       known_info TEXT,
       relationship_changes TEXT,
       ability_changes TEXT,
+      numeric_stats TEXT,
       snapshot_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );

@@ -140,10 +140,11 @@ const jsonImportPreview = ref<GoldenFingerStructured | null>(null)
 const jsonImportFields = ref<string[]>([])
 
 const FIELD_LABELS: Record<string, string> = {
-  nameAndForm: '名称形态', abilities: '核心能力', acquisition: '获取方式',
+  nameAndForm: '名称形态', manifestation: '呈现形式', visibility: '外人可见性', interaction: '交互方式',
+  abilities: '核心能力', acquisition: '获取方式', sourceNature: '来源性质',
   limit: '限制条件', backlash: '反噬机制', upgrades: '升级路径',
   infoAdvantage: '信息差', sideEffects: '副作用', forbiddenScenes: '禁用场景',
-  tagline: '一句话卖点', firstPayoffScene: '首次爽点', visualMetric: '可视化指标'
+  exposureConsequence: '暴露后果', tagline: '一句话卖点', firstPayoffScene: '首次爽点', visualMetric: '可视化指标'
 }
 
 function openJsonImport() {
@@ -247,6 +248,21 @@ function confirmJsonImport() {
             <input v-model="gf.nameAndForm" type="text" class="input input-bordered input-sm w-full" placeholder="金手指叫什么、外在表现形式" />
           </label>
 
+          <label class="form-control">
+            <span class="label-text text-xs font-medium">呈现形式 *</span>
+            <textarea v-model="gf.manifestation" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="以什么形式呈现给主角（系统面板/UI？脑海中的声音？身体纹路？随身空间？特定物品？纯感知？），感官通道，主动调出还是自动弹出" />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-xs font-medium">外人可见性 *</span>
+            <textarea v-model="gf.visibility" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="金手指本身是否被外人可见？使用时是否有外在表现（光芒/声音/气息波动/身体变化）？世界观检测手段能否发现？" />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-xs font-medium">交互方式 *</span>
+            <textarea v-model="gf.interaction" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="主角如何调用（意念/语音指令/手势/自动触发）？金手指是否有自主意识或人格？会主动干涉决策吗？" />
+          </label>
+
           <div>
             <div class="flex items-center justify-between mb-1">
               <span class="text-xs font-medium">核心能力 *</span>
@@ -265,6 +281,11 @@ function confirmJsonImport() {
           <label class="form-control">
             <span class="label-text text-xs font-medium">获取方式与觉醒条件 *</span>
             <textarea v-model="gf.acquisition" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="主角如何获得金手指、第一次激活需要什么条件" />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-xs font-medium">来源性质</span>
+            <textarea v-model="gf.sourceNature" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="金手指的本质来源（天道赐予/远古遗留/系统绑定/血脉觉醒/穿越附赠）？世界观中是否有同类？是否可被夺取/封印？" />
           </label>
 
           <div class="card bg-base-200 p-3">
@@ -322,6 +343,11 @@ function confirmJsonImport() {
           <label class="form-control">
             <span class="label-text text-xs font-medium">禁用/红线场景</span>
             <textarea v-model="gf.forbiddenScenes" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="绝对不能做的事，做了必出 bug" />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-xs font-medium">暴露后果</span>
+            <textarea v-model="gf.exposureConsequence" class="textarea textarea-bordered textarea-sm" rows="2" placeholder="金手指被他人发现后的后果？是否有势力针对持有者？是否需要隐藏？" />
           </label>
 
           <div class="card bg-base-200 p-3">

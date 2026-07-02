@@ -80,5 +80,30 @@ export function goldenFingerCrossSettingIssues(workId: number, gf: GoldenFingerS
     }
   }
 
+  if (gf.visibility.trim()) {
+    const visibleKeywords = ['可见', '光芒', '声音', '气息', '波动', '身体变化', '异象', '发光']
+    const hasExternalEffect = visibleKeywords.some(kw => gf.visibility.includes(kw))
+    if (hasExternalEffect && !gf.exposureConsequence.trim()) {
+      issues.push('金手指使用时有外在表现（外人可见性中提到），但未设定暴露后果，建议补充被发现后的风险与冲突')
+    }
+  }
+
+  if (gf.visibility.trim() && conflictEngine) {
+    const hasVisibleEffect = ['可见', '光芒', '声音', '气息', '波动', '异象'].some(kw => gf.visibility.includes(kw))
+    const conflictMentionsExposure = conflictEngine.includes('暴露') || conflictEngine.includes('隐藏') ||
+      conflictEngine.includes('发现') || conflictEngine.includes('身份')
+    if (hasVisibleEffect && !conflictMentionsExposure) {
+      issues.push('金手指有外在可见表现，但冲突升级引擎未涉及暴露/隐藏/身份发现等冲突线，建议将外显性纳入冲突设计')
+    }
+  }
+
+  if (gf.sourceNature.trim() && worldPressure) {
+    const sourceMentionsSystem = gf.sourceNature.includes('系统') || gf.sourceNature.includes('面板')
+    const worldMentionsSystem = worldPressure.includes('系统') || worldPressure.includes('面板')
+    if (sourceMentionsSystem && !worldMentionsSystem) {
+      issues.push('金手指来源涉及「系统」，但世界观压力规则中未提及系统类设定，建议补充系统在世界观中的存在依据')
+    }
+  }
+
   return issues
 }

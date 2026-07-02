@@ -20,7 +20,8 @@ import { editorNavKey } from './editor-nav'
 import { toPlainForIpc } from '../../../../shared/ipc-plain'
 import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine, countWords } from '../../../../shared/body-word-target'
-import { formatBodyPromptLines, workUnitLabels } from '../../../../shared/work-terminology'
+import { formatBodyPromptLines, workUnitLabels, buildMergedStoryText } from '../../../../shared/work-terminology'
+import { formatPreviewAnchorReport } from '../../../../shared/story-preview-anchor'
 import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../../shared/body-generation-prompt'
 import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../../shared/auto-optimize-config'
 import type { AutoOptimizeConfig } from '../../../../shared/auto-optimize-config'
@@ -60,6 +61,7 @@ const chapters = ref<Chapter[]>([])
 const selectedVolume = ref<number | null>(null)
 const selectedChapterId = ref<number | null>(null)
 const workType = ref<string | null>(null)
+const workDescription = ref<string>('')
 const wordTarget = ref(4000)
 
 const currentPage = ref(1)
@@ -300,8 +302,9 @@ onMounted(async () => {
   const plan = await window.anovel.invoke('writingPlan:get', props.workId) as { wordsPerChapter: number }
   if (plan.wordsPerChapter) wordTarget.value = plan.wordsPerChapter
 
-  const work = await window.anovel.invoke('work:get', props.workId) as { work_type?: string } | null
+  const work = await window.anovel.invoke('work:get', props.workId) as { work_type?: string; description?: string | null } | null
   workType.value = work?.work_type ?? null
+  workDescription.value = work?.description?.trim() ?? ''
 
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
 
@@ -349,8 +352,8 @@ function syncResultFromCache(chapterId: number) {
   const ch = chapters.value.find(c => c.id === chapterId)
   const dbContent = ch?.content ?? ''
   const cached = getCachedBodyContent(chapterId)
-  if (cached !== undefined && cached !== dbContent) {
-    result.value = cached ? normalizeBodyParagraphSpacing(cached) : cached
+  if (cached && cached !== dbContent) {
+    result.value = normalizeBodyParagraphSpacing(cached)
   } else {
     result.value = dbContent ? normalizeBodyParagraphSpacing(dbContent) : dbContent
   }
@@ -363,6 +366,8 @@ onActivated(async () => {
   if (selectedChapterId.value != null) {
     syncResultFromCache(selectedChapterId.value)
   }
+  const work = await window.anovel.invoke('work:get', props.workId) as { description?: string | null } | null
+  workDescription.value = work?.description?.trim() ?? ''
 })
 
 // 存储最近一次 AI 生成的情绪强度（由 saveToChapter 消费后清除）
@@ -393,7 +398,7 @@ watch(selectedChapterId, async (id) => {
     const ch = chapters.value.find(c => c.id === id)
     const dbContent = ch?.content ?? ''
     const cached = getCachedBodyContent(id)
-    const raw = (cached !== undefined && cached !== dbContent) ? cached : dbContent
+    const raw = (cached && cached !== dbContent) ? cached : dbContent
     result.value = raw ? normalizeBodyParagraphSpacing(raw) : raw
     critiqueResult.value = null
     qualityResult.value = null
@@ -1345,8 +1350,22 @@ async function copyBodyContent() {
   }
 }
 
+async function restoreContent() {
+  const ch = selectedChapter.value
+  if (!ch) return
+  const dbChapter = await window.anovel.invoke('chapter:get', ch.id) as Chapter | null
+  const dbContent = dbChapter?.content ?? ''
+  clearCachedBodyContent(ch.id)
+  result.value = dbContent ? normalizeBodyParagraphSpacing(dbContent) : dbContent
+  resetBodyEditorDiagnostics()
+  showToast('success', '已恢复数据库存储的内容')
+}
+
 const isExportingStory = ref(false)
 const clearingAllBody = ref(false)
+const previewRatioPct = ref(30)
+const previewReport = ref('')
+const showPreviewReport = ref(false)
 
 const hasAnyBodyContent = computed(() => {
   if (result.value.trim()) return true
@@ -1420,15 +1439,18 @@ async function copyCompleteStory() {
   if (chapters.value.length === 0) return
   isExportingStory.value = true
   try {
-    const fullText = chapters.value
+    const beatContents = chapters.value
       .filter(ch => ch.content && ch.content.trim() !== '')
       .map(ch => ch.content!.trim())
-      .join('\n\n')
-    
-    if (!fullText) {
+
+    if (beatContents.length === 0) {
       alert('所有节拍均无正文，无法复制！')
       return
     }
+
+    const fullText = workType.value === 'story'
+      ? buildMergedStoryText(workDescription.value, beatContents)
+      : beatContents.join('\n\n')
 
     await navigator.clipboard.writeText(fullText)
     alert('合并成功！已复制全文到剪贴板，请直接粘贴到发布平台。')
@@ -1437,6 +1459,23 @@ async function copyCompleteStory() {
   } finally {
     isExportingStory.value = false
   }
+}
+
+function generatePreviewReport() {
+  const beatContents = chapters.value
+    .filter(ch => ch.content && ch.content.trim() !== '')
+    .map(ch => ch.content!.trim())
+  if (beatContents.length === 0) {
+    previewReport.value = '所有节拍均无正文，无法生成试读卡点报告。'
+    showPreviewReport.value = true
+    return
+  }
+  const fullText = workType.value === 'story'
+    ? buildMergedStoryText(workDescription.value, beatContents)
+    : beatContents.join('\n\n')
+  const ratio = Math.max(0.01, Math.min(0.95, previewRatioPct.value / 100))
+  previewReport.value = formatPreviewAnchorReport(fullText, ratio)
+  showPreviewReport.value = true
 }
 </script>
 
@@ -1594,6 +1633,42 @@ async function copyCompleteStory() {
               <font-awesome-icon :icon="isExportingStory ? 'spinner' : 'copy'" :spin="isExportingStory" class="w-3.5 h-3.5" />
               {{ isExportingStory ? '合并复制中...' : '一键合并并复制全文' }}
             </button>
+
+            <!-- 试读卡点 -->
+            <div class="flex gap-2">
+              <div class="flex items-center gap-1.5 shrink-0">
+                <span class="text-xs text-base-content/50">试读</span>
+                <input
+                  v-model.number="previewRatioPct"
+                  type="number"
+                  min="1"
+                  max="95"
+                  class="input input-bordered input-xs w-14 text-center rounded-lg"
+                />
+                <span class="text-xs text-base-content/40">%</span>
+              </div>
+              <button
+                type="button"
+                class="btn btn-outline btn-sm gap-2 flex-1"
+                :disabled="chapters.length === 0 || !hasAnyBodyContent"
+                @click="showPreviewReport = !showPreviewReport; if (showPreviewReport && !previewReport) generatePreviewReport()"
+              >
+                <font-awesome-icon icon="bookmark" class="w-3.5 h-3.5" />
+                {{ showPreviewReport ? '收起试读卡点' : '查看试读卡点' }}
+              </button>
+            </div>
+            <div v-if="showPreviewReport" class="space-y-2">
+              <div v-if="!previewReport" class="flex justify-end">
+                <button class="btn btn-xs btn-primary gap-1" @click="generatePreviewReport">
+                  <font-awesome-icon icon="sync" class="w-3 h-3" />生成报告
+                </button>
+              </div>
+              <pre
+                v-if="previewReport"
+                class="text-xs text-base-content/70 whitespace-pre-wrap font-mono leading-relaxed max-h-60 overflow-y-auto bg-base-100 rounded-lg p-3 border border-base-300/60"
+              >{{ previewReport }}</pre>
+            </div>
+
             <button
               type="button"
               class="btn btn-outline btn-error btn-block btn-sm gap-2"
@@ -1675,6 +1750,16 @@ async function copyCompleteStory() {
                   class="w-3.5 h-3.5"
                 />
                 {{ savingChapter ? '保存中...' : extractingMemory ? '更新记忆中...' : '保存' }}
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost btn-xs gap-1"
+                :disabled="!selectedChapter"
+                title="恢复数据库中存储的内容，覆盖当前显示的内容"
+                @click="restoreContent"
+              >
+                <font-awesome-icon icon="rotate-left" class="w-3 h-3" />
+                恢复内容
               </button>
               <ChapterVersionHistory ref="versionHistoryRef" :chapter-id="selectedChapterId" :current-content="result" />
               <label class="flex items-center gap-1 text-xs cursor-pointer" title="生成后自动进行词级人性化处理，降低AI检测率">

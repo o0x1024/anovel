@@ -685,4 +685,11 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       }
     }
   } catch { /* 忽略解析失败 */ }
+
+  // V3.8: character_snapshots 表新增 numeric_stats 字段，保存角色数值类状态（体力/气血/法力/积分等）
+  try {
+    if (hasTable(db, 'character_snapshots') && !hasColumn(db, 'character_snapshots', 'numeric_stats')) {
+      db.exec(`ALTER TABLE character_snapshots ADD COLUMN numeric_stats TEXT`)
+    }
+  } catch { /* 已存在 */ }
 }

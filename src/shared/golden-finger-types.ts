@@ -35,14 +35,19 @@ export interface GoldenFingerVisualMetric {
 
 export interface GoldenFingerStructured {
   nameAndForm: string
+  manifestation: string
+  visibility: string
+  interaction: string
   abilities: GoldenFingerAbility[]
   acquisition: string
+  sourceNature: string
   limit: GoldenFingerLimit
   backlash: string
   upgrades: GoldenFingerUpgrade[]
   infoAdvantage: string
   sideEffects: string
   forbiddenScenes: string
+  exposureConsequence: string
   tagline: string
   firstPayoffScene: string
   visualMetric: GoldenFingerVisualMetric
@@ -50,14 +55,19 @@ export interface GoldenFingerStructured {
 
 export const EMPTY_GOLDEN_FINGER: GoldenFingerStructured = {
   nameAndForm: '',
+  manifestation: '',
+  visibility: '',
+  interaction: '',
   abilities: [{ name: '', effect: '', scope: '' }],
   acquisition: '',
+  sourceNature: '',
   limit: { cooldown: '', cost: '', usageLimit: '', invalidScenes: '' },
   backlash: '',
   upgrades: [{ stage: '', condition: '', unlocks: '' }],
   infoAdvantage: '',
   sideEffects: '',
   forbiddenScenes: '',
+  exposureConsequence: '',
   tagline: '',
   firstPayoffScene: '',
   visualMetric: {
@@ -104,8 +114,12 @@ export function normalizeGoldenFinger(value: Partial<GoldenFingerStructured>): G
   }
   return {
     nameAndForm: safeStr(value.nameAndForm),
+    manifestation: safeStr(value.manifestation),
+    visibility: safeStr(value.visibility),
+    interaction: safeStr(value.interaction),
     abilities: (value.abilities ?? []).map(safeAbility),
     acquisition: safeStr(value.acquisition),
+    sourceNature: safeStr(value.sourceNature),
     limit: {
       cooldown: safeStr(value.limit?.cooldown),
       cost: safeStr(value.limit?.cost),
@@ -117,6 +131,7 @@ export function normalizeGoldenFinger(value: Partial<GoldenFingerStructured>): G
     infoAdvantage: safeStr(value.infoAdvantage),
     sideEffects: safeStr(value.sideEffects),
     forbiddenScenes: safeStr(value.forbiddenScenes),
+    exposureConsequence: safeStr(value.exposureConsequence),
     tagline: safeStr(value.tagline),
     firstPayoffScene: safeStr(value.firstPayoffScene),
     visualMetric: {
@@ -135,6 +150,9 @@ export function renderGoldenFingerMarkdown(gf: GoldenFingerStructured): string {
 
   if (gf.tagline.trim()) lines.push('## 番茄一句话卖点', gf.tagline, '')
   if (gf.nameAndForm.trim()) lines.push('## 名称与形态', gf.nameAndForm, '')
+  if (gf.manifestation.trim()) lines.push('## 呈现形式', gf.manifestation, '')
+  if (gf.visibility.trim()) lines.push('## 外人可见性', gf.visibility, '')
+  if (gf.interaction.trim()) lines.push('## 交互方式', gf.interaction, '')
 
   const abilities = gf.abilities.filter(a => a.name.trim() || a.effect.trim())
   if (abilities.length) {
@@ -147,6 +165,7 @@ export function renderGoldenFingerMarkdown(gf: GoldenFingerStructured): string {
   }
 
   if (gf.acquisition.trim()) lines.push('## 获取方式与觉醒条件', gf.acquisition, '')
+  if (gf.sourceNature.trim()) lines.push('## 来源性质', gf.sourceNature, '')
 
   const limit = gf.limit
   const hasLimit = limit.cooldown?.trim() || limit.cost?.trim() || limit.usageLimit?.trim() || limit.invalidScenes?.trim()
@@ -176,6 +195,7 @@ export function renderGoldenFingerMarkdown(gf: GoldenFingerStructured): string {
   if (gf.infoAdvantage.trim()) lines.push('## 信息差优势', gf.infoAdvantage, '')
   if (gf.sideEffects.trim()) lines.push('## 副作用/负面绑定', gf.sideEffects, '')
   if (gf.forbiddenScenes.trim()) lines.push('## 禁用/红线场景', gf.forbiddenScenes, '')
+  if (gf.exposureConsequence.trim()) lines.push('## 暴露后果', gf.exposureConsequence, '')
 
   const vm = gf.visualMetric
   const hasVm = vm.currentLevel?.trim() || vm.costPerUse?.trim() || vm.cooldown?.trim() ||
@@ -200,11 +220,21 @@ const GOLDEN_FINGER_KEY_MAP: Record<string, string> = {
   名称与形态: 'nameAndForm',
   设定名称: 'nameAndForm',
   能力名称: 'nameAndForm',
+  呈现形式: 'manifestation',
+  呈现: 'manifestation',
+  外显形态: 'manifestation',
+  外人可见性: 'visibility',
+  可见性: 'visibility',
+  外显性: 'visibility',
+  交互方式: 'interaction',
+  交互: 'interaction',
   核心能力: 'abilities',
   能力: 'abilities',
   获取方式: 'acquisition',
   获取方式与觉醒条件: 'acquisition',
   觉醒条件: 'acquisition',
+  来源性质: 'sourceNature',
+  来源: 'sourceNature',
   限制条件: 'limit',
   限制: 'limit',
   反噬机制: 'backlash',
@@ -219,6 +249,8 @@ const GOLDEN_FINGER_KEY_MAP: Record<string, string> = {
   禁用场景: 'forbiddenScenes',
   红线场景: 'forbiddenScenes',
   禁用: 'forbiddenScenes',
+  暴露后果: 'exposureConsequence',
+  暴露: 'exposureConsequence',
   番茄一句话卖点: 'tagline',
   一句话卖点: 'tagline',
   卖点: 'tagline',
@@ -376,6 +408,12 @@ export function parseGoldenFingerFromMarkdown(content: string): GoldenFingerStru
 
     if (title.includes('名称与形态')) {
       gf.nameAndForm = body
+    } else if (title.includes('呈现形式') || title.includes('外显形态')) {
+      gf.manifestation = body
+    } else if (title.includes('外人可见性') || title.includes('可见性')) {
+      gf.visibility = body
+    } else if (title.includes('交互方式') || title.includes('交互')) {
+      gf.interaction = body
     } else if (title.includes('核心能力')) {
       gf.abilities = parseListItems(body).map(item => {
         const parsed = parseBoldItem(item)
@@ -389,6 +427,8 @@ export function parseGoldenFingerFromMarkdown(content: string): GoldenFingerStru
       })
     } else if (title.includes('获取') || title.includes('觉醒')) {
       gf.acquisition = body
+    } else if (title.includes('来源性质') || title.includes('来源')) {
+      gf.sourceNature = body
     } else if (title.includes('限制条件')) {
       for (const item of parseListItems(body)) {
         const parsed = parseBoldItem(item)
@@ -414,6 +454,8 @@ export function parseGoldenFingerFromMarkdown(content: string): GoldenFingerStru
       gf.sideEffects = body
     } else if (title.includes('禁用') || title.includes('红线')) {
       gf.forbiddenScenes = body
+    } else if (title.includes('暴露后果') || title.includes('暴露')) {
+      gf.exposureConsequence = body
     } else if (title.includes('卖点')) {
       gf.tagline = body
     } else if (title.includes('爽点场景')) {
@@ -439,6 +481,9 @@ export function parseGoldenFingerFromMarkdown(content: string): GoldenFingerStru
 export function goldenFingerValidationIssues(gf: GoldenFingerStructured): string[] {
   const issues: string[] = []
   if (!gf.nameAndForm.trim()) issues.push('缺少「名称与形态」')
+  if (!gf.manifestation.trim()) issues.push('缺少「呈现形式」')
+  if (!gf.visibility.trim()) issues.push('缺少「外人可见性」')
+  if (!gf.interaction.trim()) issues.push('缺少「交互方式」')
   if (!gf.abilities.some(a => a.name.trim() && a.effect.trim())) issues.push('缺少有效的「核心能力」')
   if (!gf.acquisition.trim()) issues.push('缺少「获取方式与觉醒条件」')
   if (!gf.limit.cooldown?.trim() && !gf.limit.cost?.trim() && !gf.limit.usageLimit?.trim()) {
@@ -460,15 +505,20 @@ export function formatGoldenFingerConstraints(gf: GoldenFingerStructured): strin
 
   const lines: string[] = ['【金手指硬性约束】']
   lines.push(`能力：${gf.nameAndForm}`)
+  lines.push(`呈现形式：${gf.manifestation}`)
+  lines.push(`外人可见性：${gf.visibility}`)
+  lines.push(`交互方式：${gf.interaction}`)
   for (const a of gf.abilities.filter(x => x.name.trim() || x.effect.trim())) {
     lines.push(`- ${a.name || '能力'}：${a.effect}${a.scope ? `（范围：${a.scope}）` : ''}`)
   }
   lines.push(`获取/觉醒：${gf.acquisition}`)
+  if (gf.sourceNature.trim()) lines.push(`来源性质：${gf.sourceNature}`)
   lines.push(`限制：冷却=${gf.limit.cooldown || '无'}；消耗=${gf.limit.cost || '无'}；上限=${gf.limit.usageLimit || '无'}；失效场景=${gf.limit.invalidScenes || '无'}`)
   lines.push(`反噬：${gf.backlash}`)
   lines.push(`信息差：${gf.infoAdvantage}`)
   if (gf.sideEffects.trim()) lines.push(`副作用：${gf.sideEffects}`)
   if (gf.forbiddenScenes.trim()) lines.push(`红线：${gf.forbiddenScenes}`)
+  if (gf.exposureConsequence.trim()) lines.push(`暴露后果：${gf.exposureConsequence}`)
   lines.push(`可视化指标：等级=${gf.visualMetric.currentLevel}；每次消耗=${gf.visualMetric.costPerUse}；冷却=${gf.visualMetric.cooldown}；次数上限=${gf.visualMetric.usageCap}；进度条=${gf.visualMetric.progressBar}；越级后果=${gf.visualMetric.failureScene}`)
   if (gf.upgrades.some(u => u.stage.trim())) {
     lines.push('升级路径：')
@@ -487,14 +537,19 @@ export function goldenFingerStructuredPromptSection(): string {
     '请在 Markdown 分析之后，附加一个 JSON 代码块（标记为 json），字段如下：',
     '{',
     '  "nameAndForm": "能力名称与形态",',
+    '  "manifestation": "呈现形式：以什么形式呈现给主角（面板/声音/纹路/空间/物品/纯感知），感官通道，触发方式",',
+    '  "visibility": "外人可见性：金手指本身是否可见、使用时是否有外在表现、世界观检测手段能否发现",',
+    '  "interaction": "交互方式：主角如何调用金手指、金手指是否有自主意识/人格",',
     '  "abilities": [{ "name": "能力名", "effect": "具体效果", "scope": "作用范围" }],',
     '  "acquisition": "获取与觉醒条件",',
+    '  "sourceNature": "来源性质：金手指的本质来源、在世界观中是否有同类、是否可被夺取/封印",',
     '  "limit": { "cooldown": "冷却/间隔", "cost": "消耗", "usageLimit": "次数/容量上限", "invalidScenes": "失效场景" },',
     '  "backlash": "反噬/代价机制",',
     '  "upgrades": [{ "stage": "阶段名", "condition": "升级条件", "unlocks": "解锁能力" }],',
     '  "infoAdvantage": "信息差优势",',
     '  "sideEffects": "副作用/负面绑定",',
     '  "forbiddenScenes": "禁用/红线场景",',
+    '  "exposureConsequence": "暴露后果：金手指被他人发现后的后果、是否需要隐藏、是否有势力针对持有者",',
     '  "tagline": "番茄一句话卖点",',
     '  "firstPayoffScene": "前三章首次爽点场景",',
     '  "visualMetric": {',
@@ -521,7 +576,7 @@ export function mergeGoldenFinger(
   const merged = normalizeGoldenFinger(current)
 
   const scalarFields: Array<keyof Omit<GoldenFingerStructured, 'abilities' | 'upgrades' | 'limit' | 'visualMetric'>> = [
-    'nameAndForm', 'acquisition', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'tagline', 'firstPayoffScene'
+    'nameAndForm', 'manifestation', 'visibility', 'interaction', 'acquisition', 'sourceNature', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'exposureConsequence', 'tagline', 'firstPayoffScene'
   ]
   for (const key of scalarFields) {
     const value = patch[key]

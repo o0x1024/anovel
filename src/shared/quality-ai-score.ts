@@ -1,14 +1,15 @@
 export const QUALITY_AI_METRIC_DEFS = [
-  { key: 'ai_pattern_ratio', label: 'AI句式占比', max: 12 },
-  { key: 'dialogue_density', label: '对话密度', max: 10 },
-  { key: 'sentence_variation', label: '句长波动', max: 10 },
-  { key: 'short_sentence_ratio', label: '短句占比', max: 8 },
-  { key: 'imagery_repeat', label: '强意象复用', max: 8 },
-  { key: 'scene_description_cap', label: '场景描写克制', max: 8 },
-  { key: 'new_info_density', label: '推进信息密度', max: 10 },
-  { key: 'outline_coverage', label: '大纲覆盖度', max: 14 },
-  { key: 'content_logic', label: '内容逻辑', max: 10 },
-  { key: 'word_count', label: '字数达标', max: 10 }
+  { key: 'ai_pattern_ratio', label: 'AI句式占比', max: 100 },
+  { key: 'dialogue_density', label: '对话密度', max: 100 },
+  { key: 'sentence_variation', label: '句长波动', max: 100 },
+  { key: 'short_sentence_ratio', label: '短句占比', max: 100 },
+  { key: 'imagery_repeat', label: '强意象复用', max: 100 },
+  { key: 'scene_description_cap', label: '场景描写克制', max: 100 },
+  { key: 'new_info_density', label: '推进信息密度', max: 100 },
+  { key: 'outline_coverage', label: '大纲覆盖度', max: 100 },
+  { key: 'content_logic', label: '内容逻辑', max: 100 },
+  { key: 'setting_consistency', label: '设定一致性', max: 100 },
+  { key: 'word_count', label: '字数达标', max: 100 }
 ] as const
 
 export type QualityAiMetricKey = (typeof QUALITY_AI_METRIC_DEFS)[number]['key']
@@ -142,7 +143,6 @@ export function parseQualityAiScoreReport(report: string): QualityAiScoreBreakdo
 
   // 兼容 camelCase 键名（AI 有时会偏离 snake_case 约定）
   const hardFail = data.hard_fail === true || data.hardFail === true
-  const scoreTotal = readNumber(data.score_total ?? data.scoreTotal)
   const rawScores = data.scores ?? data.Scores
 
   let scoreMap: Record<string, unknown> = {}
@@ -215,8 +215,19 @@ export function parseQualityAiScoreReport(report: string): QualityAiScoreBreakdo
         .filter((item): item is QualityAiPatch => item != null)
     : []
 
+  const computedAvg = items.length > 0
+    ? Math.round(items.reduce((sum, it) => sum + it.score, 0) / items.length)
+    : 0
+  let explicitTotal = data.score_total ?? data.scoreTotal
+  if (typeof explicitTotal !== 'number') {
+    explicitTotal = parseInt(explicitTotal as string, 10)
+  }
+  const finalScoreTotal = Number.isFinite(explicitTotal as number) && (explicitTotal as number) > 0
+    ? Math.min(explicitTotal as number, 100)
+    : computedAvg
+
   return {
-    scoreTotal,
+    scoreTotal: finalScoreTotal,
     hardFail,
     items,
     failedRules,

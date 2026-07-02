@@ -121,24 +121,25 @@ const BUILTIN_WORD_ENTRIES: Array<{ source: string; target: string }> = [
   { source: '快步从她身旁挤过去', target: '从她身边蹭过去|侧身闪了出去' },
 ]
 
-const BUILTIN_PATTERN_ENTRIES: Array<{ source: string; target: string }> = [
+const BUILTIN_REGEX_ENTRIES: Array<{ source: string; target: string }> = [
   // ── 【致命】电影镜头链 —— 朱雀实验F6证实：注入镜头链使人工特征↓81% ──
-  { source: '目光...落在...上', target: '瞄了一眼{2}|扫了眼{2}|盯着{2}' },
-  { source: '目光...扫过...', target: '瞅了一圈{1}|打量着{1}' },
-  { source: '视线...移到...', target: '又看向{2}|瞟了一眼{2}' },
-  { source: '嘴角微微...上扬', target: '咧了咧嘴|嘴巴一弯' },
-  { source: '缓缓...回过头', target: '扭过脸|转过身子' },
+  { source: '目光[\\s\\S]+?落在[\\s\\S]+?上', target: '瞄了一眼$2|扫了眼$2|盯着$2' },
+  { source: '目光[\\s\\S]+?扫过[\\s\\S]+?', target: '瞅了一圈$1|打量着$1' },
+  { source: '视线[\\s\\S]+?移到[\\s\\S]+?', target: '又看向$2|瞟了一眼$2' },
+  { source: '嘴角微微[\\s\\S]+?上扬', target: '咧了咧嘴|嘴巴一弯' },
+  { source: '缓缓[\\s\\S]+?回过头', target: '扭过脸|转过身子' },
 
   // ── 【中危】模板情感句/总结收束句 —— 朱雀实验F1/F5证实 ──
-  { source: '一股...涌上心头', target: '{1}冒了上来|心里一阵{1}' },
-  { source: '心中涌起...', target: '心头一{1}|{1}涌上来' },
-  { source: '眼中闪过一丝...', target: '眼底有点{1}|眼神带上了{1}' },
-  { source: '这一刻...明白了...', target: '' },
-  { source: '或许...这便是...', target: '' },
+  { source: '一股[\\s\\S]+?涌上心头', target: '$1冒了上来|心里一阵$1' },
+  { source: '心中涌起[\\s\\S]+?', target: '心头一$1|$1涌上来' },
+  { source: '眼中闪过一丝[\\s\\S]+?', target: '眼底有点$1|眼神带上了$1' },
+  { source: '这一刻[\\s\\S]+?明白了[\\s\\S]+?', target: '' },
+  { source: '或许[\\s\\S]+?这便是[\\s\\S]+?', target: '' },
 
   // ── 句式模板 ──
-  { source: '不是...而是', target: '{2}|{1}不重要，{2}' },
-  { source: '虽然...但是', target: '{1}归{1}，可{2}|就算{1}，{2}' },
+  { source: '不是[\\s\\S]+?而是', target: '$2|$1不重要，$2' },
+  { source: '不是[\\s\\S]+?是[\\s\\S]+?。', target: '' },
+  { source: '虽然[\\s\\S]+?但是', target: '$1归$1，可$2|就算$1，$2' },
 ]
 
 export const BUILTIN_ANTI_AI_VOCAB: WordTableEntryRow[] = [
@@ -151,9 +152,9 @@ export const BUILTIN_ANTI_AI_VOCAB: WordTableEntryRow[] = [
     create_time: '',
     update_time: '',
   })),
-  ...BUILTIN_PATTERN_ENTRIES.map((entry, idx) => ({
+  ...BUILTIN_REGEX_ENTRIES.map((entry, idx) => ({
     id: -(BUILTIN_WORD_ENTRIES.length + idx + 1),
-    type: 'pattern',
+    type: 'regex',
     source: entry.source,
     target: entry.target,
     enabled: 1,

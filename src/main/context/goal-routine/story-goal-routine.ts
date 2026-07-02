@@ -7,9 +7,9 @@
  *   freeze_storyline → 冻结主线版本
  *   materialize_settings → 沉淀核心设定
  *   generate_character_cards → 生成主角人设卡片
- *   generate_title_hook → 生成爆款书名与导语
- *   overall_self_check → 核心设定整体自检
  *   generate_beats → 生成完整节拍大纲
+ *   generate_title_hook → 基于节拍大纲生成爆款书名与导语
+ *   overall_self_check → 核心设定整体自检
  *   draft_body → 顺序生成全部正文
  *   goal_check → 统一验收目标维度
  *   repair_plan/repair_execute → 结构化修复后回到验收
@@ -508,9 +508,12 @@ async function generateTitleHook(
       prompt: buildTitleHookPrompt(workId, goal),
       systemPrompt: [
         '你是番茄短故事的顶流爆款编辑，深谙爆款流量密码。',
-        '基于大纲孵化设定、章节大纲和创作目标，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的短故事书名与导语组合。',
+        '基于大纲孵化设定、节拍大纲和创作目标，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的短故事书名与导语组合。',
         '书名必须强网感、直击人性弱点、带爽感/反差/悬念/场景刺激。',
+        '导语是放在全篇正文最开头、独立于编号节拍之外的"钩子段落"，交待核心故事、留住用户。',
         '导语 150-300 字，前三句爆发冲突，第一人称，强情绪，最后留悬念钩子。',
+        '导语是独立于正文节拍之外的开篇钩子，发布时置于第一节拍之前。须用最具冲击力的场景直切核心冲突，让读者3秒内被抓住，产生强烈的追读冲动。',
+        '导语必须是一个完整的场景片段（包含对话、动作或弹幕/心声等形式），而非概括性介绍；读者读完导语就要产生"然后呢"的强烈冲动。',
         storyHotWordPromptSection(),
         storyCategoryPromptSection(),
         '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评","tags":{"main_category":"主分类","plot":["情节分类"],"character":["角色分类"],"emotion":["情绪分类"],"setting":["背景分类"]}}]}'
@@ -1096,6 +1099,14 @@ export async function runStoryGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'character_cards', summary: `生成 ${count} 张主角人设卡片`
           })
           emit(`生成 ${count} 张主角人设卡片`, 'running')
+          phase = 'generate_beats'
+        } else if (phase === 'generate_beats') {
+          const res = await ensureBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          if (res.error) throw new Error(res.error)
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'beats', summary: res.created > 0 ? `生成 ${res.created} 个节拍` : '复用已有节拍'
+          })
+          emit(res.created > 0 ? `生成 ${res.created} 个节拍` : '复用已有节拍', 'running')
           phase = 'generate_title_hook'
         } else if (phase === 'generate_title_hook') {
           emit('正在生成爆款书名和导语', 'running')
@@ -1117,14 +1128,6 @@ export async function runStoryGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: conclusion
           })
           emit(`整体自检完成：${conclusion}`, 'running')
-          phase = 'generate_beats'
-        } else if (phase === 'generate_beats') {
-          const res = await ensureBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
-          if (res.error) throw new Error(res.error)
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'beats', summary: res.created > 0 ? `生成 ${res.created} 个节拍` : '复用已有节拍'
-          })
-          emit(res.created > 0 ? `生成 ${res.created} 个节拍` : '复用已有节拍', 'running')
           phase = 'draft_body'
         } else if (phase === 'draft_body') {
           const beat = nextEmptyBeat(workId)
@@ -1192,7 +1195,16 @@ export async function runStoryGoalLoop(
             }
 
             goalRoutineDAO.setStatus(workId, 'goal_met')
-            emit(`目标达成：质量${lastCheck.qualityScore} · 目标匹配${lastCheck.goalMatchScore} · 节拍${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
+
+            // 试读卡点报告
+            const previewRatioPct = Math.round(fullConfig.previewRatio * 100)
+            if (lastCheck.previewReport) {
+              goalRoutineDAO.appendTurn({
+                work_id: workId, turn_no: turn, phase, action: 'preview_anchor',
+                summary: `试读卡点报告（目标比例 ${previewRatioPct}%）已生成`
+              })
+            }
+            emit(`目标达成：质量${lastCheck.qualityScore} · 目标匹配${lastCheck.goalMatchScore} · 节拍${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords} · 试读${previewRatioPct}%`, 'goal_met')
             return
           }
 

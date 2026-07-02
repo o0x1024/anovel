@@ -6,6 +6,7 @@ export const STORY_QUALITY_AI_METRIC_DEFS = [
   { key: 'scene_description_cap', label: '场景描写克制', max: 100 },
   { key: 'dialogue_impact', label: '对话信息密度', max: 100 },
   { key: 'outline_coverage', label: '大纲覆盖度', max: 100 },
+  { key: 'setting_consistency', label: '设定一致性', max: 100 },
   { key: 'word_count', label: '字数达标', max: 100 }
 ] as const
 

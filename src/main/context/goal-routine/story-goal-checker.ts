@@ -10,12 +10,15 @@ import { runConsistencyGate } from '../consistency-gate'
 import { getWritingStats } from '../writing-stats'
 import { loadWritingPlan } from '../writing-plan'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
-import { volumeChapterDAO } from '../../db'
+import { volumeChapterDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
 import { parseStoryQualityAiScoreBreakdown } from '../../../shared/story-quality-score'
+import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
 import { bodyWordCountBounds, isTotalWordCountInTargetRange } from '../../../shared/body-word-target'
 import { storyGoalModelOpts } from './story-goal-model'
+import { formatPreviewAnchorReport } from '../../../shared/story-preview-anchor'
+import { buildStoryMergedText } from '../../../shared/work-terminology'
 
 export interface StoryGoalConfig {
   /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
@@ -36,6 +39,8 @@ export interface StoryGoalConfig {
   maxTurns: number
   /** 语义验收：用户创作目标匹配度下限（0=不卡） */
   goalMatchMin: number
+  /** 试读比例（0-1），目标循环验收时据此计算试读卡点报告 */
+  previewRatio: number
   /** 正文工作台右上角所选模型（与手动正文生成一致） */
   modelType?: string
   modelName?: string
@@ -51,7 +56,8 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
-  goalMatchMin: 85
+  goalMatchMin: 85,
+  previewRatio: 0.3
 }
 
 export interface GoalCheckResult {
@@ -71,6 +77,7 @@ export interface GoalCheckResult {
   antiAiViolations: number
   goalMatchScore: number
   goalMatchReason: string
+  previewReport: string | null
   chapterDiagnostics: GoalChapterDiagnostic[]
   reasons: string[]
 }
@@ -153,6 +160,8 @@ export async function checkStoryGoal(
   const reasons: string[] = []
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const fullBody = collectFullBody(workId)
+  const isStory = workDAO.getById(workId)?.work_type === 'story'
+  const parseBreakdown = isStory ? parseStoryQualityAiScoreBreakdown : parseQualityAiScoreReport
   const chapterDiagnostics: GoalChapterDiagnostic[] = chapters.map(ch => ({
     chapterId: ch.id,
     title: ch.title,
@@ -207,7 +216,7 @@ export async function checkStoryGoal(
           }
           if (res.hardFail) anyHardFail = true
 
-          const breakdown = res.report ? parseStoryQualityAiScoreBreakdown(res.report) : null
+          const breakdown = res.report ? parseBreakdown(res.report) : null
           if (breakdown) {
             for (const item of breakdown.items) {
               if (item.score < config.qualityMin) {
@@ -279,6 +288,16 @@ export async function checkStoryGoal(
     }
   }
 
+  // ---- 6. 试读卡点报告（全篇正文就绪时计算） ----
+  let previewReport: string | null = null
+  if (content > 0 && content === total && config.previewRatio > 0) {
+    const work = workDAO.getById(workId)
+    const mergedText = buildStoryMergedText(work?.description ?? '', chapters.map(c => ({ content: c.content ?? '' })))
+    if (mergedText.trim()) {
+      previewReport = formatPreviewAnchorReport(mergedText, config.previewRatio)
+    }
+  }
+
   const met = reasons.length === 0
   return {
     met,
@@ -293,6 +312,7 @@ export async function checkStoryGoal(
     antiAiViolations,
     goalMatchScore,
     goalMatchReason,
+    previewReport,
     chapterDiagnostics,
     reasons
   }

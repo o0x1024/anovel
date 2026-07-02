@@ -10,9 +10,9 @@
  * 状态机：
  *   materialize_settings → 沉淀核心设定
  *   generate_character_cards → 生成主角人设卡片
- *   generate_title_hook → 生成爆款书名与导语
- *   overall_self_check → 核心设定整体自检
  *   generate_beats → 确保章节大纲完整
+ *   generate_title_hook → 基于章节大纲生成爆款书名与导语
+ *   overall_self_check → 核心设定整体自检
  *   draft_body → 顺序生成全部正文
  *   goal_check → 统一验收目标维度
  *   repair_plan / repair_execute → 结构化修复后回到验收
@@ -43,7 +43,7 @@ import {
 } from './story-goal-checker'
 import { generateBeatBody, type BeatGenResult } from './story-goal-doer'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
-import { parseStoryQualityAiScoreBreakdown } from '../../../shared/story-quality-score'
+import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
 import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
 import { QUALITY_APPLY_FIXES_PROMPT } from '../chapter-quality'
 import { STYLE_REWRITE_INSTRUCTION, countEmDashes, stripEmDashes } from '../anti-ai-rules'
@@ -94,14 +94,15 @@ interface ChapterOutline {
   beatRole?: string
 }
 
-const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'supporting_cast', 'worldview'] as const
+const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'supporting_cast', 'worldview', 'main_plotline'] as const
 
 const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
   protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
   golden_finger: '你是顶级长篇小说设定设计师。判断故事是否需要特殊机制；没有机制则设计身份反差与信息差。输出 Markdown：## 设定名称与形态 / ## 信息差构建 / ## 限制与升级节奏 / ## 对主线冲突的推动作用。',
   pleasure_engine: '你是顶级长篇小说节奏与爽点设计师。输出 Markdown：## 开篇钩子 / ## 前期小高潮 / ## 中期大反转 / ## 后期终极清算。必须明确每个爽点对应的卷/章位置。',
   supporting_cast: '你是顶级长篇小说配角设计师。输出 Markdown：## 核心反派与对手 / ## 盟友与导师 / ## 情感线对象 / ## 关系演变与情绪宣泄点。配角只写功能、冲突价值和记忆点。',
-  worldview: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动。'
+  worldview: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动。',
+  main_plotline: '你是顶级长篇小说主线架构师。基于全部已有设定，设计故事从开局到终局的发展轨迹。输出 Markdown：## 故事起点 / ## 核心发展线（3-5个关键阶段，每阶段标注触发事件、主角选择、状态变化）/ ## 关键转折点（至少2次预判外转向）/ ## 伏笔与回收布局 / ## 高潮设计 / ## 故事终点 / ## 各阶段递进逻辑。递进必须因果闭环，禁止"突然"跳跃。总字数 800-1500 字。'
 }
 
 const activeLoops = new Map<number, AbortController>()
@@ -391,7 +392,7 @@ async function diagnoseAndFixUntilPass(
       break
     }
 
-    const breakdown = res.report ? parseStoryQualityAiScoreBreakdown(res.report) : null
+    const breakdown = res.report ? parseQualityAiScoreReport(res.report) : null
     const metricFailures = breakdown
       ? breakdown.items.filter(i => i.score < qualityMin).map(i => i.label)
       : []
@@ -641,6 +642,14 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'character_cards', summary: `生成 ${count} 张主角人设卡片`
           })
           emit(`生成 ${count} 张主角人设卡片`, 'running')
+          phase = 'generate_beats'
+        } else if (phase === 'generate_beats') {
+          const res = await generateNovelBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'beats',
+            summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
+          })
+          emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
           phase = 'generate_title_hook'
         } else if (phase === 'generate_title_hook') {
           emit('正在生成书名和导语', 'running')
@@ -658,14 +667,6 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: report
           })
           emit(`整体自检完成：${report}`, 'running')
-          phase = 'generate_beats'
-        } else if (phase === 'generate_beats') {
-          const res = await generateNovelBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'beats',
-            summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
-          })
-          emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
           phase = 'draft_body'
         } else if (phase === 'draft_body') {
           const chapter = nextEmptyChapter(workId)

@@ -96,7 +96,7 @@ function buildBodyPrompt(
         : '',
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
       openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
-      hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致。` : ''
+      hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致，但不得重复导语中已写的场景和台词，须从导语结束处自然衔接、继续推进剧情。` : ''
     ].filter(Boolean)
   ).join('\n\n')
 }

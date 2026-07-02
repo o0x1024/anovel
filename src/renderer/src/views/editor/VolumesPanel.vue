@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, inject } from 'vue'
+import { ref, computed, onMounted, watch, inject } from 'vue'
 import { useModelChat } from './useModelChat'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -39,6 +39,16 @@ const fixingVolumes = ref(false)
 const volumeFixError = ref('')
 const volumeFixResult = ref('')
 
+const diagnosisConclusion = computed(() => {
+  if (!volumeDiagnosisResult.value) return ''
+  const match = volumeDiagnosisResult.value.match(/【(PASS|REVISE|FAIL)】/)
+  return match?.[1] ?? ''
+})
+
+const hasFixableIssues = computed(() => {
+  return diagnosisConclusion.value === 'REVISE' || diagnosisConclusion.value === 'FAIL'
+})
+
 const volumeFixSystemPrompt = [
   '你是犀利、资深的网文总编辑，擅长根据诊断报告对分卷大纲进行精准修复。',
   '根据下方的诊断报告和当前分卷列表，对存在问题的分卷进行修复。',
@@ -65,18 +75,33 @@ const volumeDiagnosisSystemPrompt = [
   '3. 【冲突升级曲线】：从卷一至最后一卷，矛盾冲突是否持续升级？是否存在冲突强度停滞甚至回落的问题？',
   '4. 【故事弧完整性】：故事起承转合是否完整？高潮点分布是否合理？结局卷是否为积累的矛盾提供有力收束？',
   '5. 【角色动机跨卷一致性】：主要角色的行为逻辑和成长弧线是否跨卷一致？是否存在人设崩塌隐患？',
+  '6. 【主线设定对齐】：各卷的发展是否与「主线设定」中的故事轨迹、关键转折点、阶段递进逻辑一致？是否存在偏离主线骨架的自由发挥？',
   '',
   '## 质量维度',
   '',
-  '6. 【节奏与体量分布】：各卷说明的篇幅体量是否均匀？是否存在关键卷过于单薄或配比失衡？',
-  '7. 【设定使用效率】：世界观规则和金手指设定是否被有效利用？是否存在设定了但后文未用的浪费？',
-  '8. 【分卷说明质量】：每卷 description 是否清晰体现主题、主冲突和卷末钩子？是否存在描述空洞、模板化或信息不足的问题？',
-  '9. 【分卷命名质量】：分卷名称是否有吸引力？是否为真实的分卷标题而非通用标签？是否存在命名重复或缺乏辨识度？',
-  '10. 【钩子与悬念设计】：每卷末尾是否有足够的悬念或钩子推动读者进入下一卷？钩子是否与前文铺垫一致？',
+  '7. 【节奏与体量分布】：各卷说明的篇幅体量是否均匀？是否存在关键卷过于单薄或配比失衡？',
+  '8. 【设定使用效率】：世界观规则和金手指设定是否被有效利用？是否存在设定了但后文未用的浪费？',
+  '9. 【分卷说明质量】：每卷 description 是否清晰体现主题、主冲突和卷末钩子？是否存在描述空洞、模板化或信息不足的问题？',
+  '10. 【分卷命名质量】：分卷名称是否有吸引力？是否为真实的分卷标题而非通用标签？是否存在命名重复或缺乏辨识度？',
+  '11. 【钩子与悬念设计】：每卷末尾是否有足够的悬念或钩子推动读者进入下一卷？钩子是否与前文铺垫一致？',
+  '',
+  '## 诊断原则（极重要）',
+  '',
+  '- 只报告真正会影响读者体验的实质性问题，不要为了凑数而报告吹毛求疵的细节。',
+  '- 如果某个维度没有实质性问题，直接写「✅ 无明显问题」，不要硬找毛病。',
+  '- 区分问题严重程度：',
+  '  🔴 阻断级：逻辑断裂、因果矛盾、人设崩塌——必须修复',
+  '  🟡 改进级：可以更好但不影响理解——建议修复',
+  '  ⚪ 微调级：锦上添花——可选修复',
+  '- 只有存在 🔴 或 🟡 问题时才建议修复；如果全部为 ✅ 或 ⚪，应明确告知作者大纲已达标。',
   '',
   '【输出要求】',
-  '请用中文输出诊断报告，针对每个问题维度，指出涉及的具体分卷、具体问题点，并给出可操作的改进建议。',
-  '报告应直接、犀利、实用，避免套话和泛泛之谈。不要输出 JSON，直接输出带 Markdown 格式的诊断报告。'
+  '报告第一行必须输出总体结论：【PASS】或【REVISE】或【FAIL】。',
+  '- PASS = 无阻断级问题，最多 2 个改进级问题，可进入下一步',
+  '- REVISE = 存在阻断级或 3 个以上改进级问题，建议修复后再继续',
+  '- FAIL = 存在结构性缺陷，需重新设计分卷',
+  '之后按维度输出诊断报告，每个问题标注严重程度（🔴/🟡/⚪），无问题的维度写「✅ 无明显问题」。',
+  '报告应直接、犀利、实用，避免套话和泛泛之谈。不要输出 JSON。'
 ].join('\n')
 
 const volumeSystemPrompt = [
@@ -165,7 +190,7 @@ async function aiGenerateVolumes() {
   await chat('请生成分卷大纲建议。', volumeSystemPrompt, 'volumes_outline', {
     workContextOptions: {
       includeVolumes: false,
-      includeIncubator: false
+      includeIncubator: true
     }
   })
 }
@@ -258,6 +283,8 @@ async function runVolumeFix() {
 
     if (!parsed.patches || parsed.patches.length === 0) {
       volumeFixResult.value = '诊断未发现需修复的问题，所有分卷已达标'
+      volumeDiagnosisResult.value = ''
+      showDiagnosisResult.value = false
       return
     }
 
@@ -272,6 +299,9 @@ async function runVolumeFix() {
 
     await loadVolumes()
     volumeFixResult.value = `已修复 ${parsed.patches.length} 个分卷`
+    volumeDiagnosisResult.value = ''
+    volumeDiagnosisError.value = ''
+    showDiagnosisResult.value = false
   } catch (e) {
     volumeFixError.value = '修复失败: ' + String(e)
   } finally {
@@ -458,10 +488,19 @@ function aiSuggestionSummary(): string {
           <h4 class="font-semibold text-sm flex items-center gap-1.5">
             <font-awesome-icon icon="stethoscope" class="w-3.5 h-3.5 text-warning" />
             逻辑与质量诊断报告
+            <span
+              v-if="diagnosisConclusion"
+              class="badge badge-sm"
+              :class="{
+                'badge-success': diagnosisConclusion === 'PASS',
+                'badge-warning': diagnosisConclusion === 'REVISE',
+                'badge-error': diagnosisConclusion === 'FAIL'
+              }"
+            >{{ diagnosisConclusion }}</span>
           </h4>
           <div class="flex items-center gap-2">
             <button
-              v-if="volumeDiagnosisResult && !fixingVolumes"
+              v-if="volumeDiagnosisResult && hasFixableIssues && !fixingVolumes"
               class="btn btn-primary btn-xs gap-1"
               @click="runVolumeFix"
             >

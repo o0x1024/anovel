@@ -15,14 +15,14 @@ const entries = ref<WordTableEntryRow[]>([])
 const loading = ref(false)
 const showAddForm = ref(false)
 
-const newType = ref<'word' | 'pattern'>('word')
+const newType = ref<'word' | 'regex'>('word')
 const newSource = ref('')
 const newTarget = ref('')
 
 const editingId = ref<number | null>(null)
 const editSource = ref('')
 const editTarget = ref('')
-const editType = ref<'word' | 'pattern'>('word')
+const editType = ref<'word' | 'regex'>('word')
 
 const previewText = ref('')
 const previewResult = ref('')
@@ -61,7 +61,7 @@ function startEdit(entry: WordTableEntryRow) {
   editingId.value = entry.id
   editSource.value = entry.source
   editTarget.value = entry.target
-  editType.value = entry.type as 'word' | 'pattern'
+  editType.value = entry.type as 'word' | 'regex'
 }
 
 async function saveEdit() {
@@ -171,7 +171,7 @@ onMounted(loadEntries)
           class="select select-xs select-bordered w-full max-w-[5.5rem] shrink-0"
         >
           <option value="word">词/短语</option>
-          <option value="pattern">句式模板</option>
+          <option value="regex">正则</option>
         </select>
         <input
           v-model="newSource"
@@ -296,8 +296,8 @@ onMounted(loadEntries)
                 />
               </td>
               <td>
-                <span class="badge badge-xs" :class="entry.type === 'pattern' ? 'badge-accent' : 'badge-info'">
-                  {{ entry.type === 'word' ? '词' : '句式' }}
+                <span class="badge badge-xs" :class="entry.type === 'regex' ? 'badge-accent' : 'badge-info'">
+                  {{ entry.type === 'word' ? '词' : '正则' }}
                 </span>
               </td>
               <template v-if="editingId === entry.id">

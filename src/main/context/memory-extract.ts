@@ -18,6 +18,7 @@ interface ExtractedMemory {
     known_info?: string
     relationship_changes?: string
     ability_changes?: string
+    numeric_stats?: { name: string; value: string; unit?: string }[]
   }[]
 }
 
@@ -66,6 +67,9 @@ export function applyMemoryExtract(
   // 硬编码匹配已移除 — 回收检测改用 AI 语义判断（foreshadowing:detectResolutions）
   for (const snap of extracted.character_snapshots ?? []) {
     if (!snap.character_name?.trim()) continue
+    const numericStats = snap.numeric_stats && snap.numeric_stats.length > 0
+      ? JSON.stringify(snap.numeric_stats)
+      : undefined
     characterSnapshotDAO.create({
       work_id: workId,
       character_name: snap.character_name.trim(),
@@ -74,7 +78,8 @@ export function applyMemoryExtract(
       mental_state: snap.mental_state,
       known_info: snap.known_info,
       relationship_changes: snap.relationship_changes,
-      ability_changes: snap.ability_changes
+      ability_changes: snap.ability_changes,
+      numeric_stats: numericStats
     })
     snapshots++
   }
@@ -167,9 +172,17 @@ export function applyForeshadowingResolutions(
 export const MEMORY_EXTRACT_SYSTEM_PROMPT = [
   '从章节正文中提取叙事记忆体更新信息。',
   '识别：新埋设的伏笔（标注 depth: shallow/normal/deep）、本章回收的伏笔、出场角色的状态变化。',
+  '',
+  '角色快照的 numeric_stats 字段（极重要）：',
+  '提取角色在本章结束时的所有数值类状态，包括但不限于：体力/气血/法力/灵力、等级/境界、积分/贡献点/信用度、金钱/资源数量、装备耐久度等。',
+  '每项格式：{"name":"属性名","value":"数值或状态","unit":"单位（可选）"}',
+  '必须记录本章中发生变化的数值，以及与后续剧情可能产生冲突的关键数值。',
+  '示例：[{"name":"体力","value":"50","unit":""},{"name":"信用度","value":"87","unit":"点"},{"name":"境界","value":"练气三层","unit":""}]',
+  '若本章无数值类状态变化，numeric_stats 留空数组。',
+  '',
   '输出 JSON：',
   '```json',
-  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":""}]}',
+  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":"","numeric_stats":[{"name":"","value":"","unit":""}]}]}',
   '```',
   '若无某项则留空数组。'
 ].join('\n')

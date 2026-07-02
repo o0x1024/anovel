@@ -10,6 +10,7 @@ export interface CharacterSnapshotRow {
   known_info: string | null
   relationship_changes: string | null
   ability_changes: string | null
+  numeric_stats: string | null
   snapshot_time: string
 }
 
@@ -66,16 +67,17 @@ export class CharacterSnapshotDAO extends BaseDAO {
     known_info?: string
     relationship_changes?: string
     ability_changes?: string
+    numeric_stats?: string
   }): number {
     return this.insert(
       `INSERT INTO character_snapshots
-       (work_id, character_name, chapter_id, location, mental_state, known_info, relationship_changes, ability_changes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (work_id, character_name, chapter_id, location, mental_state, known_info, relationship_changes, ability_changes, numeric_stats)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.work_id, input.character_name, input.chapter_id,
         input.location ?? null, input.mental_state ?? null,
         input.known_info ?? null, input.relationship_changes ?? null,
-        input.ability_changes ?? null
+        input.ability_changes ?? null, input.numeric_stats ?? null
       ]
     )
   }

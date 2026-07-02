@@ -116,7 +116,7 @@ export function mergeOutlinePlanningWorkContextOptions(
 
   return {
     ...options,
-    includeIncubator: false,
+    includeIncubator: options.includeIncubator ?? (step === 'volumes_outline' || step.startsWith('volumes_outline_')),
     includeQualityIssues: false,
     includeIdea: options.includeIdea ?? true,
     includeCoreSettings: options.includeCoreSettings ?? true,
