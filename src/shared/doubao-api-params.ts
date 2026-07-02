@@ -16,7 +16,7 @@ export function parseDoubaoProviderOptions(raw: string | null | undefined): Doub
   try {
     const parsed = JSON.parse(raw) as Partial<DoubaoProviderOptions>
     return {
-      thinkingEnabled: parsed.thinkingEnabled !== false
+      thinkingEnabled: parsed.thinkingEnabled === true
     }
   } catch {
     return { ...DEFAULT_DOUBAO_PROVIDER_OPTIONS }

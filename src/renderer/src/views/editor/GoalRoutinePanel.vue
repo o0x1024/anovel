@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onActivated, onUnmounted, watch } from 'vue'
 import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel'
 import {
-  GOAL_ROUTINE_PHASE_ORDER,
-  GOAL_ROUTINE_PHASE_LABELS,
+  STORY_GOAL_ROUTINE_PHASE_ORDER,
+  NOVEL_GOAL_ROUTINE_PHASE_ORDER,
+  getGoalRoutinePhaseLabels,
   goalRoutinePhaseLabel,
   isGoalRoutinePhase,
   type GoalRoutinePhase
@@ -14,13 +15,13 @@ import { isTotalWordCountInTargetRange } from '../../../../shared/body-word-targ
 const props = defineProps<{ workId: number; workType?: 'novel' | 'story' }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
-const NOVEL_START_PHASE: GoalRoutinePhase = 'materialize_settings'
 const availablePhases = computed<GoalRoutinePhase[]>(() => {
   if (props.workType === 'novel') {
-    const idx = GOAL_ROUTINE_PHASE_ORDER.indexOf(NOVEL_START_PHASE)
-    return idx >= 0 ? GOAL_ROUTINE_PHASE_ORDER.slice(idx) : GOAL_ROUTINE_PHASE_ORDER
+    return config.value.incubatorEnabled
+      ? [...STORY_GOAL_ROUTINE_PHASE_ORDER.slice(0, 3), ...NOVEL_GOAL_ROUTINE_PHASE_ORDER]
+      : NOVEL_GOAL_ROUTINE_PHASE_ORDER
   }
-  return GOAL_ROUTINE_PHASE_ORDER
+  return STORY_GOAL_ROUTINE_PHASE_ORDER
 })
 
 const CONFIG_STORAGE_KEY = 'goalRoutineConfig'
@@ -36,6 +37,7 @@ interface GoalConfig {
   maxTurns: number
   goalMatchMin: number
   previewRatio: number
+  incubatorEnabled: boolean
 }
 
 const DEFAULT_CONFIG: GoalConfig = {
@@ -48,7 +50,8 @@ const DEFAULT_CONFIG: GoalConfig = {
   checkAntiAiRules: true,
   maxTurns: 60,
   goalMatchMin: 85,
-  previewRatio: 0.3
+  previewRatio: 0.3,
+  incubatorEnabled: false
 }
 
 function loadConfig(): GoalConfig {
@@ -141,9 +144,9 @@ const statusBadge = computed(() => {
   return map[s ?? 'idle'] ?? 'badge-ghost'
 })
 
-const phaseMap = GOAL_ROUTINE_PHASE_LABELS
+const phaseMap = computed(() => getGoalRoutinePhaseLabels(props.workType))
 
-const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_phase))
+const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_phase, props.workType))
 
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
@@ -248,6 +251,7 @@ function goalInvokePayload() {
     maxTurns: config.value.maxTurns,
     goalMatchMin: config.value.goalMatchMin,
     previewRatio: config.value.previewRatio,
+    ...(props.workType === 'novel' ? { incubatorEnabled: config.value.incubatorEnabled } : {}),
     ...bodyModelParams()
   }
 }
@@ -319,6 +323,10 @@ onMounted(() => {
   void refreshState()
 })
 
+onActivated(() => {
+  void refreshState()
+})
+
 onUnmounted(() => {
   window.anovel.off('goal:progress', onProgress)
 })
@@ -340,7 +348,7 @@ watch(config, saveConfig, { deep: true })
       </div>
       <div>
         <h3 class="text-lg font-bold">目标循环</h3>
-        <p class="text-xs text-base-content/50">给定创作目标，AI 自主生成一篇完整短故事直到达成或轮次上限</p>
+        <p class="text-xs text-base-content/50">给定创作目标，AI 自主生成一篇完整{{ workType === 'novel' ? '小说' : '短故事' }}直到达成或轮次上限</p>
       </div>
       <span class="badge badge-sm ml-auto" :class="statusBadge">{{ statusLabel }}</span>
     </div>
@@ -352,10 +360,18 @@ watch(config, saveConfig, { deep: true })
         v-model="config.goalDescription"
         :disabled="running"
         rows="3"
-        placeholder="描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」"
+        :placeholder="workType === 'novel'
+          ? '描述你想要的小说：题材、风格、主角、情节走向、结局要求……例如「都市重生，男主修仙，20章，逆袭爽文」'
+          : '描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」'"
         class="textarea textarea-bordered w-full text-sm rounded-lg resize-none leading-relaxed"
       ></textarea>
-      <p class="text-xs text-base-content/40">会自动回填：大纲孵化槽位 → AI 门禁/冻结 → 核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 节拍大纲 → 正文编辑器；进度区会显示当前子步骤。</p>
+      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 章节大纲 → 整体自检 → 书名导语 → 正文生成' : '大纲孵化 → AI 门禁/冻结 → 核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 节拍大纲 → 正文生成' }}；进度区会显示当前子步骤。</p>
+      <label v-if="workType === 'novel'" class="flex items-center gap-2 text-xs cursor-pointer pt-1 border-t border-base-300/40">
+        <input v-model="config.incubatorEnabled" type="checkbox" :disabled="running"
+          class="checkbox checkbox-xs checkbox-primary" />
+        <span>启用大纲孵化器</span>
+        <span class="text-base-content/40">— 开启后先走孵化器（情绪定位/核心冲突/黄金开局等），再进入核心设定</span>
+      </label>
     </div>
 
     <!-- 目标维度配置 -->
@@ -369,7 +385,7 @@ watch(config, saveConfig, { deep: true })
         <div class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-3">
           <p class="text-xs font-bold text-base-content/70">完成度</p>
           <label class="flex items-center justify-between gap-3 text-xs cursor-pointer">
-            <span>所有节拍须有正文</span>
+            <span>所有{{ workType === 'novel' ? '章节' : '节拍' }}须有正文</span>
             <input v-model="config.requireAllBeatsContent" type="checkbox" :disabled="running"
               class="checkbox checkbox-xs checkbox-primary" />
           </label>
@@ -397,7 +413,7 @@ watch(config, saveConfig, { deep: true })
               class="checkbox checkbox-xs checkbox-primary" />
           </label>
           <p class="text-[11px] text-base-content/40 leading-relaxed">
-            开启后每节拍正文生成完会立即诊断并尝试修复；关闭则跳过，直接进入下一节拍生成。
+            开启后每{{ workType === 'novel' ? '章' : '拍' }}正文生成完会立即诊断并尝试修复；关闭则跳过，直接进入下一{{ workType === 'novel' ? '章' : '拍' }}生成。
           </p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>质量分下限</span>
@@ -438,7 +454,7 @@ watch(config, saveConfig, { deep: true })
             <input v-model.number="config.maxTurns" type="number" min="1" max="100"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含孵化、门禁、冻结、设定、卡片、书名导语、自检、节拍、正文、验收和修复阶段。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '设定、卡片、章节大纲、自检、书名导语、正文、验收和修复' : '孵化、门禁、冻结、设定、卡片、书名导语、自检、节拍、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
 
@@ -451,7 +467,7 @@ watch(config, saveConfig, { deep: true })
           @change="phasePickerTouched = true"
         >
           <option v-for="phase in availablePhases" :key="phase" :value="phase">
-            {{ GOAL_ROUTINE_PHASE_LABELS[phase] }}
+            {{ phaseMap[phase] }}
           </option>
         </select>
         <p class="text-[11px] text-base-content/40 leading-relaxed">
@@ -492,7 +508,7 @@ watch(config, saveConfig, { deep: true })
         <!-- 各维度状态 -->
         <div v-if="lastCheck && dimStatus" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
           <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
-            <span class="text-base-content/50">节拍完成</span>
+            <span class="text-base-content/50">{{ workType === 'novel' ? '章节' : '节拍' }}完成</span>
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono">{{ lastCheck.contentBeats }}/{{ lastCheck.totalBeats }}</span>
               <span class="badge badge-xs" :class="dimStatus.beats ? 'badge-success' : 'badge-error'">{{ dimStatus.beats ? '达标' : '未达' }}</span>
@@ -575,7 +591,7 @@ watch(config, saveConfig, { deep: true })
     <!-- 安全提示 -->
     <div class="alert alert-info text-xs py-2">
       <font-awesome-icon icon="info-circle" class="w-4 h-4 shrink-0" />
-      <span>每次写正文自动存版本快照；进入「节拍大纲」步骤可逐节拍查看版本历史并回滚。</span>
+      <span>每次写正文自动存版本快照；进入「{{ workType === 'novel' ? '章节大纲' : '节拍大纲' }}」步骤可逐{{ workType === 'novel' ? '章' : '拍' }}查看版本历史并回滚。</span>
     </div>
   </div>
 </template>

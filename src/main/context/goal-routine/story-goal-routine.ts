@@ -309,7 +309,7 @@ async function generateSlot(
   return await selectBestSlotCandidate(workId, slotKey, goal, candidates, signal)
 }
 
-async function incubateStoryline(
+export async function incubateStoryline(
   workId: number,
   goal: string,
   signal?: AbortSignal,
@@ -375,7 +375,7 @@ function formatGateFailureReasons(gate: Awaited<ReturnType<typeof runIncubatorGa
   ].filter(Boolean).join('；') || '请先修复主线槽位'
 }
 
-async function runStorylineGate(
+export async function runStorylineGate(
   workId: number,
   goal: string,
   signal?: AbortSignal,
@@ -412,7 +412,7 @@ async function runStorylineGate(
   }
 }
 
-async function freezeStoryline(
+export async function freezeStoryline(
   workId: number,
   signal?: AbortSignal,
   onProgress?: (message: string) => void

@@ -42,6 +42,7 @@ import {
   type GoalCheckResult
 } from './story-goal-checker'
 import { generateBeatBody, type BeatGenResult } from './story-goal-doer'
+import { incubateStoryline, runStorylineGate, freezeStoryline } from './story-goal-routine'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
 import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
@@ -57,7 +58,7 @@ import {
 } from './story-goal-model'
 
 import {
-  GOAL_ROUTINE_PHASE_ORDER,
+  NOVEL_GOAL_ROUTINE_PHASE_ORDER,
   isGoalRoutinePhase,
   type GoalRoutinePhase
 } from '../../../shared/goal-routine-phases'
@@ -94,7 +95,7 @@ interface ChapterOutline {
   beatRole?: string
 }
 
-const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'supporting_cast', 'worldview', 'main_plotline'] as const
+const NOVEL_SETTING_TYPES = ['worldview', 'protagonist', 'golden_finger', 'main_plotline', 'pleasure_engine', 'supporting_cast'] as const
 
 const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
   protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
@@ -199,7 +200,7 @@ async function generateNovelCharacterCards(workId: number, signal?: AbortSignal)
   const res = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       workId,
-      step: 'goal_character_cards',
+      step: 'character_cards_generate',
       enrichWorkContext: false,
       enrichNarrativeMemory: false,
       systemPrompt: CHARACTER_CARDS_AI_PROMPT,
@@ -532,7 +533,7 @@ async function executeNovelRepairPlan(
   return summaries.join('；') || '无需修复'
 }
 
-const VALID_PHASES: Phase[] = GOAL_ROUTINE_PHASE_ORDER
+const VALID_PHASES: Phase[] = NOVEL_GOAL_ROUTINE_PHASE_ORDER
 
 function isResumable(status: string | null | undefined): boolean {
   return status === 'paused' || status === 'running' || status === 'cancelled' || status === 'timeout'
@@ -573,7 +574,8 @@ export async function runNovelGoalLoop(
     fullConfig = { ...saved, ...extractStoryGoalModelPatch(config) }
     turn = existing.turn_count ?? 0
     const savedPhase = existing.current_phase as Phase
-    phase = explicitPhase ?? (VALID_PHASES.includes(savedPhase) ? savedPhase : 'materialize_settings')
+    const defaultStart: Phase = fullConfig.incubatorEnabled ? 'incubate_outline' : 'materialize_settings'
+    phase = explicitPhase ?? (VALID_PHASES.includes(savedPhase) ? savedPhase : defaultStart)
     if (existing.status === 'timeout' || turn >= fullConfig.maxTurns) {
       turn = 0
     }
@@ -590,7 +592,7 @@ export async function runNovelGoalLoop(
   } else {
     fullConfig = { ...DEFAULT_STORY_GOAL_CONFIG, ...config }
     turn = 0
-    phase = explicitPhase ?? 'materialize_settings'
+    phase = explicitPhase ?? (fullConfig.incubatorEnabled ? 'incubate_outline' : 'materialize_settings')
   }
 
   const controller = new AbortController()
@@ -628,7 +630,41 @@ export async function runNovelGoalLoop(
       goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
 
       try {
-        if (phase === 'materialize_settings') {
+        if (phase === 'incubate_outline') {
+          const count = await incubateStoryline(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'incubate', summary: `完成 ${count} 个孵化槽位`
+          })
+          emit(`完成 ${count} 个孵化槽位`, 'running')
+          phase = 'incubator_gate'
+        } else if (phase === 'incubator_gate') {
+          const res = await runStorylineGate(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'gate',
+            score: Math.min(res.serializabilityScore, res.conflictClosureScore),
+            summary: res.repairRounds > 0
+              ? `门禁通过：自动修复 ${res.repairRounds} 轮 · 可写性 ${res.serializabilityScore} · 闭环 ${res.conflictClosureScore}`
+              : `门禁通过：可写性 ${res.serializabilityScore} · 闭环 ${res.conflictClosureScore}`
+          })
+          emit(res.repairRounds > 0
+            ? `门禁通过：已自动修复 ${res.repairRounds} 轮 · 可写性 ${res.serializabilityScore} · 闭环 ${res.conflictClosureScore}`
+            : `门禁通过：可写性 ${res.serializabilityScore} · 闭环 ${res.conflictClosureScore}`, 'running')
+          phase = 'freeze_storyline'
+        } else if (phase === 'freeze_storyline') {
+          const versionId = await freezeStoryline(workId, controller.signal, msg => emit(msg, 'running'))
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'freeze',
+            summary: `冻结孵化版本 #${versionId}`
+          })
+          emit(`冻结孵化版本 #${versionId}`, 'running')
+          phase = 'materialize_settings'
+        } else if (phase === 'materialize_settings') {
           const count = await materializeNovelSettings(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: 'settings', summary: `生成 ${count} 项核心设定`
@@ -650,15 +686,6 @@ export async function runNovelGoalLoop(
             summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
           })
           emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
-          phase = 'generate_title_hook'
-        } else if (phase === 'generate_title_hook') {
-          emit('正在生成书名和导语', 'running')
-          const picked = await generateNovelTitleHook(workId, fullConfig.goalDescription, controller.signal)
-          workDAO.update(workId, { title: picked.title })
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'title_hook', summary: `应用书名「${picked.title}」`
-          })
-          emit(`已应用书名「${picked.title}」`, 'running')
           phase = 'overall_self_check'
         } else if (phase === 'overall_self_check') {
           emit('正在运行整体自检', 'running')
@@ -667,6 +694,15 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: report
           })
           emit(`整体自检完成：${report}`, 'running')
+          phase = 'generate_title_hook'
+        } else if (phase === 'generate_title_hook') {
+          emit('正在生成书名和导语', 'running')
+          const picked = await generateNovelTitleHook(workId, fullConfig.goalDescription, controller.signal)
+          workDAO.update(workId, { title: picked.title, description: picked.hook || undefined })
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'title_hook', summary: `应用书名「${picked.title}」`
+          })
+          emit(`已应用书名「${picked.title}」`, 'running')
           phase = 'draft_body'
         } else if (phase === 'draft_body') {
           const chapter = nextEmptyChapter(workId)

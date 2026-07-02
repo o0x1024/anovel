@@ -41,6 +41,8 @@ export interface StoryGoalConfig {
   goalMatchMin: number
   /** 试读比例（0-1），目标循环验收时据此计算试读卡点报告 */
   previewRatio: number
+  /** 小说目标循环：是否走大岗孵化器三阶段（incubate/gate/freeze），默认 false */
+  incubatorEnabled: boolean
   /** 正文工作台右上角所选模型（与手动正文生成一致） */
   modelType?: string
   modelName?: string
@@ -57,7 +59,8 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   checkAntiAiRules: true,
   maxTurns: 60,
   goalMatchMin: 85,
-  previewRatio: 0.3
+  previewRatio: 0.3,
+  incubatorEnabled: false
 }
 
 export interface GoalCheckResult {

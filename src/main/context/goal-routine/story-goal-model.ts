@@ -10,7 +10,7 @@ export function storyGoalModelOpts(
 ): WorkModelOptions {
   return {
     ...(config.modelType ? { modelType: config.modelType, modelName: config.modelName } : {}),
-    thinkingEnabled: config.thinkingEnabled ?? true
+    ...(config.thinkingEnabled !== undefined ? { thinkingEnabled: config.thinkingEnabled } : {})
   }
 }
 
@@ -38,7 +38,7 @@ export function clearGoalLoopModelOpts(workId: number): void {
 }
 
 export function getGoalLoopModelOpts(workId: number): WorkModelOptions {
-  return loopModelOpts.get(workId) ?? { thinkingEnabled: true }
+  return loopModelOpts.get(workId) ?? {}
 }
 
 export function withGoalLoopModelOptions<T extends ModelRequest>(workId: number, request: T): T {
