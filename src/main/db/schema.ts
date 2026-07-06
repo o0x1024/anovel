@@ -236,6 +236,48 @@ export function initSchema(): void {
     );
 
     -- ============================================
+    -- 资源约束账本（体力/法力/积分/等级/冷却等跨章节可变状态）
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS resource_constraints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      owner VARCHAR(100),
+      resource VARCHAR(100) NOT NULL,
+      unit VARCHAR(20),
+      initial_value REAL,
+      min_value REAL,
+      max_value REAL,
+      hard_rules_json TEXT,
+      milestones_json TEXT,
+      spend_rules_json TEXT,
+      recover_rules_json TEXT,
+      source_types TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS chapter_resource_budgets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      owner VARCHAR(100),
+      resource VARCHAR(100) NOT NULL,
+      unit VARCHAR(20),
+      start_min REAL,
+      start_max REAL,
+      end_min REAL,
+      end_max REAL,
+      allowed_events TEXT,
+      forbidden_events TEXT,
+      reason TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    -- ============================================
     -- 故事时间线表（V1.5）
     -- ============================================
     CREATE TABLE IF NOT EXISTS story_timeline (

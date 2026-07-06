@@ -50,6 +50,14 @@ export type {
   GoalRoutineTurnRow,
   GoalStateUpdate
 } from './dao/goal-routine-dao'
+export { resourceLedgerDAO }
+  from './dao/resource-ledger-dao'
+export type {
+  ResourceConstraintRow,
+  ResourceConstraintInput,
+  ChapterResourceBudgetRow,
+  ChapterResourceBudgetInput
+} from './dao/resource-ledger-dao'
 export {
   incubatorSeedDAO,
   incubatorCandidateDAO,

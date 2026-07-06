@@ -15,6 +15,7 @@ import { runPerplexityDetect, getSegmentMetrics, type SegmentDetectDetail, type 
 import { applyWordTable } from './aigc-wordtable-engine'
 import { BUILTIN_ANTI_AI_VOCAB } from './builtin-anti-ai-vocab'
 import { evaluateRewriteCandidates, type RewriteCandidateInput } from './aigc-rewrite-quality'
+import type { WorkModelOptions } from '../../../shared/work-model-options'
 
 const activeRuns = new Map<string, AiSessionHandle>()
 const activeRewriteRuns = new Map<string, AiSessionHandle>()
@@ -1121,7 +1122,7 @@ export async function runAigcDetect(
   sender: WebContents,
   runId: string,
   text: string,
-  modelOpts?: { modelType?: string; modelName?: string }
+  modelOpts?: WorkModelOptions
 ): Promise<AigcDetectResult> {
   if (!text.trim()) throw new Error('待检测内容不能为空')
   if (text.length > 50000) throw new Error('文本超出 50000 字符限制')
@@ -1243,7 +1244,7 @@ export async function runAigcRewrite(
   runId: string,
   text: string,
   detectResult?: AigcDetectResult | null,
-  modelOpts?: { modelType?: string; modelName?: string },
+  modelOpts?: WorkModelOptions,
   seedOpts?: { mode: 'fast' | 'strong'; seedText?: string; workId?: number; chapterId?: number }
 ): Promise<string> {
   const input = text.trim()
@@ -1403,7 +1404,7 @@ async function runSegmentBySegmentRewrite(
   session: AiSessionHandle,
   segMetrics: SegmentDetectDetail[],
   isStrongMode: boolean,
-  modelOpts?: { modelType?: string; modelName?: string }
+  modelOpts?: WorkModelOptions
 ): Promise<string> {
   const AI_THRESHOLD = 45
   const segmentsToRewrite = segMetrics.filter(s => s.aiScore >= AI_THRESHOLD)
@@ -1477,7 +1478,7 @@ async function rewriteBatch(
   batch: RewriteBatch,
   isStrongMode: boolean,
   session: AiSessionHandle,
-  modelOpts?: { modelType?: string; modelName?: string }
+  modelOpts?: WorkModelOptions
 ): Promise<string[]> {
   const { targetIndices, contextStart, contextEnd } = batch
 
@@ -1514,7 +1515,8 @@ async function rewriteBatch(
       enrichNarrativeMemory: false,
       temperature: 0.65,
       modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
-      modelName: modelOpts?.modelName
+      modelName: modelOpts?.modelName,
+      thinkingEnabled: modelOpts?.thinkingEnabled
     },
     {
       sessionHandle: session,
@@ -1565,7 +1567,7 @@ async function runWholeTextRewrite(
   input: string,
   detectResult?: AigcDetectResult | null,
   isStrongMode?: boolean,
-  modelOpts?: { modelType?: string; modelName?: string }
+  modelOpts?: WorkModelOptions
 ): Promise<string> {
   const systemPrompt = isStrongMode
     ? AIGC_REWRITE_INTENSIVE_SYSTEM_PROMPT + AIGC_REWRITE_STRONG_COLLOQUIAL_CONSTRAINT
@@ -1581,7 +1583,8 @@ async function runWholeTextRewrite(
       enrichNarrativeMemory: false,
       temperature: 0.65,
       modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
-      modelName: modelOpts?.modelName
+      modelName: modelOpts?.modelName,
+      thinkingEnabled: modelOpts?.thinkingEnabled
     },
     {
       sessionHandle: session,

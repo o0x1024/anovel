@@ -7,8 +7,10 @@ import { useModelConfigChangeSync } from '../composables/useModelConfigChangeSyn
 
 const props = withDefaults(defineProps<{
   label?: string
+  explicitSelection?: boolean
 }>(), {
-  label: ''
+  label: '',
+  explicitSelection: false
 })
 
 const modelType = defineModel<string | null>('modelType', { default: null })
@@ -59,8 +61,8 @@ const filteredFlatOptions = computed(() => {
 
 const showGrouped = computed(() => !query.value.trim())
 
-const effectiveType = computed(() => modelType.value ?? globalDefault.value.provider)
-const effectiveName = computed(() => modelName.value ?? globalDefault.value.modelName)
+const effectiveType = computed(() => modelType.value ?? (props.explicitSelection ? null : globalDefault.value.provider))
+const effectiveName = computed(() => modelName.value ?? (props.explicitSelection ? null : globalDefault.value.modelName))
 
 const currentLabel = computed(() => {
   const type = effectiveType.value
@@ -87,15 +89,16 @@ function isOptionActive(option: AssistantModelOption): boolean {
   if (modelType.value) {
     return isSameBodyModelOption(modelType.value, modelName.value, option)
   }
+  if (props.explicitSelection) return false
   return isGlobalDefaultOption(option)
 }
 
 function selectOption(option: AssistantModelOption) {
-  if (isGlobalDefaultOption(option) && !modelType.value) {
+  if (!props.explicitSelection && isGlobalDefaultOption(option) && !modelType.value) {
     closeDropdown()
     return
   }
-  if (isGlobalDefaultOption(option)) {
+  if (!props.explicitSelection && isGlobalDefaultOption(option)) {
     modelType.value = null
     modelName.value = null
   } else {

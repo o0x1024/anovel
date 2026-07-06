@@ -10,6 +10,7 @@ import { getModelStatus, deleteModel, isModelReady, listModels, switchModel, del
 import type { LabTaskCreateInput, LabUploadParseInput } from '../shared/lab-types'
 import type { AigcDetectResult } from '../shared/aigc-detect-types'
 import type { WordTableEntryInput } from '../shared/aigc-wordtable-types'
+import type { WorkModelOptions } from '../shared/work-model-options'
 
 export function registerLabIpcHandlers(): void {
   ipcMain.handle('lab:getAntiAiPresets', () => ({
@@ -32,14 +33,14 @@ export function registerLabIpcHandlers(): void {
     const id = labTaskDAO.create(input)
     return labTaskDAO.getById(id)
   })
-  ipcMain.handle('lab:run', async (e, taskId: number, modelOpts?: { modelType?: string; modelName?: string }) =>
+  ipcMain.handle('lab:run', async (e, taskId: number, modelOpts?: WorkModelOptions) =>
     runDeaiRewrite(e.sender, taskId, modelOpts)
   )
   ipcMain.handle('lab:cancelRun', (_e, taskId: number) => cancelDeaiRewrite(taskId))
   ipcMain.handle('lab:parseFile', (_e, input: LabUploadParseInput) => parseLabUploadFile(input))
 
   // AIGC 检测
-  ipcMain.handle('lab:aigc-detect:run', async (e, runId: string, text: string, modelOpts?: { modelType?: string; modelName?: string }) => {
+  ipcMain.handle('lab:aigc-detect:run', async (e, runId: string, text: string, modelOpts?: WorkModelOptions) => {
     const result = await runAigcDetect(e.sender, runId, text, modelOpts)
     return result
   })
@@ -50,7 +51,7 @@ export function registerLabIpcHandlers(): void {
       runId: string,
       text: string,
       detectResultJson?: string | null,
-      modelOpts?: { modelType?: string; modelName?: string },
+      modelOpts?: WorkModelOptions,
       seedOpts?: { mode: 'fast' | 'strong'; seedText?: string; workId?: number; chapterId?: number }
     ) => {
       let detectResult: AigcDetectResult | null = null

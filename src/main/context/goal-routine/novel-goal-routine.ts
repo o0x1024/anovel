@@ -19,7 +19,7 @@
  */
 import { BrowserWindow, type WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO } from '../../db'
+import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO, resourceLedgerDAO, type ChapterResourceBudgetInput } from '../../db'
 import { modelService } from '../../model'
 import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
 import { buildWorkContext } from '../work-context'
@@ -49,6 +49,11 @@ import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../..
 import { QUALITY_APPLY_FIXES_PROMPT } from '../chapter-quality'
 import { STYLE_REWRITE_INSTRUCTION, countEmDashes, stripEmDashes } from '../anti-ai-rules'
 import { runConsistencyGate } from '../consistency-gate'
+import {
+  formatResourceConstraintsForPrompt,
+  normalizeChapterResourceBudgets,
+  refreshResourceConstraints
+} from '../resource-ledger'
 import {
   bindGoalLoopModelOpts,
   clearGoalLoopModelOpts,
@@ -93,16 +98,18 @@ interface ChapterOutline {
   title: string
   outline: string
   beatRole?: string
+  resourceBudget?: ChapterResourceBudgetInput[]
 }
 
-const NOVEL_SETTING_TYPES = ['worldview', 'protagonist', 'golden_finger', 'main_plotline', 'pleasure_engine', 'supporting_cast'] as const
+const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'world_pressure', 'conflict_engine', 'pleasure_engine', 'supporting_cast', 'main_plotline'] as const
 
 const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
   protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
   golden_finger: '你是顶级长篇小说设定设计师。判断故事是否需要特殊机制；没有机制则设计身份反差与信息差。输出 Markdown：## 设定名称与形态 / ## 信息差构建 / ## 限制与升级节奏 / ## 对主线冲突的推动作用。',
+  world_pressure: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动 / ## 压迫升级路径。',
+  conflict_engine: '你是顶级长篇小说冲突设计师。输出 Markdown：## 对立双方价值观冲突 / ## 不可调和点 / ## 三层赌注（个人/势力/世界） / ## 冲突升级机制 / ## 终局收束方式。',
   pleasure_engine: '你是顶级长篇小说节奏与爽点设计师。输出 Markdown：## 开篇钩子 / ## 前期小高潮 / ## 中期大反转 / ## 后期终极清算。必须明确每个爽点对应的卷/章位置。',
   supporting_cast: '你是顶级长篇小说配角设计师。输出 Markdown：## 核心反派与对手 / ## 盟友与导师 / ## 情感线对象 / ## 关系演变与情绪宣泄点。配角只写功能、冲突价值和记忆点。',
-  worldview: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动。',
   main_plotline: '你是顶级长篇小说主线架构师。基于全部已有设定，设计故事从开局到终局的发展轨迹。输出 Markdown：## 故事起点 / ## 核心发展线（3-5个关键阶段，每阶段标注触发事件、主角选择、状态变化）/ ## 关键转折点（至少2次预判外转向）/ ## 伏笔与回收布局 / ## 高潮设计 / ## 故事终点 / ## 各阶段递进逻辑。递进必须因果闭环，禁止"突然"跳跃。总字数 800-1500 字。'
 }
 
@@ -294,6 +301,7 @@ async function generateNovelBeats(
 
   const ctx = buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true })
   const constraints = outlineConstraintsForWordTarget(plan.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
+  const resourceConstraints = formatResourceConstraintsForPrompt(workId)
 
   const res = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -304,18 +312,25 @@ async function generateNovelBeats(
       systemPrompt: [
         `你是长篇小说结构编辑。请为作品生成 ${targetChapters} 个章节的标题与大纲。`,
         `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须包含：本章目标、关键冲突、情绪转折、结尾钩子。`,
-        '输出 JSON 数组：[{"volume":"第一卷 名字","title":"第N章 标题","outline":"...","beatRole":"setup|inciting|rising|midpoint|climax|resolution"}]'
+        resourceConstraints
+          ? [
+              '若存在资源约束，每章必须输出 resource_budget 数组，给出该章资源开章区间、章末区间、允许事件、禁止事件和预算理由。',
+              'resource_budget 必须承接全书资源约束，禁止在前期提前透支后续里程碑要求。'
+            ].join('\n')
+          : '',
+        '输出 JSON 数组：[{"volume":"第一卷 名字","title":"第N章 标题","outline":"...","beatRole":"setup|inciting|rising|midpoint|climax|resolution","resource_budget":[{"owner":"主角","resource":"体力","unit":"%","start_min":80,"start_max":90,"end_min":70,"end_max":85,"allowed_events":["小规模消耗"],"forbidden_events":["不得跌破50%"],"reason":"承接第20章最低50%"}]}]'
       ].join('\n'),
       prompt: [
         `【用户创作目标】\n${goal.trim() || '请自动策划一部长篇小说。'}`,
         `【目标章节数】${targetChapters} 章`,
+        resourceConstraints,
         `【作品上下文】\n${ctx.text.slice(0, 8000)}`
-      ].join('\n\n')
+      ].filter(Boolean).join('\n\n')
     }),
     { stream: false, signal }
   )
 
-  if (!res.success || !res.content?.trim()) throw new Error('章节大纲生成失败')
+  if (!res.success || !res.content?.trim()) throw new Error(`章节大纲生成失败：${res.error || '模型未返回内容'}`)
   const json = extractJsonText(res.content.trim()) ?? res.content.trim()
   let outlines: ChapterOutline[]
   try {
@@ -326,7 +341,8 @@ async function generateNovelBeats(
         volumeName: o.volumeName ?? (o as { volume?: string }).volume,
         title: o.title!.trim(),
         outline: o.outline!.trim(),
-        beatRole: o.beatRole?.trim()
+        beatRole: o.beatRole?.trim(),
+        resourceBudget: normalizeChapterResourceBudgets((o as { resource_budget?: unknown; resourceBudget?: unknown }).resource_budget ?? (o as { resourceBudget?: unknown }).resourceBudget)
       }))
   } catch {
     throw new Error('章节大纲解析失败')
@@ -354,6 +370,9 @@ async function generateNovelBeats(
     const id = volumeChapterDAO.createChapter(currentVolumeId!, o.title, o.outline)
     if (o.beatRole) {
       volumeChapterDAO.updateChapter(id, { beat_role: o.beatRole })
+    }
+    if (o.resourceBudget && o.resourceBudget.length > 0) {
+      resourceLedgerDAO.replaceBudgetsForChapter(workId, id, o.resourceBudget)
     }
     created.push(id)
   }
@@ -666,10 +685,12 @@ export async function runNovelGoalLoop(
           phase = 'materialize_settings'
         } else if (phase === 'materialize_settings') {
           const count = await materializeNovelSettings(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          emit('正在抽取资源约束账本', 'running')
+          const resourceCount = await refreshResourceConstraints(workId, controller.signal)
           goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'settings', summary: `生成 ${count} 项核心设定`
+            work_id: workId, turn_no: turn, phase, action: 'settings', summary: `生成 ${count} 项核心设定，抽取 ${resourceCount} 项资源约束`
           })
-          emit(`生成 ${count} 项核心设定`, 'running')
+          emit(`生成 ${count} 项核心设定，抽取 ${resourceCount} 项资源约束`, 'running')
           phase = 'generate_character_cards'
         } else if (phase === 'generate_character_cards') {
           emit('正在生成主角人设卡片', 'running')
@@ -678,22 +699,6 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'character_cards', summary: `生成 ${count} 张主角人设卡片`
           })
           emit(`生成 ${count} 张主角人设卡片`, 'running')
-          phase = 'generate_beats'
-        } else if (phase === 'generate_beats') {
-          const res = await generateNovelBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'beats',
-            summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
-          })
-          emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
-          phase = 'overall_self_check'
-        } else if (phase === 'overall_self_check') {
-          emit('正在运行整体自检', 'running')
-          const report = await runNovelOverallSelfCheck(workId, controller.signal)
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: report
-          })
-          emit(`整体自检完成：${report}`, 'running')
           phase = 'generate_title_hook'
         } else if (phase === 'generate_title_hook') {
           emit('正在生成书名和导语', 'running')
@@ -703,6 +708,22 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'title_hook', summary: `应用书名「${picked.title}」`
           })
           emit(`已应用书名「${picked.title}」`, 'running')
+          phase = 'overall_self_check'
+        } else if (phase === 'overall_self_check') {
+          emit('正在运行整体自检', 'running')
+          const report = await runNovelOverallSelfCheck(workId, controller.signal)
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: report
+          })
+          emit(`整体自检完成：${report}`, 'running')
+          phase = 'generate_beats'
+        } else if (phase === 'generate_beats') {
+          const res = await generateNovelBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'beats',
+            summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
+          })
+          emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
           phase = 'draft_body'
         } else if (phase === 'draft_body') {
           const chapter = nextEmptyChapter(workId)

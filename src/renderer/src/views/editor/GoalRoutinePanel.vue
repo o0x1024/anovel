@@ -365,7 +365,7 @@ watch(config, saveConfig, { deep: true })
           : '描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」'"
         class="textarea textarea-bordered w-full text-sm rounded-lg resize-none leading-relaxed"
       ></textarea>
-      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 章节大纲 → 整体自检 → 书名导语 → 正文生成' : '大纲孵化 → AI 门禁/冻结 → 核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 节拍大纲 → 正文生成' }}；进度区会显示当前子步骤。</p>
+      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 章节大纲 → 正文生成' : '大纲孵化 → AI 门禁/冻结 → 核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 节拍大纲 → 正文生成' }}；进度区会显示当前子步骤。</p>
       <label v-if="workType === 'novel'" class="flex items-center gap-2 text-xs cursor-pointer pt-1 border-t border-base-300/40">
         <input v-model="config.incubatorEnabled" type="checkbox" :disabled="running"
           class="checkbox checkbox-xs checkbox-primary" />
@@ -454,7 +454,7 @@ watch(config, saveConfig, { deep: true })
             <input v-model.number="config.maxTurns" type="number" min="1" max="100"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '设定、卡片、章节大纲、自检、书名导语、正文、验收和修复' : '孵化、门禁、冻结、设定、卡片、书名导语、自检、节拍、正文、验收和修复' }}阶段。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '设定、卡片、书名导语、自检、章节大纲、正文、验收和修复' : '孵化、门禁、冻结、设定、卡片、书名导语、自检、节拍、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
 

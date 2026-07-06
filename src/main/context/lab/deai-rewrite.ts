@@ -4,12 +4,13 @@ import { modelService } from '../../model'
 import { aiSessionManager, type AiSessionHandle } from '../../ai/ai-session-manager'
 import { extractTextFromDocx, isDocxFileName } from '../assistant/docx-extract'
 import { BODY_PARAGRAPH_SPACING_RULE, normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
+import type { WorkModelOptions } from '../../../shared/work-model-options'
 
 const activeRuns = new Map<number, AiSessionHandle>()
 
 function buildDeaiUserPrompt(originalText: string): string {
-  return [
-    '请对如下内容进行重新生成和改写，只输出改写后的正文，不要解释过程。',
+  return [  
+    '【原文】',
     BODY_PARAGRAPH_SPACING_RULE,
     '',
     originalText
@@ -19,7 +20,7 @@ function buildDeaiUserPrompt(originalText: string): string {
 export async function runDeaiRewrite(
   sender: WebContents,
   taskId: number,
-  modelOpts?: { modelType?: string; modelName?: string }
+  modelOpts?: WorkModelOptions
 ): Promise<void> {
   const task = labTaskDAO.getById(taskId)
   if (!task) throw new Error('任务不存在')
@@ -51,7 +52,8 @@ export async function runDeaiRewrite(
         enrichWorkContext: false,
         enrichNarrativeMemory: false,
         modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
-        modelName: modelOpts?.modelName
+        modelName: modelOpts?.modelName,
+        thinkingEnabled: modelOpts?.thinkingEnabled
       },
       {
         sessionHandle: session,

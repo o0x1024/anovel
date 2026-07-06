@@ -1,6 +1,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useStyleChangeSync } from './useStyleChangeSync'
 import type { LabTaskRow } from '../../../shared/lab-types'
+import type { WorkModelOptions } from '../../../shared/work-model-options'
 import { normalizeBodyParagraphSpacing } from '../../../shared/normalize-body-text'
 import {
   loadLabPageState,
@@ -139,7 +140,7 @@ export function useDeaiTask() {
     }
   }
 
-  async function run(labModelParams?: { modelType?: string; modelName?: string }) {
+  async function run(labModelParams?: WorkModelOptions) {
     const text = originalText.value.trim()
     if (!text) throw new Error('请输入待处理文本')
     const prompt = systemPrompt.value.trim()

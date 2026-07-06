@@ -58,6 +58,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
     groupLabel: '大纲 & 章节',
     steps: [
       { step: 'volume_chapters_batch', label: '章节批量生成' },
+      { step: 'story_beat_gate', label: '短故事节拍门禁' },
       { step: 'volume_diagnose', label: '分卷诊断' },
       { step: 'volume_diagnose_fix', label: '分卷修复' },
       { step: 'story_title_hook_gen', label: '短故事标题与钩子' },
@@ -109,6 +110,8 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
     steps: [
       { step: 'goal_slot_candidate_score', label: '候选评分' },
       { step: 'goal_semantic_check', label: '语义检查' },
+      { step: 'resource_constraints_extract', label: '资源约束抽取' },
+      { step: 'goal_generate_beats', label: '目标章节大纲' },
     ]
   },
   {

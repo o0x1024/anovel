@@ -9,11 +9,12 @@ import BodyModelSelect from '../../components/BodyModelSelect.vue'
 import { useDeaiTask } from '../../composables/useDeaiTask'
 import { useAigcDetect } from '../../composables/useAigcDetect'
 import { useLabModel } from '../../composables/useLabModel'
+import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
 
 type LabTab = 'deai' | 'aigc-detect' | 'wordtable'
 const activeTab = ref<LabTab>('aigc-detect')
 
-const { labModelType, labModelName, modelParams } = useLabModel()
+const { labModelType, labModelName, labThinkingEnabled, modelParams } = useLabModel()
 
 const showHistory = ref(false)
 const {
@@ -57,10 +58,20 @@ const {
 
 const pageError = ref('')
 
+function requireLabModelParams() {
+  if (!labModelType.value) {
+    pageError.value = '请先在右上角选择模型'
+    return null
+  }
+  return modelParams()
+}
+
 async function onRun() {
   pageError.value = ''
+  const params = requireLabModelParams()
+  if (!params) return
   try {
-    await run(modelParams())
+    await run(params)
   } catch (error) {
     pageError.value = error instanceof Error ? error.message : '执行失败'
   }
@@ -68,8 +79,10 @@ async function onRun() {
 
 async function onAigcRun() {
   pageError.value = ''
+  const params = requireLabModelParams()
+  if (!params) return
   try {
-    await aigcRun(modelParams())
+    await aigcRun(params)
   } catch (error) {
     if ((error instanceof Error ? error.message : '') !== '已取消') {
       pageError.value = error instanceof Error ? error.message : '检测失败'
@@ -79,8 +92,10 @@ async function onAigcRun() {
 
 async function onAigcRewrite() {
   pageError.value = ''
+  const params = requireLabModelParams()
+  if (!params) return
   try {
-    await aigcRewrite(modelParams())
+    await aigcRewrite(params)
   } catch (error) {
     if ((error instanceof Error ? error.message : '') !== '已取消') {
       pageError.value = error instanceof Error ? error.message : '改写失败'
@@ -92,6 +107,21 @@ async function onAigcApplyWordTable() {
   pageError.value = ''
   try {
     await aigcApplyWordTable()
+  } catch (error) {
+    pageError.value = error instanceof Error ? error.message : '词表替换失败'
+  }
+}
+
+async function onDeaiApplyWordTable() {
+  pageError.value = ''
+  const text = originalText.value.trim()
+  if (!text) {
+    pageError.value = '请输入待处理文本'
+    return
+  }
+  try {
+    const replaced = await window.anovel.invoke('lab:wordtable:apply', text) as string
+    originalText.value = normalizeBodyParagraphSpacing(replaced)
   } catch (error) {
     pageError.value = error instanceof Error ? error.message : '词表替换失败'
   }
@@ -161,7 +191,19 @@ async function onStyleChanged(styleIdValue: number | null) {
         <BodyModelSelect
           v-model:model-type="labModelType"
           v-model:model-name="labModelName"
+          explicit-selection
         />
+        <label
+          class="flex items-center gap-1 cursor-pointer shrink-0"
+          title="深度思考"
+        >
+          <font-awesome-icon icon="brain" class="w-3.5 h-3.5 text-base-content/50" />
+          <input
+            v-model="labThinkingEnabled"
+            type="checkbox"
+            class="toggle toggle-primary toggle-xs"
+          />
+        </label>
         <button
           v-if="activeTab === 'deai'"
           type="button"
@@ -185,6 +227,7 @@ async function onStyleChanged(styleIdValue: number | null) {
         :writing-styles="writingStyles"
         :status="status"
         @run="onRun"
+        @wordtable-apply="onDeaiApplyWordTable"
         @cancel="cancel"
         @file-loaded="onFileLoaded"
         @style-changed="onStyleChanged"

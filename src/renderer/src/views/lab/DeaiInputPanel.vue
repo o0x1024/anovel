@@ -29,6 +29,7 @@ const emit = defineEmits<{
   'file-loaded': [fileName: string]
   'style-changed': [styleId: number | null]
   run: []
+  'wordtable-apply': []
   cancel: []
 }>()
 
@@ -55,6 +56,10 @@ const canRun = () =>
   props.status !== 'running'
   && props.originalText.trim().length > 0
   && props.systemPrompt.trim().length > 0
+
+const canApplyWordTable = () =>
+  props.status !== 'running'
+  && props.originalText.trim().length > 0
 
 async function onWorkImport(ref: AssistantWorkReference) {
   uploadError.value = ''
@@ -195,6 +200,14 @@ async function onFileChange(event: Event) {
           >
             <span v-if="props.status === 'running'" class="loading loading-spinner loading-xs" />
             去AI味
+          </button>
+          <button
+            type="button"
+            class="btn btn-outline btn-primary btn-xs"
+            :disabled="!canApplyWordTable()"
+            @click="emit('wordtable-apply')"
+          >
+            手动去AI
           </button>
         </div>
       </div>

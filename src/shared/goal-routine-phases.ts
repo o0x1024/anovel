@@ -29,13 +29,13 @@ export const STORY_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'repair_execute'
 ]
 
-/** 小说阶段顺序（跳过孵化器；先生成章节大纲再自检设定后做书名导语） */
+/** 小说阶段顺序（跳过孵化器；设定→人设卡→书名导语→自检→章节大纲→正文） */
 export const NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'materialize_settings',
   'generate_character_cards',
-  'generate_beats',
-  'overall_self_check',
   'generate_title_hook',
+  'overall_self_check',
+  'generate_beats',
   'draft_body',
   'goal_check',
   'repair_plan',

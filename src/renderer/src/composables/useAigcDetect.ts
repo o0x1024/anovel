@@ -4,6 +4,7 @@ import type {
   AigcRewriteSelectionView,
   AigcRewriteCompareView
 } from '../../../shared/aigc-detect-types'
+import type { WorkModelOptions } from '../../../shared/work-model-options'
 
 export interface AigcSeedOpts {
   mode: 'fast' | 'strong'
@@ -44,7 +45,7 @@ export function useAigcDetect() {
 
   let runIdCounter = 0
 
-  async function run(labModelParams?: { modelType?: string; modelName?: string }) {
+  async function run(labModelParams?: WorkModelOptions) {
     const text = inputText.value.trim()
     if (!text) throw new Error('请输入待检测文本')
 
@@ -72,7 +73,7 @@ export function useAigcDetect() {
     }
   }
 
-  async function rewrite(labModelParams?: { modelType?: string; modelName?: string }) {
+  async function rewrite(labModelParams?: WorkModelOptions) {
     const text = inputText.value.trim()
     if (!text) throw new Error('请输入待改写文本')
     if (rewriting.value || applyingWordTable.value) return

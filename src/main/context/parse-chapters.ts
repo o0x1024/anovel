@@ -8,6 +8,7 @@ export interface ParsedChapter {
   next_hook?: string | null
   pov_mode?: string | null
   characters?: string | null
+  dramatic_contract?: DramaticContract | null
 }
 
 export interface ParsedSingleChapterOutline {
@@ -17,6 +18,20 @@ export interface ParsedSingleChapterOutline {
   next_hook?: string | null
   pov_mode?: string | null
   characters?: string | null
+  dramatic_contract?: DramaticContract | null
+}
+
+export interface DramaticContract {
+  scene_promise?: string
+  protagonist_want?: string
+  obstacle?: string
+  stakes?: string
+  info_gap?: string
+  pressure_escalation?: string
+  turn?: string
+  irreversible_change?: string
+  payoff_or_debt?: string
+  next_question?: string
 }
 
 /** 文档级标题，不应作为章节条目 */
@@ -66,7 +81,8 @@ function normalizePlotPoints(value: unknown): string[] {
 function buildOutlineFromParts(
   plotPoints: string[],
   outlineRaw: string,
-  nextHook?: string | null
+  nextHook?: string | null,
+  dramaticContract?: DramaticContract | null
 ): string {
   const parts: string[] = []
   if (plotPoints.length > 0) {
@@ -83,7 +99,59 @@ function buildOutlineFromParts(
   if (hook && !parts.some(l => l.includes(hook))) {
     parts.push(`【章末钩子】${hook}`)
   }
+  const contractLines = formatDramaticContractLines(dramaticContract)
+  if (contractLines.length > 0) {
+    parts.push('【戏剧契约】')
+    parts.push(...contractLines)
+  }
   return parts.join('\n')
+}
+
+function normalizeDramaticContract(value: unknown): DramaticContract | null {
+  if (!value || typeof value !== 'object') return null
+  const row = value as Record<string, unknown>
+  const contract: DramaticContract = {}
+  const keys: (keyof DramaticContract)[] = [
+    'scene_promise',
+    'protagonist_want',
+    'obstacle',
+    'stakes',
+    'info_gap',
+    'pressure_escalation',
+    'turn',
+    'irreversible_change',
+    'payoff_or_debt',
+    'next_question'
+  ]
+  for (const key of keys) {
+    const raw = row[key]
+    if (raw == null) continue
+    const text = String(raw).trim()
+    if (text) contract[key] = text
+  }
+  return Object.keys(contract).length > 0 ? contract : null
+}
+
+function formatDramaticContractLines(contract?: DramaticContract | null): string[] {
+  if (!contract) return []
+  const labels: Array<[keyof DramaticContract, string]> = [
+    ['scene_promise', '读者承诺'],
+    ['protagonist_want', '主角目标'],
+    ['obstacle', '阻力'],
+    ['stakes', '代价'],
+    ['info_gap', '信息差'],
+    ['pressure_escalation', '压力升级'],
+    ['turn', '中段转折'],
+    ['irreversible_change', '不可逆变化'],
+    ['payoff_or_debt', '兑现/欠账'],
+    ['next_question', '结尾问题']
+  ]
+  return labels
+    .map(([key, label]) => {
+      const text = contract[key]?.trim()
+      return text ? `- ${label}：${text}` : ''
+    })
+    .filter(Boolean)
 }
 
 function stripOutlineFieldLabels(text: string): string {
@@ -139,7 +207,10 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   ).trim()
 
   const nextHook = row.next_hook != null ? String(row.next_hook) : null
-  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook)
+  const dramaticContract = normalizeDramaticContract(
+    row.dramatic_contract ?? row.dramaticContract ?? row.scene_contract ?? row.sceneContract
+  )
+  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract)
 
   if (isPlaceholderOutline(outline)) return null
 
@@ -150,7 +221,8 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     foreshadow_target: row.foreshadow_target != null ? String(row.foreshadow_target) : null,
     next_hook: nextHook,
     pov_mode: row.pov_mode != null ? String(row.pov_mode) : null,
-    characters: normalizeCharactersField(row.characters)
+    characters: normalizeCharactersField(row.characters),
+    dramatic_contract: dramaticContract
   }
 }
 
@@ -166,7 +238,10 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
     )
     const outlineRaw = String(parsed.outline ?? parsed.summary ?? '').trim()
     const nextHook = parsed.next_hook != null ? String(parsed.next_hook) : null
-    const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook)
+    const dramaticContract = normalizeDramaticContract(
+      parsed.dramatic_contract ?? parsed.dramaticContract ?? parsed.scene_contract ?? parsed.sceneContract
+    )
+    const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract)
     if (isPlaceholderOutline(outline)) return null
 
     return {
@@ -175,7 +250,8 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
       foreshadow_target: parsed.foreshadow_target != null ? String(parsed.foreshadow_target) : null,
       next_hook: nextHook,
       pov_mode: parsed.pov_mode != null ? String(parsed.pov_mode) : null,
-      characters: normalizeCharactersField(parsed.characters)
+      characters: normalizeCharactersField(parsed.characters),
+      dramatic_contract: dramaticContract
     }
   } catch {
     return null

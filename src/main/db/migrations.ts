@@ -692,4 +692,51 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       db.exec(`ALTER TABLE character_snapshots ADD COLUMN numeric_stats TEXT`)
     }
   } catch { /* 已存在 */ }
+
+  // V3.9: 资源约束账本，贯通核心设定 -> 章节预算 -> 正文后数值门禁
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS resource_constraints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id INTEGER NOT NULL,
+        owner VARCHAR(100),
+        resource VARCHAR(100) NOT NULL,
+        unit VARCHAR(20),
+        initial_value REAL,
+        min_value REAL,
+        max_value REAL,
+        hard_rules_json TEXT,
+        milestones_json TEXT,
+        spend_rules_json TEXT,
+        recover_rules_json TEXT,
+        source_types TEXT,
+        create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS chapter_resource_budgets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id INTEGER NOT NULL,
+        chapter_id INTEGER NOT NULL,
+        owner VARCHAR(100),
+        resource VARCHAR(100) NOT NULL,
+        unit VARCHAR(20),
+        start_min REAL,
+        start_max REAL,
+        end_min REAL,
+        end_max REAL,
+        allowed_events TEXT,
+        forbidden_events TEXT,
+        reason TEXT,
+        create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+        FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_resource_constraints_work ON resource_constraints(work_id);
+      CREATE INDEX IF NOT EXISTS idx_chapter_resource_budgets_work_chapter ON chapter_resource_budgets(work_id, chapter_id);
+    `)
+  } catch { /* 已存在 */ }
 }

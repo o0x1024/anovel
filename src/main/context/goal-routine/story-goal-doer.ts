@@ -22,9 +22,10 @@ import {
   parseForeshadowingResolutions,
   applyForeshadowingResolutions
 } from '../memory-extract'
-import { clearChapterMemoryBeforeExtract } from '../memory-cleanup'
+import { clearChapterMemoryBeforeExtract, clearChapterNarrativeMemory } from '../memory-cleanup'
 import { appLogger } from '../../logger/app-logger'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { formatChapterResourceBudgetsForPrompt, runResourceConstraintGate } from '../resource-ledger'
 
 export interface BeatGenResult {
   success: boolean
@@ -63,6 +64,36 @@ function getWorkHook(workId: number): string {
   return workDAO.getById(workId)?.description?.trim() ?? ''
 }
 
+function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
+  if (!outlineDiagnosis?.trim()) return ''
+  try {
+    const parsed = JSON.parse(outlineDiagnosis) as { dramatic_contract?: Record<string, unknown> }
+    const contract = parsed.dramatic_contract
+    if (!contract || typeof contract !== 'object') return ''
+    const rows: Array<[string, string]> = [
+      ['读者承诺', String(contract.scene_promise ?? '').trim()],
+      ['主角目标', String(contract.protagonist_want ?? '').trim()],
+      ['阻力', String(contract.obstacle ?? '').trim()],
+      ['失败代价', String(contract.stakes ?? '').trim()],
+      ['信息差', String(contract.info_gap ?? '').trim()],
+      ['压力升级', String(contract.pressure_escalation ?? '').trim()],
+      ['中段转折', String(contract.turn ?? '').trim()],
+      ['不可逆变化', String(contract.irreversible_change ?? '').trim()],
+      ['兑现/欠账', String(contract.payoff_or_debt ?? '').trim()],
+      ['结尾问题', String(contract.next_question ?? '').trim()]
+    ].filter(([, value]) => value)
+    if (rows.length === 0) return ''
+    return [
+      '【本拍戏剧契约 - 必须执行】',
+      '正文不是复述事件流水账，必须把本拍写成一场有目标、阻力、代价、转折和不可逆变化的戏。',
+      ...rows.map(([label, value]) => `- ${label}：${value}`),
+      '执行要求：每个主要段落都必须推动目标/阻力/压力/信息差之一；禁止连续两段只交代背景、移动地点、解释设定或重复情绪。结尾必须落实“不可逆变化”，并抛出“结尾问题”。'
+    ].join('\n')
+  } catch {
+    return ''
+  }
+}
+
 /**
  * 构造用户提示。注入创作目标引导生成。
  * @param extraHint 额外修复提示（fix 阶段用，如"提升质量/扩写"）
@@ -83,6 +114,8 @@ function buildBodyPrompt(
   const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
   const openingSlot = firstBeat ? getOpeningSlotContent(workId) : ''
   const hookText = firstBeat ? getWorkHook(workId) : ''
+  const dramaticContract = workType === 'story' ? getDramaticContractPrompt(ch.outline_diagnosis) : ''
+  const resourceBudget = formatChapterResourceBudgetsForPrompt(workId, chapterId)
   return formatBodyPromptLines(workType, {
     volName: vol?.name,
     volDescription: vol?.description,
@@ -95,6 +128,8 @@ function buildBodyPrompt(
         ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本${workType === 'story' ? '拍' : '章'}时贯彻该目标（题材/风格/情节走向）。`
         : '',
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
+      dramaticContract,
+      resourceBudget,
       openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
       hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致，但不得重复导语中已写的场景和台词，须从导语结束处自然衔接、继续推进剧情。` : ''
     ].filter(Boolean)
@@ -173,6 +208,28 @@ export async function generateBeatBody(
   } catch (e) {
     appLogger.warn('goal_routine', '叙事记忆提取失败（不阻断生成）', {
       workId, chapterId, error: e instanceof Error ? e.message : String(e)
+    })
+  }
+
+  const resourceGate = runResourceConstraintGate(workId, chapterId)
+  if (!resourceGate.passed) {
+    clearChapterNarrativeMemory(workId, chapterId)
+    volumeChapterDAO.updateChapterWithVersion(chapterId, {
+      content: '',
+      word_count: 0,
+      status: 'draft'
+    })
+    return {
+      success: false,
+      content: '',
+      wordCount: 0,
+      memoryExtracted,
+      error: `资源数值门禁未通过：${resourceGate.blockers.join('；')}`
+    }
+  }
+  if (resourceGate.warnings.length > 0) {
+    appLogger.warn('goal_routine', '资源数值门禁存在警告', {
+      workId, chapterId, warnings: resourceGate.warnings
     })
   }
 

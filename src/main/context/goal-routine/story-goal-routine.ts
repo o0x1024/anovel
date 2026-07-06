@@ -34,7 +34,7 @@ import { STORY_OVERALL_CHECK_SYSTEM_PROMPT } from '../story-settings-quality'
 import { runIncubatorGate } from '../incubator/gate-check'
 import { runGateFix } from '../incubator/gate-fix'
 import { freezeIncubatorStorylineVersion } from '../incubator/freeze-version'
-import { parseChapterSuggestions } from '../parse-chapters'
+import { parseChapterSuggestions, type ParsedChapter } from '../parse-chapters'
 import { outlineConstraintsForWordTarget } from '../../../shared/outline-constraints'
 import { DEFAULT_WORDS_PER_CHAPTER } from '../../../shared/writing-plan-presets'
 import { loadWritingPlan } from '../writing-plan'
@@ -575,14 +575,216 @@ function buildBeatBatchSystemPrompt(wordsPerChapter: number): string {
     '- plot_points 第一条必须是冲突的极端场景直接切入（不公/背叛/羞辱/悬念），禁止背景介绍、角色出场铺垫或日常开篇。',
     '- beat_role 必须是 B(推进冲突) 或 A(爽点释放)，禁止 C(反转铺垫)——第一节拍不允许慢热。',
     '- next_hook 必须是能让读者瞬间想看下一拍的强悬念。',
+    '【每拍戏剧契约 - 防流水账硬约束】',
+    '- 每个节拍都必须像一场戏，而不是事件摘要。必须明确：主角想要什么、谁阻止、失败代价、信息差、压力升级、中段转折、结尾后局面发生什么不可逆变化。',
+    '- 如果某拍只是在交代背景、移动地点、解释设定、串联事件，没有不可逆变化，则该拍不合格，必须重设为冲突场。',
+    '- dramatic_contract.scene_promise：本拍给读者承诺的爽点/悬念/情绪释放。',
+    '- dramatic_contract.protagonist_want：主角此刻明确想得到/阻止/证明什么。',
+    '- dramatic_contract.obstacle：具体阻力，必须是人、规则、误会、证据缺失或即时危险，不得写成泛泛困难。',
+    '- dramatic_contract.stakes：失败会立刻失去什么，必须具体。',
+    '- dramatic_contract.info_gap：读者与角色、主角与对手之间的信息差；没有信息差也要写清"无，靠正面对抗推进"。',
+    '- dramatic_contract.pressure_escalation：本拍中压力如何升级，不能只维持原状。',
+    '- dramatic_contract.turn：中段揭示/反转/选择，必须改变读者对局面的判断。',
+    '- dramatic_contract.irreversible_change：本拍结束后局面发生的不可逆变化，这是防流水账的核心字段。',
+    '- dramatic_contract.payoff_or_debt：本拍兑现了什么爽点，或欠下什么更大的情绪债。',
+    '- dramatic_contract.next_question：读者结尾最想立刻知道的问题，必须与 next_hook 一致。',
     '【输出格式 - 必须严格遵守】',
     '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
     'chapters 数组每一项为一个节拍（请勿输出"第X章"或"节拍X"字样，直接写节拍剧情标题即可）。',
-    `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。`,
+    `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、dramatic_contract、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。`,
     'beat_role: A(爽点释放)/B(推进冲突)/C(反转铺垫)，禁止使用 transition',
     `【长度】每项 plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每节拍目标 ${wordsPerChapter} 字正文），禁止正文级长文。`,
-    `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}`
+    `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"dramatic_contract":{"scene_promise":"...","protagonist_want":"...","obstacle":"...","stakes":"...","info_gap":"...","pressure_escalation":"...","turn":"...","irreversible_change":"...","payoff_or_debt":"...","next_question":"..."},"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}`
   ].join('\n')
+}
+
+interface BeatGateResult {
+  passed: boolean
+  score: number
+  blockingIssues: string[]
+  suggestions: string[]
+}
+
+const BEAT_GATE_MAX_ROUNDS = 3
+
+function parseBeatGateResult(content: string): BeatGateResult | null {
+  const jsonText = extractJsonText(content.trim()) ?? extractFirstJsonObject(content.trim())
+  if (!jsonText) return null
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>
+    const rawPassed = parsed.passed
+    if (typeof rawPassed !== 'boolean') return null
+    const rawScore = Number(parsed.score)
+    const score = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0
+    const blockingRaw = parsed.blocking_issues ?? parsed.blockingIssues
+    const suggestionsRaw = parsed.suggestions
+    const blockingIssues = Array.isArray(blockingRaw)
+      ? blockingRaw.map(v => String(v).trim()).filter(Boolean)
+      : []
+    const suggestions = Array.isArray(suggestionsRaw)
+      ? suggestionsRaw.map(v => String(v).trim()).filter(Boolean)
+      : []
+    return { passed: rawPassed, score, blockingIssues, suggestions }
+  } catch {
+    return null
+  }
+}
+
+function extractFirstJsonObject(content: string): string | null {
+  const start = content.indexOf('{')
+  if (start < 0) return null
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < content.length; i++) {
+    const ch = content[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{') depth++
+    if (ch === '}') {
+      depth--
+      if (depth === 0) return content.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+function buildBeatGatePrompt(goalDescription: string, chapters: ParsedChapter[]): string {
+  return [
+    goalDescription.trim() ? `【用户创作目标】\n${goalDescription.trim()}` : '',
+    '【待门禁节拍】',
+    JSON.stringify(chapters.map((chapter, index) => ({
+      index: index + 1,
+      title: chapter.title,
+      plot_outline: chapter.outline,
+      beat_role: chapter.beat_role,
+      next_hook: chapter.next_hook,
+      characters: chapter.characters,
+      dramatic_contract: chapter.dramatic_contract
+    })), null, 2)
+  ].filter(Boolean).join('\n\n')
+}
+
+async function runBeatGate(
+  workId: number,
+  goalDescription: string,
+  chapters: ParsedChapter[],
+  signal?: AbortSignal
+): Promise<BeatGateResult> {
+  assertNotAborted(signal)
+  const res = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      prompt: buildBeatGatePrompt(goalDescription, chapters),
+      systemPrompt: [
+        '你是短故事节拍门禁主编。你的任务是在正文生成前拦截会导致流水账的节拍大纲。',
+        '只输出合法 JSON，不要输出 markdown、解释或代码块。',
+        '',
+        '【硬性通过条件】',
+        '1. 每拍都必须有完整 dramatic_contract，尤其是 protagonist_want、obstacle、stakes、pressure_escalation、turn、irreversible_change、next_question。',
+        '2. 每拍必须是一场有目标、阻力、选择和后果的戏，不能只是事件顺序、设定解释、地点移动或背景补充。',
+        '3. 每拍结尾必须让局面发生不可逆变化，且 next_question/next_hook 能驱动读者继续看。',
+        '4. 全篇节拍之间必须形成压力递增和因果推进，不能每拍相互独立。',
+        '5. 第一拍必须直接切入极端冲突，不能慢热铺垫。',
+        '',
+        '【评分】',
+        'score 0-100，85 分以下或存在 blocking_issues 时 passed=false。',
+        'blocking_issues 必须写清第几拍、缺什么、为什么会导致流水账。',
+        'suggestions 必须给出可直接用于下一轮重生的改法。',
+        '输出格式：{"passed":false,"score":70,"blocking_issues":["第2拍缺少不可逆变化..."],"suggestions":["把第2拍改成..."]}'
+      ].join('\n'),
+      step: 'story_beat_gate',
+      workId,
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false
+    }),
+    { stream: false, signal }
+  )
+  if (!res.success || !res.content?.trim()) {
+    throw new Error(res.error || '节拍门禁失败：模型未返回内容')
+  }
+  const parsed = parseBeatGateResult(res.content)
+  if (!parsed) throw new Error('节拍门禁失败：返回 JSON 解析失败')
+  if (parsed.score < 85 && parsed.passed) {
+    return { ...parsed, passed: false, blockingIssues: parsed.blockingIssues.length > 0 ? parsed.blockingIssues : [`门禁分 ${parsed.score} 低于 85`] }
+  }
+  if (parsed.blockingIssues.length > 0 && parsed.passed) {
+    return { ...parsed, passed: false }
+  }
+  return parsed
+}
+
+function formatBeatGateFeedback(gate: BeatGateResult): string {
+  return [
+    `上一轮节拍门禁未通过，得分 ${gate.score}。`,
+    gate.blockingIssues.length > 0 ? `阻塞问题：\n${gate.blockingIssues.map(x => `- ${x}`).join('\n')}` : '',
+    gate.suggestions.length > 0 ? `重生要求：\n${gate.suggestions.map(x => `- ${x}`).join('\n')}` : '',
+    '请整组重生 chapters，不要只小修文字；必须让每拍具备目标、阻力、代价、转折和不可逆变化。'
+  ].filter(Boolean).join('\n')
+}
+
+async function generateBeatCandidatesWithGate(
+  workId: number,
+  volumeId: number,
+  systemPrompt: string,
+  basePrompt: string,
+  goalDescription: string,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<{ chapters: ParsedChapter[]; gate: BeatGateResult; rounds: number }> {
+  let gateFeedback = ''
+  let lastGate: BeatGateResult | null = null
+
+  for (let round = 1; round <= BEAT_GATE_MAX_ROUNDS; round++) {
+    assertNotAborted(signal)
+    const prompt = [
+      basePrompt,
+      gateFeedback ? `【上一轮门禁反馈 - 必须全部修复】\n${gateFeedback}` : ''
+    ].filter(Boolean).join('\n\n')
+
+    const response = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        prompt,
+        systemPrompt,
+        step: 'volume_chapters_batch',
+        workId,
+        volumeId,
+        workContextOptions: { includeVolumes: true }
+      }),
+      { stream: false, signal }
+    )
+
+    if (!response.success || !response.content?.trim()) {
+      throw new Error(response.error || '节拍生成失败')
+    }
+
+    const parsed = parseChapterSuggestions(response.content.trim())
+    if (parsed.length === 0) throw new Error('节拍解析为空')
+
+    onProgress?.(`正在运行节拍 AI 门禁（第 ${round}/${BEAT_GATE_MAX_ROUNDS} 轮）`)
+    const gate = await runBeatGate(workId, goalDescription, parsed, signal)
+    lastGate = gate
+    if (gate.passed) {
+      onProgress?.(`节拍 AI 门禁通过（${gate.score}分，第 ${round} 轮）`)
+      return { chapters: parsed, gate, rounds: round }
+    }
+
+    onProgress?.(`节拍 AI 门禁未通过（${gate.score}分），正在重生节拍`)
+    gateFeedback = formatBeatGateFeedback(gate)
+  }
+
+  throw new Error(`节拍 AI 门禁 ${BEAT_GATE_MAX_ROUNDS} 轮仍未通过：${lastGate ? formatBeatGateFeedback(lastGate) : '无门禁报告'}`)
 }
 
 /** outline 阶段：若无节拍，生成节拍大纲并入库（注入创作目标） */
@@ -617,24 +819,23 @@ async function ensureBeats(
     '请输出完整 chapters 数组。'
   ].filter(Boolean).join('\n')
 
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      prompt,
-      systemPrompt: buildBeatBatchSystemPrompt(wpc),
-      step: 'volume_chapters_batch',
+  let parsed: ParsedChapter[]
+  let gateRounds = 0
+  try {
+    const gated = await generateBeatCandidatesWithGate(
       workId,
       volumeId,
-      workContextOptions: { includeVolumes: true }
-    }),
-    { stream: false, signal }
-  )
-
-  if (!response.success || !response.content?.trim()) {
-    return { created: 0, error: response.error || '节拍生成失败' }
+      buildBeatBatchSystemPrompt(wpc),
+      prompt,
+      goalDescription,
+      signal,
+      onProgress
+    )
+    parsed = gated.chapters
+    gateRounds = gated.rounds
+  } catch (e) {
+    return { created: 0, error: e instanceof Error ? e.message : String(e) }
   }
-
-  const parsed = parseChapterSuggestions(response.content.trim())
-  if (parsed.length === 0) return { created: 0, error: '节拍解析为空' }
 
   const items = parsed.map(p => ({
     title: p.title,
@@ -642,10 +843,13 @@ async function ensureBeats(
     beat_role: p.beat_role ?? null,
     foreshadow_target: p.foreshadow_target ?? null,
     next_hook: p.next_hook ?? null,
-    characters: p.characters ?? null
+    characters: p.characters ?? null,
+    outline_diagnosis: p.dramatic_contract
+      ? JSON.stringify({ dramatic_contract: p.dramatic_contract })
+      : null
   }))
   volumeChapterDAO.batchCreateChapters(volumeId, items, existing.length > 0 ? 'replace' : 'append')
-  onProgress?.(`已回填 ${items.length} 个节拍到节拍大纲`)
+  onProgress?.(`已回填 ${items.length} 个节拍到节拍大纲（门禁 ${gateRounds} 轮）`)
   return { created: items.length }
 }
 
