@@ -315,7 +315,9 @@ export function getSettingsQualityStatus(workId: number): SettingsQualityStatus 
   const state = loadSettingsQualityState(workId)
   const hasOverallCheck = !!(state.overall?.report?.trim() && state.overall.checkedAt)
   const isStale = hasOverallCheck && isSettingsQualityStale(workId)
-  const coreDone = FINGERPRINT_TYPES.slice(0, 3).every(t => !!coreSettingDAO.getByType(workId, t)?.content?.trim())
+  const hasProtagonist = !!coreSettingDAO.getByType(workId, 'protagonist')?.content?.trim()
+  const hasPleasureEngine = !!coreSettingDAO.getByType(workId, 'pleasure_engine')?.content?.trim()
+  const coreDone = hasProtagonist && hasPleasureEngine
   const conclusion = !isStale ? getEffectiveConclusion(state) : null
   const enrichedSections = !isStale && state.overall?.report
     ? parseEnrichedReportSections(workId, state.overall.report)

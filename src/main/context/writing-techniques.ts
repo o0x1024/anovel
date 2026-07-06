@@ -125,9 +125,10 @@ export const CHAPTER_OUTLINE_JSON_PROMPT = [
   '为指定章节生成情节大纲（写作指令，不是正文）。',
   '只输出一个 JSON 对象，禁止 Markdown 与代码块外说明。',
   'plot_points 为 3-5 条情节节点；next_hook 写在 JSON 字段，不要单独作为标题或章节。',
+  '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），本章必须在 plot_points 或 state_constraints 中写清消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
   CHAPTER_ABC_OUTLINE_PROMPT,
   '【长度】plot_points 合计约 300-600 字。',
-  '格式：{"plot_points":["节点1","节点2"],"beat_role":"B","foreshadow_target":"...","next_hook":"..."}'
+  '格式：{"plot_points":["节点1","节点2"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","state_constraints":"体力从60降至25，章末靠休整恢复到40"}'
 ].join('\n')
 
 /** 章节情节大纲长度与体裁约束（规划层，非正文） */
@@ -138,7 +139,8 @@ export function chapterOutlineLengthRules(wordsPerChapter = 4000): string {
     '1. 大纲是写作指令，不是正文：只写事件链、冲突、转折，禁止写完整对话/场景描写/心理独白',
     `2. 每章 plot_points 合计约 ${c.charsMin}-${c.charsMax} 字；超过 ${c.charsWarn} 字视为不合格`,
     `3. ${c.pointsMin}-${c.pointsMax} 个 plot_points，每点 1-3 句梗概`,
-    '4. beat_role / foreshadow_target / next_hook 仅作为 JSON 字段，不得拆成独立「章节」'
+    '4. 若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），每章必须在 plot_points 或 state_constraints 字段中写清本章约束变化；无相关机制则跳过',
+    '5. beat_role / foreshadow_target / next_hook / state_constraints 仅作为同章 JSON 字段，不得拆成独立「章节」'
   ].join('\n')
 }
 
@@ -156,10 +158,11 @@ export const VOLUME_OUTLINE_TARGET_CHARS = { min: 80, max: 300, compactInject: 8
 
 export const VOLUME_OUTLINE_LENGTH_RULES = [
   '【分卷大纲体裁 - 必须遵守】',
-  '1. 每卷 description 仅写核心主题、主冲突、卷末钩子，禁止写具体章节情节或场景描写',
+  '1. 每卷 description 仅写核心主题、主冲突、卷末钩子；若作品存在需连续追踪的能力/状态机制，必须写清本卷能力/状态约束与消耗/恢复/升级节奏',
   '2. 每卷 description 控制在 80-300 字；超过 400 字视为不合格',
   '3. JSON 中 description 字段须可直接作为写作约束，不要写成市场分析或创作笔记',
-  '4. theme / core_conflict / end_hook 仅作为同卷 JSON 字段，不得拆成独立「分卷」'
+  '4. 可额外使用 state_constraints 字段承载能力/状态约束，解析时会并入 description',
+  '5. theme / core_conflict / end_hook / state_constraints 仅作为同卷 JSON 字段，不得拆成独立「分卷」'
 ].join('\n')
 
 /** 批量生成分卷：仅 JSON */
@@ -167,9 +170,9 @@ export const VOLUMES_OUTLINE_JSON_PROMPT = [
   '根据作品创作上下文，生成 3-5 卷分卷大纲。',
   '只输出一个 JSON 对象，禁止 Markdown 正文、标题、解释或代码块外的任何文字。',
   'volumes 数组每项为一卷；不要把「分卷大纲」「卷末钩子」「核心冲突」等标签当作 name。',
-  '每卷用 description（80-300 字，含主题/主冲突/卷末钩子），或 theme + core_conflict + end_hook 三字段。',
+  '每卷用 description（80-300 字，含主题/主冲突/卷末钩子；如有能力/状态约束，也必须含本卷消耗/恢复/升级节奏），或 theme + core_conflict + end_hook + state_constraints 字段。',
   VOLUME_OUTLINE_LENGTH_RULES,
-  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；卷末钩子…"}]}'
+  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；体力从30/100降至濒危后靠安全区休整恢复，卷末钩子…","state_constraints":"体力系统本卷主要体现消耗压力与首次恢复规则"}]}'
 ].join('\n')
 
 export const WRITER_BLOCK_TYPES = {

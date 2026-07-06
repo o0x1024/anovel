@@ -38,7 +38,7 @@ export interface DramaticContract {
 const META_CHAPTER_TITLE = /^章节大纲|^分章|^分卷|^情节大纲|^章节列表|^目录|^大纲建议|^创作|^本卷/i
 
 /** 字段标签被误当成章节名 */
-const FIELD_LABEL_TITLE = /^(?:\*{0,2})?(?:章节结尾钩子|章末钩子|结尾钩子|情节节点|爽点链|核心情节|关键冲突|beat_role|foreshadow_target|next_hook)(?:\*{0,2})?[：:]/i
+const FIELD_LABEL_TITLE = /^(?:\*{0,2})?(?:章节结尾钩子|章末钩子|结尾钩子|情节节点|爽点链|核心情节|关键冲突|能力\/状态约束|金手指数值|金手指状态|数值状态|beat_role|foreshadow_target|next_hook|state_constraints|golden_finger_state|numeric_state)(?:\*{0,2})?[：:]/i
 
 function isVolumeLevelChapterHeader(title: string): boolean {
   const t = title.trim()
@@ -82,7 +82,8 @@ function buildOutlineFromParts(
   plotPoints: string[],
   outlineRaw: string,
   nextHook?: string | null,
-  dramaticContract?: DramaticContract | null
+  dramaticContract?: DramaticContract | null,
+  numericState?: string | null
 ): string {
   const parts: string[] = []
   if (plotPoints.length > 0) {
@@ -103,6 +104,10 @@ function buildOutlineFromParts(
   if (contractLines.length > 0) {
     parts.push('【戏剧契约】')
     parts.push(...contractLines)
+  }
+  const state = numericState?.trim()
+  if (state && !parts.some(l => l.includes(state))) {
+    parts.push(`【能力/状态约束】${state}`)
   }
   return parts.join('\n')
 }
@@ -210,7 +215,8 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   const dramaticContract = normalizeDramaticContract(
     row.dramatic_contract ?? row.dramaticContract ?? row.scene_contract ?? row.sceneContract
   )
-  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract)
+  const numericState = extractNumericState(row)
+  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState)
 
   if (isPlaceholderOutline(outline)) return null
 
@@ -224,6 +230,29 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     characters: normalizeCharactersField(row.characters),
     dramatic_contract: dramaticContract
   }
+}
+
+function extractNumericState(row: Record<string, unknown>): string | null {
+  const keys = [
+    'state_constraints',
+    'stateConstraints',
+    'ability_state_constraints',
+    'abilityStateConstraints',
+    'golden_finger_state',
+    'goldenFingerState',
+    'numeric_state',
+    'numericState',
+    'gf_state',
+    '能力/状态约束',
+    '金手指数值',
+    '金手指状态',
+    '数值状态'
+  ]
+  for (const key of keys) {
+    const value = row[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
 }
 
 /** 单章 AI 大纲：仅 JSON */
@@ -241,7 +270,7 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
     const dramaticContract = normalizeDramaticContract(
       parsed.dramatic_contract ?? parsed.dramaticContract ?? parsed.scene_contract ?? parsed.sceneContract
     )
-    const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract)
+    const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, extractNumericState(parsed))
     if (isPlaceholderOutline(outline)) return null
 
     return {

@@ -9,7 +9,7 @@ export interface ParsedVolume {
 const META_VOLUME_TITLE = /^分卷大纲|^总体|^概述|^作品名|^书名|^说明|^摘要|^目录|^大纲建议|^创作/i
 
 /** 字段标签被误当成卷名 */
-const FIELD_LABEL_NAME = /^(?:\*{0,2})?(?:卷末钩子|结尾钩子|核心冲突|核心主题|主题|分卷说明|description|theme|end_hook)(?:\*{0,2})?[：:]/i
+const FIELD_LABEL_NAME = /^(?:\*{0,2})?(?:卷末钩子|结尾钩子|核心冲突|核心主题|主题|分卷说明|能力\/状态约束|金手指数值|金手指节奏|数值状态|description|theme|end_hook|state_constraints|golden_finger_progression)(?:\*{0,2})?[：:]/i
 
 /** 名称是否像真实分卷（卷一 / 第一卷 / Volume 1 等） */
 function looksLikeVolumeTitle(name: string): boolean {
@@ -35,11 +35,36 @@ function isPlaceholderDescription(description: string): boolean {
   return !d || /^[-—–_=\s]+$/.test(d)
 }
 
+function firstString(row: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = row[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return ''
+}
+
 function buildVolumeDescription(row: Record<string, unknown>): string {
-  const direct = String(
-    row.description ?? row.summary ?? row.描述 ?? ''
-  ).trim()
-  if (direct) return direct
+  const direct = firstString(row, ['description', 'summary', '描述'])
+  const stateConstraints = firstString(row, [
+    'state_constraints',
+    'stateConstraints',
+    'ability_state_constraints',
+    'abilityStateConstraints',
+    'golden_finger_progression',
+    'goldenFingerProgression',
+    'gf_progression',
+    'golden_finger',
+    '能力/状态约束',
+    '金手指数值',
+    '金手指进展',
+    '金手指节奏',
+    '数值状态'
+  ])
+  if (direct) {
+    return stateConstraints && !direct.includes(stateConstraints)
+      ? `${direct}\n【能力/状态约束】${stateConstraints}`
+      : direct
+  }
 
   const theme = String(row.theme ?? row.核心主题 ?? row.主题 ?? '').trim()
   const conflict = String(row.core_conflict ?? row.conflict ?? row.核心冲突 ?? '').trim()
@@ -49,6 +74,7 @@ function buildVolumeDescription(row: Record<string, unknown>): string {
   if (theme) parts.push(`【主题】${theme}`)
   if (conflict) parts.push(`【冲突】${conflict}`)
   if (hook) parts.push(`【卷末钩子】${hook}`)
+  if (stateConstraints) parts.push(`【能力/状态约束】${stateConstraints}`)
   return parts.join('\n')
 }
 

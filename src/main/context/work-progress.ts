@@ -13,7 +13,7 @@ export interface WorkStepProgress {
   settingsQuality?: SettingsQualityStatus
 }
 
-const CORE_TYPES = ['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast'] as const
+const REQUIRED_CORE_TYPES = ['protagonist', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast'] as const
 
 function hasContent(map: Map<string, string>, type: string): boolean {
   return !!map.get(type)?.trim()
@@ -29,7 +29,7 @@ export function getWorkStepProgress(workId: number): WorkStepProgress {
   const hasIdea = hasContent(byType, 'idea')
   const frozenStoryline = !!incubatorVersionDAO.getLatestFrozen(workId)
   const filledStorylineSlots = incubatorDraftSlotDAO.countFilledSlots(workId)
-  const coreDone = CORE_TYPES.every(t => hasContent(byType, t))
+  const coreDone = REQUIRED_CORE_TYPES.every(t => hasContent(byType, t))
 
   const volumes = volumeChapterDAO.listVolumes(workId)
   const chapters = volumeChapterDAO.listChaptersByWork(workId)

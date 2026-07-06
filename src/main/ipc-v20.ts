@@ -21,6 +21,7 @@ import { exportWorkContent } from './context/export-content'
 import { generateImage } from './image/image-service'
 import { modelService } from './model'
 import type { ModelType } from './model/types'
+import { fuzzyReplace } from '../shared/fuzzy-match'
 
 export function registerV20IpcHandlers(): void {
   // ==================== 品味档案 ====================
@@ -124,9 +125,8 @@ export function registerV20IpcHandlers(): void {
     let patchedText = content
     for (const patch of patches) {
       if (!patch.find) continue
-      const idx = patchedText.indexOf(patch.find)
-      if (idx === -1) continue
-      patchedText = patchedText.slice(0, idx) + patch.replace + patchedText.slice(idx + patch.find.length)
+      const next = fuzzyReplace(patchedText, patch.find, patch.replace)
+      if (next !== null) patchedText = next
     }
 
     return { success: true, content: patchedText }

@@ -16,6 +16,7 @@ import AntiMeanPanel from './AntiMeanPanel.vue'
 import ModelDebatePanel from './ModelDebatePanel.vue'
 import AiTraceReport from './AiTraceReport.vue'
 import AntiAiRulesPanel from './AntiAiRulesPanel.vue'
+import ChapterAssistantDialog from './ChapterAssistantDialog.vue'
 import { editorNavKey } from './editor-nav'
 import { toPlainForIpc } from '../../../../shared/ipc-plain'
 import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
@@ -228,6 +229,7 @@ const humanizeStats = ref<{ wordSubstitutionHits: number; uniformSentenceRuns: n
 const versionHistoryRef = ref<InstanceType<typeof ChapterVersionHistory> | null>(null)
 const workReferenceText = ref('')
 const workRefSaving = ref(false)
+const chapterAssistantOpen = ref(false)
 
 const { loading, result, error, contextBudget, chat } = useModelChat(() => props.workId)
 const { showToast } = useToast()
@@ -1820,6 +1822,16 @@ function generatePreviewReport() {
                 {{ runningQualityAI ? '诊断中...' : 'AI 诊断' }}
               </button>
               <button
+                type="button"
+                class="btn btn-ghost btn-xs gap-1"
+                :disabled="!selectedChapterId"
+                title="与 AI 编辑讨论当前章节的问题"
+                @click="chapterAssistantOpen = true"
+              >
+                <font-awesome-icon icon="comments" class="w-3 h-3" />
+                讨论助手
+              </button>
+              <button
                 v-if="qualityAiReport"
                 class="btn btn-warning btn-xs gap-1"
                 :disabled="applyingFixes || loading"
@@ -2179,4 +2191,13 @@ function generatePreviewReport() {
       <button type="button">close</button>
     </form>
   </dialog>
+
+  <ChapterAssistantDialog
+    v-model:open="chapterAssistantOpen"
+    :work-id="workId"
+    :chapter-id="selectedChapterId"
+    :chapter-title="selectedChapter?.title ?? ''"
+    :chapter-content="result"
+    :work-type="workType"
+  />
 </template>

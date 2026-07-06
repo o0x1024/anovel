@@ -18,6 +18,7 @@ import {
   faChartBar,
   faCheck,
   faCheckCircle,
+  faCheckSquare,
   faChevronDown,
   faChevronLeft,
   faChevronRight,
@@ -27,6 +28,7 @@ import {
   faClock,
   faCode,
   faCommentDots,
+  faComments,
   faCopy,
   faCog,
   faDatabase,
@@ -60,6 +62,7 @@ import {
   faMoon,
   faPalette,
   faPaperclip,
+  faPaperPlane,
   faPen,
   faPlay,
   faPenNib,
@@ -78,6 +81,7 @@ import {
   faSitemap,
   faSliders,
   faSpinner,
+  faSquare,
   faStethoscope,
   faStop,
   faSun,
@@ -90,7 +94,9 @@ import {
   faUpload,
   faUser,
   faWandMagicSparkles,
-  faWifi
+  faWifi,
+  faWindowMinimize,
+  faWindowRestore
 } from '@fortawesome/free-solid-svg-icons'
 
 library.add(
@@ -108,6 +114,7 @@ library.add(
   faChartBar,
   faCheck,
   faCheckCircle,
+  faCheckSquare,
   faChevronDown,
   faChevronLeft,
   faChevronRight,
@@ -117,6 +124,7 @@ library.add(
   faClock,
   faCode,
   faCommentDots,
+  faComments,
   faCopy,
   faCog,
   faDatabase,
@@ -150,6 +158,7 @@ library.add(
   faMoon,
   faPalette,
   faPaperclip,
+  faPaperPlane,
   faPen,
   faPlay,
   faPenNib,
@@ -168,6 +177,7 @@ library.add(
   faSitemap,
   faSliders,
   faSpinner,
+  faSquare,
   faStethoscope,
   faStop,
   faSun,
@@ -180,7 +190,9 @@ library.add(
   faUpload,
   faUser,
   faWandMagicSparkles,
-  faWifi
+  faWifi,
+  faWindowMinimize,
+  faWindowRestore
 )
 
 import { initAppearanceSettings } from './services/appearanceSettings'

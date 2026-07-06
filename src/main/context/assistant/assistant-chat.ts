@@ -35,6 +35,16 @@ const activeChats = new Map<number, AbortController>()
 
 const DEFAULT_ASSISTANT_SYSTEM_PROMPT = '你是 ANovel AI 助手，可以帮助用户解决和处理问题。'
 const CORE_SETTING_ADVISOR_ROLE_NAME = '核心设定顾问'
+const CHAPTER_DISCUSS_SETTING_TYPE = 'chapter_discuss'
+
+const CHAPTER_DISCUSS_SYSTEM_PROMPT = `你是资深网文编辑，正在与作者一对一讨论其正在创作的章节正文。
+
+你的职责：
+- 分析章节中的问题：逻辑矛盾、人设崩塌、节奏拖沓、AI腔句式、对话不自然、铺垫不足等。
+- 给出具体、可操作的修改建议，而非泛泛而谈。
+- 如果用户引用了核心设定或前文，须对照检查一致性。
+- 使用 Markdown 回复，不要输出 JSON 结构化块。
+- 简洁直接，像真实编辑一样沟通。`
 
 function buildWorkScaleInfoText(workId: number): string {
   const work = workDAO.getById(workId)
@@ -64,6 +74,10 @@ function buildSettingContextAddon(workId: number, settingType: string): string {
 
   if (work) {
     parts.push(`【作品信息】\n标题：${work.title || '未命名'}\n类型：${isStory ? '短故事' : '长篇网文'}\n简介：${work.description || '暂无简介'}`)
+  }
+
+  if (settingType === CHAPTER_DISCUSS_SETTING_TYPE) {
+    return parts.join('\n\n')
   }
 
   parts.push(`【作品规模规划】\n请以下列规模为约束，确保设定与后续章节容量、节奏和字数规划相匹配：\n${buildWorkScaleInfoText(workId)}`)
@@ -145,6 +159,13 @@ function resolveAssistantRole(roleId: number | null) {
 function resolveAssistantRoleForConversation(settingType: string | null) {
   if (!settingType) {
     return resolveAssistantRole(resolveAssistantGlobalRoleId())
+  }
+  if (settingType === CHAPTER_DISCUSS_SETTING_TYPE) {
+    return {
+      system_prompt: CHAPTER_DISCUSS_SYSTEM_PROMPT,
+      analysis_rules_json: null as string | null,
+      capabilities_json: null as string | null
+    }
   }
   const advisor = assistantRoleDAO.getByName(CORE_SETTING_ADVISOR_ROLE_NAME)
   if (advisor) return advisor

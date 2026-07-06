@@ -7,7 +7,7 @@ import {
   getCoreSettingLabel,
   type CoreSettingType
 } from '../../shared/settings-types'
-import { formatGoldenFingerConstraints, loadGoldenFingerStructured } from './golden-finger-validation'
+import { formatGoldenFingerConstraints, isNoGoldenFingerDesign, loadGoldenFingerStructured } from './golden-finger-validation'
 
 export const INCUBATOR_SETTING_TYPES = [
   'incubator_diagnose',
@@ -112,9 +112,11 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
       if (!content) continue
       let sectionContent = content
       if (type === 'golden_finger') {
-        const structured = loadGoldenFingerStructured(workId)
-        const constraints = formatGoldenFingerConstraints(structured)
-        sectionContent = [content, '', constraints].join('\n')
+        if (!isNoGoldenFingerDesign(content)) {
+          const structured = loadGoldenFingerStructured(workId)
+          const constraints = formatGoldenFingerConstraints(structured)
+          sectionContent = [content, '', constraints].join('\n')
+        }
       }
       sections[getCoreSettingLabel(type, isStory)] = sectionContent
     }

@@ -105,7 +105,7 @@ const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'world_pressure', '
 
 const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
   protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
-  golden_finger: '你是顶级长篇小说设定设计师。判断故事是否需要特殊机制；没有机制则设计身份反差与信息差。输出 Markdown：## 设定名称与形态 / ## 信息差构建 / ## 限制与升级节奏 / ## 对主线冲突的推动作用。',
+  golden_finger: '你是顶级长篇小说特殊机制设计师。仅当故事明确需要系统、空间、异能、面板、重生、穿越、血脉、修炼外挂等特殊机制时，才设计金手指。输出 Markdown：## 名称与形态 / ## 核心能力 / ## 限制条件 / ## 反噬机制 / ## 对主线冲突的推动作用。',
   world_pressure: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动 / ## 压迫升级路径。',
   conflict_engine: '你是顶级长篇小说冲突设计师。输出 Markdown：## 对立双方价值观冲突 / ## 不可调和点 / ## 三层赌注（个人/势力/世界） / ## 冲突升级机制 / ## 终局收束方式。',
   pleasure_engine: '你是顶级长篇小说节奏与爽点设计师。输出 Markdown：## 开篇钩子 / ## 前期小高潮 / ## 中期大反转 / ## 后期终极清算。必须明确每个爽点对应的卷/章位置。',
@@ -114,6 +114,16 @@ const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string
 }
 
 const activeLoops = new Map<number, AbortController>()
+
+function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean {
+  const text = `${goal}\n${mainline}`.trim()
+  if (!text) return false
+
+  const specialMechanism = /系统|面板|空间|异能|超能力|重生|穿越|穿书|快穿|无限流|规则怪谈|灵气|修仙|玄幻|修炼|血脉|天赋|签到|抽奖|熟练度|属性点|金手指|外挂|随身/.test(text)
+  if (specialMechanism) return false
+
+  return /年代文|年代|历史|历史文|现实|现实向|现实主义|正剧|权谋|官场|商战|乡村|种田|家长里短|军旅|谍战|民国|古代言情|宫斗|宅斗/.test(text)
+}
 
 export function isNovelGoalLoopRunning(workId: number): boolean {
   return activeLoops.has(workId)
@@ -161,20 +171,28 @@ async function materializeNovelSettings(
 ): Promise<number> {
   assertNotAborted(signal)
   const existing = coreSettingDAO.listByWork(workId)
-  const missing = NOVEL_SETTING_TYPES.filter(t => !existing.some(e => e.type === t && e.content?.trim()))
+  const mainline = coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
+    || buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true }).text.slice(0, 4000)
+  const shouldSkipGoldenFinger = shouldSkipGoldenFingerForNovel(goal, mainline)
+  const targetTypes = shouldSkipGoldenFinger
+    ? NOVEL_SETTING_TYPES.filter(t => t !== 'golden_finger')
+    : [...NOVEL_SETTING_TYPES]
+  const missing = targetTypes.filter(t => !existing.some(e => e.type === t && e.content?.trim()))
+
+  if (shouldSkipGoldenFinger) {
+    onProgress?.('检测为无特殊机制题材，跳过「金手指系统」生成')
+  }
 
   if (missing.length === 0) {
     onProgress?.('核心设定已存在，跳过')
     return 0
   }
 
-  const mainline = coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
-    || buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true }).text.slice(0, 4000)
   let count = 0
   for (const type of missing) {
     assertNotAborted(signal)
     onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length})`)
-    const existingText = NOVEL_SETTING_TYPES
+    const existingText = targetTypes
       .map(t => coreSettingDAO.getByType(workId, t)?.content?.trim() ? `## ${t}\n${coreSettingDAO.getByType(workId, t)?.content?.trim()}` : '')
       .filter(Boolean)
       .join('\n\n')

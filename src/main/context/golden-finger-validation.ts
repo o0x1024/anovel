@@ -29,7 +29,40 @@ export function loadGoldenFingerStructured(workId: number): GoldenFingerStructur
   return parseGoldenFingerFromMarkdown(row?.content ?? '')
 }
 
+export function hasGoldenFingerSetting(workId: number): boolean {
+  const row = coreSettingDAO.getByType(workId, 'golden_finger')
+  return !!(row?.content?.trim() || row?.structured_content?.trim())
+}
+
+export function isNoGoldenFingerDesign(content: string | null | undefined): boolean {
+  const text = content?.trim() ?? ''
+  if (!text) return true
+  return /无金手指|没有金手指|无特殊设定|没有特殊设定|无特殊机制|没有特殊机制|纯现实|历史文|正剧向|身份反差|关键信息差/.test(text)
+    && !/系统面板|签到|抽奖|空间|异能|超能力|血脉觉醒|天赋面板|熟练度|属性点|穿越附赠|金手指能力/.test(text)
+}
+
 export function validateGoldenFinger(workId: number): GoldenFingerValidationResult {
+  if (!hasGoldenFingerSetting(workId)) {
+    const structured = loadGoldenFingerStructured(workId)
+    return {
+      valid: true,
+      issues: [],
+      constraints: '',
+      structured
+    }
+  }
+
+  const row = coreSettingDAO.getByType(workId, 'golden_finger')
+  if (isNoGoldenFingerDesign(row?.content)) {
+    const structured = loadGoldenFingerStructured(workId)
+    return {
+      valid: true,
+      issues: [],
+      constraints: '',
+      structured
+    }
+  }
+
   const structured = loadGoldenFingerStructured(workId)
   const issues = goldenFingerValidationIssues(structured)
   return {
@@ -42,6 +75,9 @@ export function validateGoldenFinger(workId: number): GoldenFingerValidationResu
 
 export function goldenFingerCrossSettingIssues(workId: number, gf: GoldenFingerStructured): string[] {
   const issues: string[] = []
+  const gfRow = coreSettingDAO.getByType(workId, 'golden_finger')
+  if (!hasGoldenFingerSetting(workId) || isNoGoldenFingerDesign(gfRow?.content)) return issues
+
   const protagonist = coreSettingDAO.getByType(workId, 'protagonist')?.content?.trim() ?? ''
   const worldPressure = coreSettingDAO.getByType(workId, 'world_pressure')?.content?.trim() ?? ''
   const conflictEngine = coreSettingDAO.getByType(workId, 'conflict_engine')?.content?.trim() ?? ''

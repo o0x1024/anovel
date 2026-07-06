@@ -78,6 +78,13 @@ const settingTypes = computed(() => {
 type SettingType = CoreSettingType
 type WorldviewGenreDetectMode = 'strict' | 'balanced' | 'loose'
 
+function isNoGoldenFingerContent(content: string): boolean {
+  const text = content.trim()
+  if (!text) return true
+  return /无金手指|没有金手指|无特殊设定|没有特殊设定|无特殊机制|没有特殊机制|纯现实|历史文|正剧向|身份反差|关键信息差/.test(text)
+    && !/系统面板|签到|抽奖|空间|异能|超能力|血脉觉醒|天赋面板|熟练度|属性点|穿越附赠|金手指能力/.test(text)
+}
+
 const aiSystemPrompts: Record<SettingType, string> = {
   protagonist: [
     '你是顶级的角色设计师。基于以下故事信息，深度设计主角。',
@@ -98,15 +105,17 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '- 禁止写叙事段落或场景示例'
   ].join('\n'),
   golden_finger: [
-    '你是顶级的能力系统设计师，专攻番茄网文爆款。基于以下主角设定和故事信息，设计金手指系统。',
-    '若上下文含「用户补充要求」，须严格遵守。',
+    '你是顶级的长篇网文核心钩子设计师。请先判断故事是否需要特殊机制/金手指，再选择对应路径输出。',
+    '若上下文含「用户补充要求」，须严格遵守；若用户明确要求历史文、现实向、正剧向或无金手指，不得强塞系统/异能/空间。',
+    '',
+    '【路径 A：有特殊机制/金手指的故事】',
+    '适用于系统、异能、空间、面板、血脉、修炼外挂、特殊感知等机制明确存在的故事。',
     '核心原则：',
     '- 限制比能力更重要——金手指应同时是优势来源和麻烦来源',
     '- 好的金手指让读者 3 秒内理解「主角凭什么赢」和「主角为什么还不能赢」',
     '- 金手指决定了整本书的核心玩法，不是装饰性设定',
     '- 番茄铁律：可视化指标 > 模糊描述；限制条件必须能写成进度条/数值',
-    '输出要求：',
-    '- 用 Markdown 结构化输出，必须包含以下章节（缺项视为不合格）：',
+    '输出以下 Markdown 章节：',
     '  ## 番茄一句话卖点',
     '  ## 名称与形态',
     '  ## 呈现形式',
@@ -124,6 +133,20 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '  ## 暴露后果',
     '  ## 可视化限制指标（番茄核心）',
     '  ## 前三章首次爽点场景',
+    '',
+    '【路径 B：无特殊机制/无金手指的故事】',
+    '适用于历史文、现实文、年代文、权谋正剧、纯情感或主角靠身份/经验/资源/策略取胜的故事。',
+    '输出以下 Markdown 章节：',
+    '  ## 番茄一句话卖点',
+    '  ## 无金手指声明',
+    '  ## 核心钩子与身份反差',
+    '  ## 关键信息差',
+    '  ## 主角优势来源（经验/资源/时代知识/性格策略）',
+    '  ## 优势限制与失败风险',
+    '  ## 信息差释放节奏',
+    '  ## 前三章首次爽点场景',
+    '',
+    '【通用要求】',
     '- 总字数 600-1200 字',
     '- 核心能力最多 3 个，宁可少而精——能力越多=越无聊',
     '- 呈现形式：金手指以什么形式呈现给主角（系统面板/UI？脑海中的声音？身体纹路？随身空间？特定物品？纯感知？），通过什么感官通道感知，主动调出还是自动弹出',
@@ -138,6 +161,8 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '- 可视化限制指标必须包含：当前等级/阶段、每次使用消耗、冷却时间、使用次数上限、进度条形态、越级/失效后果',
     '- 前三章首次爽点场景必须具体：触发事件、金手指如何发挥作用、读者爽感来源',
     '- 禁止写"无敌""全能"类设计',
+    '选择路径 B 时，不要输出能力系统字段；正文之后无需附加结构化金手指 JSON。',
+    '选择路径 A 时，在 Markdown 输出之后附加一个 JSON 代码块（标记为 json）：',
     goldenFingerStructuredPromptSection()
   ].join('\n'),
   pleasure_engine: [
@@ -274,7 +299,8 @@ const aiSystemPromptsStory: Record<SettingType, string> = {
     '- 必须说明该设计如何直接服务于主角的爽点爆发',
     '- 禁止万能设定，限制条件是制造张力的核心工具',
     '- 前三章首次爽点场景必须具体到事件、动作、读者情绪落点',
-    '无论选择路径 A 还是路径 B，在 Markdown 输出之后，都必须附加一个 JSON 代码块（标记为 json），字段与上述 schema 一致：',
+    '选择路径 B 时，不要输出能力系统字段；正文之后无需附加结构化金手指 JSON。',
+    '选择路径 A 时，在 Markdown 输出之后附加一个 JSON 代码块（标记为 json）：',
     goldenFingerStructuredPromptSection(),
     STORY_HOT_WORD_PROMPT
   ].join('\n'),
@@ -1161,6 +1187,8 @@ async function runAiSuggest(
             extracted.markdown,
             extracted.structured
           )
+        } else if (isNoGoldenFingerContent(res.content)) {
+          await window.anovel.invoke('setting:upsert', props.workId, 'golden_finger', res.content.trim())
         } else {
           const parsed = parseGoldenFingerFromMarkdown(res.content)
           const markdown = renderGoldenFingerMarkdown(parsed)

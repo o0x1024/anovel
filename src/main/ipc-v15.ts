@@ -22,6 +22,7 @@ import {
   ADJUST_WORDS_COMPRESS_PROMPT
 } from './context/chapter-quality'
 import { stripDeterministicAiPatterns, stripForbiddenNotIsPatterns } from '../shared/normalize-body-text'
+import { fuzzyReplace, fuzzyFindRangeSpan } from '../shared/fuzzy-match'
 import { CORE_SETTING_TYPES, getCoreSettingLabel } from '../shared/settings-types'
 import { formatGoldenFingerConstraints, loadGoldenFingerStructured } from './context/golden-finger-validation'
 
@@ -716,9 +717,8 @@ function parseTimelineGeneration(content: string): Array<{
       let patchedText = content
       for (const patch of patches) {
         if (!patch.find) continue
-        const idx = patchedText.indexOf(patch.find)
-        if (idx === -1) continue
-        patchedText = patchedText.slice(0, idx) + patch.replace + patchedText.slice(idx + patch.find.length)
+        const next = fuzzyReplace(patchedText, patch.find, patch.replace)
+        if (next !== null) patchedText = next
       }
       return { success: true, content: patchedText }
     }
@@ -830,48 +830,6 @@ function parseTimelineGeneration(content: string): Array<{
       : { success: false, error: res.error }
   })
 
-  function fuzzyReplace(content: string, find: string, replace: string): string | null {
-    if (!find?.trim()) return null
-    // 1. 优先尝试精确匹配
-    const exactIdx = content.indexOf(find)
-    if (exactIdx !== -1) {
-      return content.slice(0, exactIdx) + replace + content.slice(exactIdx + find.length)
-    }
-
-    // 2. 尝试空白/换行自适应匹配
-    const escapedFind = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = escapedFind.trim().replace(/\s+/g, '\\s+')
-    try {
-      const regex = new RegExp(pattern, 'm')
-      const match = content.match(regex)
-      if (match && match.index !== undefined) {
-        return content.slice(0, match.index) + replace + content.slice(match.index + match[0].length)
-      }
-    } catch {
-      // 忽略无效的正则异常
-    }
-    return null
-  }
-
-  function fuzzyFindRange(content: string, find: string, from = 0): { index: number; length: number } | null {
-    if (!find?.trim()) return null
-    const exactIdx = content.indexOf(find, from)
-    if (exactIdx !== -1) return { index: exactIdx, length: find.length }
-
-    const escapedFind = find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = escapedFind.trim().replace(/\s+/g, '\\s+')
-    try {
-      const regex = new RegExp(pattern, 'm')
-      const match = content.slice(from).match(regex)
-      if (match && match.index !== undefined) {
-        return { index: from + match.index, length: match[0].length }
-      }
-    } catch {
-      // 忽略无效的正则异常
-    }
-    return null
-  }
-
   // ==================== Patch 模式修复（精准替换，不重写全文） ====================
   ipcMain.handle('quality:applyPatches', async (e, workId: number, content: string, topIssues: QualityAiTopIssue[], modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number }) => {
     if (!content?.trim()) return { success: false, error: '原文为空' }
@@ -969,13 +927,9 @@ function parseTimelineGeneration(content: string): Array<{
 
   ipcMain.handle('quality:applySectionRewrite', (_e, content: string, findStart: string, findEnd: string, replacement: string) => {
     if (!content?.trim()) return { success: false, error: '原文为空' }
-    const start = fuzzyFindRange(content, findStart)
-    if (!start) return { success: false, error: '未能定位起始句' }
-    const end = fuzzyFindRange(content, findEnd, start.index + start.length)
-    if (!end) return { success: false, error: '未能定位结束句' }
-    const endIndex = end.index + end.length
-    if (endIndex <= start.index) return { success: false, error: '定位范围无效' }
-    const patchedText = content.slice(0, start.index) + replacement + content.slice(endIndex)
+    const span = fuzzyFindRangeSpan(content, findStart, findEnd)
+    if (!span) return { success: false, error: '未能定位起始句或结束句' }
+    const patchedText = content.slice(0, span.start) + replacement + content.slice(span.end)
     return {
       success: true,
       patchedText: stripDeterministicAiPatterns(patchedText)

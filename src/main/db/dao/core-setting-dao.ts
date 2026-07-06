@@ -3,6 +3,13 @@ import { parseGoldenFingerFromMarkdown } from '../../../shared/golden-finger-typ
 
 const MAX_VERSIONS = 10
 
+function isNoGoldenFingerContent(content: string): boolean {
+  const text = content.trim()
+  if (!text) return true
+  return /无金手指|没有金手指|无特殊设定|没有特殊设定|无特殊机制|没有特殊机制|纯现实|历史文|正剧向|身份反差|关键信息差/.test(text)
+    && !/系统面板|签到|抽奖|空间|异能|超能力|血脉觉醒|天赋面板|熟练度|属性点|穿越附赠|金手指能力/.test(text)
+}
+
 export interface CoreSettingRow {
   id: number
   work_id: number
@@ -64,6 +71,24 @@ export class CoreSettingDAO extends BaseDAO {
   /** 更新或插入（每种类型只保留一条）；变更前自动保存版本快照 */
   upsert(workId: number, type: CoreSettingType, content: string): void {
     if (type === 'golden_finger') {
+      if (isNoGoldenFingerContent(content)) {
+        const existing = this.getByType(workId, type)
+        if (existing) {
+          if (existing.content !== content || existing.structured_content) {
+            this.createVersion(workId, type, existing.content)
+          }
+          this.run(
+            'UPDATE core_settings SET content = ?, structured_content = NULL, update_time = CURRENT_TIMESTAMP WHERE id = ?',
+            [content, existing.id]
+          )
+        } else {
+          this.insert(
+            'INSERT INTO core_settings (work_id, type, content, structured_content, update_time) VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP)',
+            [workId, type, content]
+          )
+        }
+        return
+      }
       const structured = parseGoldenFingerFromMarkdown(content)
       this.upsertStructured(workId, type, content, JSON.stringify(structured))
       return

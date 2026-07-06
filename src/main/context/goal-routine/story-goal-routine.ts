@@ -80,6 +80,7 @@ import {
 } from '../../../shared/story-category-tags'
 
 import { storyHotWordPromptSection } from '../../../shared/story-hot-words'
+import { fuzzyReplace } from '../../../shared/fuzzy-match'
 
 export type Phase = GoalRoutinePhase
 
@@ -513,7 +514,7 @@ async function generateTitleHook(
         '导语是放在全篇正文最开头、独立于编号节拍之外的"钩子段落"，交待核心故事、留住用户。',
         '导语 150-300 字，前三句爆发冲突，第一人称，强情绪，最后留悬念钩子。',
         '导语是独立于正文节拍之外的开篇钩子，发布时置于第一节拍之前。须用最具冲击力的场景直切核心冲突，让读者3秒内被抓住，产生强烈的追读冲动。',
-        '导语必须是一个完整的场景片段（包含对话、动作或弹幕/心声等形式），而非概括性介绍；读者读完导语就要产生"然后呢"的强烈冲动。',
+        '导语必须是一个完整的场景片段（包含对话、动作/心声等形式），而非概括性介绍；读者读完导语就要产生"然后呢"的强烈冲动。',
         storyHotWordPromptSection(),
         storyCategoryPromptSection(),
         '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评","tags":{"main_category":"主分类","plot":["情节分类"],"character":["角色分类"],"emotion":["情绪分类"],"setting":["背景分类"]}}]}'
@@ -986,8 +987,10 @@ async function diagnoseAndFixUntilPass(
     let patched = content
     let patchApplied = 0
     for (const p of patches) {
-      if (p.find && patched.includes(p.find)) {
-        patched = patched.replace(p.find, p.replace)
+      if (!p.find) continue
+      const next = fuzzyReplace(patched, p.find, p.replace)
+      if (next !== null) {
+        patched = next
         patchApplied++
       }
     }
