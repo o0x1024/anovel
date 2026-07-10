@@ -35,6 +35,7 @@ export interface GoldenFingerVisualMetric {
 
 export interface GoldenFingerStructured {
   nameAndForm: string
+  coreRules: string
   manifestation: string
   visibility: string
   interaction: string
@@ -55,6 +56,7 @@ export interface GoldenFingerStructured {
 
 export const EMPTY_GOLDEN_FINGER: GoldenFingerStructured = {
   nameAndForm: '',
+  coreRules: '',
   manifestation: '',
   visibility: '',
   interaction: '',
@@ -114,6 +116,7 @@ export function normalizeGoldenFinger(value: Partial<GoldenFingerStructured>): G
   }
   return {
     nameAndForm: safeStr(value.nameAndForm),
+    coreRules: safeStr(value.coreRules),
     manifestation: safeStr(value.manifestation),
     visibility: safeStr(value.visibility),
     interaction: safeStr(value.interaction),
@@ -150,6 +153,7 @@ export function renderGoldenFingerMarkdown(gf: GoldenFingerStructured): string {
 
   if (gf.tagline.trim()) lines.push('## 番茄一句话卖点', gf.tagline, '')
   if (gf.nameAndForm.trim()) lines.push('## 名称与形态', gf.nameAndForm, '')
+  if (gf.coreRules.trim()) lines.push('## 核心规则', gf.coreRules, '')
   if (gf.manifestation.trim()) lines.push('## 呈现形式', gf.manifestation, '')
   if (gf.visibility.trim()) lines.push('## 外人可见性', gf.visibility, '')
   if (gf.interaction.trim()) lines.push('## 交互方式', gf.interaction, '')
@@ -220,6 +224,9 @@ const GOLDEN_FINGER_KEY_MAP: Record<string, string> = {
   名称与形态: 'nameAndForm',
   设定名称: 'nameAndForm',
   能力名称: 'nameAndForm',
+  核心规则: 'coreRules',
+  规则体系: 'coreRules',
+  硬性规则: 'coreRules',
   呈现形式: 'manifestation',
   呈现: 'manifestation',
   外显形态: 'manifestation',
@@ -368,9 +375,27 @@ export function extractGoldenFingerFromAiContent(
   if (!jsonText) return null
   try {
     const parsed = JSON.parse(jsonText) as Record<string, unknown>
-    const withEnglishKeys = normalizeGoldenFingerKeys(parsed)
+    const patchItem = Array.isArray(parsed.settingPatches)
+      ? parsed.settingPatches.find(item =>
+        item
+        && typeof item === 'object'
+        && (item as Record<string, unknown>).slot === 'golden_finger'
+      ) as Record<string, unknown> | undefined
+      : undefined
+    const structuredSource = patchItem?.structuredContent && typeof patchItem.structuredContent === 'object'
+      ? patchItem.structuredContent as Record<string, unknown>
+      : parsed
+    const withEnglishKeys = normalizeGoldenFingerKeys(structuredSource)
     const structured = normalizeGoldenFinger(withEnglishKeys)
-    let markdown = fencedMatch ? trimmed.replace(fencedMatch[0], '').trim() : ''
+    const patchContent = typeof patchItem?.content === 'string' ? patchItem.content.trim() : ''
+    let markdown = patchContent || (fencedMatch ? trimmed.replace(fencedMatch[0], '').trim() : '')
+    if (patchContent) {
+      const contentStructured = parseGoldenFingerFromMarkdown(patchContent)
+      return {
+        markdown: renderGoldenFingerMarkdown(mergeGoldenFinger(contentStructured, structured)),
+        structured: mergeGoldenFinger(contentStructured, structured)
+      }
+    }
     if (!markdown) markdown = renderGoldenFingerMarkdown(structured)
     return { markdown, structured }
   } catch {
@@ -408,6 +433,8 @@ export function parseGoldenFingerFromMarkdown(content: string): GoldenFingerStru
 
     if (title.includes('名称与形态')) {
       gf.nameAndForm = body
+    } else if (title.includes('核心规则') || title.includes('规则体系') || title.includes('硬性规则')) {
+      gf.coreRules = body
     } else if (title.includes('呈现形式') || title.includes('外显形态')) {
       gf.manifestation = body
     } else if (title.includes('外人可见性') || title.includes('可见性')) {
@@ -504,7 +531,13 @@ export function formatGoldenFingerConstraints(gf: GoldenFingerStructured): strin
   }
 
   const lines: string[] = ['【金手指硬性约束】']
+  const fullText = JSON.stringify(gf)
+  const prefersNoNumeric = /无数值|不用算数值|不需要.*数值|禁止.*(?:百分比|进度条|固定数值)|不需要AI记忆任何数据/.test(fullText)
   lines.push(`能力：${gf.nameAndForm}`)
+  if (prefersNoNumeric) {
+    lines.push('表达方式：该金手指明确要求无数值表达；后续分卷/章节/正文禁止新增百分比、进度条、固定冷却时间、精确次数或兑换比例，只能用体感、场景边界、能力阶段和失效表现描述。')
+  }
+  if (gf.coreRules.trim()) lines.push(`核心规则：${gf.coreRules}`)
   lines.push(`呈现形式：${gf.manifestation}`)
   lines.push(`外人可见性：${gf.visibility}`)
   lines.push(`交互方式：${gf.interaction}`)
@@ -513,13 +546,13 @@ export function formatGoldenFingerConstraints(gf: GoldenFingerStructured): strin
   }
   lines.push(`获取/觉醒：${gf.acquisition}`)
   if (gf.sourceNature.trim()) lines.push(`来源性质：${gf.sourceNature}`)
-  lines.push(`限制：冷却=${gf.limit.cooldown || '无'}；消耗=${gf.limit.cost || '无'}；上限=${gf.limit.usageLimit || '无'}；失效场景=${gf.limit.invalidScenes || '无'}`)
+  lines.push(`限制：使用间隔=${gf.limit.cooldown || '无'}；使用代价=${gf.limit.cost || '无'}；上限边界=${gf.limit.usageLimit || '无'}；失效场景=${gf.limit.invalidScenes || '无'}`)
   lines.push(`反噬：${gf.backlash}`)
   lines.push(`信息差：${gf.infoAdvantage}`)
   if (gf.sideEffects.trim()) lines.push(`副作用：${gf.sideEffects}`)
   if (gf.forbiddenScenes.trim()) lines.push(`红线：${gf.forbiddenScenes}`)
   if (gf.exposureConsequence.trim()) lines.push(`暴露后果：${gf.exposureConsequence}`)
-  lines.push(`可视化指标：等级=${gf.visualMetric.currentLevel}；每次消耗=${gf.visualMetric.costPerUse}；冷却=${gf.visualMetric.cooldown}；次数上限=${gf.visualMetric.usageCap}；进度条=${gf.visualMetric.progressBar}；越级后果=${gf.visualMetric.failureScene}`)
+  lines.push(`可视化限制：阶段=${gf.visualMetric.currentLevel}；使用代价=${gf.visualMetric.costPerUse}；使用间隔=${gf.visualMetric.cooldown}；上限边界=${gf.visualMetric.usageCap}；表现方式=${gf.visualMetric.progressBar}；越级/失效后果=${gf.visualMetric.failureScene}`)
   if (gf.upgrades.some(u => u.stage.trim())) {
     lines.push('升级路径：')
     for (const u of gf.upgrades.filter(x => x.stage.trim())) {
@@ -537,6 +570,7 @@ export function goldenFingerStructuredPromptSection(): string {
     '请在 Markdown 分析之后，附加一个 JSON 代码块（标记为 json），字段如下：',
     '{',
     '  "nameAndForm": "能力名称与形态",',
+    '  "coreRules": "核心规则：触发规则、转化规则、消耗规则、污染代价、品类解锁等硬性约束",',
     '  "manifestation": "呈现形式：以什么形式呈现给主角（面板/声音/纹路/空间/物品/纯感知），感官通道，触发方式",',
     '  "visibility": "外人可见性：金手指本身是否可见、使用时是否有外在表现、世界观检测手段能否发现",',
     '  "interaction": "交互方式：主角如何调用金手指、金手指是否有自主意识/人格",',
@@ -576,7 +610,7 @@ export function mergeGoldenFinger(
   const merged = normalizeGoldenFinger(current)
 
   const scalarFields: Array<keyof Omit<GoldenFingerStructured, 'abilities' | 'upgrades' | 'limit' | 'visualMetric'>> = [
-    'nameAndForm', 'manifestation', 'visibility', 'interaction', 'acquisition', 'sourceNature', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'exposureConsequence', 'tagline', 'firstPayoffScene'
+    'nameAndForm', 'coreRules', 'manifestation', 'visibility', 'interaction', 'acquisition', 'sourceNature', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'exposureConsequence', 'tagline', 'firstPayoffScene'
   ]
   for (const key of scalarFields) {
     const value = patch[key]
@@ -611,4 +645,3 @@ export function mergeGoldenFinger(
 
   return merged
 }
-

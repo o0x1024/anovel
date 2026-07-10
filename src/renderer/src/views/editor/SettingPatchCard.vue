@@ -77,8 +77,9 @@ async function applyPatch(item: SettingPatchItem) {
       let merged: GoldenFingerStructured
 
       if (item.structuredContent && typeof item.structuredContent === 'object') {
+        const contentStructured = parseGoldenFingerFromMarkdown(item.content.trim())
         const patchStructured = normalizeGoldenFinger(item.structuredContent as Partial<GoldenFingerStructured>)
-        merged = mergeGoldenFinger(current, patchStructured)
+        merged = mergeGoldenFinger(current, mergeGoldenFinger(contentStructured, patchStructured))
       } else {
         const trimmed = item.content.trim()
         const extracted = extractGoldenFingerFromAiContent(trimmed)

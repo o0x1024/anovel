@@ -1,6 +1,6 @@
 import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, anchorDAO } from '../db'
 import { coreSettingDAO } from '../db'
-import { formatCharacterCardsForChapter } from './character-cards'
+import { formatCharacterCardsForChapter, resolveChapterCharacterNames } from './character-cards'
 import { getPreviousChapterContext } from './chapter-continuity'
 import { MAX_ACTIVE_ANCHORS } from './writing-techniques'
 
@@ -46,6 +46,7 @@ export function buildNarrativeMemorySections(
   options: NarrativeMemoryBuildOptions = {}
 ): NarrativeMemoryResult {
   const { includeChapterOutline = true } = options
+  const isBodyGenerationMemory = !includeChapterOutline
   const empty: NarrativeMemorySections = {
     chapterMeta: '',
     foreshadowing: '',
@@ -59,10 +60,19 @@ export function buildNarrativeMemorySections(
   let snapshotCharacterCount = 0
   let timelineEventCount = 0
   const sections = { ...empty }
+  let chapterText = ''
+  let focusCharacterNames: string[] = []
+  let currentChapterIndex = -1
+  const allChaptersForWork = chapterId ? volumeChapterDAO.listChaptersByWork(workId) : []
 
   if (chapterId) {
     const ch = volumeChapterDAO.getChapter(chapterId)
     if (ch) {
+      chapterText = [ch.title, ch.outline, ch.foreshadow_target, ch.next_hook, ch.characters]
+        .filter(Boolean)
+        .join('\n')
+      focusCharacterNames = resolveChapterCharacterNames(workId, ch)
+      currentChapterIndex = allChaptersForWork.findIndex(row => row.id === chapterId)
       characterCardsText = formatCharacterCardsForChapter(workId)
       const metaParts: string[] = []
       if (characterCardsText) metaParts.push(characterCardsText)
@@ -93,10 +103,28 @@ export function buildNarrativeMemorySections(
 
   const pending = foreshadowingDAO.listPending(workId)
   pendingForeshadowingCount = pending.length
-  if (pending.length > 0) {
+  const focusedPending = isBodyGenerationMemory
+    ? pending.filter(f => {
+        const desc = f.description?.trim() ?? ''
+        const plantLocation = f.plant_location?.trim() ?? ''
+        if (f.status === 'partial' || f.depth === 'deep') return true
+        if (desc && chapterText.includes(desc.slice(0, Math.min(12, desc.length)))) return true
+        if (plantLocation && chapterText.includes(plantLocation.slice(0, Math.min(8, plantLocation.length)))) return true
+        if (f.plant_chapter_id && currentChapterIndex >= 0) {
+          const plantedIndex = allChaptersForWork.findIndex(ch => ch.id === f.plant_chapter_id)
+          const distance = currentChapterIndex - plantedIndex
+          return plantedIndex >= 0 && distance >= 0 && distance <= 3
+        }
+        return false
+      }).slice(0, 12)
+    : pending
+  if (focusedPending.length > 0) {
+    const omitted = pending.length - focusedPending.length
     sections.foreshadowing = [
-      '【待回收伏笔 - 本章应适当推进或回收】',
-      ...pending.map((f, i) => {
+      isBodyGenerationMemory
+        ? `【本章相关待回收伏笔 - 仅在大纲适配时推进或回收${omitted > 0 ? `；另有 ${omitted} 条未注入` : ''}】`
+        : '【待回收伏笔 - 本章应适当推进或回收】',
+      ...focusedPending.map((f, i) => {
         const depth = DEPTH_LABELS[f.depth || 'normal'] || '普通'
         const loc = f.plant_location ? `（埋设于：${f.plant_location}）` : ''
         return `${i + 1}. [${depth}] ${f.description}${loc}`
@@ -105,13 +133,22 @@ export function buildNarrativeMemorySections(
   }
 
   const allSnapshotNames = characterSnapshotDAO.listCharacterNames(workId)
-  const snapshots = allSnapshotNames
+  const allSnapshots = allSnapshotNames
     .map(name => characterSnapshotDAO.getLatest(workId, name))
     .filter((s): s is NonNullable<typeof s> => !!s)
-  snapshotCharacterCount = snapshots.length
+  snapshotCharacterCount = allSnapshots.length
+  const focusSet = new Set(focusCharacterNames)
+  const snapshots = isBodyGenerationMemory && focusSet.size > 0
+    ? allSnapshots.filter(s => focusSet.has(s.character_name))
+    : isBodyGenerationMemory
+      ? allSnapshots.slice(0, 6)
+      : allSnapshots
   if (snapshots.length > 0) {
+    const omitted = allSnapshots.length - snapshots.length
     sections.snapshots = [
-      '【角色当前状态快照 - 出场角色须与此一致】',
+      isBodyGenerationMemory
+        ? `【本章相关角色状态快照 - 出场角色须与此一致${omitted > 0 ? `；另有 ${omitted} 名角色未注入` : ''}】`
+        : '【角色当前状态快照 - 出场角色须与此一致】',
       ...snapshots.map(s => {
         const parts = [
           `角色：${s.character_name}`,

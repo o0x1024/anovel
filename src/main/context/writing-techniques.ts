@@ -12,7 +12,8 @@ export const BODY_CONTINUITY_RULE = [
   '2. 人物言行须与角色快照、人设卡片一致',
   '3. 用场景与动作展示性格，避免直述「性格XX」「十分美丽」',
   '4. 本章只完成大纲任务，不提前写后续章节内容',
-  '5. 环境描写只在场景首次出现时点到为止（1-2句），之后靠角色互动推进；同一章中同一自然意象（雨/风/光线等）不要反复出现超过 3 次'
+  '5. 若大纲含【必须覆盖】，必须逐条写成可见事件；若含【禁止越界】，绝对不得提前兑现其中内容；若含【结尾落点】，正文必须停在该落点附近',
+  '6. 环境描写只在场景首次出现时点到为止（1-2句），之后靠角色互动推进；同一章中同一自然意象（雨/风/光线等）不要反复出现超过 3 次'
 ].join('\n')
 
 export const STYLE_CORE_DIRECTIVE =
@@ -113,22 +114,26 @@ export const VOLUME_CHAPTERS_BATCH_JSON_PROMPT = [
   '【输出格式 - 必须严格遵守】',
   '只输出一个 JSON 对象；禁止 Markdown 章节标题、前置说明、分析过程，以及 ``` 代码块围栏。',
   'chapters 数组每一项代表一章；不要把「卷X章节大纲」「分章情节」「章节结尾钩子」等文档标题当作 title。',
-  '每章字段：title、outline（或 plot_points 数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。',
+  '每章字段：title、entry_state、must_cover、must_not、ending_state、continuity_constraints、outline（或 plot_points 数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。',
+  'entry_state 写本章开始时的位置、人物关系、伤势/资源/情绪等承接状态；ending_state 写本章必须停住的位置。',
+  'must_cover 是正文生成验收清单，写 3-6 条必须发生的事件、冲突、转折、结果；must_not 写禁止提前兑现的后续情节、禁止新增支线或禁止改变的状态。',
   CHAPTER_ABC_OUTLINE_PROMPT,
   '- characters: 从人设卡片或核心设定中选取本章实际出场角色',
   '【长度】outline / plot_points 合计约 300-600 字；禁止写正文级对话与场景描写。',
-  '格式：{"chapters":[{"title":"第1章 雨夜书店","outline":"情节摘要","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}'
+  '格式：{"chapters":[{"title":"第1章 雨夜书店","entry_state":"承接上一章的状态","must_cover":["必须事件1","必须事件2","必须事件3"],"must_not":["不得提前写下一章反转"],"ending_state":"停在危机揭露但未解决","continuity_constraints":"紧接上一章结尾，不复述旧场景","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}'
 ].join('\n')
 
 /** 单章 AI 大纲：仅 JSON */
 export const CHAPTER_OUTLINE_JSON_PROMPT = [
   '为指定章节生成情节大纲（写作指令，不是正文）。',
   '只输出一个 JSON 对象，禁止 Markdown 与代码块外说明。',
-  'plot_points 为 3-5 条情节节点；next_hook 写在 JSON 字段，不要单独作为标题或章节。',
-  '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），本章必须在 plot_points 或 state_constraints 中写清消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
+  '输出 entry_state、must_cover、must_not、ending_state、continuity_constraints，作为正文生成的执行蓝图；plot_points 可选，用于补充情节节点。',
+  'must_cover 为 3-5 条必须覆盖事件；next_hook 写在 JSON 字段，不要单独作为标题或章节。',
+  '若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），本章必须在 must_cover 或 state_constraints 中写清消耗、恢复、冷却/间隔、解锁或状态变化；无相关机制则跳过。',
+  '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
   CHAPTER_ABC_OUTLINE_PROMPT,
-  '【长度】plot_points 合计约 300-600 字。',
-  '格式：{"plot_points":["节点1","节点2"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","state_constraints":"体力从60降至25，章末靠休整恢复到40"}'
+  '【长度】must_cover / plot_points 合计约 300-600 字。',
+  '格式：{"entry_state":"承接状态","must_cover":["必须事件1","必须事件2"],"must_not":["不得提前写后续反转"],"ending_state":"停在未解决危机","continuity_constraints":"紧接上一章结尾","beat_role":"B","foreshadow_target":"...","next_hook":"...","state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}'
 ].join('\n')
 
 /** 章节情节大纲长度与体裁约束（规划层，非正文） */
@@ -137,10 +142,11 @@ export function chapterOutlineLengthRules(wordsPerChapter = 4000): string {
   return [
     '【章节情节大纲体裁 - 必须遵守】',
     '1. 大纲是写作指令，不是正文：只写事件链、冲突、转折，禁止写完整对话/场景描写/心理独白',
-    `2. 每章 plot_points 合计约 ${c.charsMin}-${c.charsMax} 字；超过 ${c.charsWarn} 字视为不合格`,
-    `3. ${c.pointsMin}-${c.pointsMax} 个 plot_points，每点 1-3 句梗概`,
-    '4. 若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），每章必须在 plot_points 或 state_constraints 字段中写清本章约束变化；无相关机制则跳过',
-    '5. beat_role / foreshadow_target / next_hook / state_constraints 仅作为同章 JSON 字段，不得拆成独立「章节」'
+    `2. 每章 must_cover / plot_points 合计约 ${c.charsMin}-${c.charsMax} 字；超过 ${c.charsWarn} 字视为不合格`,
+    `3. ${c.pointsMin}-${c.pointsMax} 个 must_cover，每点 1-3 句梗概，作为正文生成验收清单`,
+    '4. 若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），每章必须在 must_cover / plot_points 或 state_constraints 字段中写清本章约束变化；无相关机制则跳过',
+    '5. 若核心设定明确要求无数值表达，禁止在 state_constraints 中输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述',
+    '6. entry_state / must_cover / must_not / ending_state / continuity_constraints / beat_role / foreshadow_target / next_hook / state_constraints 仅作为同章 JSON 字段，不得拆成独立「章节」'
   ].join('\n')
 }
 
@@ -158,7 +164,7 @@ export const VOLUME_OUTLINE_TARGET_CHARS = { min: 80, max: 300, compactInject: 8
 
 export const VOLUME_OUTLINE_LENGTH_RULES = [
   '【分卷大纲体裁 - 必须遵守】',
-  '1. 每卷 description 仅写核心主题、主冲突、卷末钩子；若作品存在需连续追踪的能力/状态机制，必须写清本卷能力/状态约束与消耗/恢复/升级节奏',
+  '1. 每卷 description 仅写核心主题、主冲突、卷末钩子；若作品存在需连续追踪的能力/状态机制，必须写清本卷能力/状态约束与消耗/恢复/解锁节奏',
   '2. 每卷 description 控制在 80-300 字；超过 400 字视为不合格',
   '3. JSON 中 description 字段须可直接作为写作约束，不要写成市场分析或创作笔记',
   '4. 可额外使用 state_constraints 字段承载能力/状态约束，解析时会并入 description',
@@ -170,9 +176,10 @@ export const VOLUMES_OUTLINE_JSON_PROMPT = [
   '根据作品创作上下文，生成 3-5 卷分卷大纲。',
   '只输出一个 JSON 对象，禁止 Markdown 正文、标题、解释或代码块外的任何文字。',
   'volumes 数组每项为一卷；不要把「分卷大纲」「卷末钩子」「核心冲突」等标签当作 name。',
-  '每卷用 description（80-300 字，含主题/主冲突/卷末钩子；如有能力/状态约束，也必须含本卷消耗/恢复/升级节奏），或 theme + core_conflict + end_hook + state_constraints 字段。',
+  '每卷用 description（80-300 字，含主题/主冲突/卷末钩子；如有能力/状态约束，也必须含本卷消耗/恢复/解锁节奏），或 theme + core_conflict + end_hook + state_constraints 字段。',
+  '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
   VOLUME_OUTLINE_LENGTH_RULES,
-  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；体力从30/100降至濒危后靠安全区休整恢复，卷末钩子…","state_constraints":"体力系统本卷主要体现消耗压力与首次恢复规则"}]}'
+  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；主角多次回收后逐渐乏力，污染刺痒感加重，卷末钩子…","state_constraints":"本卷主要体现回收带来的疲惫积累、污染不适加重与首次新品类解锁"}]}'
 ].join('\n')
 
 export const WRITER_BLOCK_TYPES = {

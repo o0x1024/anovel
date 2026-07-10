@@ -60,7 +60,12 @@ function normalizeVerdict(value: unknown, conclusion: Omit<QualityConclusion, 'v
   return 'review'
 }
 
-const SCORABLE_SECTION_KEYS = new Set(['protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure', 'conflict_engine', 'supporting_cast', 'cards', 'anchors', 'cross'])
+const SCORABLE_SECTION_KEYS = new Set([
+  'protagonist', 'golden_finger', 'pleasure_engine', 'world_pressure',
+  'conflict_engine', 'supporting_cast', 'cards', 'anchors', 'cross',
+  // 短故事整体自检使用的 section keys
+  'conflict', 'characters', 'plot_twists'
+])
 
 function isScorableSectionKey(key: string): boolean {
   return SCORABLE_SECTION_KEYS.has(key)

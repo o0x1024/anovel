@@ -34,11 +34,19 @@ export interface DramaticContract {
   next_question?: string
 }
 
+interface ChapterExecutionBlueprint {
+  entry_state?: string
+  must_cover?: string[]
+  must_not?: string[]
+  ending_state?: string
+  continuity_constraints?: string
+}
+
 /** 文档级标题，不应作为章节条目 */
 const META_CHAPTER_TITLE = /^章节大纲|^分章|^分卷|^情节大纲|^章节列表|^目录|^大纲建议|^创作|^本卷/i
 
 /** 字段标签被误当成章节名 */
-const FIELD_LABEL_TITLE = /^(?:\*{0,2})?(?:章节结尾钩子|章末钩子|结尾钩子|情节节点|爽点链|核心情节|关键冲突|能力\/状态约束|金手指数值|金手指状态|数值状态|beat_role|foreshadow_target|next_hook|state_constraints|golden_finger_state|numeric_state)(?:\*{0,2})?[：:]/i
+const FIELD_LABEL_TITLE = /^(?:\*{0,2})?(?:章节结尾钩子|章末钩子|结尾钩子|情节节点|爽点链|核心情节|关键冲突|开场状态|必须覆盖|禁止越界|结尾落点|连续性约束|能力\/状态约束|金手指数值|金手指状态|数值状态|beat_role|foreshadow_target|next_hook|entry_state|must_cover|must_not|ending_state|continuity_constraints|state_constraints|golden_finger_state|numeric_state)(?:\*{0,2})?[：:]/i
 
 function isVolumeLevelChapterHeader(title: string): boolean {
   const t = title.trim()
@@ -83,10 +91,16 @@ function buildOutlineFromParts(
   outlineRaw: string,
   nextHook?: string | null,
   dramaticContract?: DramaticContract | null,
-  numericState?: string | null
+  numericState?: string | null,
+  blueprint?: ChapterExecutionBlueprint | null
 ): string {
   const parts: string[] = []
+  const blueprintLines = formatExecutionBlueprintLines(blueprint)
+  if (blueprintLines.length > 0) {
+    parts.push(...blueprintLines)
+  }
   if (plotPoints.length > 0) {
+    if (blueprintLines.length > 0) parts.push('【情节节点】')
     parts.push(
       ...plotPoints.map((p, i) => {
         const cleaned = p.replace(/^\d+[.)]\s*/, '').trim()
@@ -110,6 +124,59 @@ function buildOutlineFromParts(
     parts.push(`【能力/状态约束】${state}`)
   }
   return parts.join('\n')
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean)
+  if (typeof value !== 'string') return []
+  const text = value.trim()
+  if (!text) return []
+  return text
+    .split(/\n|；|;/)
+    .map(s => s.replace(/^\s*(?:[-*]|\d+[.)、])\s*/, '').trim())
+    .filter(Boolean)
+}
+
+function firstString(row: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = row[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function normalizeExecutionBlueprint(row: Record<string, unknown>): ChapterExecutionBlueprint | null {
+  const blueprint: ChapterExecutionBlueprint = {
+    entry_state: firstString(row, ['entry_state', 'entryState', 'opening_state', 'openingState', '开场状态']),
+    must_cover: normalizeStringArray(row.must_cover ?? row.mustCover ?? row.required_events ?? row.requiredEvents ?? row.必须覆盖),
+    must_not: normalizeStringArray(row.must_not ?? row.mustNot ?? row.forbidden_events ?? row.forbiddenEvents ?? row.禁止越界),
+    ending_state: firstString(row, ['ending_state', 'endingState', 'end_state', 'endState', '结尾落点']),
+    continuity_constraints: firstString(row, ['continuity_constraints', 'continuityConstraints', 'boundary_constraints', 'boundaryConstraints', '连续性约束'])
+  }
+  return blueprint.entry_state ||
+    blueprint.must_cover?.length ||
+    blueprint.must_not?.length ||
+    blueprint.ending_state ||
+    blueprint.continuity_constraints
+    ? blueprint
+    : null
+}
+
+function formatExecutionBlueprintLines(blueprint?: ChapterExecutionBlueprint | null): string[] {
+  if (!blueprint) return []
+  const lines: string[] = []
+  if (blueprint.entry_state?.trim()) lines.push(`【开场状态】${blueprint.entry_state.trim()}`)
+  if (blueprint.must_cover?.length) {
+    lines.push('【必须覆盖】')
+    lines.push(...blueprint.must_cover.map((item, i) => `${i + 1}. ${item}`))
+  }
+  if (blueprint.must_not?.length) {
+    lines.push('【禁止越界】')
+    lines.push(...blueprint.must_not.map((item, i) => `${i + 1}. ${item}`))
+  }
+  if (blueprint.ending_state?.trim()) lines.push(`【结尾落点】${blueprint.ending_state.trim()}`)
+  if (blueprint.continuity_constraints?.trim()) lines.push(`【连续性约束】${blueprint.continuity_constraints.trim()}`)
+  return lines
 }
 
 function normalizeDramaticContract(value: unknown): DramaticContract | null {
@@ -216,7 +283,8 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     row.dramatic_contract ?? row.dramaticContract ?? row.scene_contract ?? row.sceneContract
   )
   const numericState = extractNumericState(row)
-  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState)
+  const blueprint = normalizeExecutionBlueprint(row)
+  const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState, blueprint)
 
   if (isPlaceholderOutline(outline)) return null
 
@@ -270,7 +338,14 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
     const dramaticContract = normalizeDramaticContract(
       parsed.dramatic_contract ?? parsed.dramaticContract ?? parsed.scene_contract ?? parsed.sceneContract
     )
-    const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, extractNumericState(parsed))
+    const outline = buildOutlineFromParts(
+      plotPoints,
+      outlineRaw,
+      nextHook,
+      dramaticContract,
+      extractNumericState(parsed),
+      normalizeExecutionBlueprint(parsed)
+    )
     if (isPlaceholderOutline(outline)) return null
 
     return {

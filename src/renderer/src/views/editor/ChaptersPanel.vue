@@ -155,13 +155,16 @@ const batchSystemPrompt = computed(() => {
       '【输出格式 - 必须严格遵守】',
       '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
       'chapters 数组每一项为一个节拍（请勿输出“第X章”或“节拍X”字样，直接写节拍剧情标题即可）。',
-      `每拍字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本拍出场角色名数组）；如有能力/状态约束，可加 state_constraints。`,
+      `每拍字段：title、entry_state、must_cover（${oc.pointsMin}-${oc.pointsMax} 条必须覆盖事件数组）、must_not（禁止提前写/越界内容数组）、ending_state、continuity_constraints、plot_points（可选，补充情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本拍出场角色名数组）；如有能力/状态约束，可加 state_constraints。`,
       'beat_role: A(爽点释放)/B(进行中)/C(铺垫)/transition(过渡)',
       'foreshadow_target: 铺垫的下一节点；next_hook: 结尾悬念（仅写在 JSON 字段内，不要单独成拍）。',
       'characters: 从人设卡片或核心设定中选取本节拍实际出场角色。',
-      '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），每拍必须在 plot_points 或 state_constraints 中写清消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
-      `【长度】每项 plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每节拍目标 ${wpc} 字正文），禁止正文级长文。`,
-      `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"体力从60降至25，章末靠休整恢复到40"}]}`
+      'entry_state 写清本拍开始时人物位置、关系、伤势/资源/情绪等承接状态；ending_state 写清本拍必须停住的位置，禁止把下一拍事件写完。',
+      'must_cover 是正文生成验收清单，必须具体到事件、冲突、转折、结果；must_not 写本拍禁止提前兑现的后续情节、禁止新增的支线或禁止改变的状态。',
+      '若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），每拍必须在 must_cover 或 state_constraints 中写清消耗、恢复、冷却/间隔、解锁或状态变化；无相关机制则跳过。',
+      '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
+      `【长度】每项 must_cover / plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每节拍目标 ${wpc} 字正文），禁止正文级长文。`,
+      `格式：{"chapters":[{"title":"节拍剧情标题","entry_state":"承接上一拍的状态","must_cover":["必须事件1","必须事件2","必须事件3"],"must_not":["不得提前写下一拍反转"],"ending_state":"停在新危机揭露但未解决","continuity_constraints":"紧接上一拍结尾，不复述旧场景","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}]}`
     ].join('\n')
   }
 
@@ -170,14 +173,17 @@ const batchSystemPrompt = computed(() => {
     '【输出格式 - 必须严格遵守】',
     '只输出一个 JSON 对象；禁止 Markdown 章节标题、前置说明、思考过程，以及 ``` 代码块围栏。',
     'chapters 数组每一项为一章；不要把「卷X章节大纲」「分章情节」「章节结尾钩子」等文档标题当作 title。',
-    `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）；如有能力/状态约束，可加 state_constraints。`,
+    `每章字段：title、entry_state、must_cover（${oc.pointsMin}-${oc.pointsMax} 条必须覆盖事件数组）、must_not（禁止提前写/越界内容数组）、ending_state、continuity_constraints、plot_points（可选，补充情节节点数组）、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）；如有能力/状态约束，可加 state_constraints。`,
     'beat_role: A(爽点释放)/B(进行中)/C(铺垫)/transition(过渡)',
     'foreshadow_target: 本章铺垫的下一节点；next_hook: 章末钩子（仅写在 JSON 字段内，不要单独成章）。',
     'characters: 从人设卡片或核心设定中选取本章实际出场角色。',
-    '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），每章必须在 plot_points 或 state_constraints 中写清消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
-    `【长度】每章 plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每章目标 ${wpc} 字正文），禁止正文级长文。`,
+    'entry_state 写清本章开始时人物位置、关系、伤势/资源/情绪等承接状态；ending_state 写清本章必须停住的位置，禁止把下一章事件写完。',
+    'must_cover 是正文生成验收清单，必须具体到事件、冲突、转折、结果；must_not 写本章禁止提前兑现的后续情节、禁止新增的支线或禁止改变的状态。',
+    '若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），每章必须在 must_cover 或 state_constraints 中写清消耗、恢复、冷却/间隔、解锁或状态变化；无相关机制则跳过。',
+    '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
+    `【长度】每章 must_cover / plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每章目标 ${wpc} 字正文），禁止正文级长文。`,
     `【章节编号】title 中的章节序号必须从第 ${startNum} 章开始，依次递增。`,
-    `格式：{"chapters":[{"title":"第${startNum}章 标题","plot_points":["节点1","节点2","节点3"],"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"体力从60降至25，章末靠休整恢复到40"}]}`
+    `格式：{"chapters":[{"title":"第${startNum}章 标题","entry_state":"承接上一章的状态","must_cover":["必须事件1","必须事件2","必须事件3"],"must_not":["不得提前写下一章反转"],"ending_state":"停在新危机揭露但未解决","continuity_constraints":"紧接上一章结尾，不复述旧场景","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}]}`
   ].join('\n')
 })
 
@@ -194,25 +200,46 @@ function outlineLengthLabel(ch: Chapter): string {
   return n > warnThreshold ? `大纲 ${n} 字（偏长）` : `大纲 ${n} 字`
 }
 
-function extractNumericConstraintLines(outline: string | null | undefined): string[] {
+function extractStateConstraintLines(outline: string | null | undefined): string[] {
   const text = outline?.trim()
   if (!text) return []
-  return text
+  const seen = new Set<string>()
+  const lines = text
     .split('\n')
     .map(line => line.trim())
     .filter(line =>
       line &&
-      /【(?:能力\/状态约束|金手指数值|金手指状态|数值状态)】|state_constraints|golden_finger_state|numeric_state|体力|冷却|次数上限|每次消耗|消耗|升级进度|进度条|恢复(?:到|至|为)|回复(?:到|至|为)/.test(line)
+      /^(?:[-*]\s*)?(?:【(?:能力\/状态约束|金手指数值|金手指状态|数值状态)】|(?:state_constraints|ability_state_constraints|golden_finger_state|numeric_state)\s*[：:])/.test(line)
     )
+  return lines.filter(line => {
+    const key = line.replace(/\s+/g, '')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function dedupeOutlineLines(outline: string): string {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const line of outline.trim().split('\n')) {
+    const trimmed = line.trim()
+    const key = trimmed.replace(/\s+/g, '')
+    if (trimmed && seen.has(key)) continue
+    if (trimmed) seen.add(key)
+    result.push(line)
+  }
+  return result.join('\n').trim()
 }
 
 function preserveNumericConstraints(currentOutline: string | null | undefined, revisedOutline: string): string {
-  const currentLines = extractNumericConstraintLines(currentOutline)
-  if (!currentLines.length) return revisedOutline
-  const next = revisedOutline.trim()
-  const missing = currentLines.filter(line => !next.includes(line))
-  if (!missing.length) return revisedOutline
-  return [next, ...missing].filter(Boolean).join('\n')
+  const next = dedupeOutlineLines(revisedOutline)
+  const nextLines = extractStateConstraintLines(next)
+  if (nextLines.length) return next
+
+  const currentLines = extractStateConstraintLines(currentOutline)
+  if (!currentLines.length) return next
+  return [next, ...currentLines].filter(Boolean).join('\n')
 }
 
 function parseCharacterNames(raw: string | null | undefined): string[] {
@@ -667,18 +694,22 @@ async function aiChapterOutline(ch: Chapter) {
   const outlineSystem = workType.value === 'story' ? [
     '为以上短故事节拍生成情节大纲（写作指令，不是正文）。',
     '短故事要求：剧情极度紧凑、节奏极快，必须包含强烈的矛盾冲突或情绪拉扯。禁止流水账式的平铺直叙。',
-    `${oc.pointsMin}-${oc.pointsMax} 个情节节点，每节点 1-2 句：出场人物、关键冲突、转折、极限悬念钩子。`,
+    `输出 entry_state、must_cover（${oc.pointsMin}-${oc.pointsMax} 条）、must_not、ending_state、continuity_constraints，作为正文生成的执行蓝图；可额外给 plot_points 补充情节节点。`,
+    'must_cover 必须具体到出场人物、关键冲突、转折、极限悬念钩子；must_not 必须写清不得提前兑现的后续情节。',
     `全文 ${oc.charsMin}-${oc.charsMax} 字（本节拍目标 ${wpc} 字正文），禁止写完整对话、场景描写或心理独白。`,
-    '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），正文大纲或末尾 JSON 必须写清本节拍消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
+    '若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），must_cover 或末尾 JSON 必须写清本节拍消耗、恢复、冷却/间隔、解锁或状态变化；无相关机制则跳过。',
+    '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
     '标注 beat_role(A/B/C/transition)、foreshadow_target、next_hook、characters（本章出场角色名数组）、state_constraints（有能力/状态约束时填写），放在末尾 JSON 代码块。',
-    '末尾附 JSON：{"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"体力从60降至25，章末靠休整恢复到40"}'
+    '末尾附 JSON：{"entry_state":"承接状态","must_cover":["必须事件1","必须事件2"],"must_not":["不得提前写后续反转"],"ending_state":"停在未解决危机","continuity_constraints":"紧接上一拍结尾","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}'
   ].join('\n') : [
     '为以上章节生成情节大纲（写作指令，不是正文）。',
-    `${oc.pointsMin}-${oc.pointsMax} 个情节节点，每节点 1-2 句：出场人物、关键冲突、转折、章末钩子。`,
+    `输出 entry_state、must_cover（${oc.pointsMin}-${oc.pointsMax} 条）、must_not、ending_state、continuity_constraints，作为正文生成的执行蓝图；可额外给 plot_points 补充情节节点。`,
+    'must_cover 必须具体到出场人物、关键冲突、转折、章末钩子；must_not 必须写清不得提前兑现的后续章节内容。',
     `全文 ${oc.charsMin}-${oc.charsMax} 字（本章目标 ${wpc} 字正文），禁止写完整对话、场景描写或心理独白。`,
-    '若作品存在需连续追踪的能力/状态机制（如体力、冷却、次数、等级、进度条、伤势、资源、声望等），正文大纲或末尾 JSON 必须写清本章消耗、恢复、冷却、升级或状态变化；无相关机制则跳过。',
+    '若作品存在需连续追踪的能力/状态机制（如疲惫程度、污染不适、使用间隔、能力阶段、伤势、资源压力、声望处境等），must_cover 或末尾 JSON 必须写清本章消耗、恢复、冷却/间隔、解锁或状态变化；无相关机制则跳过。',
+    '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
     '标注 beat_role(A/B/C/transition)、foreshadow_target、next_hook、characters（本章出场角色名数组）、state_constraints（有能力/状态约束时填写），放在末尾 JSON 代码块。',
-    '末尾附 JSON：{"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"体力从60降至25，章末靠休整恢复到40"}'
+    '末尾附 JSON：{"entry_state":"承接状态","must_cover":["必须事件1","必须事件2"],"must_not":["不得提前写后续反转"],"ending_state":"停在未解决危机","continuity_constraints":"紧接上一章结尾","beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"],"state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}'
   ].join('\n')
   const res = await chat(context, outlineSystem, 'chapter_outline', {
     chapterId: ch.id,
@@ -717,6 +748,7 @@ const applyingAiFixId = ref(false)
 const autoDiagnosisFixLoading = ref(false)
 const diagnosisScope = ref<'volume' | 'cross' | 'all'>('volume')
 const savedDiagnoses = ref<Record<string, string>>({})
+const AUTO_DIAGNOSIS_FIX_MAX_ROUNDS = 8
 
 const currentDiagnosisKey = computed(() => {
   if (diagnosisScope.value === 'volume') return `diagnosis_vol_${selectedVolume.value}`
@@ -983,6 +1015,9 @@ async function runOutlineDiagnosis(options: { silent?: boolean } = {}) {
       '7. 禁止输出“可更强”“可更细”“建议增强”“略显平淡”这类精修建议；除非能证明它会导致正文无法展开、逻辑断裂、设定冲突或追读钩子断裂。',
       '8. 若原章节大纲包含「【能力/状态约束】」「数值状态」或体力/冷却/消耗/恢复/升级进度等约束，修复后的 outline 必须原样保留或等价更新，禁止因精简而删除。',
       '9. 能力/状态约束缺失只有在同时满足三项时才算问题：作品上下文/分卷说明/相邻章节已明确建立该机制；本章实际涉及使用、消耗、恢复、升级、伤势或资源变化；缺失会造成后续正文生成的连续性风险。否则不得报告。',
+      '9a. 若核心设定明确要求无数值表达（如“不用算数值”“无数值”“禁止百分比/进度条”），修复后的「【能力/状态约束】」必须改为体感、场景边界和阶段性描述，禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数。',
+      '10. 执行蓝图完整性只在会影响正文生成时才算问题：如果章节大纲缺少「【开场状态】」「【必须覆盖】」「【禁止越界】」「【结尾落点】」「【连续性约束】」中的关键项，且会导致正文无法判断开头承接、必写事件、禁止提前写或结尾停点，才输出 issue 与补丁。',
+      '11. 修复执行蓝图时，outline 必须是完整可替换文本：保留原有核心情节与约束，补齐「【开场状态】」「【必须覆盖】」「【禁止越界】」「【结尾落点】」「【连续性约束】」；不得只追加批注，不得删除已有章末钩子与能力/状态约束。',
       '【诊断维度】',
       '1. 逻辑与设定合理性：因果、时间线、能力边界、世界观规则是否自洽。',
       '2. 期待感与目标拉扯：主角目标、阻力、延迟满足、爽点承诺是否连续。',
@@ -991,7 +1026,8 @@ async function runOutlineDiagnosis(options: { silent?: boolean } = {}) {
       '5. 情节密度与节奏：是否连续过渡、注水、重复信息，是否缺少推进。',
       '6. 连续性与跨卷衔接：伏笔、铺垫、前后卷承接是否断裂或冲突。',
       '7. 主线设定对齐：各章节情节是否与「主线设定」中的故事轨迹、关键转折点、阶段递进逻辑一致？是否存在偏离主线骨架的自由发挥或游离于主线之外的冗余支线？',
-      '8. 能力/状态约束覆盖：仅当作品已明确建立需连续追踪的状态机制，且本章发生相关变化时，才检查是否写明「【能力/状态约束】」；无相关机制或本章无变化时跳过。'
+      '8. 能力/状态约束覆盖：仅当作品已明确建立需连续追踪的状态机制，且本章发生相关变化时，才检查是否写明「【能力/状态约束】」；无相关机制或本章无变化时跳过。',
+      '9. 正文执行蓝图：检查是否有足够明确的开场承接、必须覆盖事件、禁止越界事项、结尾落点与连续性约束；缺失会造成正文跑偏时，自动补成可执行蓝图。'
     ].join('\n')
 
     const res = await chat(promptContext, systemPrompt, 'chapter_outline_diagnose', {
@@ -1108,32 +1144,45 @@ async function applyAiFixes(
 async function runOutlineDiagnosisAndAutoFix() {
   if (!selectedVolume.value || chapters.value.length === 0 || autoDiagnosisFixLoading.value) return
   const noun = unitNoun.value
-  if (!confirm(`将自动运行${unitLabels.value.outline}诊断，并把 AI 返回的所有可应用修复直接写入对应${noun}大纲。旧内容会自动备份到版本历史。确定继续？`)) return
+  if (!confirm(`将循环运行${unitLabels.value.outline}诊断，并把 AI 返回的所有可应用修复直接写入对应${noun}大纲。每轮修复后会重新诊断，直到没有需要修复的问题，或达到 ${AUTO_DIAGNOSIS_FIX_MAX_ROUNDS} 轮安全上限。旧内容会自动备份到版本历史。确定继续？`)) return
 
   autoDiagnosisFixLoading.value = true
   try {
-    const parsed = await runOutlineDiagnosis({ silent: true })
-    if (!parsed) {
-      alert('自动诊断失败：AI 未返回有效诊断结果。')
-      return
-    }
+    let totalFixed = 0
+    let totalSkipped = 0
 
-    const patches = parsed.revised_chapters ?? []
-    if (!patches.length) {
-      if (parsed.issues.length > 0) {
-        alert(`诊断发现 ${parsed.issues.length} 个问题，但 AI 未返回可自动应用的修复补丁，请查看诊断结果后手动处理。`)
-      } else {
-        alert(`${unitLabels.value.outline}诊断通过：未发现需要自动修复的问题。`)
+    for (let round = 1; round <= AUTO_DIAGNOSIS_FIX_MAX_ROUNDS; round++) {
+      const parsed = await runOutlineDiagnosis({ silent: true })
+      if (!parsed) {
+        alert(`自动诊断失败：第 ${round} 轮 AI 未返回有效诊断结果。已修复 ${totalFixed} 个${noun}大纲。`)
+        return
       }
-      return
+
+      const patches = parsed.revised_chapters ?? []
+      if (!patches.length) {
+        if (parsed.issues.length > 0) {
+          alert(`自动诊断已停止：第 ${round} 轮仍发现 ${parsed.issues.length} 个问题，但 AI 未返回可自动应用的修复补丁。已修复 ${totalFixed} 个${noun}大纲，请查看诊断结果后手动处理。`)
+        } else {
+          alert(`${unitLabels.value.outline}诊断通过：共运行 ${round} 轮，已修复 ${totalFixed} 个${noun}大纲。${totalSkipped ? `跳过 ${totalSkipped} 个无效补丁。` : ''}`)
+        }
+        return
+      }
+
+      const applied = await applyAiFixes(patches, { skipConfirm: true, silent: true })
+      if (!applied) {
+        alert(`自动修复失败：第 ${round} 轮未能应用 AI 返回的补丁。已修复 ${totalFixed} 个${noun}大纲。`)
+        return
+      }
+
+      totalFixed += applied.successCount
+      totalSkipped += applied.skippedCount
+      if (applied.successCount === 0) {
+        alert(`自动诊断已停止：第 ${round} 轮 AI 返回了补丁，但没有任何补丁成功应用。已跳过 ${totalSkipped} 个无效补丁，请查看诊断结果后手动处理。`)
+        return
+      }
     }
 
-    const applied = await applyAiFixes(patches, { skipConfirm: true, silent: true })
-    if (!applied) {
-      alert('自动修复失败：未能应用 AI 返回的补丁。')
-      return
-    }
-    alert(`自动诊断并修复完成：已修复 ${applied.successCount} 个${noun}大纲。${applied.skippedCount ? `跳过 ${applied.skippedCount} 个无效补丁。` : ''}`)
+    alert(`自动诊断已达到 ${AUTO_DIAGNOSIS_FIX_MAX_ROUNDS} 轮安全上限：已修复 ${totalFixed} 个${noun}大纲。请再次运行诊断确认是否仍有残留问题。${totalSkipped ? `跳过 ${totalSkipped} 个无效补丁。` : ''}`)
   } finally {
     autoDiagnosisFixLoading.value = false
   }

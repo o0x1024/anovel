@@ -13,12 +13,17 @@ import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { volumeChapterDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
-import { parseStoryQualityAiScoreBreakdown } from '../../../shared/story-quality-score'
+import {
+  parseStoryQualityAiScoreBreakdown,
+  type StoryQualityAiScoreItem,
+  type StoryQualityAiMetricKey
+} from '../../../shared/story-quality-score'
 import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
 import { bodyWordCountBounds, isTotalWordCountInTargetRange } from '../../../shared/body-word-target'
 import { storyGoalModelOpts } from './story-goal-model'
 import { formatPreviewAnchorReport } from '../../../shared/story-preview-anchor'
 import { buildStoryMergedText } from '../../../shared/work-terminology'
+import { assessWholeStory, type StoryWeakestLayer } from './story-whole-evaluator'
 
 export interface StoryGoalConfig {
   /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
@@ -31,6 +36,8 @@ export interface StoryGoalConfig {
   qualityMin: number
   /** 正文生成后是否立即运行 AI 诊断与修复（关闭则直接进入下一节拍） */
   diagnoseBodyAfterGeneration: boolean
+  /** 书名导语盲评后是否暂停，由作者从候选中确认 */
+  humanReviewTitleHook: boolean
   /** 门禁：每章 runConsistencyGate 通过（无 blockers） */
   checkConsistencyGate: boolean
   /** 去AI：anti-AI 规则零违规 */
@@ -39,6 +46,10 @@ export interface StoryGoalConfig {
   maxTurns: number
   /** 语义验收：用户创作目标匹配度下限（0=不卡） */
   goalMatchMin: number
+  /** 短故事整篇结构与兑现质量下限（0=不卡） */
+  overallStoryMin: number
+  /** 试读边界的阶段兑现与追读动力下限（0=不卡） */
+  previewHookMin: number
   /** 试读比例（0-1），目标循环验收时据此计算试读卡点报告 */
   previewRatio: number
   /** 小说目标循环：是否走大岗孵化器三阶段（incubate/gate/freeze），默认 false */
@@ -55,10 +66,13 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   targetTotalWords: null,
   qualityMin: 85,
   diagnoseBodyAfterGeneration: true,
+  humanReviewTitleHook: true,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
   goalMatchMin: 85,
+  overallStoryMin: 80,
+  previewHookMin: 75,
   previewRatio: 0.3,
   incubatorEnabled: false
 }
@@ -80,9 +94,38 @@ export interface GoalCheckResult {
   antiAiViolations: number
   goalMatchScore: number
   goalMatchReason: string
+  overallStoryScore: number
+  overallStoryReason: string
+  previewHookScore: number
+  previewHookReason: string
+  weakestLayer: StoryWeakestLayer
+  weakChapterTitles: string[]
+  storyIssues: string[]
   previewReport: string | null
   chapterDiagnostics: GoalChapterDiagnostic[]
   reasons: string[]
+}
+
+const STORY_CRITICAL_METRICS = new Set<StoryQualityAiMetricKey>([
+  'hook_density',
+  'dramatic_causality',
+  'state_change',
+  'outline_coverage',
+  'setting_consistency'
+])
+
+/**
+ * 单项分只拦截真正的承重维度，且使用低于总分线的硬伤门槛。
+ * 避免要求 13 项全部达到同一高分，导致模型对评分表过拟合。
+ */
+export function failedCriticalStoryMetrics(
+  items: StoryQualityAiScoreItem[],
+  qualityMin: number
+): string[] {
+  const criticalFloor = Math.max(60, qualityMin - 15)
+  return items
+    .filter(item => STORY_CRITICAL_METRICS.has(item.key) && item.score < criticalFloor)
+    .map(item => `${item.label}:${item.score}`)
 }
 
 export interface GoalChapterDiagnostic {
@@ -221,9 +264,18 @@ export async function checkStoryGoal(
 
           const breakdown = res.report ? parseBreakdown(res.report) : null
           if (breakdown) {
-            for (const item of breakdown.items) {
-              if (item.score < config.qualityMin) {
-                allMetricFailures.push(`${ch.title}/${item.label}:${item.score}`)
+            if (isStory) {
+              for (const failed of failedCriticalStoryMetrics(
+                breakdown.items as StoryQualityAiScoreItem[],
+                config.qualityMin
+              )) {
+                allMetricFailures.push(`${ch.title}/${failed}`)
+              }
+            } else {
+              for (const item of breakdown.items) {
+                if (item.score < config.qualityMin) {
+                  allMetricFailures.push(`${ch.title}/${item.label}:${item.score}`)
+                }
               }
             }
           }
@@ -235,7 +287,7 @@ export async function checkStoryGoal(
         if (qualityHardFail) {
           reasons.push('存在硬失败章节（质量门禁致命项）')
         } else if (allMetricFailures.length > 0) {
-          reasons.push(`质量单项未达标（下限${config.qualityMin}）：${allMetricFailures.join('、')}`)
+          reasons.push(`质量承重项存在硬伤：${allMetricFailures.join('、')}`)
         } else if (qualityScore < config.qualityMin) {
           reasons.push(`质量分 ${qualityScore} 低于下限 ${config.qualityMin}`)
         }
@@ -276,7 +328,43 @@ export async function checkStoryGoal(
 
   let goalMatchScore = config.goalDescription.trim() ? 0 : 100
   let goalMatchReason = ''
-  if (config.goalMatchMin > 0 && config.goalDescription.trim() && content > 0 && content === total) {
+  let overallStoryScore = isStory ? 0 : 100
+  let overallStoryReason = ''
+  let previewHookScore = isStory ? 0 : 100
+  let previewHookReason = ''
+  let weakestLayer: StoryWeakestLayer = 'scene'
+  let weakChapterTitles: string[] = []
+  let storyIssues: string[] = []
+
+  if (isStory && content > 0 && content === total
+    && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0)) {
+    try {
+      const assessment = await assessWholeStory(workId, config, signal)
+      goalMatchScore = assessment.goalMatchScore
+      goalMatchReason = assessment.goalMatchReason
+      overallStoryScore = assessment.overallStoryScore
+      overallStoryReason = assessment.overallStoryReason
+      previewHookScore = assessment.previewHookScore
+      previewHookReason = assessment.previewHookReason
+      weakestLayer = assessment.weakestLayer
+      weakChapterTitles = assessment.weakChapterTitles
+      storyIssues = assessment.issues
+
+      if (config.goalMatchMin > 0 && config.goalDescription.trim() && goalMatchScore < config.goalMatchMin) {
+        reasons.push(`创作目标匹配度 ${goalMatchScore} 低于下限 ${config.goalMatchMin}：${goalMatchReason}`)
+      }
+      if (config.overallStoryMin > 0 && overallStoryScore < config.overallStoryMin) {
+        reasons.push(`整篇结构与兑现 ${overallStoryScore} 低于下限 ${config.overallStoryMin}：${overallStoryReason}`)
+      }
+      if (config.previewHookMin > 0 && previewHookScore < config.previewHookMin) {
+        reasons.push(`试读追读力 ${previewHookScore} 低于下限 ${config.previewHookMin}：${previewHookReason}`)
+      }
+    } catch (e) {
+      if (signal?.aborted) throw e
+      storyIssues = [e instanceof Error ? e.message : String(e)]
+      reasons.push(`整篇终审失败：${storyIssues[0]}`)
+    }
+  } else if (!isStory && config.goalMatchMin > 0 && config.goalDescription.trim() && content > 0 && content === total) {
     try {
       const match = await assessGoalMatch(workId, config.goalDescription, fullBody, config, signal)
       goalMatchScore = match.score
@@ -297,7 +385,16 @@ export async function checkStoryGoal(
     const work = workDAO.getById(workId)
     const mergedText = buildStoryMergedText(work?.description ?? '', chapters.map(c => ({ content: c.content ?? '' })))
     if (mergedText.trim()) {
-      previewReport = formatPreviewAnchorReport(mergedText, config.previewRatio)
+      const anchorReport = formatPreviewAnchorReport(mergedText, config.previewRatio)
+      previewReport = isStory
+        ? [
+            `语义追读力：${previewHookScore}/100`,
+            previewHookReason ? `终审理由：${previewHookReason}` : '',
+            '',
+            '以下关键词候选仅用于定位切点，不参与质量通过判定：',
+            anchorReport
+          ].filter(line => line !== '').join('\n')
+        : anchorReport
     }
   }
 
@@ -315,6 +412,13 @@ export async function checkStoryGoal(
     antiAiViolations,
     goalMatchScore,
     goalMatchReason,
+    overallStoryScore,
+    overallStoryReason,
+    previewHookScore,
+    previewHookReason,
+    weakestLayer,
+    weakChapterTitles,
+    storyIssues,
     previewReport,
     chapterDiagnostics,
     reasons

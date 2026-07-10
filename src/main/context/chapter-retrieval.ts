@@ -10,13 +10,13 @@ export interface RetrievedChapter {
 }
 
 /**
- * 按伏笔关联、角色名、大纲关键词检索历史章节全文（不含上一章，上一章单独注入）
+ * 按伏笔关联、角色名、大纲关键词检索历史章节摘录（不含上一章，上一章单独注入）
  */
 export function retrieveRelevantChapters(
   workId: number,
   chapterId: number,
   outlineText: string,
-  limit = 5
+  limit = 2
 ): RetrievedChapter[] {
   const all = volumeChapterDAO.listChaptersByWork(workId)
   const idx = all.findIndex(c => c.id === chapterId)
@@ -75,7 +75,7 @@ export function retrieveRelevantChapters(
         chapterId: ch.id,
         chapterTitle: ch.title,
         volumeName: ch.volume_name,
-        content,
+        content: buildRelevantExcerpt(content, keywords, pending.map(f => f.description)),
         reason: [...new Set(reasons)].slice(0, 3).join('；') || '相关',
         score
       })
@@ -90,7 +90,7 @@ export function retrieveRelevantChapters(
 export function formatRetrievedChapters(chapters: RetrievedChapter[]): string {
   if (chapters.length === 0) return ''
   return [
-    '【相关历史章节全文 - 仅供逻辑参照，禁止重复叙述】',
+    '【相关历史章节摘录 - 仅供逻辑参照，禁止重复叙述或照搬旧章】',
     ...chapters.map(c => [
       `--- ${c.volumeName} · ${c.chapterTitle}（关联：${c.reason}）---`,
       c.content
@@ -111,4 +111,32 @@ function extractKeywords(text: string): string[] {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 8)
     .map(([w]) => w)
+}
+
+function buildRelevantExcerpt(content: string, keywords: string[], foreshadowingDescriptions: string[]): string {
+  const needles = [
+    ...keywords,
+    ...foreshadowingDescriptions
+      .map(desc => desc.trim().slice(0, 12))
+      .filter(Boolean)
+  ].filter(Boolean)
+
+  const spans: string[] = []
+  for (const needle of needles) {
+    const idx = content.indexOf(needle)
+    if (idx < 0) continue
+    const start = Math.max(0, idx - 280)
+    const end = Math.min(content.length, idx + needle.length + 420)
+    const snippet = content.slice(start, end).trim()
+    if (snippet && !spans.some(existing => existing.includes(snippet.slice(0, 30)))) {
+      spans.push(`${start > 0 ? '…' : ''}${snippet}${end < content.length ? '…' : ''}`)
+    }
+    if (spans.length >= 2) break
+  }
+
+  if (spans.length > 0) return spans.join('\n\n')
+
+  const head = content.slice(0, 420).trim()
+  const tail = content.length > 900 ? content.slice(-420).trim() : ''
+  return tail ? `${head}\n\n…\n\n${tail}` : head
 }

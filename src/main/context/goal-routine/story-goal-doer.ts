@@ -11,7 +11,12 @@ import { volumeChapterDAO, foreshadowingDAO, workDAO, incubatorDraftSlotDAO } fr
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
 import { formatBodyPromptLines } from '../../../shared/work-terminology'
-import { STORY_BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_OPENING_EXTRA, extractEmotionIntensity } from '../../../shared/body-generation-prompt'
+import {
+  BODY_GENERATION_SYSTEM,
+  STORY_BODY_GENERATION_SYSTEM,
+  STORY_BODY_GENERATION_OPENING_EXTRA,
+  extractEmotionIntensity
+} from '../../../shared/body-generation-prompt'
 import { humanizeText } from '../humanize-text'
 import { loadWritingPlan } from '../writing-plan'
 import {
@@ -70,7 +75,7 @@ function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
     const parsed = JSON.parse(outlineDiagnosis) as { dramatic_contract?: Record<string, unknown> }
     const contract = parsed.dramatic_contract
     if (!contract || typeof contract !== 'object') return ''
-    const rows: Array<[string, string]> = [
+    const rows = ([
       ['读者承诺', String(contract.scene_promise ?? '').trim()],
       ['主角目标', String(contract.protagonist_want ?? '').trim()],
       ['阻力', String(contract.obstacle ?? '').trim()],
@@ -81,7 +86,7 @@ function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
       ['不可逆变化', String(contract.irreversible_change ?? '').trim()],
       ['兑现/欠账', String(contract.payoff_or_debt ?? '').trim()],
       ['结尾问题', String(contract.next_question ?? '').trim()]
-    ].filter(([, value]) => value)
+    ] as Array<[string, string]>).filter(([, value]) => Boolean(value))
     if (rows.length === 0) return ''
     return [
       '【本拍戏剧契约 - 必须执行】',
@@ -154,9 +159,10 @@ export async function generateBeatBody(
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
   const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
+  const baseSystemPrompt = workType === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM
   const systemPrompt = firstBeat
-    ? STORY_BODY_GENERATION_SYSTEM + STORY_BODY_GENERATION_OPENING_EXTRA
-    : STORY_BODY_GENERATION_SYSTEM
+    ? baseSystemPrompt + STORY_BODY_GENERATION_OPENING_EXTRA
+    : baseSystemPrompt
 
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -236,7 +242,7 @@ export async function generateBeatBody(
   return { success: true, content, wordCount, memoryExtracted }
 }
 
-async function extractNarrativeMemoryAfterGeneration(
+export async function extractNarrativeMemoryAfterGeneration(
   workId: number,
   chapterId: number,
   content: string,

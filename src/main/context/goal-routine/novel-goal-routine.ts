@@ -41,7 +41,7 @@ import {
   type StoryGoalConfig,
   type GoalCheckResult
 } from './story-goal-checker'
-import { generateBeatBody, type BeatGenResult } from './story-goal-doer'
+import { generateBeatBody, extractNarrativeMemoryAfterGeneration, type BeatGenResult } from './story-goal-doer'
 import { incubateStoryline, runStorylineGate, freezeStoryline } from './story-goal-routine'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
@@ -57,7 +57,6 @@ import {
 import {
   bindGoalLoopModelOpts,
   clearGoalLoopModelOpts,
-  extractStoryGoalModelPatch,
   getGoalLoopModelOpts,
   withGoalLoopModelOptions
 } from './story-goal-model'
@@ -329,14 +328,15 @@ async function generateNovelBeats(
       enrichNarrativeMemory: false,
       systemPrompt: [
         `你是长篇小说结构编辑。请为作品生成 ${targetChapters} 个章节的标题与大纲。`,
-        `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须包含：本章目标、关键冲突、情绪转折、结尾钩子。`,
+        `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须写成正文执行蓝图，包含【开场状态】【必须覆盖】【禁止越界】【结尾落点】【连续性约束】等标签。`,
+        '【必须覆盖】写 3-6 条正文必须落地的事件、冲突、转折、结果；【禁止越界】写本章不得提前兑现的后续内容；【结尾落点】写本章必须停住的位置。',
         resourceConstraints
           ? [
               '若存在资源约束，每章必须输出 resource_budget 数组，给出该章资源开章区间、章末区间、允许事件、禁止事件和预算理由。',
               'resource_budget 必须承接全书资源约束，禁止在前期提前透支后续里程碑要求。'
             ].join('\n')
           : '',
-        '输出 JSON 数组：[{"volume":"第一卷 名字","title":"第N章 标题","outline":"...","beatRole":"setup|inciting|rising|midpoint|climax|resolution","resource_budget":[{"owner":"主角","resource":"体力","unit":"%","start_min":80,"start_max":90,"end_min":70,"end_max":85,"allowed_events":["小规模消耗"],"forbidden_events":["不得跌破50%"],"reason":"承接第20章最低50%"}]}]'
+        '输出 JSON 数组：[{"volume":"第一卷 名字","title":"第N章 标题","outline":"【开场状态】...\\n【必须覆盖】\\n1. ...\\n2. ...\\n【禁止越界】\\n1. 不得提前写...\\n【结尾落点】...\\n【连续性约束】...","beatRole":"setup|inciting|rising|midpoint|climax|resolution","resource_budget":[{"owner":"主角","resource":"体力","unit":"%","start_min":80,"start_max":90,"end_min":70,"end_max":85,"allowed_events":["小规模消耗"],"forbidden_events":["不得跌破50%"],"reason":"承接第20章最低50%"}]}]'
       ].join('\n'),
       prompt: [
         `【用户创作目标】\n${goal.trim() || '请自动策划一部长篇小说。'}`,
@@ -608,7 +608,7 @@ export async function runNovelGoalLoop(
     const saved = existing.goal_config_json
       ? { ...DEFAULT_STORY_GOAL_CONFIG, ...JSON.parse(existing.goal_config_json) as Partial<StoryGoalConfig> }
       : { ...DEFAULT_STORY_GOAL_CONFIG }
-    fullConfig = { ...saved, ...extractStoryGoalModelPatch(config) }
+    fullConfig = { ...saved, ...config }
     turn = existing.turn_count ?? 0
     const savedPhase = existing.current_phase as Phase
     const defaultStart: Phase = fullConfig.incubatorEnabled ? 'incubate_outline' : 'materialize_settings'
@@ -620,7 +620,7 @@ export async function runNovelGoalLoop(
     const saved = existing.goal_config_json
       ? { ...DEFAULT_STORY_GOAL_CONFIG, ...JSON.parse(existing.goal_config_json) as Partial<StoryGoalConfig> }
       : { ...DEFAULT_STORY_GOAL_CONFIG }
-    fullConfig = { ...saved, ...extractStoryGoalModelPatch(config) }
+    fullConfig = { ...saved, ...config }
     turn = existing.turn_count ?? 0
     phase = explicitPhase
     if (existing.status === 'timeout' || turn >= fullConfig.maxTurns) {
@@ -752,8 +752,9 @@ export async function runNovelGoalLoop(
             emit(`正在生成正文「${chapter.title}」`, 'running')
             const gen = await generateBeatBody(workId, chapter.id, { signal: controller.signal, goalDescription: fullConfig.goalDescription, workType: 'novel' })
             if (!gen.success) throw new Error(gen.error || '正文生成失败')
-            const mem = gen.memoryExtracted
-            const memMsg = mem ? ` · 记忆体：+${mem.planted}伏笔/${mem.snapshots}快照/${mem.foreshadowingResolved}回收` : ''
+            let finalMemory: BeatGenResult['memoryExtracted'] = gen.memoryExtracted
+            let shouldSyncFinalMemory = !finalMemory
+            const memMsg = finalMemory ? ` · 记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收` : ''
             goalRoutineDAO.appendTurn({
               work_id: workId, turn_no: turn, phase, action: 'draft',
               target_chapter_id: chapter.id,
@@ -765,6 +766,7 @@ export async function runNovelGoalLoop(
               const diagResult = await diagnoseAndFixUntilPass(workId, chapter.id, fullConfig.qualityMin, controller.signal, msg => emit(msg, 'running'))
               const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma')
               const cleanMsg = cleaned.replaced > 0 ? `；破折号已替换 ${cleaned.replaced} 处` : ''
+              shouldSyncFinalMemory = true
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
                 target_chapter_id: chapter.id,
@@ -773,6 +775,20 @@ export async function runNovelGoalLoop(
                   ? `「${chapter.title}」诊断通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
                   : `「${chapter.title}」诊断未完全通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
               })
+            }
+
+            if (shouldSyncFinalMemory) {
+              const latest = volumeChapterDAO.getChapter(chapter.id)
+              if (latest?.content?.trim()) {
+                emit(`正在同步「${chapter.title}」最终正文的伏笔与角色快照`, 'running')
+                finalMemory = await extractNarrativeMemoryAfterGeneration(workId, chapter.id, latest.content, controller.signal)
+                goalRoutineDAO.appendTurn({
+                  work_id: workId, turn_no: turn, phase, action: 'memory_sync',
+                  target_chapter_id: chapter.id,
+                  summary: `同步「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`
+                })
+                emit(`已同步「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`, 'running')
+              }
             }
 
             phase = nextEmptyChapter(workId) ? 'draft_body' : 'goal_check'

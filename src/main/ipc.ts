@@ -50,7 +50,14 @@ import { getConditionRules, setConditionRules } from './context/condition-rules'
 import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTrace, checkAntiAiRuleViolations, stripEmDashes, getWorkReferenceText, setWorkReferenceText, getAllAntiAiPresets, getCustomAntiAiPresets, setCustomAntiAiPresets, type AntiAiPreset } from './context/anti-ai-rules'
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { autoRewriteBody } from './context/lab/body-auto-rewrite'
-import { runStoryGoalLoop, cancelGoalLoop, isGoalLoopRunning, shouldResumeGoalLoop, type Phase } from './context/goal-routine/story-goal-routine'
+import {
+  runStoryGoalLoop,
+  cancelGoalLoop,
+  isGoalLoopRunning,
+  shouldResumeGoalLoop,
+  applyGoalTitleHookSelection,
+  type Phase
+} from './context/goal-routine/story-goal-routine'
 import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning, shouldResumeNovelGoalLoop } from './context/goal-routine/novel-goal-routine'
 import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
 import { goalRoutineDAO } from './db'
@@ -65,7 +72,7 @@ import {
   applyNovelLengthPreset,
   suggestBatchChapterCount
 } from './context/writing-plan'
-import type { NovelLength, PresetNovelLength } from '../../shared/writing-plan-presets'
+import type { NovelLength, PresetNovelLength } from '../shared/writing-plan-presets'
 import {
   deleteWorkCoverFile,
   pickAndSetWorkCover,
@@ -523,10 +530,30 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:cancel', (_e, workId: number) => {
     return isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
   })
+  ipcMain.handle('goal:selectTitleHook', (_e, workId: number, candidateIndex: number) => {
+    if (isNovelWork(workId)) throw new Error('小说目标循环暂不支持此书名导语确认流程')
+    return applyGoalTitleHookSelection(workId, candidateIndex)
+  })
   ipcMain.handle('goal:getState', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
     const turns = goalRoutineDAO.listTurns(workId, 30)
     return { state: state ?? null, turns }
+  })
+  ipcMain.handle('goal:getEvaluationData', (_e, workId: number) => {
+    const state = goalRoutineDAO.getByWork(workId)
+    const work = workDAO.getById(workId)
+    let runtime: Record<string, unknown> = {}
+    let config: Record<string, unknown> = {}
+    try { runtime = state?.state_json ? JSON.parse(state.state_json) as Record<string, unknown> : {} } catch { /* ignore */ }
+    try { config = state?.goal_config_json ? JSON.parse(state.goal_config_json) as Record<string, unknown> : {} } catch { /* ignore */ }
+    return {
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      work: work ? { id: work.id, title: work.title, genre: work.genre, tags: work.tags, workType: work.work_type } : null,
+      config,
+      evaluations: Array.isArray(runtime.evaluationHistory) ? runtime.evaluationHistory : [],
+      turns: goalRoutineDAO.listTurns(workId, 200)
+    }
   })
   ipcMain.handle('goal:isRunning', (_e, workId: number) => {
     return isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)

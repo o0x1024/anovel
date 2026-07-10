@@ -32,10 +32,13 @@ interface GoalConfig {
   targetTotalWords: number | null
   qualityMin: number
   diagnoseBodyAfterGeneration: boolean
+  humanReviewTitleHook: boolean
   checkConsistencyGate: boolean
   checkAntiAiRules: boolean
   maxTurns: number
   goalMatchMin: number
+  overallStoryMin: number
+  previewHookMin: number
   previewRatio: number
   incubatorEnabled: boolean
 }
@@ -46,10 +49,13 @@ const DEFAULT_CONFIG: GoalConfig = {
   targetTotalWords: null,
   qualityMin: 85,
   diagnoseBodyAfterGeneration: true,
+  humanReviewTitleHook: true,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
   goalMatchMin: 85,
+  overallStoryMin: 80,
+  previewHookMin: 75,
   previewRatio: 0.3,
   incubatorEnabled: false
 }
@@ -79,6 +85,7 @@ interface GoalState {
   last_quality_score: number | null
   goal_met: number
   update_time: string
+  state_json: string | null
 }
 
 interface GoalCheckResult {
@@ -94,6 +101,13 @@ interface GoalCheckResult {
   antiAiViolations: number
   goalMatchScore: number
   goalMatchReason: string
+  overallStoryScore: number
+  overallStoryReason: string
+  previewHookScore: number
+  previewHookReason: string
+  weakestLayer: 'storyline' | 'beat' | 'scene' | 'paragraph'
+  weakChapterTitles: string[]
+  storyIssues: string[]
   previewReport: string | null
   reasons: string[]
 }
@@ -126,6 +140,30 @@ const lastMessage = ref('')
 const lastStatus = ref('')
 const lastCheck = ref<GoalCheckResult | null>(null)
 
+interface TitleHookReviewCandidate {
+  title: string
+  hook: string
+  summary?: string
+}
+
+const titleHookReview = computed(() => {
+  const raw = state.value?.state_json
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as {
+      titleHookCandidates?: TitleHookReviewCandidate[]
+      titleHookPreferredIndex?: number
+    }
+    if (!Array.isArray(parsed.titleHookCandidates) || parsed.titleHookCandidates.length === 0) return null
+    return {
+      candidates: parsed.titleHookCandidates,
+      preferredIndex: Number.isInteger(parsed.titleHookPreferredIndex) ? parsed.titleHookPreferredIndex! : 0
+    }
+  } catch {
+    return null
+  }
+})
+
 const statusLabel = computed(() => {
   const s = state.value?.status
   const map: Record<string, string> = {
@@ -150,6 +188,7 @@ const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_pha
 
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
+  if (titleHookReview.value) return false
   const s = state.value?.status
   if (!s || s === 'goal_met' || s === 'timeout') return false
   if (running.value && s === 'running') return false
@@ -219,7 +258,9 @@ const dimStatus = computed(() => {
     quality: c.qualityScore >= 0 && !c.qualityHardFail && c.qualityScore >= cfg.qualityMin,
     gate: c.gateBlockers === 0,
     antiAi: c.antiAiViolations === 0,
-    goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin
+    goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin,
+    overall: props.workType !== 'story' || cfg.overallStoryMin <= 0 || c.overallStoryScore >= cfg.overallStoryMin,
+    preview: props.workType !== 'story' || cfg.previewHookMin <= 0 || c.previewHookScore >= cfg.previewHookMin
   }
 })
 
@@ -246,10 +287,13 @@ function goalInvokePayload() {
     targetTotalWords: config.value.targetTotalWords,
     qualityMin: config.value.qualityMin,
     diagnoseBodyAfterGeneration: config.value.diagnoseBodyAfterGeneration,
+    humanReviewTitleHook: config.value.humanReviewTitleHook,
     checkConsistencyGate: config.value.checkConsistencyGate,
     checkAntiAiRules: config.value.checkAntiAiRules,
     maxTurns: config.value.maxTurns,
     goalMatchMin: config.value.goalMatchMin,
+    overallStoryMin: config.value.overallStoryMin,
+    previewHookMin: config.value.previewHookMin,
     previewRatio: config.value.previewRatio,
     ...(props.workType === 'novel' ? { incubatorEnabled: config.value.incubatorEnabled } : {}),
     ...bodyModelParams()
@@ -306,6 +350,24 @@ async function continueRepair() {
   resumeFromPhase.value = 'goal_check'
   phasePickerTouched.value = true
   await resume()
+}
+
+async function selectTitleHook(index: number) {
+  if (running.value) return
+  await window.anovel.invoke('goal:selectTitleHook', props.workId, index)
+  lastMessage.value = '书名导语已确认，可从「整体自检」继续运行'
+  phasePickerTouched.value = false
+  await refreshState()
+}
+
+async function copyEvaluationData() {
+  try {
+    const data = await window.anovel.invoke('goal:getEvaluationData', props.workId)
+    await navigator.clipboard.writeText(JSON.stringify(data, null, 2))
+    lastMessage.value = '评测记录已复制，可用于人工盲评与阈值校准'
+  } catch (error) {
+    lastMessage.value = `复制评测记录失败：${error instanceof Error ? error.message : String(error)}`
+  }
 }
 
 function onProgress(payload: unknown) {
@@ -415,6 +477,14 @@ watch(config, saveConfig, { deep: true })
           <p class="text-[11px] text-base-content/40 leading-relaxed">
             开启后每{{ workType === 'novel' ? '章' : '拍' }}正文生成完会立即诊断并尝试修复；关闭则跳过，直接进入下一{{ workType === 'novel' ? '章' : '拍' }}生成。
           </p>
+          <label v-if="workType === 'story'" class="flex items-center justify-between gap-3 text-xs cursor-pointer">
+            <span>书名导语由作者确认</span>
+            <input v-model="config.humanReviewTitleHook" type="checkbox" :disabled="running"
+              class="checkbox checkbox-xs checkbox-primary" />
+          </label>
+          <p v-if="workType === 'story'" class="text-[11px] text-base-content/40 leading-relaxed">
+            开启后系统先做交换位置盲评，再暂停展示全部候选；确认后从整体自检继续。
+          </p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>质量分下限</span>
             <div class="flex items-center gap-1.5">
@@ -427,6 +497,22 @@ watch(config, saveConfig, { deep: true })
             <span>目标匹配度</span>
             <div class="flex items-center gap-1.5">
               <input v-model.number="config.goalMatchMin" type="number" min="0" max="100"
+                :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
+              <span class="text-base-content/40">/100</span>
+            </div>
+          </label>
+          <label v-if="workType === 'story'" class="flex items-center justify-between gap-3 text-xs">
+            <span>整篇结构与兑现</span>
+            <div class="flex items-center gap-1.5">
+              <input v-model.number="config.overallStoryMin" type="number" min="0" max="100"
+                :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
+              <span class="text-base-content/40">/100</span>
+            </div>
+          </label>
+          <label v-if="workType === 'story'" class="flex items-center justify-between gap-3 text-xs">
+            <span>试读追读力</span>
+            <div class="flex items-center gap-1.5">
+              <input v-model.number="config.previewHookMin" type="number" min="0" max="100"
                 :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
               <span class="text-base-content/40">/100</span>
             </div>
@@ -476,7 +562,7 @@ watch(config, saveConfig, { deep: true })
       </div>
 
       <div class="flex gap-2 pt-2 border-t border-base-300/60">
-        <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
+        <button v-if="!running" class="btn btn-primary btn-sm gap-2" :disabled="!!titleHookReview" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
           {{ state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环' }}
         </button>
@@ -491,6 +577,37 @@ watch(config, saveConfig, { deep: true })
         <button v-if="running" class="btn btn-error btn-sm gap-2" @click="cancel">
           <font-awesome-icon icon="stop" class="w-3.5 h-3.5" />
           取消
+        </button>
+        <button v-if="!running" class="btn btn-ghost btn-sm gap-2 ml-auto" @click="copyEvaluationData">
+          <font-awesome-icon icon="clipboard-check" class="w-3.5 h-3.5" />
+          复制评测记录
+        </button>
+      </div>
+    </div>
+
+    <!-- 书名导语人工确认 -->
+    <div v-if="titleHookReview" class="card bg-base-200 border border-primary/40 shadow-sm p-5 space-y-3">
+      <div class="flex items-center gap-2">
+        <font-awesome-icon icon="wand-magic-sparkles" class="w-4 h-4 text-primary" />
+        <h4 class="font-semibold text-sm">确认书名与导语</h4>
+        <span class="badge badge-xs badge-primary ml-auto">盲评推荐已标记</span>
+      </div>
+      <p class="text-xs text-base-content/50">选择会进入你的创作决策记录；确认后点击“断点续跑”继续整体自检。</p>
+      <div class="space-y-2">
+        <button
+          v-for="(candidate, index) in titleHookReview.candidates"
+          :key="`${candidate.title}-${index}`"
+          type="button"
+          class="w-full text-left rounded-xl border bg-base-100 p-3 transition hover:border-primary"
+          :class="index === titleHookReview.preferredIndex ? 'border-primary ring-1 ring-primary/30' : 'border-base-300'"
+          @click="selectTitleHook(index)"
+        >
+          <div class="flex items-center gap-2">
+            <span class="font-semibold text-sm">{{ candidate.title }}</span>
+            <span v-if="index === titleHookReview.preferredIndex" class="badge badge-xs badge-primary">系统推荐</span>
+          </div>
+          <p class="text-xs text-base-content/70 whitespace-pre-wrap leading-relaxed mt-2">{{ candidate.hook }}</p>
+          <p v-if="candidate.summary" class="text-[11px] text-base-content/40 mt-2">{{ candidate.summary }}</p>
         </button>
       </div>
     </div>
@@ -533,6 +650,20 @@ watch(config, saveConfig, { deep: true })
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono">{{ lastCheck.goalMatchScore }}</span>
               <span class="badge badge-xs" :class="dimStatus.goal ? 'badge-success' : 'badge-error'">{{ dimStatus.goal ? '达标' : '未达' }}</span>
+            </div>
+          </div>
+          <div v-if="workType === 'story'" class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
+            <span class="text-base-content/50">整篇结构与兑现</span>
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono">{{ lastCheck.overallStoryScore }}</span>
+              <span class="badge badge-xs" :class="dimStatus.overall ? 'badge-success' : 'badge-error'">{{ dimStatus.overall ? '达标' : '未达' }}</span>
+            </div>
+          </div>
+          <div v-if="workType === 'story'" class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
+            <span class="text-base-content/50">试读追读力</span>
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono">{{ lastCheck.previewHookScore }}</span>
+              <span class="badge badge-xs" :class="dimStatus.preview ? 'badge-success' : 'badge-error'">{{ dimStatus.preview ? '达标' : '未达' }}</span>
             </div>
           </div>
           <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">

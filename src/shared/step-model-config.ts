@@ -110,6 +110,11 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
     steps: [
       { step: 'goal_slot_candidate_score', label: '候选评分' },
       { step: 'goal_semantic_check', label: '语义检查' },
+      { step: 'story_whole_chunk_summary', label: '短故事整篇证据摘要' },
+      { step: 'story_whole_evaluation', label: '短故事整篇终审' },
+      { step: 'story_title_hook_pairwise', label: '书名导语盲评' },
+      { step: 'story_repair_pairwise', label: '改稿前后盲评' },
+      { step: 'story_repair_blueprint', label: '结构层修复' },
       { step: 'resource_constraints_extract', label: '资源约束抽取' },
       { step: 'goal_generate_beats', label: '目标章节大纲' },
     ]

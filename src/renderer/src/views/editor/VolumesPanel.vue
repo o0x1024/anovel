@@ -39,6 +39,9 @@ const fixingVolumes = ref(false)
 const volumeFixError = ref('')
 const volumeFixResult = ref('')
 
+const batchSelectMode = ref(false)
+const batchSelectedIds = ref<Set<number>>(new Set())
+
 const diagnosisConclusion = computed(() => {
   if (!volumeDiagnosisResult.value) return ''
   const match = volumeDiagnosisResult.value.match(/【(PASS|REVISE|FAIL)】/)
@@ -108,10 +111,11 @@ const volumeSystemPrompt = [
   '根据作品创作上下文，生成 3-5 卷分卷大纲。',
   '只输出一个 JSON 对象，禁止 Markdown 正文、标题、解释或代码块外的任何文字。',
   'volumes 数组每项为一卷；不要把「分卷大纲」「卷末钩子」「核心冲突」等标签当作 name。',
-  '每卷 description 80-300 字（主题 + 主冲突 + 卷末钩子；如作品存在需连续追踪的能力/状态机制，也必须写清本卷状态约束与消耗/恢复/升级节奏），禁止写具体章节情节或市场分析。',
+  '每卷 description 80-300 字（主题 + 主冲突 + 卷末钩子；如作品存在需连续追踪的能力/状态机制，也必须写清本卷状态约束与消耗/恢复/解锁节奏），禁止写具体章节情节或市场分析。',
   '可额外输出 state_constraints 字段承载能力/状态约束，解析时会并入 description。',
+  '若核心设定明确要求无数值表达，state_constraints 禁止输出百分比、固定数值、进度条、固定冷却时间或精确次数，只能用体感、场景边界和阶段性描述。',
   'name 须像真实分卷名（如「卷一：《标题》」），不要写作品名或文档标题。',
-  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；体力从30/100降至濒危后靠安全区休整恢复，卷末钩子…","state_constraints":"体力系统本卷主要体现消耗压力与首次恢复规则"}]}'
+  '示例：{"volumes":[{"name":"卷一：《雨夜书店的猫》","description":"主题…；主冲突…；主角多次回收后逐渐乏力，污染刺痒感加重，卷末钩子…","state_constraints":"本卷主要体现回收带来的疲惫积累、污染不适加重与首次新品类解锁"}]}'
 ].join('\n')
 
 const parseError = ref('')
@@ -153,6 +157,39 @@ async function deleteVolume(id: number, name: string) {
   if (!confirm(`删除分卷「${name}」？`)) return
   await window.anovel.invoke('volume:delete', id)
   await loadVolumes()
+}
+
+function toggleBatchSelect() {
+  batchSelectMode.value = !batchSelectMode.value
+  if (!batchSelectMode.value) batchSelectedIds.value = new Set()
+}
+
+function toggleBatchItem(id: number) {
+  const next = new Set(batchSelectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  batchSelectedIds.value = next
+}
+
+function selectAllVolumes() {
+  if (batchSelectedIds.value.size === volumes.value.length) {
+    batchSelectedIds.value = new Set()
+  } else {
+    batchSelectedIds.value = new Set(volumes.value.map(v => v.id))
+  }
+}
+
+async function batchDeleteVolumes() {
+  const count = batchSelectedIds.value.size
+  if (count === 0) return
+  if (!confirm(`确定删除选中的 ${count} 个分卷？此操作不可撤销。`)) return
+  for (const id of batchSelectedIds.value) {
+    await window.anovel.invoke('volume:delete', id)
+  }
+  batchSelectedIds.value = new Set()
+  batchSelectMode.value = false
+  await loadVolumes()
+  await nav?.refreshProgress()
 }
 
 function startEditVolume(vol: { id: number; name: string; description: string | null }) {
@@ -533,8 +570,36 @@ function aiSuggestionSummary(): string {
 
     <div class="card bg-base-200 border border-base-300 shadow-sm">
       <div class="px-4 py-3 border-b border-base-300/50">
-        <h4 class="font-semibold text-sm">分卷列表</h4>
-        <p v-if="volumes.length" class="text-xs text-base-content/50 mt-0.5">共 {{ volumes.length }} 卷</p>
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <h4 class="font-semibold text-sm">分卷列表</h4>
+            <p v-if="volumes.length" class="text-xs text-base-content/50 mt-0.5">共 {{ volumes.length }} 卷</p>
+          </div>
+          <button
+            v-if="volumes.length"
+            type="button"
+            class="btn btn-outline btn-xs gap-1"
+            :class="batchSelectMode ? 'btn-error' : 'btn-neutral'"
+            @click="toggleBatchSelect"
+          >
+            <font-awesome-icon icon="check-double" class="w-3 h-3" />
+            {{ batchSelectMode ? '退出批量' : '批量操作' }}
+          </button>
+        </div>
+        <div v-if="batchSelectMode" class="flex items-center gap-2 mt-2">
+          <button type="button" class="btn btn-ghost btn-xs" @click="selectAllVolumes">
+            {{ batchSelectedIds.size === volumes.length ? '取消全选' : '全选' }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-error btn-xs"
+            :disabled="batchSelectedIds.size === 0"
+            @click="batchDeleteVolumes"
+          >
+            <font-awesome-icon icon="trash" class="w-3 h-3 mr-1" />
+            删除 ({{ batchSelectedIds.size }})
+          </button>
+        </div>
       </div>
       <div class="px-4 pb-4 pt-3">
         <div v-if="volumes.length === 0" class="text-center py-12 text-base-content/40">
@@ -546,7 +611,10 @@ function aiSuggestionSummary(): string {
             v-for="vol in volumes"
             :key="vol.id"
             class="card bg-base-100 border shadow-sm overflow-hidden"
-            :class="isInvalidVolumeName(vol.name) ? 'border-warning/50' : 'border-base-300'"
+            :class="[
+              isInvalidVolumeName(vol.name) ? 'border-warning/50' : 'border-base-300',
+              batchSelectMode && batchSelectedIds.has(vol.id) ? '!border-error/40 !bg-error/5' : ''
+            ]"
           >
             <div v-if="editingVolumeId === vol.id" class="p-4 space-y-2">
               <input v-model="editVolumeName" class="input input-bordered input-sm w-full" placeholder="分卷名称" />
@@ -563,21 +631,31 @@ function aiSuggestionSummary(): string {
             </div>
             <template v-else>
               <div class="flex items-center justify-between gap-2 px-4 py-3">
-                <button
-                  type="button"
-                  class="flex items-center gap-2 min-w-0 flex-1 text-left hover:opacity-80 transition-opacity"
-                  @click="toggleVolumeExpanded(vol.id)"
-                >
-                  <h4 class="font-semibold text-sm truncate flex items-center gap-1">
-                    <span class="truncate">{{ vol.name }}</span>
-                    <span v-if="isInvalidVolumeName(vol.name)" class="badge badge-warning badge-xs shrink-0">无效</span>
-                  </h4>
-                  <font-awesome-icon
-                    :icon="isVolumeExpanded(vol.id) ? 'chevron-up' : 'chevron-down'"
-                    class="w-3 h-3 shrink-0 text-base-content/40"
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  <input
+                    v-if="batchSelectMode"
+                    type="checkbox"
+                    class="checkbox checkbox-xs checkbox-error shrink-0"
+                    :checked="batchSelectedIds.has(vol.id)"
+                    @click.stop="toggleBatchItem(vol.id)"
                   />
-                </button>
-                <div class="flex gap-1 shrink-0">
+                  <button
+                    type="button"
+                    class="flex items-center gap-2 min-w-0 text-left hover:opacity-80 transition-opacity"
+                    @click="batchSelectMode ? toggleBatchItem(vol.id) : toggleVolumeExpanded(vol.id)"
+                  >
+                    <h4 class="font-semibold text-sm truncate flex items-center gap-1">
+                      <span class="truncate">{{ vol.name }}</span>
+                      <span v-if="isInvalidVolumeName(vol.name)" class="badge badge-warning badge-xs shrink-0">无效</span>
+                    </h4>
+                    <font-awesome-icon
+                      v-if="!batchSelectMode"
+                      :icon="isVolumeExpanded(vol.id) ? 'chevron-up' : 'chevron-down'"
+                      class="w-3 h-3 shrink-0 text-base-content/40"
+                    />
+                  </button>
+                </div>
+                <div v-if="!batchSelectMode" class="flex gap-1 shrink-0">
                   <button class="btn btn-ghost btn-xs gap-1" @click.stop="startEditVolume(vol)">
                     <font-awesome-icon icon="edit" class="w-3 h-3" />
                     编辑
@@ -589,7 +667,7 @@ function aiSuggestionSummary(): string {
                 </div>
               </div>
               <div
-                v-show="isVolumeExpanded(vol.id)"
+                v-show="!batchSelectMode && isVolumeExpanded(vol.id)"
                 class="px-4 pb-4 pt-0 border-t border-base-300/50"
               >
                 <p v-if="vol.description" class="text-sm text-base-content/50 mt-3 whitespace-pre-wrap">{{ vol.description }}</p>

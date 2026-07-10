@@ -60,7 +60,12 @@ export function recordTasteReject(workId: number, reason: string): void {
 }
 
 export function recordTasteChoice(workId: number, choiceType: string, detail: string): void {
-  const profile = getWorkTasteProfile(workId)
+  let profile = getWorkTasteProfile(workId)
+  if (!profile) {
+    const id = tasteProfileDAO.create({ profile_name: '默认品味', is_default: true })
+    tasteProfileDAO.bindToWork(workId, id)
+    profile = tasteProfileDAO.getById(id)
+  }
   if (profile) tasteProfileDAO.recordChoice(profile.id, choiceType, detail)
 }
 

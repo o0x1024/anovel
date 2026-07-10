@@ -98,7 +98,7 @@ export const STORY_QUALITY_AI_SYSTEM_PROMPT = [
   '',
   '### 输出格式（严格）',
   '直接输出 JSON，不要输出任何诊断过程说明、分析文字或 markdown 标题。',
-  '每项 scores 取值 0-100 整数；score_total = 9 项算术平均值（四舍五入取整）。',
+  '每项 scores 取值 0-100 整数；score_total = 13 项算术平均值（四舍五入取整）。',
   '```json',
   '{',
   '  "score_total": 0,',
