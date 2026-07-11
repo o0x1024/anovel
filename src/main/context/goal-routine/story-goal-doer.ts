@@ -31,6 +31,7 @@ import { clearChapterMemoryBeforeExtract, clearChapterNarrativeMemory } from '..
 import { appLogger } from '../../logger/app-logger'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { formatChapterResourceBudgetsForPrompt, runResourceConstraintGate } from '../resource-ledger'
+import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
 
 export interface BeatGenResult {
   success: boolean
@@ -45,6 +46,7 @@ export interface GenerateBeatBodyOptions {
   goalDescription?: string
   extraHint?: string
   workType?: 'novel' | 'story'
+  wordTargetOverride?: number
 }
 
 function countWords(s: string): number {
@@ -72,7 +74,10 @@ function getWorkHook(workId: number): string {
 function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
   if (!outlineDiagnosis?.trim()) return ''
   try {
-    const parsed = JSON.parse(outlineDiagnosis) as { dramatic_contract?: Record<string, unknown> }
+    const parsed = JSON.parse(outlineDiagnosis) as {
+      dramatic_contract?: Record<string, unknown>
+      tension_plan?: { phase?: unknown; level?: unknown; payoff_type?: unknown }
+    }
     const contract = parsed.dramatic_contract
     if (!contract || typeof contract !== 'object') return ''
     const rows = ([
@@ -87,13 +92,19 @@ function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
       ['兑现/欠账', String(contract.payoff_or_debt ?? '').trim()],
       ['结尾问题', String(contract.next_question ?? '').trim()]
     ] as Array<[string, string]>).filter(([, value]) => Boolean(value))
-    if (rows.length === 0) return ''
+    const tension = parsed.tension_plan
+    if (rows.length === 0 && !tension) return ''
     return [
       '【本拍戏剧契约 - 必须执行】',
       '正文不是复述事件流水账，必须把本拍写成一场有目标、阻力、代价、转折和不可逆变化的戏。',
       ...rows.map(([label, value]) => `- ${label}：${value}`),
+      tension ? `【本拍张力位置】${String(tension.phase ?? '')} · 强度 ${String(tension.level ?? '')}/10 · 兑现类型 ${String(tension.payoff_type ?? '')}` : '',
+      tension?.payoff_type === 'debt' ? '本拍以蓄力和欠债为主，不得强行完成大清算。' : '',
+      tension?.payoff_type === 'partial' ? '本拍只做阶段兑现，同时产生更具体的新代价。' : '',
+      tension?.payoff_type === 'major' ? '本拍允许重大兑现，但兑现必须由此前筹备和本拍选择共同触发。' : '',
+      tension?.payoff_type === 'aftertaste' ? '本拍完成闭环后保留人物损失、关系余波或主题余味。' : '',
       '执行要求：每个主要段落都必须推动目标/阻力/压力/信息差之一；禁止连续两段只交代背景、移动地点、解释设定或重复情绪。结尾必须落实“不可逆变化”，并抛出“结尾问题”。'
-    ].join('\n')
+    ].filter(Boolean).join('\n')
   } catch {
     return ''
   }
@@ -120,6 +131,10 @@ function buildBodyPrompt(
   const openingSlot = firstBeat ? getOpeningSlotContent(workId) : ''
   const hookText = firstBeat ? getWorkHook(workId) : ''
   const dramaticContract = workType === 'story' ? getDramaticContractPrompt(ch.outline_diagnosis) : ''
+  const work = workDAO.getById(workId)
+  const genrePolicy = workType === 'story'
+    ? formatGenrePolicy(resolveStoryGenrePolicy([work?.genre, work?.tags, goalDescription].filter(Boolean).join('\n')), 'proseRules')
+    : ''
   const resourceBudget = formatChapterResourceBudgetsForPrompt(workId, chapterId)
   return formatBodyPromptLines(workType, {
     volName: vol?.name,
@@ -133,6 +148,7 @@ function buildBodyPrompt(
         ? `【本篇创作目标】\n${goalDescription.trim()}\n请在生成本${workType === 'story' ? '拍' : '章'}时贯彻该目标（题材/风格/情节走向）。`
         : '',
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
+      genrePolicy,
       dramaticContract,
       resourceBudget,
       openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
@@ -150,9 +166,9 @@ export async function generateBeatBody(
   chapterId: number,
   options: GenerateBeatBodyOptions = {}
 ): Promise<BeatGenResult> {
-  const { signal, goalDescription, extraHint, workType = 'story' } = options
+  const { signal, goalDescription, extraHint, workType = 'story', wordTargetOverride } = options
   const plan = loadWritingPlan(workId)
-  const wordTarget = plan.wordsPerChapter || 4000
+  const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
   const prompt = buildBodyPrompt(workId, chapterId, wordTarget, goalDescription, extraHint, workType)
   if (!prompt) return { success: false, content: '', wordCount: 0, error: `${workType === 'story' ? '节拍' : '章节'}不存在` }
 

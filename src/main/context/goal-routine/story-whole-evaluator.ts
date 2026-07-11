@@ -3,6 +3,7 @@ import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
 import type { StoryGoalConfig } from './story-goal-checker'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
 
 export type StoryWeakestLayer = 'storyline' | 'beat' | 'scene' | 'paragraph'
 
@@ -13,8 +14,16 @@ export interface StoryWholeAssessment {
   overallStoryReason: string
   previewHookScore: number
   previewHookReason: string
+  proseReadScore: number
+  proseReadReason: string
   weakestLayer: StoryWeakestLayer
   weakChapterTitles: string[]
+  issues: string[]
+}
+
+interface ProseBlindRead {
+  score: number
+  reason: string
   issues: string[]
 }
 
@@ -154,6 +163,52 @@ function boundaryExcerpt(text: string, ratio: number, radius = 1800): string {
   return text.slice(Math.max(0, point - radius), Math.min(text.length, point + radius))
 }
 
+function blindReadSamples(text: string): string {
+  const sampleSize = 1700
+  const points = [0, 0.25, 0.5, 0.75, 1]
+  return points.map((ratio, index) => {
+    const center = Math.round(text.length * ratio)
+    const start = ratio === 0 ? 0 : ratio === 1 ? Math.max(0, text.length - sampleSize) : Math.max(0, center - Math.floor(sampleSize / 2))
+    return `【匿名原文切片${index + 1}】\n${text.slice(start, start + sampleSize)}`
+  }).join('\n\n')
+}
+
+async function assessProseBlindRead(
+  workId: number,
+  mergedBody: string,
+  genreText: string,
+  signal?: AbortSignal
+): Promise<ProseBlindRead> {
+  const policy = resolveStoryGenrePolicy(genreText)
+  const res = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      step: 'story_prose_blind_read',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false,
+      temperature: 0,
+      maxTokens: 1500,
+      systemPrompt: [
+        '你是独立短故事盲读编辑。你看不到标题、大纲、评分表和剧情摘要，只按普通读者阅读原文切片。',
+        '重点识别：重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
+        '格式完整、反转数量和问号不能加分。只有自然、可信、能让人继续读的原文才能高分。',
+        formatGenrePolicy(policy, 'evaluationRules'),
+        '只输出 JSON：{"score":75,"reason":"一句话总评","issues":["带原文现象的具体问题"]}'
+      ].join('\n\n'),
+      prompt: blindReadSamples(mergedBody)
+    }),
+    { stream: false, signal }
+  )
+  if (!res.success || !res.content?.trim()) throw new Error(res.error || '原文盲读失败')
+  const parsed = parseJsonObject(res.content)
+  if (!parsed) throw new Error('原文盲读返回 JSON 解析失败')
+  return {
+    score: clampScore(parsed.score),
+    reason: String(parsed.reason ?? '').trim(),
+    issues: stringList(parsed.issues, 8)
+  }
+}
+
 function storyModeGuidance(text: string): string {
   if (/悬疑|推理|刑侦|惊悚|谜案/.test(text)) {
     return '悬疑/推理：重点评估线索公平性、信息控制、误导与真相回收；不能用单纯情绪烈度替代推理兑现。'
@@ -189,6 +244,8 @@ export async function assessWholeStory(
       overallStoryReason: '尚无正文',
       previewHookScore: 0,
       previewHookReason: '尚无正文',
+      proseReadScore: 0,
+      proseReadReason: '尚无正文',
       weakestLayer: 'storyline',
       weakChapterTitles: [],
       issues: ['尚无正文']
@@ -220,6 +277,8 @@ export async function assessWholeStory(
     work?.tags ?? '',
     config.goalDescription
   ].join('\n'))
+  const genreText = [work?.genre ?? '', work?.tags ?? '', config.goalDescription].join('\n')
+  const proseRead = await assessProseBlindRead(workId, mergedBody, genreText, signal)
 
   const res = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -264,8 +323,10 @@ export async function assessWholeStory(
     overallStoryReason: String(parsed.overall_story_reason ?? '').trim(),
     previewHookScore: clampScore(parsed.preview_hook_score),
     previewHookReason: String(parsed.preview_hook_reason ?? '').trim(),
+    proseReadScore: proseRead.score,
+    proseReadReason: proseRead.reason,
     weakestLayer: normalizeLayer(parsed.weakest_layer),
     weakChapterTitles: stringList(parsed.weak_chapter_titles, 4),
-    issues: stringList(parsed.issues, 10)
+    issues: [...stringList(parsed.issues, 10), ...proseRead.issues].slice(0, 12)
   }
 }

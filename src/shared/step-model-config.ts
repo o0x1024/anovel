@@ -59,6 +59,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
     steps: [
       { step: 'volume_chapters_batch', label: '章节批量生成' },
       { step: 'story_beat_gate', label: '短故事节拍门禁' },
+      { step: 'story_engine_gate', label: '短故事发动机门禁' },
       { step: 'volume_diagnose', label: '分卷诊断' },
       { step: 'volume_diagnose_fix', label: '分卷修复' },
       { step: 'story_title_hook_gen', label: '短故事标题与钩子' },
@@ -112,6 +113,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'goal_semantic_check', label: '语义检查' },
       { step: 'story_whole_chunk_summary', label: '短故事整篇证据摘要' },
       { step: 'story_whole_evaluation', label: '短故事整篇终审' },
+      { step: 'story_prose_blind_read', label: '短故事原文盲读' },
       { step: 'story_title_hook_pairwise', label: '书名导语盲评' },
       { step: 'story_repair_pairwise', label: '改稿前后盲评' },
       { step: 'story_repair_blueprint', label: '结构层修复' },

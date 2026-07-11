@@ -39,6 +39,7 @@ interface GoalConfig {
   goalMatchMin: number
   overallStoryMin: number
   previewHookMin: number
+  proseReadMin: number
   previewRatio: number
   incubatorEnabled: boolean
 }
@@ -56,6 +57,7 @@ const DEFAULT_CONFIG: GoalConfig = {
   goalMatchMin: 85,
   overallStoryMin: 80,
   previewHookMin: 75,
+  proseReadMin: 78,
   previewRatio: 0.3,
   incubatorEnabled: false
 }
@@ -105,6 +107,8 @@ interface GoalCheckResult {
   overallStoryReason: string
   previewHookScore: number
   previewHookReason: string
+  proseReadScore: number
+  proseReadReason: string
   weakestLayer: 'storyline' | 'beat' | 'scene' | 'paragraph'
   weakChapterTitles: string[]
   storyIssues: string[]
@@ -260,7 +264,8 @@ const dimStatus = computed(() => {
     antiAi: c.antiAiViolations === 0,
     goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin,
     overall: props.workType !== 'story' || cfg.overallStoryMin <= 0 || c.overallStoryScore >= cfg.overallStoryMin,
-    preview: props.workType !== 'story' || cfg.previewHookMin <= 0 || c.previewHookScore >= cfg.previewHookMin
+    preview: props.workType !== 'story' || cfg.previewHookMin <= 0 || c.previewHookScore >= cfg.previewHookMin,
+    prose: props.workType !== 'story' || cfg.proseReadMin <= 0 || c.proseReadScore >= cfg.proseReadMin
   }
 })
 
@@ -294,6 +299,7 @@ function goalInvokePayload() {
     goalMatchMin: config.value.goalMatchMin,
     overallStoryMin: config.value.overallStoryMin,
     previewHookMin: config.value.previewHookMin,
+    proseReadMin: config.value.proseReadMin,
     previewRatio: config.value.previewRatio,
     ...(props.workType === 'novel' ? { incubatorEnabled: config.value.incubatorEnabled } : {}),
     ...bodyModelParams()
@@ -517,6 +523,14 @@ watch(config, saveConfig, { deep: true })
               <span class="text-base-content/40">/100</span>
             </div>
           </label>
+          <label v-if="workType === 'story'" class="flex items-center justify-between gap-3 text-xs">
+            <span>原文匿名盲读</span>
+            <div class="flex items-center gap-1.5">
+              <input v-model.number="config.proseReadMin" type="number" min="0" max="100"
+                :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
+              <span class="text-base-content/40">/100</span>
+            </div>
+          </label>
           <label class="flex items-center justify-between gap-3 text-xs cursor-pointer">
             <span>一致性门禁</span>
             <input v-model="config.checkConsistencyGate" type="checkbox" :disabled="running"
@@ -664,6 +678,13 @@ watch(config, saveConfig, { deep: true })
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono">{{ lastCheck.previewHookScore }}</span>
               <span class="badge badge-xs" :class="dimStatus.preview ? 'badge-success' : 'badge-error'">{{ dimStatus.preview ? '达标' : '未达' }}</span>
+            </div>
+          </div>
+          <div v-if="workType === 'story'" class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
+            <span class="text-base-content/50">原文匿名盲读</span>
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono">{{ lastCheck.proseReadScore }}</span>
+              <span class="badge badge-xs" :class="dimStatus.prose ? 'badge-success' : 'badge-error'">{{ dimStatus.prose ? '达标' : '未达' }}</span>
             </div>
           </div>
           <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">

@@ -9,6 +9,7 @@ export interface ParsedChapter {
   pov_mode?: string | null
   characters?: string | null
   dramatic_contract?: DramaticContract | null
+  tension_plan?: TensionPlan | null
 }
 
 export interface ParsedSingleChapterOutline {
@@ -32,6 +33,12 @@ export interface DramaticContract {
   irreversible_change?: string
   payoff_or_debt?: string
   next_question?: string
+}
+
+export interface TensionPlan {
+  phase: string
+  level: number
+  payoff_type: 'debt' | 'partial' | 'major' | 'aftertaste'
 }
 
 interface ChapterExecutionBlueprint {
@@ -204,6 +211,16 @@ function normalizeDramaticContract(value: unknown): DramaticContract | null {
   return Object.keys(contract).length > 0 ? contract : null
 }
 
+function normalizeTensionPlan(value: unknown): TensionPlan | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  const phase = String(row.phase ?? '').trim()
+  const level = Math.max(1, Math.min(10, Math.round(Number(row.level) || 0)))
+  const payoff = String(row.payoff_type ?? row.payoffType ?? '')
+  if (!phase || !['debt', 'partial', 'major', 'aftertaste'].includes(payoff)) return null
+  return { phase, level, payoff_type: payoff as TensionPlan['payoff_type'] }
+}
+
 function formatDramaticContractLines(contract?: DramaticContract | null): string[] {
   if (!contract) return []
   const labels: Array<[keyof DramaticContract, string]> = [
@@ -282,6 +299,7 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   const dramaticContract = normalizeDramaticContract(
     row.dramatic_contract ?? row.dramaticContract ?? row.scene_contract ?? row.sceneContract
   )
+  const tensionPlan = normalizeTensionPlan(row.tension_plan ?? row.tensionPlan)
   const numericState = extractNumericState(row)
   const blueprint = normalizeExecutionBlueprint(row)
   const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState, blueprint)
@@ -296,7 +314,8 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     next_hook: nextHook,
     pov_mode: row.pov_mode != null ? String(row.pov_mode) : null,
     characters: normalizeCharactersField(row.characters),
-    dramatic_contract: dramaticContract
+    dramatic_contract: dramaticContract,
+    tension_plan: tensionPlan
   }
 }
 

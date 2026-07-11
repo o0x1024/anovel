@@ -5,6 +5,7 @@ export type GoalRoutinePhase =
   | 'freeze_storyline'
   | 'materialize_settings'
   | 'generate_character_cards'
+  | 'story_engine_gate'
   | 'generate_title_hook'
   | 'overall_self_check'
   | 'generate_beats'
@@ -20,6 +21,7 @@ export const STORY_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'freeze_storyline',
   'materialize_settings',
   'generate_character_cards',
+  'story_engine_gate',
   'generate_beats',
   'generate_title_hook',
   'overall_self_check',
@@ -52,6 +54,7 @@ export const STORY_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   freeze_storyline: '冻结版本',
   materialize_settings: '核心设定',
   generate_character_cards: '主角人设卡',
+  story_engine_gate: '故事发动机',
   generate_title_hook: '书名导语',
   overall_self_check: '整体自检',
   generate_beats: '节拍大纲',
@@ -68,6 +71,7 @@ export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   freeze_storyline: '冻结版本',
   materialize_settings: '核心设定',
   generate_character_cards: '主角人设卡',
+  story_engine_gate: '故事发动机',
   generate_title_hook: '书名导语',
   overall_self_check: '整体自检',
   generate_beats: '章节大纲',

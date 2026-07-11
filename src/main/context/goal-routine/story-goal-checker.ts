@@ -50,6 +50,8 @@ export interface StoryGoalConfig {
   overallStoryMin: number
   /** 试读边界的阶段兑现与追读动力下限（0=不卡） */
   previewHookMin: number
+  /** 匿名原文切片盲读下限（0=不卡） */
+  proseReadMin: number
   /** 试读比例（0-1），目标循环验收时据此计算试读卡点报告 */
   previewRatio: number
   /** 小说目标循环：是否走大岗孵化器三阶段（incubate/gate/freeze），默认 false */
@@ -73,6 +75,7 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   goalMatchMin: 85,
   overallStoryMin: 80,
   previewHookMin: 75,
+  proseReadMin: 78,
   previewRatio: 0.3,
   incubatorEnabled: false
 }
@@ -98,6 +101,8 @@ export interface GoalCheckResult {
   overallStoryReason: string
   previewHookScore: number
   previewHookReason: string
+  proseReadScore: number
+  proseReadReason: string
   weakestLayer: StoryWeakestLayer
   weakChapterTitles: string[]
   storyIssues: string[]
@@ -332,12 +337,14 @@ export async function checkStoryGoal(
   let overallStoryReason = ''
   let previewHookScore = isStory ? 0 : 100
   let previewHookReason = ''
+  let proseReadScore = isStory ? 0 : 100
+  let proseReadReason = ''
   let weakestLayer: StoryWeakestLayer = 'scene'
   let weakChapterTitles: string[] = []
   let storyIssues: string[] = []
 
   if (isStory && content > 0 && content === total
-    && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0)) {
+    && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
     try {
       const assessment = await assessWholeStory(workId, config, signal)
       goalMatchScore = assessment.goalMatchScore
@@ -346,6 +353,8 @@ export async function checkStoryGoal(
       overallStoryReason = assessment.overallStoryReason
       previewHookScore = assessment.previewHookScore
       previewHookReason = assessment.previewHookReason
+      proseReadScore = assessment.proseReadScore
+      proseReadReason = assessment.proseReadReason
       weakestLayer = assessment.weakestLayer
       weakChapterTitles = assessment.weakChapterTitles
       storyIssues = assessment.issues
@@ -358,6 +367,9 @@ export async function checkStoryGoal(
       }
       if (config.previewHookMin > 0 && previewHookScore < config.previewHookMin) {
         reasons.push(`试读追读力 ${previewHookScore} 低于下限 ${config.previewHookMin}：${previewHookReason}`)
+      }
+      if (config.proseReadMin > 0 && proseReadScore < config.proseReadMin) {
+        reasons.push(`原文盲读 ${proseReadScore} 低于下限 ${config.proseReadMin}：${proseReadReason}`)
       }
     } catch (e) {
       if (signal?.aborted) throw e
@@ -416,6 +428,8 @@ export async function checkStoryGoal(
     overallStoryReason,
     previewHookScore,
     previewHookReason,
+    proseReadScore,
+    proseReadReason,
     weakestLayer,
     weakChapterTitles,
     storyIssues,
