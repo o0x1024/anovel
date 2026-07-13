@@ -3,15 +3,16 @@
  *
  * 与短故事差异：
  * 1. 跳过短故事孵化器阶段（incubate_outline / incubator_gate / freeze_storyline），
- *    小说直接复用作品已有的分卷/章节结构或生成章节大纲。
+ *    小说直接复用作品已有的分卷/章节结构或生成分卷大纲与章节情节。
  * 2. 正文生成按「章」而非「拍」走 novel 正文 prompt。
  * 3. 验收逻辑复用 story-goal-checker（维度通用）。
  *
  * 状态机：
  *   materialize_settings → 沉淀核心设定
  *   generate_character_cards → 生成主角人设卡片
- *   generate_beats → 确保章节大纲完整
- *   generate_title_hook → 基于章节大纲生成爆款书名与导语
+ *   generate_volumes → 生成、诊断并冻结全书分卷大纲
+ *   generate_beats → 分批生成章节情节
+ *   generate_title_hook → 基于章节情节生成爆款书名与导语
  *   overall_self_check → 核心设定整体自检
  *   draft_body → 顺序生成全部正文
  *   goal_check → 统一验收目标维度
@@ -19,7 +20,7 @@
  */
 import { BrowserWindow, type WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO, resourceLedgerDAO, type ChapterResourceBudgetInput } from '../../db'
+import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
 import { buildWorkContext } from '../work-context'
@@ -29,11 +30,12 @@ import {
   saveCharacterCards,
   validateCharacterCards
 } from '../character-cards'
-import { buildSettingsQualityInput, recordQualityCheck } from '../settings-quality'
+import { buildSettingsQualityInput, getSettingsQualityStatus, recordQualityCheck } from '../settings-quality'
 import { STORY_OVERALL_CHECK_SYSTEM_PROMPT } from '../story-settings-quality'
-import { outlineConstraintsForWordTarget } from '../../../shared/outline-constraints'
-import { DEFAULT_WORDS_PER_CHAPTER } from '../../../shared/writing-plan-presets'
 import { loadWritingPlan } from '../writing-plan'
+import { bodyWordCountBounds } from '../../../shared/body-word-target'
+import { goldenFingerStructuredPromptSection } from '../../../shared/golden-finger-types'
+import { validateGoldenFinger } from '../golden-finger-validation'
 import { extractJsonText } from '../parse-json-extract'
 import {
   checkStoryGoal,
@@ -41,25 +43,32 @@ import {
   type StoryGoalConfig,
   type GoalCheckResult
 } from './story-goal-checker'
-import { generateBeatBody, extractNarrativeMemoryAfterGeneration, type BeatGenResult } from './story-goal-doer'
+import { generateBeatBody, reviseBeatBody, extractNarrativeMemoryAfterGeneration, type BeatGenResult } from './story-goal-doer'
 import { incubateStoryline, runStorylineGate, freezeStoryline } from './story-goal-routine'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
-import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
+import { parseQualityAiScoreReport, type QualityAiMetricKey } from '../../../shared/quality-ai-score'
 import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
 import { QUALITY_APPLY_FIXES_PROMPT } from '../chapter-quality'
 import { STYLE_REWRITE_INSTRUCTION, countEmDashes, stripEmDashes } from '../anti-ai-rules'
 import { runConsistencyGate } from '../consistency-gate'
-import {
-  formatResourceConstraintsForPrompt,
-  normalizeChapterResourceBudgets,
-  refreshResourceConstraints
-} from '../resource-ledger'
+import { refreshResourceConstraints, runResourceConstraintGate } from '../resource-ledger'
+import { clearChapterNarrativeMemory } from '../memory-cleanup'
 import {
   bindGoalLoopModelOpts,
   clearGoalLoopModelOpts,
   getGoalLoopModelOpts,
   withGoalLoopModelOptions
 } from './story-goal-model'
+import {
+  generateNextNovelOutlineBatch,
+  prepareNovelVolumePlan,
+  NovelPipelineError,
+  readNovelGoalState,
+  updateNovelGoalState,
+} from './novel-outline-pipeline'
+import { formatNovelScaleContract, validatePleasureEngineScale } from './novel-scale-contract'
+import { ensureEmotionEngine } from './emotion-engine'
+import { assessChapterEmotion, emotionRepairHint } from './emotion-gate'
 
 import {
   NOVEL_GOAL_ROUTINE_PHASE_ORDER,
@@ -80,7 +89,7 @@ export interface GoalProgressEvent {
 }
 
 interface RepairPlan {
-  action: 'draft_missing' | 'expand' | 'deai' | 'quality' | 'goal_align'
+  action: 'draft_missing' | 'expand' | 'compress' | 'deai' | 'quality' | 'goal_align'
   targetChapterIds: number[]
   hint: string
 }
@@ -91,20 +100,17 @@ interface TitleHookCandidate {
   summary?: string
 }
 
-interface ChapterOutline {
-  volumeId?: number
-  volumeName?: string
-  title: string
-  outline: string
-  beatRole?: string
-  resourceBudget?: ChapterResourceBudgetInput[]
-}
-
 const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'world_pressure', 'conflict_engine', 'pleasure_engine', 'supporting_cast', 'main_plotline'] as const
 
 const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
   protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
-  golden_finger: '你是顶级长篇小说特殊机制设计师。仅当故事明确需要系统、空间、异能、面板、重生、穿越、血脉、修炼外挂等特殊机制时，才设计金手指。输出 Markdown：## 名称与形态 / ## 核心能力 / ## 限制条件 / ## 反噬机制 / ## 对主线冲突的推动作用。',
+  golden_finger: [
+    '你是顶级长篇小说特殊机制设计师。修仙境界、灵力、寿命压力、身份信息差、重生或穿越身份本身不是金手指；只有作品明确存在独立于世界常规能力的特殊机制时才设计。',
+    '默认使用 narrative 模式，以阶段、触发条件、恢复条件、代价后果、场景边界和失效表现定义能力。只有用户明确要求系统面板、积分余额、属性点、数值经营或精确次数玩法时才能使用 numeric 模式。',
+    'narrative 模式禁止生成百分比成功率、固定点数消耗、精确次数、固定冷却时长、进度条和每章资源余额。',
+    '必须完整定义名称形态、核心规则、呈现形式、外人可见性、交互方式、有效能力、获取条件、来源性质、使用边界、失效场景、反噬、升级路径、信息差、副作用、禁用红线、暴露后果、番茄卖点和前三章爽点。',
+    goldenFingerStructuredPromptSection()
+  ].join('\n\n'),
   world_pressure: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动 / ## 压迫升级路径。',
   conflict_engine: '你是顶级长篇小说冲突设计师。输出 Markdown：## 对立双方价值观冲突 / ## 不可调和点 / ## 三层赌注（个人/势力/世界） / ## 冲突升级机制 / ## 终局收束方式。',
   pleasure_engine: '你是顶级长篇小说节奏与爽点设计师。输出 Markdown：## 开篇钩子 / ## 前期小高潮 / ## 中期大反转 / ## 后期终极清算。必须明确每个爽点对应的卷/章位置。',
@@ -118,10 +124,8 @@ function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean
   const text = `${goal}\n${mainline}`.trim()
   if (!text) return false
 
-  const specialMechanism = /系统|面板|空间|异能|超能力|重生|穿越|穿书|快穿|无限流|规则怪谈|灵气|修仙|玄幻|修炼|血脉|天赋|签到|抽奖|熟练度|属性点|金手指|外挂|随身/.test(text)
-  if (specialMechanism) return false
-
-  return /年代文|年代|历史|历史文|现实|现实向|现实主义|正剧|权谋|官场|商战|乡村|种田|家长里短|军旅|谍战|民国|古代言情|宫斗|宅斗/.test(text)
+  const explicitMechanism = /系统|属性面板|积分兑换|签到|抽奖|属性点|熟练度面板|随身空间|可调用空间|独立异能|超能力|金手指|外挂/.test(text)
+  return !explicitMechanism
 }
 
 export function isNovelGoalLoopRunning(workId: number): boolean {
@@ -177,6 +181,12 @@ async function materializeNovelSettings(
     ? NOVEL_SETTING_TYPES.filter(t => t !== 'golden_finger')
     : [...NOVEL_SETTING_TYPES]
   const missing = targetTypes.filter(t => !existing.some(e => e.type === t && e.content?.trim()))
+  if (!validatePleasureEngineScale(workId).valid && !missing.includes('pleasure_engine')) {
+    missing.push('pleasure_engine')
+  }
+  if (targetTypes.includes('golden_finger') && !validateGoldenFinger(workId).valid && !missing.includes('golden_finger')) {
+    missing.push('golden_finger')
+  }
 
   if (shouldSkipGoldenFinger) {
     onProgress?.('检测为无特殊机制题材，跳过「金手指系统」生成')
@@ -189,31 +199,62 @@ async function materializeNovelSettings(
 
   let count = 0
   for (const type of missing) {
-    assertNotAborted(signal)
-    onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length})`)
-    const existingText = targetTypes
-      .map(t => coreSettingDAO.getByType(workId, t)?.content?.trim() ? `## ${t}\n${coreSettingDAO.getByType(workId, t)?.content?.trim()}` : '')
-      .filter(Boolean)
-      .join('\n\n')
-    const res = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId,
-        step: `settings_${type}`,
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false,
-        systemPrompt: NOVEL_SETTING_PROMPTS[type],
-        prompt: [
-          goal.trim() ? `【用户创作目标】\n${goal.trim()}` : '',
-          `【长篇主线】\n${mainline}`,
-          existingText ? `【已生成设定】\n${existingText}` : ''
-        ].filter(Boolean).join('\n\n')
-      }),
-      { stream: false, signal }
-    )
-    if (!res.success || !res.content?.trim()) continue
-    coreSettingDAO.upsert(workId, type, res.content.trim())
-    count++
-    onProgress?.(`已回填核心设定「${type}」`)
+    while (true) {
+      assertNotAborted(signal)
+      onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length})`)
+      const existingText = targetTypes
+        .filter(t => t !== type)
+        .map(t => coreSettingDAO.getByType(workId, t)?.content?.trim() ? `## ${t}\n${coreSettingDAO.getByType(workId, t)?.content?.trim()}` : '')
+        .filter(Boolean)
+        .join('\n\n')
+      const res = await modelService.chat(
+        withGoalLoopModelOptions(workId, {
+          workId,
+          step: `settings_${type}`,
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          systemPrompt: [
+            NOVEL_SETTING_PROMPTS[type],
+            type === 'pleasure_engine'
+              ? '爽点机制必须按全书阶段规划，并明确写出目标末章的终极清算；不得自行虚构更短的卷数或提前完结。'
+              : ''
+          ].filter(Boolean).join('\n\n'),
+          prompt: [
+            formatNovelScaleContract(workId),
+            goal.trim() ? `【用户创作目标】\n${goal.trim()}` : '',
+            `【长篇主线】\n${mainline}`,
+            existingText ? `【已生成设定】\n${existingText}` : ''
+          ].filter(Boolean).join('\n\n')
+        }),
+        { stream: false, signal }
+      )
+      if (!res.success || !res.content?.trim()) break
+      if (type === 'pleasure_engine') {
+        const scaleGate = validatePleasureEngineScale(workId, res.content.trim())
+        if (!scaleGate.valid) {
+          onProgress?.(`爽点机制规模门禁未通过：${scaleGate.reason}，正在重新生成`)
+          continue
+        }
+      }
+      coreSettingDAO.upsert(workId, type, res.content.trim())
+      count++
+      onProgress?.(`已回填核心设定「${type}」`)
+      break
+    }
+  }
+  const unresolved = targetTypes.filter(type => !coreSettingDAO.getByType(workId, type)?.content?.trim())
+  if (unresolved.length > 0) {
+    throw new Error(`核心设定生成不完整：${unresolved.join('、')}`)
+  }
+  const pleasureScaleGate = validatePleasureEngineScale(workId)
+  if (!pleasureScaleGate.valid) {
+    throw new NovelPipelineError('CONTRACT_INVALID', `爽点机制规模门禁未通过：${pleasureScaleGate.reason}`)
+  }
+  if (targetTypes.includes('golden_finger')) {
+    const goldenFinger = validateGoldenFinger(workId)
+    if (!goldenFinger.valid) {
+      throw new NovelPipelineError('PREREQUISITE_MISSING', `金手指设定不完整：${goldenFinger.issues.join('、')}`)
+    }
   }
   return count
 }
@@ -232,15 +273,19 @@ async function generateNovelCharacterCards(workId: number, signal?: AbortSignal)
     }),
     { stream: false, signal }
   )
-  if (!res.success || !res.content?.trim()) return 0
+  if (!res.success || !res.content?.trim()) throw new Error(`主角人设卡生成失败：${res.error || '模型未返回内容'}`)
   const parsed = parseCharacterCardsFromAi(res.content.trim())
   const sanitized = sanitizeCharacterCards(parsed)
-  if (!validateCharacterCards(sanitized.cards)) return 0
+  if (!validateCharacterCards(sanitized.cards)) throw new Error('主角人设卡结构校验失败')
   saveCharacterCards(workId, sanitized.cards)
   return sanitized.cards.length
 }
 
-async function generateNovelTitleHook(workId: number, goal: string, signal?: AbortSignal): Promise<TitleHookCandidate> {
+async function generateNovelTitleHook(workId: number, goal: string, signal?: AbortSignal): Promise<{
+  preferred: TitleHookCandidate
+  preferredIndex: number
+  candidates: TitleHookCandidate[]
+}> {
   assertNotAborted(signal)
   const ctx = buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true })
   const res = await modelService.chat(
@@ -250,8 +295,9 @@ async function generateNovelTitleHook(workId: number, goal: string, signal?: Abo
       enrichWorkContext: false,
       enrichNarrativeMemory: false,
       systemPrompt: [
-        '你是长篇小说书名与导语策划。输出 JSON：{"title":"...","hook":"...","summary":"..."}',
-        'title 要爆款吸睛，hook 是 30 字以内导语，summary 是 100 字以内核心卖点。'
+        '你是长篇小说书名与导语策划。根据已冻结的分卷和章节结构生成3套差异明显的候选，并给出推荐序号。只输出 JSON。',
+        '格式：{"preferredIndex":0,"candidates":[{"title":"...","hook":"...","summary":"..."}]}',
+        'title 要爆款吸睛，hook 是 30 字以内导语，summary 是 100 字以内核心卖点；三套候选不得只是同义替换。'
       ].join('\n'),
       prompt: [
         `【用户创作目标】\n${goal.trim() || '请策划一部长篇小说。'}`,
@@ -260,18 +306,26 @@ async function generateNovelTitleHook(workId: number, goal: string, signal?: Abo
     }),
     { stream: false, signal }
   )
-  const fallback: TitleHookCandidate = { title: '未命名长篇小说', hook: '' }
-  if (!res.success || !res.content?.trim()) return fallback
+  if (!res.success || !res.content?.trim()) throw new Error(`书名导语生成失败：${res.error || '模型未返回内容'}`)
   try {
     const json = extractJsonText(res.content.trim()) ?? res.content.trim()
-    const parsed = JSON.parse(json) as Partial<TitleHookCandidate>
-    return {
-      title: parsed.title?.trim() || fallback.title,
-      hook: parsed.hook?.trim() || fallback.hook,
-      summary: parsed.summary?.trim()
+    const parsed = JSON.parse(json) as { preferredIndex?: unknown; candidates?: unknown }
+    if (!Array.isArray(parsed.candidates) || parsed.candidates.length !== 3) throw new Error('必须返回3套 candidates')
+    const candidates = parsed.candidates.map((value, index) => {
+      if (!value || typeof value !== 'object') throw new Error(`第${index + 1}套候选不是对象`)
+      const row = value as Record<string, unknown>
+      const title = String(row.title ?? '').trim()
+      const hook = String(row.hook ?? '').trim()
+      if (!title || !hook) throw new Error(`第${index + 1}套候选缺少 title 或 hook`)
+      return { title, hook, summary: String(row.summary ?? '').trim() || undefined }
+    })
+    const preferredIndex = Number(parsed.preferredIndex)
+    if (!Number.isInteger(preferredIndex) || preferredIndex < 0 || preferredIndex >= candidates.length) {
+      throw new Error('preferredIndex 非法')
     }
-  } catch {
-    return fallback
+    return { preferred: candidates[preferredIndex], preferredIndex, candidates }
+  } catch (error) {
+    throw new Error(`书名导语解析失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -296,106 +350,59 @@ async function runNovelOverallSelfCheck(workId: number, signal?: AbortSignal): P
   recordQualityCheck(workId, {
     overall: { report: res.content, checkedAt: new Date().toISOString() }
   })
-  const conclusion = res.content.trim().match(/(PASS|FAIL|REVISE|通过|不通过|需修订).{0,40}/i)?.[0] ?? '自检完成'
-  return conclusion
+  return res.content.trim()
 }
 
-async function generateNovelBeats(
+async function repairNovelSettingsFromOverallCheck(
   workId: number,
-  goal: string,
+  report: string,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ created: number; reused: number }> {
-  assertNotAborted(signal)
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const plan = loadWritingPlan(workId)
-  const targetChapters = plan.targetChapters || 10
-
-  if (chapters.length > 0) {
-    onProgress?.(`复用已有 ${chapters.length} 个章节，跳过大纲生成`)
-    return { created: 0, reused: chapters.length }
-  }
-
-  const ctx = buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true })
-  const constraints = outlineConstraintsForWordTarget(plan.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
-  const resourceConstraints = formatResourceConstraintsForPrompt(workId)
-
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'goal_generate_beats',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      systemPrompt: [
-        `你是长篇小说结构编辑。请为作品生成 ${targetChapters} 个章节的标题与大纲。`,
-        `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须写成正文执行蓝图，包含【开场状态】【必须覆盖】【禁止越界】【结尾落点】【连续性约束】等标签。`,
-        '【必须覆盖】写 3-6 条正文必须落地的事件、冲突、转折、结果；【禁止越界】写本章不得提前兑现的后续内容；【结尾落点】写本章必须停住的位置。',
-        resourceConstraints
-          ? [
-              '若存在资源约束，每章必须输出 resource_budget 数组，给出该章资源开章区间、章末区间、允许事件、禁止事件和预算理由。',
-              'resource_budget 必须承接全书资源约束，禁止在前期提前透支后续里程碑要求。'
-            ].join('\n')
-          : '',
-        '输出 JSON 数组：[{"volume":"第一卷 名字","title":"第N章 标题","outline":"【开场状态】...\\n【必须覆盖】\\n1. ...\\n2. ...\\n【禁止越界】\\n1. 不得提前写...\\n【结尾落点】...\\n【连续性约束】...","beatRole":"setup|inciting|rising|midpoint|climax|resolution","resource_budget":[{"owner":"主角","resource":"体力","unit":"%","start_min":80,"start_max":90,"end_min":70,"end_max":85,"allowed_events":["小规模消耗"],"forbidden_events":["不得跌破50%"],"reason":"承接第20章最低50%"}]}]'
-      ].join('\n'),
-      prompt: [
-        `【用户创作目标】\n${goal.trim() || '请自动策划一部长篇小说。'}`,
-        `【目标章节数】${targetChapters} 章`,
-        resourceConstraints,
-        `【作品上下文】\n${ctx.text.slice(0, 8000)}`
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-
-  if (!res.success || !res.content?.trim()) throw new Error(`章节大纲生成失败：${res.error || '模型未返回内容'}`)
-  const json = extractJsonText(res.content.trim()) ?? res.content.trim()
-  let outlines: ChapterOutline[]
-  try {
-    const parsed = JSON.parse(json) as Array<Partial<ChapterOutline>>
-    outlines = parsed
-      .filter(o => o.title?.trim() && o.outline?.trim())
-      .map(o => ({
-        volumeName: o.volumeName ?? (o as { volume?: string }).volume,
-        title: o.title!.trim(),
-        outline: o.outline!.trim(),
-        beatRole: o.beatRole?.trim(),
-        resourceBudget: normalizeChapterResourceBudgets((o as { resource_budget?: unknown; resourceBudget?: unknown }).resource_budget ?? (o as { resourceBudget?: unknown }).resourceBudget)
-      }))
-  } catch {
-    throw new Error('章节大纲解析失败')
-  }
-
-  if (outlines.length === 0) throw new Error('未解析到有效章节大纲')
-
-  const volumes = volumeChapterDAO.listVolumes(workId)
-  let currentVolumeId = volumes[0]?.id
-  if (!currentVolumeId) {
-    currentVolumeId = volumeChapterDAO.createVolume(workId, '第一卷', '默认分卷')
-  }
-
-  const created: number[] = []
-  for (const o of outlines) {
+): Promise<number> {
+  const mainline = coreSettingDAO.getByType(workId, 'main_plotline')?.content?.trim()
+    || coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
+    || ''
+  let revised = 0
+  for (const type of NOVEL_SETTING_TYPES) {
     assertNotAborted(signal)
-    if (o.volumeName) {
-      const existing = volumeChapterDAO.listVolumes(workId).find(v => v.name === o.volumeName)
-      if (existing) {
-        currentVolumeId = existing.id
-      } else {
-        currentVolumeId = volumeChapterDAO.createVolume(workId, o.volumeName)
-      }
+    const current = coreSettingDAO.getByType(workId, type)?.content?.trim() ?? ''
+    const otherSettings = NOVEL_SETTING_TYPES
+      .filter(other => other !== type)
+      .map(other => {
+        const content = coreSettingDAO.getByType(workId, other)?.content?.trim()
+        return content ? `## ${other}\n${content}` : ''
+      })
+      .filter(Boolean)
+      .join('\n\n')
+    onProgress?.(`正在根据整体自检修订「${type}」`)
+    const response = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: `settings_${type}_revise`,
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        systemPrompt: [
+          NOVEL_SETTING_PROMPTS[type],
+          '这是长篇设定门禁修订。保留已自洽内容，只修复报告指出的阻塞问题；输出完整修订后的 Markdown，不要解释。'
+        ].join('\n\n'),
+        prompt: [
+          `【长篇主线】\n${mainline}`,
+          `【当前 ${type}】\n${current || '（空）'}`,
+          otherSettings ? `【其他已确定设定】\n${otherSettings}` : '',
+          `【整体自检报告】\n${report}`
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+    if (!response.success || !response.content?.trim()) {
+      throw new Error(response.error || `整体自检修订 ${type} 失败`)
     }
-    const id = volumeChapterDAO.createChapter(currentVolumeId!, o.title, o.outline)
-    if (o.beatRole) {
-      volumeChapterDAO.updateChapter(id, { beat_role: o.beatRole })
+    if (response.content.trim() !== current) {
+      coreSettingDAO.upsert(workId, type, response.content.trim())
+      revised++
     }
-    if (o.resourceBudget && o.resourceBudget.length > 0) {
-      resourceLedgerDAO.replaceBudgetsForChapter(workId, id, o.resourceBudget)
-    }
-    created.push(id)
   }
-
-  return { created: created.length, reused: chapters.length }
+  return revised
 }
 
 function nextEmptyChapter(workId: number): { id: number; title: string } | null {
@@ -410,46 +417,48 @@ async function diagnoseAndFixUntilPass(
   workId: number,
   chapterId: number,
   qualityMin: number,
+  qualityMetricMins: Record<QualityAiMetricKey, number>,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<{ passed: boolean; finalScore: number; rounds: number; failedMetrics: string[] }> {
   let rounds = 0
-  const maxRounds = 3
+  let bestScore = -1
   const failedMetrics: string[] = []
 
-  while (rounds < maxRounds) {
+  while (true) {
     assertNotAborted(signal)
     rounds++
     const ch = volumeChapterDAO.getChapter(chapterId)
-    if (!ch?.content?.trim()) break
+    if (!ch?.content?.trim()) throw new Error('待诊断正文不存在')
 
     onProgress?.(`正在诊断「${ch.title}」第 ${rounds} 轮`)
     const res = await diagnoseChapterQualityAi(workId, chapterId, ch.content, { thinkingEnabled: getGoalLoopModelOpts(workId).thinkingEnabled })
     if (!res.success || typeof res.scoreTotal !== 'number') {
       failedMetrics.push('诊断未返回分数')
-      break
+      onProgress?.(`「${ch.title}」第 ${rounds} 轮诊断未返回有效分数，正在重试`)
+      continue
     }
 
     const breakdown = res.report ? parseQualityAiScoreReport(res.report) : null
     const metricFailures = breakdown
-      ? breakdown.items.filter(i => i.score < qualityMin).map(i => i.label)
+      ? breakdown.items
+          .filter(item => item.score < qualityMetricMins[item.key])
+          .map(item => `${item.label} ${item.score}/${qualityMetricMins[item.key]}`)
       : []
 
     if (!res.hardFail && res.scoreTotal >= qualityMin && metricFailures.length === 0) {
       return { passed: true, finalScore: res.scoreTotal, rounds, failedMetrics }
     }
 
-    if (rounds === maxRounds) {
-      failedMetrics.push(...metricFailures)
-      return { passed: false, finalScore: res.scoreTotal, rounds, failedMetrics }
-    }
+    bestScore = Math.max(bestScore, res.scoreTotal)
 
     onProgress?.(`正在修复「${ch.title}」第 ${rounds} 轮`)
     const fixPrompt = [
       `【原文】\n${ch.content}`,
       `【问题】${res.hardFail ? '存在硬失败项' : `质量分 ${res.scoreTotal}，未达标指标：${metricFailures.join('、')}`}`,
+      res.report ? `【完整诊断报告】\n${res.report}` : '',
       QUALITY_APPLY_FIXES_PROMPT
-    ].join('\n\n')
+    ].filter(Boolean).join('\n\n')
 
     const fixRes = await modelService.chat(
       withGoalLoopModelOptions(workId, {
@@ -470,10 +479,11 @@ async function diagnoseAndFixUntilPass(
         content: fixed,
         word_count: countWords(fixed)
       })
+    } else {
+      failedMetrics.push('修复未返回有效正文')
+      onProgress?.(`「${ch.title}」第 ${rounds} 轮修复未返回有效正文，正在重新诊断`)
     }
   }
-
-  return { passed: false, finalScore: -1, rounds, failedMetrics }
 }
 
 function cleanupEmDashesAfterPassedGate(workId: number, mode: 'comma' | 'remove' = 'comma'): { chapters: number; replaced: number } {
@@ -495,28 +505,58 @@ function cleanupEmDashesAfterPassedGate(workId: number, mode: 'comma' | 'remove'
   return { chapters, replaced }
 }
 
-function buildNovelRepairPlan(workId: number, check: GoalCheckResult): RepairPlan {
+function buildNovelRepairPlan(workId: number, check: GoalCheckResult, config: StoryGoalConfig): RepairPlan {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const emptyChapters = chapters.filter(c => !c.content?.trim())
   if (emptyChapters.length > 0) {
     return { action: 'draft_missing', targetChapterIds: emptyChapters.map(c => c.id), hint: '先生成缺失章节正文' }
   }
 
-  const lowQuality = check.chapterDiagnostics.filter(d => d.qualityScore >= 0 && (d.qualityHardFail || d.qualityScore < (check.qualityScore > 0 ? check.qualityScore : 85)))
+  const lowQuality = check.chapterDiagnostics.filter(d => d.qualityScore >= 0 && (d.qualityHardFail || d.qualityScore < config.qualityMin))
   if (lowQuality.length > 0) {
     return { action: 'quality', targetChapterIds: lowQuality.slice(0, 3).map(d => d.chapterId), hint: '提升低质量章节' }
   }
 
-  const gateFailures = check.chapterDiagnostics.filter(d => d.gateBlockers > 0)
+  const gateFailures = check.chapterDiagnostics.filter(d => d.gateBlockers > 0 || d.antiAiViolations > 0)
   if (gateFailures.length > 0) {
     return { action: 'deai', targetChapterIds: gateFailures.slice(0, 3).map(d => d.chapterId), hint: '修复一致性门禁与去AI问题' }
   }
 
-  if (check.totalWords < check.targetWords) {
-    return { action: 'expand', targetChapterIds: [chapters[chapters.length - 1]?.id].filter(Boolean) as number[], hint: '整体字数不足，适当扩写' }
+  const perChapterTarget = loadWritingPlan(workId).wordsPerChapter || 4000
+  const bounds = bodyWordCountBounds(perChapterTarget)
+  const shortChapters = chapters.filter(chapter => (chapter.word_count ?? 0) < bounds.min)
+  if (shortChapters.length > 0 || check.totalWords < check.targetWords * 0.9) {
+    const targets = (shortChapters.length > 0 ? shortChapters : chapters).slice(0, 3)
+    return {
+      action: 'expand',
+      targetChapterIds: targets.map(chapter => chapter.id),
+      hint: `扩写至每章 ${bounds.min}-${bounds.max} 字，增加有效冲突和因果细节，禁止注水`
+    }
   }
 
-  return { action: 'goal_align', targetChapterIds: [], hint: '优化创作目标匹配度' }
+  const longChapters = chapters.filter(chapter => (chapter.word_count ?? 0) > bounds.max)
+  if (longChapters.length > 0 || check.totalWords > check.targetWords * 1.1) {
+    const targets = longChapters.length > 0 ? longChapters.slice(0, 3) : chapters.slice(-3)
+    return {
+      action: 'compress',
+      targetChapterIds: targets.map(chapter => chapter.id),
+      hint: `压缩至每章 ${bounds.min}-${bounds.max} 字，只删除重复解释和无推进段落`
+    }
+  }
+
+  const weakIds = check.weakChapterTitles
+    .map(title => chapters.find(chapter => chapter.title === title)?.id)
+    .filter((id): id is number => id != null)
+  const targetChapterIds = weakIds.length > 0
+    ? weakIds.slice(0, 3)
+    : chapters
+      .filter((_, index) => index === 0 || index === Math.floor(chapters.length / 2) || index === chapters.length - 1)
+      .map(chapter => chapter.id)
+  return {
+    action: 'goal_align',
+    targetChapterIds,
+    hint: `修复整书目标与结构问题：${check.storyIssues.slice(0, 3).join('；') || check.goalMatchReason || check.overallStoryReason}`
+  }
 }
 
 async function executeNovelRepairPlan(
@@ -545,24 +585,42 @@ async function executeNovelRepairPlan(
     const ch = volumeChapterDAO.getChapter(chapterId)
     if (!ch) continue
 
-    if (plan.action === 'expand') {
-      onProgress?.(`正在扩写「${ch.title}」`)
-      const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, extraHint: plan.hint, workType: 'novel' })
-      if (!gen.success) throw new Error(gen.error || '扩写失败')
+    if (plan.action === 'expand' || plan.action === 'compress') {
+      onProgress?.(`正在${plan.action === 'expand' ? '扩写' : '压缩'}「${ch.title}」`)
+      const gen = await reviseBeatBody(workId, chapterId, { signal, instruction: plan.hint, workType: 'novel' })
+      if (!gen.success) throw new Error(gen.error || '字数修订失败')
       summaries.push(`${ch.title} ${gen.wordCount}字`)
     } else if (plan.action === 'quality') {
-      const r = await diagnoseAndFixUntilPass(workId, chapterId, 85, signal, onProgress)
-      summaries.push(`${ch.title} 诊断${r.passed ? '通过' : '未通过'}（${r.finalScore}分，${r.rounds}轮）`)
+      onProgress?.(`正在定向精修「${ch.title}」`)
+      const diagnosis = await diagnoseChapterQualityAi(workId, chapterId, ch.content ?? '', {
+        thinkingEnabled: getGoalLoopModelOpts(workId).thinkingEnabled
+      })
+      if (!diagnosis.success || !diagnosis.report) throw new Error(diagnosis.error || '质量诊断失败')
+      const gen = await reviseBeatBody(workId, chapterId, {
+        signal,
+        workType: 'novel',
+        instruction: `根据以下质量诊断逐项修复，优先处理硬失败、因果、人设、设定、大纲覆盖和章末钩子：\n${diagnosis.report}`
+      })
+      if (!gen.success) throw new Error(gen.error || '质量修复失败')
+      summaries.push(`${ch.title} 已按诊断定向精修`)
     } else if (plan.action === 'deai') {
       onProgress?.(`正在去AI/修复一致性「${ch.title}」`)
       const gate = runConsistencyGate(workId, chapterId, ch.content ?? '')
       const violations = gate.blockers.join('；')
-      const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, extraHint: `请修复以下问题：${violations || '去除AI腔、提升叙事自然度'}`, workType: 'novel' })
+      const gen = await reviseBeatBody(workId, chapterId, {
+        signal,
+        instruction: `请修复以下问题：${violations || '去除AI腔、提升叙事自然度'}`,
+        workType: 'novel'
+      })
       if (!gen.success) throw new Error(gen.error || '修复失败')
       summaries.push(`${ch.title} 已修复`)
     } else {
       onProgress?.(`正在优化目标匹配「${ch.title}」`)
-      const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, extraHint: plan.hint || '强化创作目标匹配度', workType: 'novel' })
+      const gen = await reviseBeatBody(workId, chapterId, {
+        signal,
+        instruction: `${plan.hint || '强化创作目标匹配度'}\n用户目标：${goal}`,
+        workType: 'novel'
+      })
       if (!gen.success) throw new Error(gen.error || '优化失败')
       summaries.push(`${ch.title} 已优化`)
     }
@@ -621,22 +679,41 @@ export async function runNovelGoalLoop(
       ? { ...DEFAULT_STORY_GOAL_CONFIG, ...JSON.parse(existing.goal_config_json) as Partial<StoryGoalConfig> }
       : { ...DEFAULT_STORY_GOAL_CONFIG }
     fullConfig = { ...saved, ...config }
-    turn = existing.turn_count ?? 0
+    turn = 0
     phase = explicitPhase
-    if (existing.status === 'timeout' || turn >= fullConfig.maxTurns) {
-      turn = 0
-    }
   } else {
     fullConfig = { ...DEFAULT_STORY_GOAL_CONFIG, ...config }
     turn = 0
     phase = explicitPhase ?? (fullConfig.incubatorEnabled ? 'incubate_outline' : 'materialize_settings')
   }
 
+  const targetChapters = loadWritingPlan(workId).targetChapters || 10
+  const minimumTurnsForNovel = targetChapters + Math.ceil(targetChapters / 6) + 30
+  fullConfig.maxTurns = Math.max(fullConfig.maxTurns, minimumTurnsForNovel)
+
   const controller = new AbortController()
   activeLoops.set(workId, controller)
   bindGoalLoopModelOpts(workId, fullConfig)
 
   goalRoutineDAO.ensure(workId)
+  updateNovelGoalState(workId, {
+    titleHookCandidates: undefined,
+    titleHookPreferredIndex: undefined,
+    ...(!resume ? { failure: undefined, repairStall: undefined } : {})
+  })
+  if (!resume && !explicitPhase && volumeChapterDAO.listChaptersByWork(workId).length === 0) {
+    updateNovelGoalState(workId, {
+      novelOutline: undefined,
+      volumePlanChecked: undefined,
+      volumeQualityReport: undefined,
+      repairPlan: undefined,
+      failure: undefined,
+      overallRepairRounds: 0,
+      repairStall: undefined,
+      titleHookCandidates: undefined,
+      titleHookPreferredIndex: undefined
+    })
+  }
   goalRoutineDAO.update(workId, {
     status: 'running',
     max_turns: fullConfig.maxTurns,
@@ -665,6 +742,7 @@ export async function runNovelGoalLoop(
 
       turn++
       goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
+      const attemptedPhase = phase
 
       try {
         if (phase === 'incubate_outline') {
@@ -717,32 +795,95 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'character_cards', summary: `生成 ${count} 张主角人设卡片`
           })
           emit(`生成 ${count} 张主角人设卡片`, 'running')
-          phase = 'generate_title_hook'
+          phase = 'emotion_engine_gate'
+        } else if (phase === 'emotion_engine_gate') {
+          const result = await ensureEmotionEngine(
+            workId, fullConfig.goalDescription, 'novel', controller.signal,
+            message => emit(message, 'running')
+          )
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'emotion_engine_gate',
+            score: result.score, summary: `情绪发动机通过（${result.score}分，${result.rounds}轮）`
+          })
+          emit(`情绪发动机通过（${result.score}分）`, 'running')
+          phase = 'overall_self_check'
         } else if (phase === 'generate_title_hook') {
           emit('正在生成书名和导语', 'running')
-          const picked = await generateNovelTitleHook(workId, fullConfig.goalDescription, controller.signal)
+          const selection = await generateNovelTitleHook(workId, fullConfig.goalDescription, controller.signal)
+          const picked = selection.preferred
           workDAO.update(workId, { title: picked.title, description: picked.hook || undefined })
           goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'title_hook', summary: `应用书名「${picked.title}」`
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'title_hook_auto_selected',
+            summary: `AI 从 ${selection.candidates.length} 套候选中自动选择并应用书名「${picked.title}」`
           })
-          emit(`已应用书名「${picked.title}」`, 'running')
-          phase = 'overall_self_check'
+          emit(`AI 已自动选择并应用书名「${picked.title}」`, 'running')
+          phase = 'draft_body'
         } else if (phase === 'overall_self_check') {
           emit('正在运行整体自检', 'running')
           const report = await runNovelOverallSelfCheck(workId, controller.signal)
+          const conclusionText = report.match(/(PASS|FAIL|REVISE|通过|不通过|需修订).{0,40}/i)?.[0] ?? '自检完成'
           goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: report
+            work_id: workId, turn_no: turn, phase, action: 'overall_check', summary: conclusionText
           })
-          emit(`整体自检完成：${report}`, 'running')
+          const qualityStatus = getSettingsQualityStatus(workId)
+          if (!qualityStatus.canProceed) {
+            const runtime = readNovelGoalState(workId)
+            const repairRound = runtime.overallRepairRounds ?? 0
+            const revised = await repairNovelSettingsFromOverallCheck(
+              workId,
+              report,
+              controller.signal,
+              message => emit(message, 'running')
+            )
+            updateNovelGoalState(workId, { overallRepairRounds: repairRound + 1 })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'settings_repair',
+              summary: `整体自检未通过，自动修订 ${revised} 项设定（第 ${repairRound + 1} 轮，达标前持续修订）`
+            })
+            coreSettingDAO.deleteByWorkAndTypes(workId, ['emotion_engine'])
+            phase = 'generate_character_cards'
+          } else {
+            updateNovelGoalState(workId, { overallRepairRounds: 0 })
+            emit(`整体自检通过：${conclusionText}`, 'running')
+            phase = 'generate_volumes'
+          }
+        } else if (phase === 'generate_volumes') {
+          const result = await prepareNovelVolumePlan(
+            workId,
+            fullConfig.goalDescription,
+            controller.signal,
+            msg => emit(msg, 'running')
+          )
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'volumes',
+            summary: `分卷大纲已冻结：${result.volumes} 卷${result.revised ? '，经门禁整体修订' : ''}`
+          })
+          emit(`分卷大纲完成：${result.volumes} 卷，进入章节情节`, 'running')
           phase = 'generate_beats'
         } else if (phase === 'generate_beats') {
-          const res = await generateNovelBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          const res = await generateNextNovelOutlineBatch(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: 'beats',
-            summary: res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`
+            summary: res.created > 0
+              ? `生成章节情节 ${res.range?.start}-${res.range?.end}，剩余 ${res.remaining} 章${res.volumeGate ? `；「${res.volumeGate.volume}」整卷门禁通过（${res.volumeGate.score}分，${res.volumeGate.rounds}轮）` : ''}`
+              : `章节情节完整，复用 ${res.reused} 章`
           })
-          emit(res.created > 0 ? `生成 ${res.created} 个章节大纲` : `复用 ${res.reused} 个已有章节`, 'running')
-          phase = 'draft_body'
+          if (res.volumeGate) {
+            emit(`「${res.volumeGate.volume}」章节情节门禁通过：${res.volumeGate.score}分`, 'running')
+          }
+          emit(res.complete
+            ? `章节情节已完整生成，共 ${res.created + res.reused} 章`
+            : `本批生成 ${res.created} 章，剩余 ${res.remaining} 章`, 'running')
+          phase = res.complete ? 'generate_title_hook' : 'generate_beats'
         } else if (phase === 'draft_body') {
           const chapter = nextEmptyChapter(workId)
           if (!chapter) {
@@ -763,7 +904,14 @@ export async function runNovelGoalLoop(
             emit(`生成「${chapter.title}」${gen.wordCount}字${memMsg}`, 'running')
 
             if (fullConfig.diagnoseBodyAfterGeneration && fullConfig.qualityMin > 0) {
-              const diagResult = await diagnoseAndFixUntilPass(workId, chapter.id, fullConfig.qualityMin, controller.signal, msg => emit(msg, 'running'))
+              const diagResult = await diagnoseAndFixUntilPass(
+                workId,
+                chapter.id,
+                fullConfig.qualityMin,
+                fullConfig.qualityMetricMins,
+                controller.signal,
+                msg => emit(msg, 'running')
+              )
               const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma')
               const cleanMsg = cleaned.replaced > 0 ? `；破折号已替换 ${cleaned.replaced} 处` : ''
               shouldSyncFinalMemory = true
@@ -775,6 +923,47 @@ export async function runNovelGoalLoop(
                   ? `「${chapter.title}」诊断通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
                   : `「${chapter.title}」诊断未完全通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
               })
+              if (!diagResult.passed) {
+                clearChapterNarrativeMemory(workId, chapter.id)
+                volumeChapterDAO.updateChapterWithVersion(chapter.id, {
+                  content: '',
+                  word_count: 0,
+                  status: 'draft'
+                })
+                throw new Error(
+                  `「${chapter.title}」AI 诊断未达到 ${fullConfig.qualityMin} 分，禁止进入下一章`
+                  + `；最终 ${diagResult.finalScore} 分，失败指标：${[...new Set(diagResult.failedMetrics)].join('、') || '综合质量未达标'}`
+                )
+              }
+            }
+
+            let emotionPassed = false
+            for (let emotionRound = 1; emotionRound <= 3; emotionRound++) {
+              const latest = volumeChapterDAO.getChapter(chapter.id)
+              const assessment = await assessChapterEmotion(workId, chapter.id, latest?.content ?? '', controller.signal, true)
+              if (assessment.passed) {
+                emotionPassed = true
+                goalRoutineDAO.appendTurn({
+                  work_id: workId, turn_no: turn, phase, action: 'emotion_gate',
+                  target_chapter_id: chapter.id, score: assessment.score,
+                  summary: `「${chapter.title}」情绪盲读通过（${assessment.score}分，第${emotionRound}轮）`
+                })
+                emit(`「${chapter.title}」情绪盲读通过（${assessment.score}分）`, 'running')
+                break
+              }
+              emit(`「${chapter.title}」情绪盲读未通过（${assessment.score}分），正在按${assessment.failure_layer}层修订`, 'running')
+              const revised = await reviseBeatBody(workId, chapter.id, {
+                signal: controller.signal, workType: 'novel', instruction: emotionRepairHint(assessment)
+              })
+              if (!revised.success) throw new Error(revised.error || '情绪定向修订失败')
+              shouldSyncFinalMemory = true
+            }
+            if (!emotionPassed) {
+              clearChapterNarrativeMemory(workId, chapter.id)
+              volumeChapterDAO.updateChapterWithVersion(chapter.id, {
+                content: '', word_count: 0, status: 'draft', emotion_assessment_json: null
+              })
+              throw new Error(`「${chapter.title}」情绪门禁连续3轮未通过，禁止进入下一章`)
             }
 
             if (shouldSyncFinalMemory) {
@@ -791,11 +980,22 @@ export async function runNovelGoalLoop(
               }
             }
 
+            const latestAfterRepair = volumeChapterDAO.getChapter(chapter.id)
+            const finalConsistency = runConsistencyGate(workId, chapter.id, latestAfterRepair?.content ?? '')
+            const finalResource = runResourceConstraintGate(workId, chapter.id)
+            const finalBlockers = [...finalConsistency.blockers, ...finalResource.blockers]
+            if (finalBlockers.length > 0) {
+              clearChapterNarrativeMemory(workId, chapter.id)
+              volumeChapterDAO.updateChapterWithVersion(chapter.id, { content: '', word_count: 0, status: 'draft' })
+              throw new Error(`章节最终门禁未通过：${finalBlockers.join('；')}`)
+            }
+
             phase = nextEmptyChapter(workId) ? 'draft_body' : 'goal_check'
           }
         } else if (phase === 'goal_check') {
           emit('正在进行目标验收（质量/字数/门禁/目标匹配）', 'running')
           lastCheck = await checkStoryGoal(workId, fullConfig, controller.signal)
+          updateNovelGoalState(workId, { lastCheck })
           goalRoutineDAO.update(workId, {
             last_quality_score: lastCheck.qualityScore >= 0 ? lastCheck.qualityScore : null,
             goal_met: lastCheck.met
@@ -807,6 +1007,7 @@ export async function runNovelGoalLoop(
           })
 
           if (lastCheck.met) {
+            updateNovelGoalState(workId, { repairPlan: undefined, repairStall: undefined })
             const cleanup = cleanupEmDashesAfterPassedGate(workId, 'comma')
             if (cleanup.replaced > 0) {
               goalRoutineDAO.appendTurn({
@@ -815,18 +1016,23 @@ export async function runNovelGoalLoop(
               })
               emit(`门禁通过后已自动替换破折号：${cleanup.chapters} 个章节 ${cleanup.replaced} 处`, 'running')
               lastCheck = await checkStoryGoal(workId, fullConfig, controller.signal)
+              updateNovelGoalState(workId, { lastCheck })
             }
 
             goalRoutineDAO.setStatus(workId, 'goal_met')
-            emit(`目标达成：质量${lastCheck.qualityScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
+            emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
             return
           }
 
           emit(`未达标：${lastCheck.reasons.join('；')}`, 'running')
           phase = 'repair_plan'
         } else if (phase === 'repair_plan') {
-          const plan = buildNovelRepairPlan(workId, lastCheck!)
-          goalRoutineDAO.update(workId, { state_json: JSON.stringify({ repairPlan: plan }) })
+          const signature = lastCheck!.reasons.slice().sort().join('|').slice(0, 1000)
+          const previousStall = readNovelGoalState(workId).repairStall
+          const stallCount = previousStall?.signature === signature ? previousStall.count + 1 : 1
+          updateNovelGoalState(workId, { repairStall: { signature, count: stallCount } })
+          const plan = buildNovelRepairPlan(workId, lastCheck!, fullConfig)
+          updateNovelGoalState(workId, { repairPlan: plan })
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: plan.action,
             target_chapter_id: plan.targetChapterIds[0] ?? null,
@@ -835,9 +1041,9 @@ export async function runNovelGoalLoop(
           emit(`修复计划：${plan.action}`, 'running')
           phase = 'repair_execute'
         } else if (phase === 'repair_execute') {
-          const row = goalRoutineDAO.getByWork(workId)
-          const parsed = row?.state_json ? JSON.parse(row.state_json) as { repairPlan?: RepairPlan } : {}
-          const plan = parsed.repairPlan ?? buildNovelRepairPlan(workId, lastCheck!)
+          const parsed = readNovelGoalState(workId)
+          const plan = (parsed.repairPlan as RepairPlan | undefined)
+            ?? buildNovelRepairPlan(workId, lastCheck!, fullConfig)
           emit(`正在执行修复：${plan.action}`, 'running')
           const summary = await executeNovelRepairPlan(workId, plan, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           goalRoutineDAO.appendTurn({
@@ -850,6 +1056,7 @@ export async function runNovelGoalLoop(
         } else {
           phase = 'materialize_settings'
         }
+        updateNovelGoalState(workId, { failure: undefined })
       } catch (e) {
         if (controller.signal.aborted) {
           goalRoutineDAO.setStatus(workId, 'cancelled')
@@ -862,6 +1069,22 @@ export async function runNovelGoalLoop(
           work_id: workId, turn_no: turn, phase, action: 'error', summary: msg
         })
         emit(`轮次异常：${msg}`, 'running')
+        const currentFailure = readNovelGoalState(workId).failure
+        const errorCode = attemptedPhase === 'draft_body' && msg.includes('AI 诊断未达到')
+          ? 'QUALITY_GATE_NOT_MET'
+          : e instanceof NovelPipelineError
+            ? e.code
+            : e instanceof Error ? e.name : 'unknown'
+        const signature = errorCode === 'QUALITY_GATE_NOT_MET'
+          ? `${attemptedPhase}:${errorCode}`
+          : `${attemptedPhase}:${errorCode}:${msg.slice(0, 120)}`
+        const failureCount = currentFailure?.phase === attemptedPhase && currentFailure.signature === signature
+          ? currentFailure.count + 1
+          : 1
+        updateNovelGoalState(workId, {
+          failure: { phase: attemptedPhase, signature, count: failureCount, message: msg }
+        })
+        emit(`「${attemptedPhase}」第 ${failureCount} 次执行失败，将在下一轮继续自动重试：${msg}`, 'running')
       }
     }
 

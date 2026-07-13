@@ -11,6 +11,10 @@ import {
 } from '../../../../shared/goal-routine-phases'
 import { formatDbUtcAsLocal } from '../../../../shared/local-datetime'
 import { isTotalWordCountInTargetRange } from '../../../../shared/body-word-target'
+import {
+  QUALITY_AI_METRIC_DEFS,
+  type QualityAiMetricKey
+} from '../../../../shared/quality-ai-score'
 
 const props = defineProps<{ workId: number; workType?: 'novel' | 'story' }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
@@ -31,6 +35,7 @@ interface GoalConfig {
   requireAllBeatsContent: boolean
   targetTotalWords: number | null
   qualityMin: number
+  qualityMetricMins: Record<QualityAiMetricKey, number>
   diagnoseBodyAfterGeneration: boolean
   humanReviewTitleHook: boolean
   checkConsistencyGate: boolean
@@ -49,6 +54,9 @@ const DEFAULT_CONFIG: GoalConfig = {
   requireAllBeatsContent: true,
   targetTotalWords: null,
   qualityMin: 85,
+  qualityMetricMins: Object.fromEntries(
+    QUALITY_AI_METRIC_DEFS.map(metric => [metric.key, 85])
+  ) as Record<QualityAiMetricKey, number>,
   diagnoseBodyAfterGeneration: true,
   humanReviewTitleHook: true,
   checkConsistencyGate: true,
@@ -65,7 +73,17 @@ const DEFAULT_CONFIG: GoalConfig = {
 function loadConfig(): GoalConfig {
   try {
     const raw = localStorage.getItem(`${CONFIG_STORAGE_KEY}:${props.workId}`)
-    if (raw) return { ...DEFAULT_CONFIG, ...JSON.parse(raw) as Partial<GoalConfig> }
+    if (raw) {
+      const saved = JSON.parse(raw) as Partial<GoalConfig>
+      return {
+        ...DEFAULT_CONFIG,
+        ...saved,
+        qualityMetricMins: {
+          ...DEFAULT_CONFIG.qualityMetricMins,
+          ...saved.qualityMetricMins
+        }
+      }
+    }
   } catch { /* ignore */ }
   return { ...DEFAULT_CONFIG }
 }
@@ -98,6 +116,7 @@ interface GoalCheckResult {
   totalWords: number
   targetWords: number
   qualityScore: number
+  emotionScore: number
   qualityHardFail: boolean
   gateBlockers: number
   antiAiViolations: number
@@ -151,6 +170,7 @@ interface TitleHookReviewCandidate {
 }
 
 const titleHookReview = computed(() => {
+  if (props.workType === 'novel') return null
   const raw = state.value?.state_json
   if (!raw) return null
   try {
@@ -212,7 +232,7 @@ const canContinueRepair = computed(() => {
     && repairPhases.includes(s.current_phase ?? '')
 })
 
-const resumeFromPhase = ref<GoalRoutinePhase>(availablePhases.value[0] ?? 'incubate_outline')
+const resumeFromPhase = ref<GoalRoutinePhase>(availablePhases.value[0] ?? 'materialize_settings')
 const phasePickerTouched = ref(false)
 
 const showResumePhasePicker = computed(() => {
@@ -260,6 +280,7 @@ const dimStatus = computed(() => {
     beats: c.totalBeats > 0 && c.contentBeats === c.totalBeats,
     words: isTotalWordCountInTargetRange(c.totalWords, c.targetWords),
     quality: c.qualityScore >= 0 && !c.qualityHardFail && c.qualityScore >= cfg.qualityMin,
+    emotion: c.emotionScore >= 80,
     gate: c.gateBlockers === 0,
     antiAi: c.antiAiViolations === 0,
     goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin,
@@ -281,6 +302,19 @@ async function refreshState() {
   }
   state.value = res.state
   turns.value = res.turns
+  if (res.state?.state_json) {
+    try {
+      const runtime = JSON.parse(res.state.state_json) as { lastCheck?: GoalCheckResult }
+      lastCheck.value = runtime.lastCheck ?? null
+    } catch {
+      lastCheck.value = null
+    }
+  } else {
+    lastCheck.value = null
+  }
+  if (!lastMessage.value && res.turns[0]?.summary) {
+    lastMessage.value = res.turns[0].summary
+  }
   running.value = await window.anovel.invoke('goal:isRunning', props.workId) as boolean
   syncResumePhaseFromState()
 }
@@ -291,6 +325,7 @@ function goalInvokePayload() {
     requireAllBeatsContent: config.value.requireAllBeatsContent,
     targetTotalWords: config.value.targetTotalWords,
     qualityMin: config.value.qualityMin,
+    qualityMetricMins: { ...config.value.qualityMetricMins },
     diagnoseBodyAfterGeneration: config.value.diagnoseBodyAfterGeneration,
     humanReviewTitleHook: config.value.humanReviewTitleHook,
     checkConsistencyGate: config.value.checkConsistencyGate,
@@ -325,7 +360,9 @@ async function start() {
   if (running.value) return
   const useResumePayload = showResumePhasePicker.value
   const payload = useResumePayload ? resumeInvokePayload() : goalInvokePayload()
-  const message = useResumePayload ? resumeStartMessage() : '目标循环启动…'
+  const message = useResumePayload
+    ? `从「${goalRoutinePhaseLabel(resumeFromPhase.value, props.workType)}」启动新一轮…`
+    : '目标循环启动新一轮…'
   running.value = true
   lastStatus.value = 'running'
   lastMessage.value = message
@@ -433,7 +470,7 @@ watch(config, saveConfig, { deep: true })
           : '描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」'"
         class="textarea textarea-bordered w-full text-sm rounded-lg resize-none leading-relaxed"
       ></textarea>
-      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 章节大纲 → 正文生成' : '大纲孵化 → AI 门禁/冻结 → 核心设定 → 主角人设卡 → 书名导语 → 整体自检 → 节拍大纲 → 正文生成' }}；进度区会显示当前子步骤。</p>
+      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 整体自检 → 分卷大纲 → 章节情节 → 书名导语 → 正文生成' : '核心设定 → 主角人设卡 → 故事发动机 → 节拍大纲 → 书名导语 → 整体自检 → 正文生成' }}；进度区会显示当前子步骤。</p>
       <label v-if="workType === 'novel'" class="flex items-center gap-2 text-xs cursor-pointer pt-1 border-t border-base-300/40">
         <input v-model="config.incubatorEnabled" type="checkbox" :disabled="running"
           class="checkbox checkbox-xs checkbox-primary" />
@@ -492,13 +529,33 @@ watch(config, saveConfig, { deep: true })
             开启后系统先做交换位置盲评，再暂停展示全部候选；确认后从整体自检继续。
           </p>
           <label class="flex items-center justify-between gap-3 text-xs">
-            <span>质量分下限</span>
+            <span>总质量分下限</span>
             <div class="flex items-center gap-1.5">
               <input v-model.number="config.qualityMin" type="number" min="0" max="100"
                 :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
               <span class="text-base-content/40">/100</span>
             </div>
           </label>
+          <div v-if="workType === 'novel'" class="rounded-xl border border-base-300/70 bg-base-200/35 p-3 space-y-2">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-xs font-medium">单项质量分下限</span>
+              <button type="button" class="btn btn-ghost btn-xs" :disabled="running"
+                @click="QUALITY_AI_METRIC_DEFS.forEach(metric => config.qualityMetricMins[metric.key] = config.qualityMin)">
+                同步为总分线
+              </button>
+            </div>
+            <p class="text-[11px] text-base-content/40 leading-relaxed">
+              每项独立判定；例如可单独降低“字数达标”，不会放宽其他质量指标。
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1.5">
+              <label v-for="metric in QUALITY_AI_METRIC_DEFS" :key="metric.key"
+                class="flex items-center justify-between gap-2 text-[11px]">
+                <span>{{ metric.label }}</span>
+                <input v-model.number="config.qualityMetricMins[metric.key]" type="number" min="0" max="100"
+                  :disabled="running" class="input input-bordered input-xs w-16 rounded-lg text-right" />
+              </label>
+            </div>
+          </div>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>目标匹配度</span>
             <div class="flex items-center gap-1.5">
@@ -554,12 +611,12 @@ watch(config, saveConfig, { deep: true })
             <input v-model.number="config.maxTurns" type="number" min="1" max="100"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '设定、卡片、书名导语、自检、章节大纲、正文、验收和修复' : '孵化、门禁、冻结、设定、卡片、书名导语、自检、节拍、正文、验收和修复' }}阶段。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节情节、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
 
       <div v-if="showResumePhasePicker" class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-2">
-        <label class="text-xs font-bold text-base-content/70">续跑起始步骤</label>
+        <label class="text-xs font-bold text-base-content/70">运行起始步骤</label>
         <select
           v-model="resumeFromPhase"
           :disabled="running"
@@ -571,7 +628,7 @@ watch(config, saveConfig, { deep: true })
           </option>
         </select>
         <p class="text-[11px] text-base-content/40 leading-relaxed">
-          默认选中上次断点「{{ phaseLabel }}」。可改选任意步骤重新执行，已有内容不会被自动清除。
+          “启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”保留原轮次。已有作品内容不会被自动清除。
         </p>
       </div>
 
@@ -666,6 +723,13 @@ watch(config, saveConfig, { deep: true })
               <span class="badge badge-xs" :class="dimStatus.goal ? 'badge-success' : 'badge-error'">{{ dimStatus.goal ? '达标' : '未达' }}</span>
             </div>
           </div>
+          <div class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
+            <span class="text-base-content/50">读者情绪盲读</span>
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono">{{ lastCheck.emotionScore >= 0 ? lastCheck.emotionScore : '-' }}</span>
+              <span class="badge badge-xs" :class="dimStatus.emotion ? 'badge-success' : 'badge-error'">{{ dimStatus.emotion ? '达标' : '未达' }}</span>
+            </div>
+          </div>
           <div v-if="workType === 'story'" class="rounded-xl bg-base-100 px-3 py-2 border border-base-300/60 space-y-1">
             <span class="text-base-content/50">整篇结构与兑现</span>
             <div class="flex items-center justify-between gap-2">
@@ -722,7 +786,10 @@ watch(config, saveConfig, { deep: true })
 
     <!-- 轮次历史 -->
     <div class="card bg-base-200 border border-base-300 shadow-sm p-5">
-      <h4 class="font-semibold text-sm mb-3">轮次历史</h4>
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <h4 class="font-semibold text-sm">轮次历史</h4>
+        <span class="text-[11px] text-base-content/40">按发生时间倒序</span>
+      </div>
       <div v-if="visibleTurns.length === 0" class="text-xs text-base-content/40 py-4 text-center">无记录</div>
       <div v-else class="space-y-1.5 max-h-72 overflow-y-auto">
         <div v-for="t in visibleTurns" :key="t.id"
@@ -743,7 +810,7 @@ watch(config, saveConfig, { deep: true })
     <!-- 安全提示 -->
     <div class="alert alert-info text-xs py-2">
       <font-awesome-icon icon="info-circle" class="w-4 h-4 shrink-0" />
-      <span>每次写正文自动存版本快照；进入「{{ workType === 'novel' ? '章节大纲' : '节拍大纲' }}」步骤可逐{{ workType === 'novel' ? '章' : '拍' }}查看版本历史并回滚。</span>
+      <span>每次写正文自动存版本快照；进入「{{ workType === 'novel' ? '章节情节' : '节拍大纲' }}」步骤可逐{{ workType === 'novel' ? '章' : '拍' }}查看版本历史并回滚。</span>
     </div>
   </div>
 </template>

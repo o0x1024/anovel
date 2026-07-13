@@ -34,6 +34,7 @@ export interface GoldenFingerVisualMetric {
 }
 
 export interface GoldenFingerStructured {
+  trackingMode: 'narrative' | 'numeric'
   nameAndForm: string
   coreRules: string
   manifestation: string
@@ -55,6 +56,7 @@ export interface GoldenFingerStructured {
 }
 
 export const EMPTY_GOLDEN_FINGER: GoldenFingerStructured = {
+  trackingMode: 'narrative',
   nameAndForm: '',
   coreRules: '',
   manifestation: '',
@@ -115,6 +117,7 @@ export function normalizeGoldenFinger(value: Partial<GoldenFingerStructured>): G
     return ''
   }
   return {
+    trackingMode: value.trackingMode === 'numeric' ? 'numeric' : 'narrative',
     nameAndForm: safeStr(value.nameAndForm),
     coreRules: safeStr(value.coreRules),
     manifestation: safeStr(value.manifestation),
@@ -362,8 +365,9 @@ export function extractGoldenFingerFromAiContent(
   const trimmed = content.trim()
 
   let jsonText = ''
-  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/)
-  if (fencedMatch) {
+  const jsonFenceMatches = [...trimmed.matchAll(/```json\s*([\s\S]*?)\s*```/gi)]
+  const fencedMatch = jsonFenceMatches.at(-1)
+  if (fencedMatch?.[1]) {
     jsonText = fencedMatch[1].trim()
   } else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     jsonText = trimmed
@@ -388,7 +392,7 @@ export function extractGoldenFingerFromAiContent(
     const withEnglishKeys = normalizeGoldenFingerKeys(structuredSource)
     const structured = normalizeGoldenFinger(withEnglishKeys)
     const patchContent = typeof patchItem?.content === 'string' ? patchItem.content.trim() : ''
-    let markdown = patchContent || (fencedMatch ? trimmed.replace(fencedMatch[0], '').trim() : '')
+    let markdown = patchContent || (fencedMatch?.[0] ? trimmed.replace(fencedMatch[0], '').trim() : '')
     if (patchContent) {
       const contentStructured = parseGoldenFingerFromMarkdown(patchContent)
       return {
@@ -520,7 +524,9 @@ export function goldenFingerValidationIssues(gf: GoldenFingerStructured): string
   if (!gf.infoAdvantage.trim()) issues.push('缺少「信息差优势」')
   if (!gf.tagline.trim()) issues.push('缺少「番茄一句话卖点」')
   if (!gf.firstPayoffScene.trim()) issues.push('缺少「前三章首次爽点场景」')
-  if (!gf.visualMetric.currentLevel?.trim()) issues.push('缺少「可视化限制指标-当前等级」')
+  if (gf.trackingMode === 'numeric' && !gf.visualMetric.currentLevel?.trim()) {
+    issues.push('数值模式缺少「可视化限制指标-当前等级」')
+  }
   return issues
 }
 
@@ -532,7 +538,8 @@ export function formatGoldenFingerConstraints(gf: GoldenFingerStructured): strin
 
   const lines: string[] = ['【金手指硬性约束】']
   const fullText = JSON.stringify(gf)
-  const prefersNoNumeric = /无数值|不用算数值|不需要.*数值|禁止.*(?:百分比|进度条|固定数值)|不需要AI记忆任何数据/.test(fullText)
+  const prefersNoNumeric = gf.trackingMode !== 'numeric'
+    || /无数值|不用算数值|不需要.*数值|禁止.*(?:百分比|进度条|固定数值)|不需要AI记忆任何数据/.test(fullText)
   lines.push(`能力：${gf.nameAndForm}`)
   if (prefersNoNumeric) {
     lines.push('表达方式：该金手指明确要求无数值表达；后续分卷/章节/正文禁止新增百分比、进度条、固定冷却时间、精确次数或兑换比例，只能用体感、场景边界、能力阶段和失效表现描述。')
@@ -569,6 +576,7 @@ export function goldenFingerStructuredPromptSection(): string {
     '【输出格式要求】',
     '请在 Markdown 分析之后，附加一个 JSON 代码块（标记为 json），字段如下：',
     '{',
+    '  "trackingMode": "narrative 或 numeric；默认 narrative，只有用户明确要求系统面板、积分余额、属性点或精确次数玩法时才允许 numeric",',
     '  "nameAndForm": "能力名称与形态",',
     '  "coreRules": "核心规则：触发规则、转化规则、消耗规则、污染代价、品类解锁等硬性约束",',
     '  "manifestation": "呈现形式：以什么形式呈现给主角（面板/声音/纹路/空间/物品/纯感知），感官通道，触发方式",',
@@ -577,7 +585,7 @@ export function goldenFingerStructuredPromptSection(): string {
     '  "abilities": [{ "name": "能力名", "effect": "具体效果", "scope": "作用范围" }],',
     '  "acquisition": "获取与觉醒条件",',
     '  "sourceNature": "来源性质：金手指的本质来源、在世界观中是否有同类、是否可被夺取/封印",',
-    '  "limit": { "cooldown": "冷却/间隔", "cost": "消耗", "usageLimit": "次数/容量上限", "invalidScenes": "失效场景" },',
+    '  "limit": { "cooldown": "恢复条件/再次使用边界", "cost": "使用代价与可观察后果", "usageLimit": "承载上限/失效边界", "invalidScenes": "失效场景" },',
     '  "backlash": "反噬/代价机制",',
     '  "upgrades": [{ "stage": "阶段名", "condition": "升级条件", "unlocks": "解锁能力" }],',
     '  "infoAdvantage": "信息差优势",',
@@ -588,13 +596,15 @@ export function goldenFingerStructuredPromptSection(): string {
     '  "firstPayoffScene": "前三章首次爽点场景",',
     '  "visualMetric": {',
     '    "currentLevel": "当前等级/阶段",',
-    '    "costPerUse": "每次使用消耗",',
-    '    "cooldown": "冷却时间",',
-    '    "usageCap": "使用次数上限",',
-    '    "progressBar": "进度条形态",',
+    '    "costPerUse": "使用代价及外在表现",',
+    '    "cooldown": "恢复条件与场景边界",',
+    '    "usageCap": "承载边界",',
+    '    "progressBar": "阶段表现方式",',
     '    "failureScene": "越级/失效后果"',
     '  }',
     '}',
+    'narrative 模式禁止百分比、精确成功率、固定点数、精确次数、固定冷却时长和进度条；用阶段、条件、代价、体感、场景边界表达。',
+    '修仙境界、灵力、寿命压力、身份隐藏、重生和穿越本身都不构成 numeric 模式依据。',
     'Markdown 正文用于展示；JSON 用于系统校验与正文生成注入。两者必须一致。'
   ].join('\n')
 }
@@ -608,6 +618,7 @@ export function mergeGoldenFinger(
   patch: GoldenFingerStructured
 ): GoldenFingerStructured {
   const merged = normalizeGoldenFinger(current)
+  merged.trackingMode = patch.trackingMode === 'numeric' ? 'numeric' : 'narrative'
 
   const scalarFields: Array<keyof Omit<GoldenFingerStructured, 'abilities' | 'upgrades' | 'limit' | 'visualMetric'>> = [
     'nameAndForm', 'coreRules', 'manifestation', 'visibility', 'interaction', 'acquisition', 'sourceNature', 'backlash', 'infoAdvantage', 'sideEffects', 'forbiddenScenes', 'exposureConsequence', 'tagline', 'firstPayoffScene'

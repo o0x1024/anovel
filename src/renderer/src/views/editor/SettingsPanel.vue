@@ -109,7 +109,7 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '若上下文含「用户补充要求」，须严格遵守；若用户明确要求历史文、现实向、正剧向或无金手指，不得强塞系统/异能/空间。',
     '',
     '【路径 A：有特殊机制/金手指的故事】',
-    '适用于系统、异能、空间、面板、血脉、修炼外挂、特殊感知等机制明确存在的故事。',
+    '适用于系统面板、独立异能、随身空间、积分兑换、属性点等独立于世界常规能力的机制。修仙境界、灵力、寿命压力、身份信息差、重生或穿越身份本身不属于金手指。',
     '核心原则：',
     '- 限制比能力更重要——金手指应同时是优势来源和麻烦来源',
     '- 好的金手指让读者 3 秒内理解「主角凭什么赢」和「主角为什么还不能赢」',
@@ -155,7 +155,7 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '- 来源性质：金手指的本质来源是什么（天道赐予/远古遗留/系统绑定/血脉觉醒/穿越附赠）？在当前世界观中是否有同类先例？是否可被夺取/转移/封印？',
     '- 限制条件要具体到场景与表现（何时累、如何失效、什么目标不能回收/使用）；只有核心设定明确需要数值时才写百分比/固定冷却/次数',
     '- 反噬机制是冲突的自然来源，不能是"用多了会累"这种无效限制',
-    '- 升级路径写明能力如何成长（等级/解锁新功能/融合进化）',
+    '- 升级路径写明能力如何按剧情阶段成长、满足什么条件并承担什么新代价',
     '- 信息差优势：主角知道什么别人不知道的？这是智斗和反转的基础',
     '- 暴露后果：如果金手指被他人发现会有什么后果？是否有势力专门针对金手指持有者？这决定了"隐藏身份"冲突的张力',
     '- 可视化限制指标必须可写进正文：当前阶段、使用代价、使用间隔、失效边界、越级/失效后果；若用户要求无数值，用「轻微疲惫/明显乏力/累瘫」「刺痒/幻觉/失控边缘」等体感与场景表达，禁止百分比、进度条、固定次数',
@@ -171,7 +171,7 @@ const aiSystemPrompts: Record<SettingType, string> = {
     '核心原则：',
     '- 爽点不是"隔几章来一个高潮"——爽点是读者持续追读的理由',
     '- 不同类型的爽点需要不同的对抗设计来反衬',
-    '- 爽点频率必须和金手指的冷却/升级节奏对齐',
+    '- 爽点频率必须和金手指的使用边界/升级节奏对齐',
     '输出要求：',
     '- 用 Markdown 结构化输出：## 主要爽点类型 / ## 触发条件与场景 / ## 频率设计 / ## 对抗设计 / ## 情绪节奏锚点',
     '- 总字数 300-600 字',
@@ -1245,6 +1245,19 @@ async function clearAllSettings() {
   await qualityPanelRef.value?.load?.()
   await nav?.refreshProgress()
 }
+
+async function clearGoldenFinger() {
+  if (!getSetting('golden_finger').trim()) return
+  if (!confirm('确定要清空金手指系统吗？正文内容、结构化数据及该设定的版本记录都会删除。')) return
+  await window.anovel.invoke('setting:upsert', props.workId, 'golden_finger', '')
+  draftByType.value.golden_finger = ''
+  expandedTypes.value.delete('golden_finger')
+  structuredEditorOpen.value = false
+  await loadCoreSettings()
+  await versionHistoryRefs.value.golden_finger?.load()
+  await qualityPanelRef.value?.load?.()
+  await nav?.refreshProgress()
+}
 </script>
 
 <template>
@@ -1300,6 +1313,16 @@ async function clearAllSettings() {
             <p class="text-xs text-base-content/40 mt-0.5">{{ st.desc }}</p>
           </div>
           <div class="flex gap-2">
+            <button
+              v-if="st.type === 'golden_finger' && getSetting('golden_finger')"
+              type="button"
+              class="btn btn-outline btn-error btn-xs gap-1"
+              title="清空金手指正文与结构化数据"
+              @click="clearGoldenFinger"
+            >
+              <font-awesome-icon icon="trash-can" class="w-3 h-3" />
+              清空内容
+            </button>
             <button
               class="btn btn-primary btn-xs gap-1"
               :disabled="!!aiLoadingByType[st.type]"

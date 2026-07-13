@@ -1,6 +1,7 @@
 import { coreSettingDAO } from '../db'
 import {
   parseGoldenFingerFromMarkdown,
+  extractGoldenFingerFromAiContent,
   normalizeGoldenFinger,
   goldenFingerValidationIssues,
   formatGoldenFingerConstraints,
@@ -21,11 +22,30 @@ export function loadGoldenFingerStructured(workId: number): GoldenFingerStructur
   if (row?.structured_content) {
     try {
       const parsed = JSON.parse(row.structured_content) as Partial<GoldenFingerStructured>
-      return normalizeGoldenFinger(parsed)
+      const stored = normalizeGoldenFinger(parsed)
+      const storedIssues = goldenFingerValidationIssues(stored)
+      if (storedIssues.length === 0) return stored
+
+      const extracted = extractGoldenFingerFromAiContent(row.content)
+      if (extracted) {
+        const contentIssues = goldenFingerValidationIssues(extracted.structured)
+        if (contentIssues.length < storedIssues.length) {
+          coreSettingDAO.upsertStructured(
+            workId,
+            'golden_finger',
+            row.content,
+            JSON.stringify(extracted.structured)
+          )
+          return extracted.structured
+        }
+      }
+      return stored
     } catch {
       // fall through to markdown parse
     }
   }
+  const extracted = extractGoldenFingerFromAiContent(row?.content ?? '')
+  if (extracted) return extracted.structured
   return parseGoldenFingerFromMarkdown(row?.content ?? '')
 }
 

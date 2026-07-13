@@ -25,6 +25,8 @@ export { foreshadowingDAO } from './dao/foreshadowing-dao'
 export type { ForeshadowingRow, ForeshadowingStatus } from './dao/foreshadowing-dao'
 export { characterSnapshotDAO } from './dao/character-snapshot-dao'
 export type { CharacterSnapshotRow } from './dao/character-snapshot-dao'
+export { emotionalStateDAO } from './dao/emotional-state-dao'
+export type { EmotionalStateLedgerRow, EmotionalStateLedgerInput } from './dao/emotional-state-dao'
 export { timelineDAO } from './dao/timeline-dao'
 export type { TimelineEventRow } from './dao/timeline-dao'
 export { anchorAlignmentDAO } from './dao/anchor-alignment-dao'
@@ -52,6 +54,8 @@ export type {
 } from './dao/goal-routine-dao'
 export { resourceLedgerDAO }
   from './dao/resource-ledger-dao'
+export { novelOutlineDAO } from './dao/novel-outline-dao'
+export type { NovelOutlineBatchItem } from './dao/novel-outline-dao'
 export type {
   ResourceConstraintRow,
   ResourceConstraintInput,

@@ -36,6 +36,13 @@ function hasForeignKey(
  * 幂等增量迁移：每次获取 DB 连接时执行，兼容热更新后未重跑 initSchema 的情况
  */
 export function ensureIncrementalMigrations(db: Database.Database): void {
+  if (hasTable(db, 'volumes') && !hasColumn(db, 'volumes', 'planned_start_chapter')) {
+    db.exec(`ALTER TABLE volumes ADD COLUMN planned_start_chapter INTEGER`)
+  }
+  if (hasTable(db, 'volumes') && !hasColumn(db, 'volumes', 'planned_end_chapter')) {
+    db.exec(`ALTER TABLE volumes ADD COLUMN planned_end_chapter INTEGER`)
+  }
+
   if (hasTable(db, 'core_settings') && !hasColumn(db, 'core_settings', 'update_time')) {
     db.exec(`ALTER TABLE core_settings ADD COLUMN update_time DATETIME`)
     db.exec(
@@ -737,6 +744,37 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
 
       CREATE INDEX IF NOT EXISTS idx_resource_constraints_work ON resource_constraints(work_id);
       CREATE INDEX IF NOT EXISTS idx_chapter_resource_budgets_work_chapter ON chapter_resource_budgets(work_id, chapter_id);
+    `)
+  } catch { /* 已存在 */ }
+
+  // V4.0: 情绪因果合同、盲读验收与跨章情绪状态账本
+  try {
+    if (hasTable(db, 'chapters') && !hasColumn(db, 'chapters', 'emotion_contract_json')) {
+      db.exec(`ALTER TABLE chapters ADD COLUMN emotion_contract_json TEXT`)
+    }
+    if (hasTable(db, 'chapters') && !hasColumn(db, 'chapters', 'emotion_assessment_json')) {
+      db.exec(`ALTER TABLE chapters ADD COLUMN emotion_assessment_json TEXT`)
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS emotional_state_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id INTEGER NOT NULL,
+        chapter_id INTEGER NOT NULL,
+        character_name VARCHAR(100) NOT NULL,
+        felt_state TEXT NOT NULL,
+        displayed_state TEXT NOT NULL,
+        unresolved_emotion TEXT NOT NULL,
+        protective_strategy TEXT NOT NULL,
+        behavioral_aftereffect TEXT NOT NULL,
+        beliefs_json TEXT,
+        relationships_json TEXT,
+        source_event TEXT NOT NULL,
+        create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+        FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_emotional_state_work_character
+        ON emotional_state_ledger(work_id, character_name, chapter_id);
     `)
   } catch { /* 已存在 */ }
 }

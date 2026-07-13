@@ -1,10 +1,11 @@
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, emotionalStateDAO } from '../db'
 
 export interface MemoryCleanupResult {
   snapshotsRemoved: number
   foreshadowingRemoved: number
   payoffsReverted: number
   timelineRemoved?: number
+  emotionalStatesRemoved?: number
 }
 
 function normalizeDesc(desc: string): string {
@@ -12,13 +13,7 @@ function normalizeDesc(desc: string): string {
 }
 
 export function resolveWorkIdForChapter(chapterId: number): number | null {
-  const ch = volumeChapterDAO.getChapter(chapterId)
-  if (!ch) return null
-  const row = volumeChapterDAO.get<{ work_id: number }>(
-    'SELECT work_id FROM volumes WHERE id = ?',
-    [ch.volume_id]
-  )
-  return row?.work_id ?? null
+  return volumeChapterDAO.getWorkIdForChapter(chapterId)
 }
 
 export function isEmptyChapterContent(value: unknown): boolean {
@@ -32,16 +27,18 @@ export function clearChapterMemoryBeforeExtract(workId: number, chapterId: numbe
   const payoffsReverted = foreshadowingDAO.revertPayoffsByChapter(workId, chapterId)
   const foreshadowingRemoved = foreshadowingDAO.deleteByPlantChapter(workId, chapterId)
   const snapshotsRemoved = characterSnapshotDAO.deleteByChapter(chapterId)
-  return { snapshotsRemoved, foreshadowingRemoved, payoffsReverted }
+  const timelineRemoved = timelineDAO.deleteByChapter(workId, chapterId)
+  return { snapshotsRemoved, foreshadowingRemoved, payoffsReverted, timelineRemoved }
 }
 
 /**
  * 清空某章正文时：撤销本章伏笔回收、删除本章埋设的伏笔与角色快照、删除本章时间线事件。
  */
 export function clearChapterNarrativeMemory(workId: number, chapterId: number): MemoryCleanupResult {
-  const timelineRemoved = timelineDAO.deleteByChapter(workId, chapterId)
   const result = clearChapterMemoryBeforeExtract(workId, chapterId)
-  return { ...result, timelineRemoved }
+  const emotionalStatesRemoved = emotionalStateDAO.deleteByChapter(chapterId)
+  volumeChapterDAO.updateChapter(chapterId, { emotion_assessment_json: null })
+  return { ...result, emotionalStatesRemoved }
 }
 
 /**

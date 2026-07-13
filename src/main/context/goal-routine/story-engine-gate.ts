@@ -11,8 +11,6 @@ interface EngineGatePayload {
   engine: Record<string, unknown>
 }
 
-const MAX_ENGINE_ROUNDS = 3
-
 function parsePayload(content: string): EngineGatePayload {
   const json = extractJsonText(content.trim()) ?? content.trim()
   const row = JSON.parse(json) as Record<string, unknown>
@@ -47,9 +45,11 @@ export async function ensureStoryEngine(
   if (!source.trim()) throw new Error('故事发动机门禁缺少主线与核心设定')
 
   let previous = ''
-  for (let round = 1; round <= MAX_ENGINE_ROUNDS; round++) {
+  let round = 0
+  while (true) {
+    round++
     if (signal?.aborted) throw new Error('已取消')
-    onProgress?.(`正在运行故事发动机门禁（第 ${round}/${MAX_ENGINE_ROUNDS} 轮）`)
+    onProgress?.(`正在运行故事发动机门禁（第 ${round} 轮，达标前持续重建）`)
     const response = await modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId,
@@ -90,5 +90,4 @@ export async function ensureStoryEngine(
     }
     previous = JSON.stringify({ engine: result.engine, blocking_issues: result.blockingIssues }, null, 2)
   }
-  throw new Error(`故事发动机门禁 ${MAX_ENGINE_ROUNDS} 轮仍未通过`)
 }

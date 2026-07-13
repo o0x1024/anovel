@@ -54,11 +54,10 @@ import {
   runStoryGoalLoop,
   cancelGoalLoop,
   isGoalLoopRunning,
-  shouldResumeGoalLoop,
   applyGoalTitleHookSelection,
   type Phase
 } from './context/goal-routine/story-goal-routine'
-import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning, shouldResumeNovelGoalLoop } from './context/goal-routine/novel-goal-routine'
+import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning } from './context/goal-routine/novel-goal-routine'
 import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
 import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
@@ -86,6 +85,8 @@ import {
   resolveWorkIdForChapter
 } from './context/memory-cleanup'
 import { getWorkBodyText } from './context/assistant/work-reference'
+import { ensureChapterEmotionContract } from './context/goal-routine/emotion-engine'
+import { assessChapterEmotion } from './context/goal-routine/emotion-gate'
 
 /**
  * 注册所有 IPC 处理器，桥接渲染进程与数据库层
@@ -484,6 +485,11 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('antiai:autoRewriteBody', (_e, content: string) =>
     autoRewriteBody(content))
 
+  ipcMain.handle('emotion:ensureContract', async (_e, workId: number, chapterId: number, goal = '') =>
+    ensureChapterEmotionContract(workId, chapterId, goal))
+  ipcMain.handle('emotion:assessChapter', async (_e, workId: number, chapterId: number, content: string, persistLedger = false) =>
+    assessChapterEmotion(workId, chapterId, content, undefined, persistLedger))
+
   // ==================== 目标循环（goal routine）====================
   function isNovelWork(workId: number): boolean {
     return workDAO.getById(workId)?.work_type === 'novel'
@@ -499,10 +505,9 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
     const { forcePhase, cfg } = resolveGoalForcePhase(config)
     const isNovel = isNovelWork(workId)
-    const resume = (isNovel ? shouldResumeNovelGoalLoop(workId) : shouldResumeGoalLoop(workId)) || Boolean(forcePhase)
     const runner = isNovel
-      ? runNovelGoalLoop(workId, cfg, e.sender, resume, forcePhase)
-      : runStoryGoalLoop(workId, cfg, e.sender, resume, forcePhase)
+      ? runNovelGoalLoop(workId, cfg, e.sender, false, forcePhase)
+      : runStoryGoalLoop(workId, cfg, e.sender, false, forcePhase)
     void runner.catch((err) => {
       appLogger.error('goal_routine', '目标循环启动失败', { workId, error: String(err) })
     })

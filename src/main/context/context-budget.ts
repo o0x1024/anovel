@@ -49,6 +49,7 @@ import {
 import { resolveChapterCharacterNames, buildFocusCharacterHint } from './character-cards'
 import { formatAdoptedNamesForBodyContext } from './name-registry'
 import { filterAnchorsForChapter, filterAnchorsForVolume } from './anchor-scope'
+import { formatEmotionContractForPrompt, normalizeEmotionContract } from '../../shared/emotion-contract'
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
 
@@ -268,6 +269,25 @@ export function collectPromptSections(
     }
   }
 
+  if (isBodyStep && request.chapterId) {
+    const chapter = volumeChapterDAO.getChapter(request.chapterId)
+    if (chapter?.emotion_contract_json) {
+      try {
+        const contract = normalizeEmotionContract(JSON.parse(chapter.emotion_contract_json) as unknown)
+        if (contract) {
+          sections.push(systemRuleSection({
+            key: 'emotion_contract',
+            label: '章节情绪执行卡',
+            priority: 1,
+            renderOrder: 4,
+            text: formatEmotionContractForPrompt(contract),
+            trimStrategy: 'none'
+          }))
+        }
+      } catch { /* 数据库写入前已有严格校验 */ }
+    }
+  }
+
   if (shouldInjectWritingStyle(request.step)) {
     let { languageText, stepRulesText } = resolveStyleTexts(request)
     if (languageText && request.step?.startsWith('body_')) {
@@ -401,6 +421,16 @@ export function collectPromptSections(
     }))
   }
 
+  if (memory?.sections.emotionalState) {
+    sections.push(userContextSection({
+      key: 'emotional_state',
+      label: '跨章情绪状态',
+      priority: 9,
+      text: memory.sections.emotionalState,
+      trimStrategy: 'drop'
+    }))
+  }
+
   if (workId && request.chapterId && shouldEnrichMemory) {
     const ch = volumeChapterDAO.getChapter(request.chapterId)
     const retrieved = retrieveRelevantChapters(workId, request.chapterId, ch?.outline || '')
@@ -455,12 +485,6 @@ export function collectPromptSections(
       workCtxOptions = {
         ...workCtxOptions,
         excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'worldview']
-      }
-    }
-    if (isBodyStep) {
-      workCtxOptions = {
-        ...workCtxOptions,
-        excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'pleasure_engine']
       }
     }
     const ctx = buildWorkContext(workId, workCtxOptions)

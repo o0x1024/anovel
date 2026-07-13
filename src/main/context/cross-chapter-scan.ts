@@ -51,7 +51,7 @@ export function scanCrossChapterConsistency(workId: number): CrossChapterIssue[]
         severity: 'info',
         chapterId: curr.id,
         chapterTitle: curr.title,
-        message: `情绪强度从 ${prevEmo} 突变至 ${currEmo}，节奏变化极大`
+        message: `读者唤醒度从 ${prevEmo} 突变至 ${currEmo}，需确认转场是否有足够因果与恢复空间`
       })
     }
   }

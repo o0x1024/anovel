@@ -7,23 +7,30 @@
  */
 import { checkAntiAiRuleViolations } from '../anti-ai-rules'
 import { runConsistencyGate } from '../consistency-gate'
+import { runResourceConstraintGate } from '../resource-ledger'
 import { getWritingStats } from '../writing-stats'
 import { loadWritingPlan } from '../writing-plan'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { volumeChapterDAO, workDAO } from '../../db'
-import { modelService } from '../../model'
-import { extractJsonText } from '../parse-json-extract'
 import {
   parseStoryQualityAiScoreBreakdown,
   type StoryQualityAiScoreItem,
   type StoryQualityAiMetricKey
 } from '../../../shared/story-quality-score'
-import { parseQualityAiScoreReport } from '../../../shared/quality-ai-score'
+import {
+  QUALITY_AI_METRIC_DEFS,
+  parseQualityAiScoreReport,
+  type QualityAiMetricKey
+} from '../../../shared/quality-ai-score'
 import { bodyWordCountBounds, isTotalWordCountInTargetRange } from '../../../shared/body-word-target'
 import { storyGoalModelOpts } from './story-goal-model'
 import { formatPreviewAnchorReport } from '../../../shared/story-preview-anchor'
 import { buildStoryMergedText } from '../../../shared/work-terminology'
 import { assessWholeStory, type StoryWeakestLayer } from './story-whole-evaluator'
+import { assessWholeNovel } from './novel-whole-evaluator'
+import type { EmotionBlindAssessment } from '../../../shared/emotion-contract'
+import { assessChapterEmotion } from './emotion-gate'
+import { ensureChapterEmotionContract } from './emotion-engine'
 
 export interface StoryGoalConfig {
   /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
@@ -34,6 +41,8 @@ export interface StoryGoalConfig {
   targetTotalWords: number | null
   /** 质量分下限（quality:diagnoseAI 的 scoreTotal，0-100） */
   qualityMin: number
+  /** 小说正文各质量单项的独立下限 */
+  qualityMetricMins: Record<QualityAiMetricKey, number>
   /** 正文生成后是否立即运行 AI 诊断与修复（关闭则直接进入下一节拍） */
   diagnoseBodyAfterGeneration: boolean
   /** 书名导语盲评后是否暂停，由作者从候选中确认 */
@@ -67,6 +76,9 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
   requireAllBeatsContent: true,
   targetTotalWords: null,
   qualityMin: 85,
+  qualityMetricMins: Object.fromEntries(
+    QUALITY_AI_METRIC_DEFS.map(metric => [metric.key, 85])
+  ) as Record<QualityAiMetricKey, number>,
   diagnoseBodyAfterGeneration: true,
   humanReviewTitleHook: true,
   checkConsistencyGate: true,
@@ -95,6 +107,7 @@ export interface GoalCheckResult {
   gateBlockers: number
   // 去AI
   antiAiViolations: number
+  emotionScore: number
   goalMatchScore: number
   goalMatchReason: string
   overallStoryScore: number
@@ -140,6 +153,17 @@ export interface GoalChapterDiagnostic {
   qualityScore: number
   qualityHardFail: boolean
   gateBlockers: number
+  antiAiViolations: number
+  emotionScore: number
+  emotionPassed: boolean
+}
+
+function selectNovelQualitySample<T>(chapters: T[]): T[] {
+  if (chapters.length <= 24) return chapters
+  const indexes = new Set<number>([0, 1, chapters.length - 2, chapters.length - 1])
+  const step = (chapters.length - 1) / 19
+  for (let i = 0; i < 20; i++) indexes.add(Math.round(i * step))
+  return [...indexes].sort((a, b) => a - b).map(index => chapters[index])
 }
 
 /** 拼接作品全章节正文，供整文检测 */
@@ -149,54 +173,6 @@ function collectFullBody(workId: number): string {
     .map(c => c.content?.trim())
     .filter(Boolean)
     .join('\n\n')
-}
-
-async function assessGoalMatch(
-  workId: number,
-  goalDescription: string,
-  fullBody: string,
-  config: StoryGoalConfig,
-  signal?: AbortSignal
-): Promise<{ score: number; reason: string }> {
-  const goal = goalDescription.trim()
-  if (!goal) return { score: 100, reason: '' }
-  if (!fullBody.trim()) return { score: 0, reason: '尚无正文，无法验收创作目标' }
-  if (signal?.aborted) throw new Error('已取消')
-
-  const res = await modelService.chat(
-    {
-      workId,
-      step: 'goal_semantic_check',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      systemPrompt: [
-        '你是短故事终审编辑。判断正文是否满足用户创作目标，只输出 JSON。',
-        'score 为 0-100 的整数，reason 用一句话说明最关键的匹配或偏离。',
-        '格式：{"score":80,"reason":"..."}'
-      ].join('\n'),
-      prompt: [
-        `【用户创作目标】\n${goal}`,
-        `【待验收正文】\n${fullBody.slice(0, 16000)}`
-      ].join('\n\n'),
-      thinkingEnabled: storyGoalModelOpts(config).thinkingEnabled
-    },
-    { stream: false, signal }
-  )
-
-  if (!res.success || !res.content?.trim()) {
-    return { score: 0, reason: res.error || '创作目标语义验收失败' }
-  }
-
-  try {
-    const json = extractJsonText(res.content.trim()) ?? res.content.trim()
-    const parsed = JSON.parse(json) as Record<string, unknown>
-    const rawScore = Number(parsed.score)
-    const score = Number.isFinite(rawScore) ? Math.max(0, Math.min(100, Math.round(rawScore))) : 0
-    const reason = String(parsed.reason ?? '').trim() || '未返回原因'
-    return { score, reason }
-  } catch {
-    return { score: 0, reason: '创作目标语义验收解析失败' }
-  }
 }
 
 /**
@@ -219,15 +195,21 @@ export async function checkStoryGoal(
     wordCount: ch.word_count || 0,
     qualityScore: -1,
     qualityHardFail: false,
-    gateBlockers: 0
+    gateBlockers: 0,
+    antiAiViolations: 0,
+    emotionScore: -1,
+    emotionPassed: false
   }))
 
   // ---- 1. 完成度：节拍 ----
   const total = chapters.length
   const content = chapters.filter(c => c.content?.trim()).length
   const beatCompletion = total > 0 ? content / total : 0
+  const expectedChapters = loadWritingPlan(workId).targetChapters
   if (total === 0) {
     reasons.push('尚无节拍')
+  } else if (!isStory && expectedChapters > 0 && total !== expectedChapters) {
+    reasons.push(`章节数量不完整：${total}/${expectedChapters}`)
   } else if (config.requireAllBeatsContent && content < total) {
     reasons.push(`节拍未全部完成：${content}/${total} 有正文`)
   }
@@ -255,7 +237,8 @@ export async function checkStoryGoal(
       const scores: number[] = []
       let anyHardFail = false
       const allMetricFailures: string[] = []
-      for (const ch of chapters) {
+      const qualityChapters = isStory ? chapters : selectNovelQualitySample(chapters)
+      for (const ch of qualityChapters) {
         if (signal?.aborted) throw new Error('已取消')
         const res = await diagnoseChapterQualityAi(workId, ch.id, ch.content ?? '', { thinkingEnabled: modelOpts?.thinkingEnabled })
         const diag = chapterDiagnostics.find(d => d.chapterId === ch.id)
@@ -278,8 +261,10 @@ export async function checkStoryGoal(
               }
             } else {
               for (const item of breakdown.items) {
-                if (item.score < config.qualityMin) {
-                  allMetricFailures.push(`${ch.title}/${item.label}:${item.score}`)
+                const key = item.key as QualityAiMetricKey
+                const threshold = config.qualityMetricMins[key]
+                if (item.score < threshold) {
+                  allMetricFailures.push(`${ch.title}/${item.label}:${item.score}/${threshold}`)
                 }
               }
             }
@@ -313,9 +298,11 @@ export async function checkStoryGoal(
     for (const ch of chapters) {
       if (!ch.content?.trim()) continue
       const gate = runConsistencyGate(workId, ch.id, ch.content)
-      gateBlockers += gate.blockers.length
+      const resourceGate = runResourceConstraintGate(workId, ch.id)
+      const chapterBlockers = gate.blockers.length + resourceGate.blockers.length
+      gateBlockers += chapterBlockers
       const diag = chapterDiagnostics.find(d => d.chapterId === ch.id)
-      if (diag) diag.gateBlockers = gate.blockers.length
+      if (diag) diag.gateBlockers = chapterBlockers
     }
     if (gateBlockers > 0) {
       reasons.push(`一致性门禁 ${gateBlockers} 项阻塞`)
@@ -325,11 +312,53 @@ export async function checkStoryGoal(
   // ---- 5. 去AI：anti-AI 规则违规 ----
   let antiAiViolations = 0
   if (config.checkAntiAiRules && fullBody.trim()) {
-    antiAiViolations = checkAntiAiRuleViolations(workId, fullBody).length
+    for (const ch of chapters) {
+      if (!ch.content?.trim()) continue
+      const count = checkAntiAiRuleViolations(workId, ch.content).length
+      antiAiViolations += count
+      const diag = chapterDiagnostics.find(item => item.chapterId === ch.id)
+      if (diag) diag.antiAiViolations = count
+    }
     if (antiAiViolations > 0) {
       reasons.push(`anti-AI 规则违规 ${antiAiViolations} 处`)
     }
   }
+
+  // ---- 6. 独立情绪盲读门禁（不再信任正文模型自报 intensity） ----
+  const emotionScores: number[] = []
+  const emotionFailures: string[] = []
+  if (content > 0) {
+    for (const chapter of chapters) {
+      if (!chapter.content?.trim()) continue
+      const diagnostic = chapterDiagnostics.find(item => item.chapterId === chapter.id)
+      let assessment: EmotionBlindAssessment | null = null
+      try {
+        assessment = chapter.emotion_assessment_json
+          ? JSON.parse(chapter.emotion_assessment_json) as EmotionBlindAssessment
+          : null
+      } catch { assessment = null }
+      if (!assessment) {
+        await ensureChapterEmotionContract(workId, chapter.id, config.goalDescription, signal)
+        assessment = await assessChapterEmotion(workId, chapter.id, chapter.content, signal, true)
+      }
+      if (!assessment) {
+        emotionFailures.push(`${chapter.title}:缺少情绪盲读验收`)
+        continue
+      }
+      emotionScores.push(assessment.score)
+      if (diagnostic) {
+        diagnostic.emotionScore = assessment.score
+        diagnostic.emotionPassed = assessment.passed
+      }
+      if (!assessment.passed) {
+        emotionFailures.push(`${chapter.title}:${assessment.score}分/${assessment.failure_layer}层`)
+      }
+    }
+  }
+  const emotionScore = emotionScores.length > 0
+    ? Math.round(emotionScores.reduce((sum, score) => sum + score, 0) / emotionScores.length)
+    : -1
+  if (emotionFailures.length > 0) reasons.push(`情绪门禁未通过：${emotionFailures.slice(0, 8).join('、')}`)
 
   let goalMatchScore = config.goalDescription.trim() ? 0 : 100
   let goalMatchReason = ''
@@ -376,13 +405,32 @@ export async function checkStoryGoal(
       storyIssues = [e instanceof Error ? e.message : String(e)]
       reasons.push(`整篇终审失败：${storyIssues[0]}`)
     }
-  } else if (!isStory && config.goalMatchMin > 0 && config.goalDescription.trim() && content > 0 && content === total) {
+  } else if (!isStory && content > 0 && content === total
+    && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
     try {
-      const match = await assessGoalMatch(workId, config.goalDescription, fullBody, config, signal)
-      goalMatchScore = match.score
-      goalMatchReason = match.reason
-      if (goalMatchScore < config.goalMatchMin) {
+      const assessment = await assessWholeNovel(workId, config.goalDescription, signal)
+      goalMatchScore = assessment.goalMatchScore
+      goalMatchReason = assessment.goalMatchReason
+      overallStoryScore = assessment.overallStoryScore
+      overallStoryReason = assessment.overallStoryReason
+      previewHookScore = assessment.previewHookScore
+      previewHookReason = assessment.previewHookReason
+      proseReadScore = assessment.proseReadScore
+      proseReadReason = assessment.proseReadReason
+      weakChapterTitles = assessment.weakChapterTitles
+      storyIssues = assessment.issues
+      weakestLayer = 'storyline'
+      if (config.goalMatchMin > 0 && config.goalDescription.trim() && goalMatchScore < config.goalMatchMin) {
         reasons.push(`创作目标匹配度 ${goalMatchScore} 低于下限 ${config.goalMatchMin}：${goalMatchReason}`)
+      }
+      if (config.overallStoryMin > 0 && overallStoryScore < config.overallStoryMin) {
+        reasons.push(`整书结构与兑现 ${overallStoryScore} 低于下限 ${config.overallStoryMin}：${overallStoryReason}`)
+      }
+      if (config.previewHookMin > 0 && previewHookScore < config.previewHookMin) {
+        reasons.push(`长篇追读力 ${previewHookScore} 低于下限 ${config.previewHookMin}：${previewHookReason}`)
+      }
+      if (config.proseReadMin > 0 && proseReadScore < config.proseReadMin) {
+        reasons.push(`跨阶段原文盲读 ${proseReadScore} 低于下限 ${config.proseReadMin}：${proseReadReason}`)
       }
     } catch (e) {
       if (signal?.aborted) throw e
@@ -422,6 +470,7 @@ export async function checkStoryGoal(
     qualityHardFail,
     gateBlockers,
     antiAiViolations,
+    emotionScore,
     goalMatchScore,
     goalMatchReason,
     overallStoryScore,

@@ -7,6 +7,8 @@ export interface VolumeRow {
   name: string
   description: string | null
   sort: number
+  planned_start_chapter: number | null
+  planned_end_chapter: number | null
   create_time: string
 }
 
@@ -26,6 +28,8 @@ export interface ChapterRow {
   pov_mode: string | null
   characters: string | null
   outline_diagnosis: string | null
+  emotion_contract_json: string | null
+  emotion_assessment_json: string | null
   create_time: string
   update_time: string
 }
@@ -50,22 +54,42 @@ export class VolumeChapterDAO extends BaseDAO {
     return this.all<VolumeRow>('SELECT * FROM volumes WHERE work_id = ? ORDER BY sort', [workId])
   }
 
-  createVolume(workId: number, name: string, description?: string, sort?: number): number {
+  createVolume(
+    workId: number,
+    name: string,
+    description?: string,
+    sort?: number,
+    plannedRange?: { startChapter: number; endChapter: number }
+  ): number {
     const maxSort = this.get<{ m: number }>(
       'SELECT COALESCE(MAX(sort), 0) + 1 AS m FROM volumes WHERE work_id = ?', [workId]
     )
     return this.insert(
-      'INSERT INTO volumes (work_id, name, description, sort) VALUES (?, ?, ?, ?)',
-      [workId, name, description ?? null, sort ?? maxSort?.m ?? 1]
+      `INSERT INTO volumes (
+        work_id, name, description, sort, planned_start_chapter, planned_end_chapter
+      ) VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        workId, name, description ?? null, sort ?? maxSort?.m ?? 1,
+        plannedRange?.startChapter ?? null, plannedRange?.endChapter ?? null
+      ]
     )
   }
 
-  updateVolume(id: number, fields: { name?: string; description?: string; sort?: number; expectedUpdateTime?: string }): boolean {
+  updateVolume(id: number, fields: {
+    name?: string
+    description?: string
+    sort?: number
+    plannedStartChapter?: number | null
+    plannedEndChapter?: number | null
+    expectedUpdateTime?: string
+  }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
     if (fields.name !== undefined) { sets.push('name = ?'); vals.push(fields.name) }
     if (fields.description !== undefined) { sets.push('description = ?'); vals.push(fields.description) }
     if (fields.sort !== undefined) { sets.push('sort = ?'); vals.push(fields.sort) }
+    if (fields.plannedStartChapter !== undefined) { sets.push('planned_start_chapter = ?'); vals.push(fields.plannedStartChapter) }
+    if (fields.plannedEndChapter !== undefined) { sets.push('planned_end_chapter = ?'); vals.push(fields.plannedEndChapter) }
     if (sets.length === 0) return false
     vals.push(id)
     let sql = `UPDATE volumes SET ${sets.join(', ')} WHERE id = ?`
@@ -127,6 +151,17 @@ export class VolumeChapterDAO extends BaseDAO {
     return this.get<ChapterRow>('SELECT * FROM chapters WHERE id = ?', [id])
   }
 
+  getWorkIdForChapter(chapterId: number): number | null {
+    const row = this.get<{ work_id: number }>(
+      `SELECT v.work_id
+       FROM chapters c
+       JOIN volumes v ON v.id = c.volume_id
+       WHERE c.id = ?`,
+      [chapterId]
+    )
+    return row?.work_id ?? null
+  }
+
   createChapter(volumeId: number, title: string, outline?: string, sort?: number): number {
     this.assertVolumeExists(volumeId)
     const maxSort = this.get<{ m: number }>(
@@ -148,6 +183,8 @@ export class VolumeChapterDAO extends BaseDAO {
     pov_mode?: string | null
     characters?: string | null
     outline_diagnosis?: string | null
+    emotion_contract_json?: string | null
+    emotion_assessment_json?: string | null
   }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
@@ -171,6 +208,8 @@ export class VolumeChapterDAO extends BaseDAO {
     if (fields.pov_mode !== undefined) { sets.push('pov_mode = ?'); vals.push(fields.pov_mode) }
     if (fields.characters !== undefined) { sets.push('characters = ?'); vals.push(fields.characters) }
     if (fields.outline_diagnosis !== undefined) { sets.push('outline_diagnosis = ?'); vals.push(fields.outline_diagnosis) }
+    if (fields.emotion_contract_json !== undefined) { sets.push('emotion_contract_json = ?'); vals.push(fields.emotion_contract_json) }
+    if (fields.emotion_assessment_json !== undefined) { sets.push('emotion_assessment_json = ?'); vals.push(fields.emotion_assessment_json) }
     if (sets.length === 0) return false
     sets.push("update_time = datetime('now')")
     vals.push(id)
@@ -197,6 +236,7 @@ export class VolumeChapterDAO extends BaseDAO {
       pov_mode?: string | null
       characters?: string | null
       outline_diagnosis?: string | null
+      emotion_contract_json?: string | null
     }[],
     mode: 'append' | 'replace' = 'append'
   ): number[] {
@@ -223,7 +263,8 @@ export class VolumeChapterDAO extends BaseDAO {
           next_hook: item.next_hook ?? undefined,
           pov_mode: item.pov_mode ?? undefined,
           characters: item.characters ?? undefined,
-          outline_diagnosis: item.outline_diagnosis ?? undefined
+          outline_diagnosis: item.outline_diagnosis ?? undefined,
+          emotion_contract_json: item.emotion_contract_json ?? undefined
         })
         ids.push(id)
       }
@@ -333,6 +374,7 @@ export class VolumeChapterDAO extends BaseDAO {
     beat_role?: string | null; foreshadow_target?: string | null
     next_hook?: string | null; pov_mode?: string | null; characters?: string | null
     outline_diagnosis?: string | null
+    emotion_contract_json?: string | null; emotion_assessment_json?: string | null
   }, versionMeta?: { model_type?: string; style_id?: number; generation_round?: number }): boolean {
     const current = this.getChapter(chapterId)
     if (current) {

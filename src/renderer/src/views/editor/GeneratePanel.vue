@@ -23,9 +23,10 @@ import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body
 import { formatBodyWordTargetLine, countWords } from '../../../../shared/body-word-target'
 import { formatBodyPromptLines, workUnitLabels, buildMergedStoryText } from '../../../../shared/work-terminology'
 import { formatPreviewAnchorReport } from '../../../../shared/story-preview-anchor'
-import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM, extractEmotionIntensity } from '../../../../shared/body-generation-prompt'
+import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM } from '../../../../shared/body-generation-prompt'
 import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../../shared/auto-optimize-config'
 import type { AutoOptimizeConfig } from '../../../../shared/auto-optimize-config'
+import type { EmotionBlindAssessment } from '../../../../shared/emotion-contract'
 import {
   beginBodyGeneration,
   endBodyGeneration,
@@ -185,6 +186,7 @@ const critiqueResult = ref<CritiqueResult | null>(null)
 const qualityResult = ref<QualityResult | null>(null)
 const qualityAiReport = ref('')
 const qualityAiMetrics = ref<QualityAiMetrics | null>(null)
+const emotionAssessment = ref<EmotionBlindAssessment | null>(null)
 const worldviewViolations = ref<{ rule: string; detail: string }[]>([])
 const runningV15Checks = ref(false)
 const runningCritique = ref(false)
@@ -372,14 +374,9 @@ onActivated(async () => {
   workDescription.value = work?.description?.trim() ?? ''
 })
 
-// 存储最近一次 AI 生成的情绪强度（由 saveToChapter 消费后清除）
-const pendingEmotionIntensity = ref<number | null>(null)
-
 const unsubscribeBodyDelivery = onBodyContentDelivered((chapterId, content) => {
   if (selectedChapterId.value === chapterId) {
-    const { cleanedContent, intensity } = extractEmotionIntensity(content)
-    pendingEmotionIntensity.value = intensity
-    result.value = cleanedContent
+    result.value = content
   }
 })
 
@@ -582,6 +579,8 @@ async function generateBody() {
   const ch = selectedChapter.value
   if (!ch) return
 
+  await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
+
   const vol = volumes.value.find(v => v.id === ch.volume_id)
   const prompt = formatBodyPromptLines(workType.value, {
     volName: vol?.name,
@@ -596,6 +595,7 @@ async function generateBody() {
   qualityResult.value = null
   qualityAiReport.value = ''
   qualityAiMetrics.value = null
+  emotionAssessment.value = null
   worldviewViolations.value = []
   gateResult.value = null
   humanizeMsg.value = ''
@@ -1004,12 +1004,25 @@ async function runPostGenerateChecks(content: string) {
   runningV15Checks.value = true
   try {
     const chId = selectedChapterId.value!
-    const [quality, worldview] = await Promise.all([
+    const [quality, aiQuality, worldview, emotion] = await Promise.all([
       window.anovel.invoke('quality:diagnose', props.workId, chId, content),
-      window.anovel.invoke('narrative:checkWorldview', props.workId, content)
+      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, content, { ...diagModelParams(), wordTarget: wordTarget.value }),
+      window.anovel.invoke('narrative:checkWorldview', props.workId, content),
+      window.anovel.invoke('emotion:assessChapter', props.workId, chId, content, false)
     ])
     qualityResult.value = quality as QualityResult
+    const ai = aiQuality as { success: boolean; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: QualityAiMetrics['breakdown'] }
+    if (ai.success) {
+      qualityAiReport.value = ai.report ?? ''
+      qualityAiMetrics.value = {
+        scoreTotal: ai.scoreTotal ?? 0,
+        hardFail: ai.hardFail ?? false,
+        cappedByGate: ai.cappedByGate ?? false,
+        breakdown: ai.scoreBreakdown
+      }
+    }
     worldviewViolations.value = worldview as { rule: string; detail: string }[]
+    emotionAssessment.value = emotion as EmotionBlindAssessment
   } finally {
     runningV15Checks.value = false
   }
@@ -1245,6 +1258,15 @@ async function saveToChapter() {
   const isClearing = !result.value.trim()
 
   if (!isClearing) {
+    await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
+    const emotion = await window.anovel.invoke(
+      'emotion:assessChapter', props.workId, ch.id, result.value, false
+    ) as EmotionBlindAssessment
+    emotionAssessment.value = emotion
+    if (!emotion.passed) {
+      alert(`情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}`)
+      return
+    }
     const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
     gateResult.value = gate
     if (!gate.passed) {
@@ -1266,12 +1288,12 @@ async function saveToChapter() {
       word_count: wordCount,
       status: 'draft'
     }
-    if (!isClearing) {
-      const intensity = pendingEmotionIntensity.value ?? extractEmotionIntensity(result.value).intensity
-      if (intensity != null) updateFields.emotion_intensity = intensity
-    }
-    pendingEmotionIntensity.value = null
     await window.anovel.invoke('chapter:update', ch.id, updateFields)
+    if (!isClearing) {
+      emotionAssessment.value = await window.anovel.invoke(
+        'emotion:assessChapter', props.workId, ch.id, result.value, true
+      ) as EmotionBlindAssessment
+    }
     const idx = chapters.value.findIndex(c => c.id === ch.id)
     if (idx >= 0) {
       chapters.value[idx] = {
@@ -1382,6 +1404,7 @@ function resetBodyEditorDiagnostics() {
   qualityResult.value = null
   qualityAiReport.value = ''
   qualityAiMetrics.value = null
+  emotionAssessment.value = null
   worldviewViolations.value = []
   gateResult.value = null
   memoryExtractMsg.value = ''
@@ -1390,7 +1413,6 @@ function resetBodyEditorDiagnostics() {
   humanizeHint.value = ''
   humanizeMsg.value = ''
   humanizeStats.value = null
-  pendingEmotionIntensity.value = null
   crossChapterIssues.value = []
   crossChapterScanHint.value = ''
   crossChapterScanMsg.value = ''
@@ -2047,7 +2069,7 @@ function generatePreviewReport() {
             </div>
 
             <details
-              v-if="result.trim() || critiqueResult || qualityResult || qualityAiReport || qualityAiMetrics || crossChapterIssues.length"
+              v-if="result.trim() || critiqueResult || qualityResult || qualityAiReport || qualityAiMetrics || emotionAssessment || crossChapterIssues.length"
               ref="crossChapterReportRef"
               class="collapse collapse-arrow bg-base-100 border border-base-300/60 rounded-lg mt-3 shrink-0"
               open
@@ -2098,6 +2120,24 @@ function generatePreviewReport() {
                   :ai-metrics="qualityAiMetrics"
                   :block-hints="blockHints"
                 />
+                <div
+                  v-if="emotionAssessment"
+                  class="rounded-lg border p-3 text-xs space-y-1"
+                  :class="emotionAssessment.passed ? 'border-success/40 bg-success/5' : 'border-error/40 bg-error/5'"
+                >
+                  <p class="font-medium" :class="emotionAssessment.passed ? 'text-success' : 'text-error'">
+                    情绪盲读 {{ emotionAssessment.score }} 分 · {{ emotionAssessment.failure_layer }}层
+                  </p>
+                  <p>读者在乎：{{ emotionAssessment.reader_cares_about || '未建立' }}</p>
+                  <p>希望：{{ emotionAssessment.reader_hopes || '未形成' }}</p>
+                  <p>担忧：{{ emotionAssessment.reader_fears || '未形成' }}</p>
+                  <p v-for="(issue, i) in emotionAssessment.blocking_issues" :key="i" class="text-error">
+                    {{ issue }}
+                  </p>
+                  <p v-if="!emotionAssessment.passed && emotionAssessment.repair_instruction" class="text-base-content/60">
+                    修订：{{ emotionAssessment.repair_instruction }}
+                  </p>
+                </div>
                 <div v-if="worldviewViolations.length" class="space-y-1">
                   <p class="text-xs font-medium text-warning">世界观校验</p>
                   <p v-for="(v, i) in worldviewViolations" :key="i" class="text-xs text-warning">{{ v.detail }}</p>

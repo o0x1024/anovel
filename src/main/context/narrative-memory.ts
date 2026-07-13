@@ -1,4 +1,4 @@
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, anchorDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, anchorDAO, emotionalStateDAO } from '../db'
 import { coreSettingDAO } from '../db'
 import { formatCharacterCardsForChapter, resolveChapterCharacterNames } from './character-cards'
 import { getPreviousChapterContext } from './chapter-continuity'
@@ -21,6 +21,7 @@ export interface NarrativeMemorySections {
   chapterMeta: string
   foreshadowing: string
   snapshots: string
+  emotionalState: string
   timeline: string
   worldview: string
 }
@@ -51,6 +52,7 @@ export function buildNarrativeMemorySections(
     chapterMeta: '',
     foreshadowing: '',
     snapshots: '',
+    emotionalState: '',
     timeline: '',
     worldview: ''
   }
@@ -172,6 +174,23 @@ export function buildNarrativeMemorySections(
     ].join('\n')
   }
 
+  const emotionalRows = focusCharacterNames.length > 0
+    ? focusCharacterNames.map(name => emotionalStateDAO.latestByCharacter(workId, name)).filter(Boolean)
+    : emotionalStateDAO.latestForWork(workId, 8)
+  if (emotionalRows.length > 0) {
+    sections.emotionalState = [
+      '【跨章情绪状态账本 - 不得在本章开头重置】',
+      ...emotionalRows.map(row => row ? [
+        `- ${row.character_name}`,
+        `真实:${row.felt_state}`,
+        `外显:${row.displayed_state}`,
+        `未解:${row.unresolved_emotion}`,
+        `防御:${row.protective_strategy}`,
+        `后续行为影响:${row.behavioral_aftereffect}`
+      ].join(' | ') : '')
+    ].filter(Boolean).join('\n')
+  }
+
   const timeline = timelineDAO.listByWork(workId)
   timelineEventCount = timeline.length
   if (timeline.length > 0) {
@@ -194,6 +213,7 @@ export function buildNarrativeMemorySections(
     sections.chapterMeta,
     sections.foreshadowing,
     sections.snapshots,
+    sections.emotionalState,
     sections.timeline,
     sections.worldview
   ].filter(Boolean)

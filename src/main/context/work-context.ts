@@ -120,6 +120,14 @@ export function buildWorkContext(workId: number, options: WorkContextOptions = {
       }
       sections[getCoreSettingLabel(type, isStory)] = sectionContent
     }
+    for (const [type, label] of [
+      ['story_engine', '故事发动机'],
+      ['emotion_engine', '情绪发动机']
+    ] as const) {
+      if (excluded.has(type)) continue
+      const content = byType.get(type)?.trim()
+      if (content) sections[label] = content
+    }
   }
 
   if (includeQualityIssues && includeCoreSettings) {

@@ -1,6 +1,7 @@
 import { diagnoseChapterQuality } from './chapter-quality'
 import { checkWorldviewConsistency } from './worldview-check'
 import { getSettingsQualityGateHints } from './settings-quality'
+import { timelineDAO, workDAO } from '../db'
 
 export interface ConsistencyGateResult {
   passed: boolean
@@ -16,6 +17,7 @@ export function runConsistencyGate(
 ): ConsistencyGateResult {
   const blockers: string[] = []
   const warnings: string[] = []
+  const isNovel = workDAO.getById(workId)?.work_type === 'novel'
 
   const quality = diagnoseChapterQuality(workId, chapterId, content)
   for (const item of quality.items) {
@@ -26,12 +28,18 @@ export function runConsistencyGate(
 
   const worldview = checkWorldviewConsistency(workId, content)
   for (const v of worldview) {
-    warnings.push(`世界观：${v.detail}`)
+    if (isNovel && v.severity === 'error') blockers.push(`世界观：${v.detail}`)
+    else warnings.push(`世界观：${v.detail}`)
   }
 
   const qualityHints = getSettingsQualityGateHints(workId)
   warnings.push(...qualityHints.warnings)
   blockers.push(...qualityHints.blockers)
+
+  if (isNovel) {
+    const timelineEvents = timelineDAO.listByWork(workId).filter(event => event.chapter_id === chapterId)
+    if (timelineEvents.length === 0) blockers.push('时间线：本章缺少关键事件与时间推进记录')
+  }
 
   return {
     passed: blockers.length === 0,

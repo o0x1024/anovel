@@ -25,7 +25,7 @@ export function checkWorldviewConsistency(workId: number, content: string): Worl
         violations.push({
           rule: rule.label,
           detail: `正文出现可能与世界观冲突的表述：「${word}」`,
-          severity: 'warning'
+          severity: 'error'
         })
       }
     }
@@ -42,7 +42,7 @@ export function checkWorldviewConsistency(workId: number, content: string): Worl
         violations.push({
           rule: '时代一致性',
           detail: `古代/幻想世界观中出现现代元素：${match[0]}`,
-          severity: 'warning'
+          severity: 'error'
         })
       }
     }

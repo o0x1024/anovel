@@ -84,11 +84,10 @@ function formatIdentity(rules: StyleStepRules): string {
 
 function formatDecisionRules(rules: StyleStepRules): string {
   if (!rules.decision_rules.length) return ''
-  return ''
-  // return [
-  //   '【文风决策规则 - 生成时须逐条对照】',
-  //   ...rules.decision_rules.map(r => `- ${r}`)
-  // ].join('\n')
+  return [
+    '【文风决策规则 - 生成时须逐条对照】',
+    ...rules.decision_rules.map(r => `- ${r}`)
+  ].join('\n')
 }
 
 /** 将决策规则转为场景级决策树（LLM 更易执行） */
@@ -102,13 +101,12 @@ export function formatSceneDecisionTree(rules: StyleStepRules): string {
     }
     return `${i + 1}. ${normalized}`
   })
-  return ''
-  // return [
-  //   '【场景写作决策树 - 每场景开始前执行】',
-  //   'START SCENE',
-  //   ...steps,
-  //   'END SCENE'
-  // ].join('\n')
+  return [
+    '【场景写作决策树 - 每场景开始前执行】',
+    'START SCENE',
+    ...steps,
+    'END SCENE'
+  ].join('\n')
 }
 
 function formatPacingRules(rules: StyleStepRules): string {
@@ -122,8 +120,7 @@ function formatPacingRules(rules: StyleStepRules): string {
   if (pr.emotion_loop.length) {
     lines.push(`- 情绪循环：${pr.emotion_loop.join(' → ')}`)
   }
-  return ''
-  // return lines.length > 1 ? lines.join('\n') : ''
+  return lines.length > 1 ? lines.join('\n') : ''
 }
 
 function formatChecklist(rules: StyleStepRules): string {

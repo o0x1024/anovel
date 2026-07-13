@@ -138,7 +138,7 @@ function analyzeEmotionRhythm(
     const max = Math.max(...window)
     const min = Math.min(...window)
     if (max - min < 2) {
-      hints.push(`第 ${i - 1}–${i + 1} 章情绪强度波动过小（${window.join('/')}），建议增加起伏`)
+      hints.push(`第 ${i - 1}–${i + 1} 章读者唤醒度波动过小（${window.join('/')}），应检查蓄力、转折、释放与恢复是否缺位`)
       break
     }
   }
@@ -148,7 +148,7 @@ function analyzeEmotionRhythm(
     if (intensities[i] <= 4) lowStreak++
     else lowStreak = 0
     if (lowStreak >= 5) {
-      hints.push('连续 5 章情绪强度偏低，读者可能感到压抑过久，建议安排释放或反转')
+      hints.push('连续 5 章读者唤醒度偏低，应检查是否缺少具体风险、艰难选择或状态变化；低唤醒本身不等于负面情绪')
       break
     }
   }

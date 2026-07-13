@@ -1037,14 +1037,14 @@ function parseTimelineGeneration(content: string): Array<{
         const emotionSummary = chs.map(c => c.emotion_intensity ?? 5)
         const avgEmo = Math.round(emotionSummary.reduce((a, b) => a + b, 0) / emotionSummary.length)
         const outlines = chs.slice(0, 5).map(c => c.outline?.slice(0, 50)).filter(Boolean).join(' | ')
-        volLines.push(`- [卷${vid}] ${volName}：第${firstIdx}-${lastIdx}章（${chs.length}章）平均情绪${avgEmo}${outlines ? ' | ' + outlines : ''}`)
+        volLines.push(`- [卷${vid}] ${volName}：第${firstIdx}-${lastIdx}章（${chs.length}章）平均读者唤醒度${avgEmo}${outlines ? ' | ' + outlines : ''}`)
       }
       outlineSection = `【分卷摘要（共${volGroups.size}卷，${allChapters.length}章）】\n${volLines.join('\n')}`
     } else {
       outlineSection = allChapters
         .map(c => {
           const idx = allChapters.indexOf(c) + 1
-          return `- [${idx}] ${c.title}${c.outline ? '：' + c.outline.slice(0, 80) : ''}${c.emotion_intensity ? ' 情绪:' + c.emotion_intensity : ''}`
+          return `- [${idx}] ${c.title}${c.outline ? '：' + c.outline.slice(0, 80) : ''}${c.emotion_intensity ? ' 读者唤醒度:' + c.emotion_intensity : ''}`
         })
         .join('\n')
       outlineSection = `【全部章节大纲（共${allChapters.length}章）】\n${outlineSection}`

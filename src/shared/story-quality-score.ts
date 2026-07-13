@@ -1,7 +1,7 @@
 export const STORY_QUALITY_AI_METRIC_DEFS = [
   { key: 'ai_pattern_ratio', label: 'AI句式占比', max: 100 },
   { key: 'hook_density', label: '钩子悬念密度', max: 100 },
-  { key: 'emotion_intensity', label: '情绪张力', max: 100 },
+  { key: 'emotion_intensity', label: '情绪因果', max: 100 },
   { key: 'pacing_speed', label: '节奏推进', max: 100 },
   { key: 'dramatic_causality', label: '戏剧因果', max: 100 },
   { key: 'scene_objective', label: '场景目标', max: 100 },

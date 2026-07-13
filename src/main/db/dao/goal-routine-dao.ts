@@ -115,7 +115,7 @@ export class GoalRoutineDAO extends BaseDAO {
 
   listTurns(workId: number, limit = 50): GoalRoutineTurnRow[] {
     return this.all<GoalRoutineTurnRow>(
-      'SELECT * FROM goal_routine_turns WHERE work_id = ? ORDER BY turn_no DESC LIMIT ?',
+      'SELECT * FROM goal_routine_turns WHERE work_id = ? ORDER BY id DESC LIMIT ?',
       [workId, limit]
     )
   }

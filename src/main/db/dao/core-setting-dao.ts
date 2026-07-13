@@ -1,5 +1,5 @@
 import { BaseDAO } from './base-dao'
-import { parseGoldenFingerFromMarkdown } from '../../../shared/golden-finger-types'
+import { extractGoldenFingerFromAiContent, parseGoldenFingerFromMarkdown } from '../../../shared/golden-finger-types'
 
 const MAX_VERSIONS = 10
 
@@ -89,7 +89,8 @@ export class CoreSettingDAO extends BaseDAO {
         }
         return
       }
-      const structured = parseGoldenFingerFromMarkdown(content)
+      const structured = extractGoldenFingerFromAiContent(content)?.structured
+        ?? parseGoldenFingerFromMarkdown(content)
       this.upsertStructured(workId, type, content, JSON.stringify(structured))
       return
     }

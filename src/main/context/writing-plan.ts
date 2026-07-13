@@ -1,4 +1,4 @@
-import { coreSettingDAO, volumeChapterDAO, workDAO } from '../db'
+import { coreSettingDAO, goalRoutineDAO, volumeChapterDAO, workDAO, type VolumeRow } from '../db'
 import { getWritingStats } from './writing-stats'
 import {
   DEFAULT_NOVEL_LENGTH,
@@ -154,7 +154,21 @@ export function loadWritingPlan(workId: number): WritingPlan {
 export function saveWritingPlan(workId: number, input: Partial<WritingPlan>): WritingPlan {
   const work = workDAO.getById(workId)
   const workType = work?.work_type ?? 'novel'
-  const plan = normalizePlan({ ...loadWritingPlan(workId), ...input, workType })
+  const previous = loadWritingPlan(workId)
+  const plan = normalizePlan({ ...previous, ...input, workType })
+  const scaleChanged = previous.targetTotalWords !== plan.targetTotalWords
+    || previous.targetChapters !== plan.targetChapters
+    || previous.wordsPerChapter !== plan.wordsPerChapter
+  if (workType === 'novel' && scaleChanged) {
+    const state = goalRoutineDAO.getByWork(workId)
+    if (state?.status === 'running') {
+      throw new Error('目标循环运行中不能修改写作计划，请先取消当前循环')
+    }
+    const written = volumeChapterDAO.listChaptersByWork(workId).filter(chapter => chapter.content?.trim())
+    if (written.length > 0) {
+      throw new Error(`已有 ${written.length} 章正文，不能直接改变全书规模；请先处理正文后再修改写作计划`)
+    }
+  }
   workDAO.update(workId, {
     novelLength: plan.novelLength,
     targetTotalWords: plan.targetTotalWords,
@@ -162,6 +176,29 @@ export function saveWritingPlan(workId: number, input: Partial<WritingPlan>): Wr
     wordsPerChapter: plan.wordsPerChapter
   })
   coreSettingDAO.upsert(workId, WRITING_PLAN_TYPE, JSON.stringify(plan))
+  if (workType === 'novel' && scaleChanged) {
+    coreSettingDAO.deleteByWorkAndTypes(workId, ['pleasure_engine', 'main_plotline'])
+    for (const volume of volumeChapterDAO.listVolumes(workId)) {
+      volumeChapterDAO.deleteVolume(volume.id)
+    }
+    const state = goalRoutineDAO.getByWork(workId)
+    if (state) {
+      let evaluationHistory: unknown
+      try {
+        evaluationHistory = state.state_json
+          ? (JSON.parse(state.state_json) as { evaluationHistory?: unknown }).evaluationHistory
+          : undefined
+      } catch {
+        evaluationHistory = undefined
+      }
+      goalRoutineDAO.update(workId, {
+        status: 'paused',
+        current_phase: 'materialize_settings',
+        goal_met: false,
+        state_json: JSON.stringify(evaluationHistory ? { evaluationHistory } : {})
+      })
+    }
+  }
   return plan
 }
 
@@ -183,16 +220,46 @@ export function distributeChaptersPerVolume(totalChapters: number, volumeCount: 
   return Array.from({ length: volumeCount }, (_, i) => base + (i < remainder ? 1 : 0))
 }
 
+function hydrateFrozenVolumeRanges(workId: number, volumes: VolumeRow[]): VolumeRow[] {
+  const missing = volumes.some(volume =>
+    volume.planned_start_chapter == null || volume.planned_end_chapter == null)
+  if (!missing) return volumes
+  const raw = goalRoutineDAO.getByWork(workId)?.state_json
+  if (!raw) return volumes
+  try {
+    const state = JSON.parse(raw) as {
+      volumePlanChecked?: boolean
+      novelOutline?: { volumePlan?: Array<{ name: string; startChapter: number; endChapter: number }> }
+    }
+    if (!state.volumePlanChecked || !Array.isArray(state.novelOutline?.volumePlan)) return volumes
+    for (const contract of state.novelOutline.volumePlan) {
+      const volume = volumes.find(item => item.name === contract.name)
+      if (!volume || !Number.isInteger(contract.startChapter) || !Number.isInteger(contract.endChapter)) continue
+      volumeChapterDAO.updateVolume(volume.id, {
+        plannedStartChapter: contract.startChapter,
+        plannedEndChapter: contract.endChapter
+      })
+    }
+    return volumeChapterDAO.listVolumes(workId)
+  } catch {
+    return volumes
+  }
+}
+
 export function getWritingPlanStatus(workId: number): WritingPlanStatus {
   const plan = loadWritingPlan(workId)
-  const volumes = volumeChapterDAO.listVolumes(workId)
+  const volumes = hydrateFrozenVolumeRanges(workId, volumeChapterDAO.listVolumes(workId))
   const suggestedTotalChapters = suggestTotalChapters(plan)
-  const perVolume = distributeChaptersPerVolume(suggestedTotalChapters, volumes.length)
   const stats = getWritingStats(workId)
 
-  const volumeStatuses: VolumePlanStatus[] = volumes.map((vol, index) => {
+  const volumeStatuses: VolumePlanStatus[] = volumes.map((vol) => {
     const chapterCount = volumeChapterDAO.listChapters(vol.id).length
-    const suggestedChapters = perVolume[index] ?? 0
+    const hasFrozenRange = vol.planned_start_chapter != null
+      && vol.planned_end_chapter != null
+      && vol.planned_end_chapter >= vol.planned_start_chapter
+    const suggestedChapters = hasFrozenRange
+      ? vol.planned_end_chapter! - vol.planned_start_chapter! + 1
+      : 0
     return {
       id: vol.id,
       name: vol.name,

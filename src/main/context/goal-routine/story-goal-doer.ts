@@ -32,12 +32,14 @@ import { appLogger } from '../../logger/app-logger'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { formatChapterResourceBudgetsForPrompt, runResourceConstraintGate } from '../resource-ledger'
 import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
+import { runConsistencyGate } from '../consistency-gate'
+import { emotionExecutionCard, ensureChapterEmotionContract } from './emotion-engine'
 
 export interface BeatGenResult {
   success: boolean
   content: string
   wordCount: number
-  memoryExtracted?: { planted: number; resolved: number; snapshots: number; foreshadowingResolved: number; foreshadowingPartial: number }
+  memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
 
@@ -45,6 +47,13 @@ export interface GenerateBeatBodyOptions {
   signal?: AbortSignal
   goalDescription?: string
   extraHint?: string
+  workType?: 'novel' | 'story'
+  wordTargetOverride?: number
+}
+
+export interface ReviseBeatBodyOptions {
+  signal?: AbortSignal
+  instruction: string
   workType?: 'novel' | 'story'
   wordTargetOverride?: number
 }
@@ -75,6 +84,7 @@ function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
   if (!outlineDiagnosis?.trim()) return ''
   try {
     const parsed = JSON.parse(outlineDiagnosis) as {
+      arc_phase?: unknown
       dramatic_contract?: Record<string, unknown>
       tension_plan?: { phase?: unknown; level?: unknown; payoff_type?: unknown }
     }
@@ -96,6 +106,7 @@ function getDramaticContractPrompt(outlineDiagnosis?: string | null): string {
     if (rows.length === 0 && !tension) return ''
     return [
       '【本拍戏剧契约 - 必须执行】',
+      parsed.arc_phase ? `长篇结构阶段：${String(parsed.arc_phase)}` : '',
       '正文不是复述事件流水账，必须把本拍写成一场有目标、阻力、代价、转折和不可逆变化的戏。',
       ...rows.map(([label, value]) => `- ${label}：${value}`),
       tension ? `【本拍张力位置】${String(tension.phase ?? '')} · 强度 ${String(tension.level ?? '')}/10 · 兑现类型 ${String(tension.payoff_type ?? '')}` : '',
@@ -127,15 +138,17 @@ function buildBodyPrompt(
   if (!ch) return null
   const volumes = volumeChapterDAO.listVolumes(workId)
   const vol = volumes.find(v => v.id === ch.volume_id)
-  const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
-  const openingSlot = firstBeat ? getOpeningSlotContent(workId) : ''
+  const firstBeat = isFirstBeat(workId, chapterId)
+  const openingSlot = workType === 'story' && firstBeat ? getOpeningSlotContent(workId) : ''
   const hookText = firstBeat ? getWorkHook(workId) : ''
-  const dramaticContract = workType === 'story' ? getDramaticContractPrompt(ch.outline_diagnosis) : ''
+  const dramaticContract = getDramaticContractPrompt(ch.outline_diagnosis)
   const work = workDAO.getById(workId)
-  const genrePolicy = workType === 'story'
-    ? formatGenrePolicy(resolveStoryGenrePolicy([work?.genre, work?.tags, goalDescription].filter(Boolean).join('\n')), 'proseRules')
-    : ''
+  const genrePolicy = formatGenrePolicy(
+    resolveStoryGenrePolicy([work?.genre, work?.tags, goalDescription].filter(Boolean).join('\n')),
+    'proseRules'
+  )
   const resourceBudget = formatChapterResourceBudgetsForPrompt(workId, chapterId)
+  const emotionCard = emotionExecutionCard(chapterId)
   return formatBodyPromptLines(workType, {
     volName: vol?.name,
     volDescription: vol?.description,
@@ -150,6 +163,7 @@ function buildBodyPrompt(
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
       genrePolicy,
       dramaticContract,
+      emotionCard,
       resourceBudget,
       openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
       hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致，但不得重复导语中已写的场景和台词，须从导语结束处自然衔接、继续推进剧情。` : ''
@@ -167,6 +181,7 @@ export async function generateBeatBody(
   options: GenerateBeatBodyOptions = {}
 ): Promise<BeatGenResult> {
   const { signal, goalDescription, extraHint, workType = 'story', wordTargetOverride } = options
+  await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
   const plan = loadWritingPlan(workId)
   const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
   const prompt = buildBodyPrompt(workId, chapterId, wordTarget, goalDescription, extraHint, workType)
@@ -174,7 +189,7 @@ export async function generateBeatBody(
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
-  const firstBeat = workType === 'story' && isFirstBeat(workId, chapterId)
+  const firstBeat = isFirstBeat(workId, chapterId)
   const baseSystemPrompt = workType === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM
   const systemPrompt = firstBeat
     ? baseSystemPrompt + STORY_BODY_GENERATION_OPENING_EXTRA
@@ -203,9 +218,19 @@ export async function generateBeatBody(
     return { success: false, content: '', wordCount: 0, error: response.error || '生成失败' }
   }
 
-  let content = normalizeModelBodyOutput(response.content.trim(), 'body_generation')
+  return persistGeneratedBody(workId, chapterId, response.content, workType, signal)
+}
 
-  const { cleanedContent, intensity } = extractEmotionIntensity(content)
+async function persistGeneratedBody(
+  workId: number,
+  chapterId: number,
+  rawContent: string,
+  workType: 'novel' | 'story',
+  signal?: AbortSignal
+): Promise<BeatGenResult> {
+  let content = normalizeModelBodyOutput(rawContent.trim(), 'body_generation')
+
+  const { cleanedContent } = extractEmotionIntensity(content)
   content = cleanedContent
 
   // 仅轻量 humanize（正则级），不掺重的 autoRewrite
@@ -220,17 +245,29 @@ export async function generateBeatBody(
     content,
     word_count: wordCount,
     status: 'completed',
-    ...(intensity != null ? { emotion_intensity: intensity } : {})
+    emotion_assessment_json: null
   })
 
   // 提取叙事记忆体（伏笔种植 + 角色快照）+ AI 伏笔回收检测
   let memoryExtracted: BeatGenResult['memoryExtracted']
+  let memoryError = ''
   try {
     memoryExtracted = await extractNarrativeMemoryAfterGeneration(workId, chapterId, content, signal)
   } catch (e) {
+    memoryError = e instanceof Error ? e.message : String(e)
     appLogger.warn('goal_routine', '叙事记忆提取失败（不阻断生成）', {
-      workId, chapterId, error: e instanceof Error ? e.message : String(e)
+      workId, chapterId, error: memoryError
     })
+  }
+
+  if (workType === 'novel' && memoryError) {
+    clearChapterNarrativeMemory(workId, chapterId)
+    volumeChapterDAO.updateChapterWithVersion(chapterId, {
+      content: '',
+      word_count: 0,
+      status: 'draft'
+    })
+    return { success: false, content: '', wordCount: 0, error: memoryError }
   }
 
   const resourceGate = runResourceConstraintGate(workId, chapterId)
@@ -255,7 +292,55 @@ export async function generateBeatBody(
     })
   }
 
+  const consistencyGate = runConsistencyGate(workId, chapterId, content)
+  if (!consistencyGate.passed) {
+    clearChapterNarrativeMemory(workId, chapterId)
+    volumeChapterDAO.updateChapterWithVersion(chapterId, { content: '', word_count: 0, status: 'draft' })
+    return {
+      success: false,
+      content: '',
+      wordCount: 0,
+      error: `章节一致性门禁未通过：${consistencyGate.blockers.join('；')}`
+    }
+  }
+
   return { success: true, content, wordCount, memoryExtracted }
+}
+
+/** 基于当前正文做定向修订；与首次生成共用同一套记忆、资源和时间线提交门禁。 */
+export async function reviseBeatBody(
+  workId: number,
+  chapterId: number,
+  options: ReviseBeatBodyOptions
+): Promise<BeatGenResult> {
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  if (!chapter?.content?.trim()) return { success: false, content: '', wordCount: 0, error: '当前章节没有可修订正文' }
+  const workType = options.workType ?? 'novel'
+  await ensureChapterEmotionContract(workId, chapterId, '', options.signal)
+  const wordTarget = options.wordTargetOverride ?? (loadWritingPlan(workId).wordsPerChapter || 4000)
+  const basePrompt = buildBodyPrompt(workId, chapterId, wordTarget, undefined, options.instruction, workType)
+  if (!basePrompt) return { success: false, content: '', wordCount: 0, error: '章节不存在' }
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      chapterId,
+      step: 'body_goal_revise',
+      maxTokens: Math.max(2048, wordTarget * 2),
+      enrichWorkContext: false,
+      enrichNarrativeMemory: true,
+      systemPrompt: [
+        '你是长篇小说结构精修编辑。根据修订要求修改当前章节，只输出修改后的完整正文。',
+        '保留未被问题证据涉及的情节、人物状态和有效表达；不得改变后续章节已经依赖的事实。',
+        '修改后仍须严格执行章节大纲、戏剧契约、资源预算和章末钩子。'
+      ].join('\n'),
+      prompt: `${basePrompt}\n\n【当前正文】\n${chapter.content}\n\n【修订要求】\n${options.instruction}`
+    }),
+    { stream: false, signal: options.signal }
+  )
+  if (!response.success || !response.content?.trim()) {
+    return { success: false, content: '', wordCount: 0, error: response.error || '修订失败' }
+  }
+  return persistGeneratedBody(workId, chapterId, response.content, workType, options.signal)
 }
 
 export async function extractNarrativeMemoryAfterGeneration(
@@ -264,13 +349,26 @@ export async function extractNarrativeMemoryAfterGeneration(
   content: string,
   signal?: AbortSignal
 ): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
-  if (signal?.aborted) return { planted: 0, resolved: 0, snapshots: 0, foreshadowingResolved: 0, foreshadowingPartial: 0 }
+  if (signal?.aborted) return { planted: 0, resolved: 0, snapshots: 0, timelineEvents: 0, foreshadowingResolved: 0, foreshadowingPartial: 0 }
+
+  const resourceBudgetPrompt = formatChapterResourceBudgetsForPrompt(workId, chapterId)
+  const memorySystemPrompt = resourceBudgetPrompt
+    ? [
+        MEMORY_EXTRACT_SYSTEM_PROMPT,
+        resourceBudgetPrompt,
+        '【资源快照硬要求】',
+        '上方每一项预算资源都必须写入对应 owner 的 character_snapshots.numeric_stats，禁止遗漏。',
+        '即使本章资源没有变化，也必须输出其章末数值；只有不在资源预算中的普通数值才允许省略。',
+        'numeric_stats.name 必须与预算 resource 完全一致，character_name 必须与预算 owner 一致。',
+        '章末数值必须落在预算的章末区间内，并以正文实际发生的消耗、恢复、冷却或状态变化为依据。'
+      ].join('\n\n')
+    : MEMORY_EXTRACT_SYSTEM_PROMPT
 
   // 1. 提取伏笔种植 + 角色快照
   const memRes = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       prompt: content,
-      systemPrompt: MEMORY_EXTRACT_SYSTEM_PROMPT,
+      systemPrompt: memorySystemPrompt,
       workId,
       chapterId,
       step: 'memory_extract',
@@ -282,20 +380,23 @@ export async function extractNarrativeMemoryAfterGeneration(
 
   let planted = 0
   let snapshots = 0
-  if (memRes.success && memRes.content?.trim()) {
-    const extracted = parseMemoryExtract(memRes.content)
-    clearChapterMemoryBeforeExtract(workId, chapterId)
-    const result = applyMemoryExtract(workId, chapterId, extracted)
-    planted = result.planted
-    snapshots = result.snapshots
+  let timelineEvents = 0
+  if (!memRes.success || !memRes.content?.trim()) {
+    throw new Error(`叙事记忆提取失败：${memRes.error || '模型未返回内容'}`)
   }
+  const extracted = parseMemoryExtract(memRes.content)
+  clearChapterMemoryBeforeExtract(workId, chapterId)
+  const result = applyMemoryExtract(workId, chapterId, extracted)
+  planted = result.planted
+  snapshots = result.snapshots
+  timelineEvents = result.timelineEvents
 
   // 2. AI 伏笔回收检测
   let foreshadowingResolved = 0
   let foreshadowingPartial = 0
   const pending = foreshadowingDAO.listPending(workId)
   if (pending.length > 0) {
-    if (signal?.aborted) return { planted, resolved: 0, snapshots, foreshadowingResolved, foreshadowingPartial }
+    if (signal?.aborted) return { planted, resolved: 0, snapshots, timelineEvents, foreshadowingResolved, foreshadowingPartial }
     const pendingList = pending.map(p =>
       `- [id:${p.id}] depth:${p.depth ?? 'normal'} 描述：${p.description}`
     ).join('\n')
@@ -333,6 +434,7 @@ export async function extractNarrativeMemoryAfterGeneration(
     planted,
     resolved: 0,
     snapshots,
+    timelineEvents,
     foreshadowingResolved,
     foreshadowingPartial
   }

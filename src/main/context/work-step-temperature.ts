@@ -83,6 +83,13 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
 
   if (
     normalized === 'critique_dual_channel' ||
+    normalized === 'goal_novel_volume_evaluation' ||
+    normalized === 'goal_novel_whole_evaluation' ||
+    normalized === 'emotion_engine_gate' ||
+    normalized === 'emotion_contract_generate' ||
+    normalized === 'emotion_blind_read' ||
+    normalized === 'emotion_target_compare' ||
+    normalized === 'emotion_state_extract' ||
     normalized.startsWith('quality_diagnosis') ||
     normalized === 'settings_overall_check' ||
     normalized === 'settings_character_check' ||
@@ -123,6 +130,9 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
   }
 
   if (
+    normalized === 'goal_novel_volume_plan' ||
+    normalized === 'goal_novel_chapter_batch' ||
+    normalized === 'goal_generate_beats' ||
     normalized.startsWith('volumes_outline') ||
     normalized.startsWith('volume_chapters_batch') ||
     normalized.startsWith('chapter_outline')

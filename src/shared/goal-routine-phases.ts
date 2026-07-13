@@ -6,8 +6,10 @@ export type GoalRoutinePhase =
   | 'materialize_settings'
   | 'generate_character_cards'
   | 'story_engine_gate'
+  | 'emotion_engine_gate'
   | 'generate_title_hook'
   | 'overall_self_check'
+  | 'generate_volumes'
   | 'generate_beats'
   | 'draft_body'
   | 'goal_check'
@@ -16,12 +18,10 @@ export type GoalRoutinePhase =
 
 /** 短故事阶段顺序 */
 export const STORY_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
-  'incubate_outline',
-  'incubator_gate',
-  'freeze_storyline',
   'materialize_settings',
   'generate_character_cards',
   'story_engine_gate',
+  'emotion_engine_gate',
   'generate_beats',
   'generate_title_hook',
   'overall_self_check',
@@ -31,13 +31,15 @@ export const STORY_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'repair_execute'
 ]
 
-/** 小说阶段顺序（跳过孵化器；设定→人设卡→书名导语→自检→章节大纲→正文） */
+/** 小说阶段顺序（设定→人设卡→自检→分卷大纲与章节情节→书名导语→正文） */
 export const NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'materialize_settings',
   'generate_character_cards',
-  'generate_title_hook',
+  'emotion_engine_gate',
   'overall_self_check',
+  'generate_volumes',
   'generate_beats',
+  'generate_title_hook',
   'draft_body',
   'goal_check',
   'repair_plan',
@@ -55,8 +57,10 @@ export const STORY_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   materialize_settings: '核心设定',
   generate_character_cards: '主角人设卡',
   story_engine_gate: '故事发动机',
+  emotion_engine_gate: '情绪发动机',
   generate_title_hook: '书名导语',
   overall_self_check: '整体自检',
+  generate_volumes: '分卷大纲',
   generate_beats: '节拍大纲',
   draft_body: '正文生成',
   goal_check: '目标验收',
@@ -64,7 +68,7 @@ export const STORY_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   repair_execute: '执行修复'
 }
 
-/** 小说阶段标签（generate_beats 显示为「章节大纲」） */
+/** 小说阶段标签与小说管理的创作步骤文案保持一致 */
 export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> = {
   incubate_outline: '孵化大纲',
   incubator_gate: '孵化门禁',
@@ -72,9 +76,11 @@ export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   materialize_settings: '核心设定',
   generate_character_cards: '主角人设卡',
   story_engine_gate: '故事发动机',
+  emotion_engine_gate: '情绪发动机',
   generate_title_hook: '书名导语',
   overall_self_check: '整体自检',
-  generate_beats: '章节大纲',
+  generate_volumes: '分卷大纲',
+  generate_beats: '章节情节',
   draft_body: '正文生成',
   goal_check: '目标验收',
   repair_plan: '修复计划',

@@ -86,8 +86,8 @@ export class CharacterSnapshotDAO extends BaseDAO {
     return this.run('DELETE FROM character_snapshots WHERE id = ?', [id]).changes > 0
   }
 
-  deleteByChapter(chapterId: number): boolean {
-    return this.run('DELETE FROM character_snapshots WHERE chapter_id = ?', [chapterId]).changes > 0
+  deleteByChapter(chapterId: number): number {
+    return this.run('DELETE FROM character_snapshots WHERE chapter_id = ?', [chapterId]).changes
   }
 }
 

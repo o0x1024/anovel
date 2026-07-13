@@ -60,6 +60,8 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'volume_chapters_batch', label: '章节批量生成' },
       { step: 'story_beat_gate', label: '短故事节拍门禁' },
       { step: 'story_engine_gate', label: '短故事发动机门禁' },
+      { step: 'emotion_engine_gate', label: '情绪发动机门禁' },
+      { step: 'emotion_contract_generate', label: '章节情绪契约' },
       { step: 'volume_diagnose', label: '分卷诊断' },
       { step: 'volume_diagnose_fix', label: '分卷修复' },
       { step: 'story_title_hook_gen', label: '短故事标题与钩子' },
@@ -78,6 +80,9 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
     groupLabel: 'AI 诊断',
     steps: [
       { step: 'quality_diagnosis_ai', label: 'AI 质量诊断' },
+      { step: 'emotion_blind_read', label: '情绪盲读门禁' },
+      { step: 'emotion_target_compare', label: '情绪目标比较' },
+      { step: 'emotion_state_extract', label: '情绪状态提取' },
       { step: 'critique_dual_channel', label: '双通道批判' },
       { step: 'critique_apply_fixes', label: '批判修复' },
       { step: 'milestone_audit_scan', label: '里程碑审计' },
@@ -118,7 +123,12 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'story_repair_pairwise', label: '改稿前后盲评' },
       { step: 'story_repair_blueprint', label: '结构层修复' },
       { step: 'resource_constraints_extract', label: '资源约束抽取' },
-      { step: 'goal_generate_beats', label: '目标章节大纲' },
+      { step: 'goal_generate_volumes', label: '目标分卷大纲' },
+      { step: 'goal_generate_beats', label: '目标章节情节' },
+      { step: 'goal_novel_volume_plan', label: '长篇分卷合同' },
+      { step: 'goal_novel_chapter_batch', label: '长篇章节批次' },
+      { step: 'goal_novel_volume_evaluation', label: '长篇分卷终审' },
+      { step: 'goal_novel_whole_evaluation', label: '长篇整书终审' },
     ]
   },
   {

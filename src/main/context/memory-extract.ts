@@ -1,7 +1,7 @@
-import { foreshadowingDAO, characterSnapshotDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO } from '../db'
 import type { ForeshadowingDepth } from '../db/dao/foreshadowing-dao'
 
-interface ExtractedMemory {
+export interface ExtractedMemory {
   foreshadowing_planted?: {
     description: string
     depth?: ForeshadowingDepth
@@ -20,12 +20,19 @@ interface ExtractedMemory {
     ability_changes?: string
     numeric_stats?: { name: string; value: string; unit?: string }[]
   }[]
+  timeline_events?: {
+    event_name: string
+    event_description?: string
+    absolute_time?: string
+    relative_time?: string
+  }[]
 }
 
 export interface MemoryExtractResult {
   planted: number
   resolved: number
   snapshots: number
+  timelineEvents: number
 }
 
 export interface ForeshadowingResolutionResult {
@@ -35,11 +42,25 @@ export interface ForeshadowingResolutionResult {
 }
 
 export function parseMemoryExtract(content: string): ExtractedMemory {
-  const match = content.match(/```json\s*([\s\S]*?)```/)
+  const match = content.match(/```(?:json)?\s*([\s\S]*?)```/i)
   try {
-    return JSON.parse(match?.[1] ?? content) as ExtractedMemory
-  } catch {
-    return {}
+    const parsed = JSON.parse(match?.[1] ?? content) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('根节点必须是对象')
+    }
+    const result = parsed as ExtractedMemory
+    if (!Array.isArray(result.foreshadowing_planted)
+      || !Array.isArray(result.foreshadowing_resolved)
+      || !Array.isArray(result.character_snapshots)
+      || !Array.isArray(result.timeline_events)) {
+      throw new Error('缺少完整的叙事记忆数组字段')
+    }
+    if (result.timeline_events.length === 0) {
+      throw new Error('本章至少需要一条关键时间线事件')
+    }
+    return result
+  } catch (error) {
+    throw new Error(`叙事记忆解析失败：${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -51,6 +72,7 @@ export function applyMemoryExtract(
   let planted = 0
   let resolved = 0
   let snapshots = 0
+  let timelineEvents = 0
 
   for (const item of extracted.foreshadowing_planted ?? []) {
     if (!item.description?.trim()) continue
@@ -84,7 +106,21 @@ export function applyMemoryExtract(
     snapshots++
   }
 
-  return { planted, resolved, snapshots }
+  for (const event of extracted.timeline_events ?? []) {
+    if (!event.event_name?.trim()) continue
+    timelineDAO.create({
+      work_id: workId,
+      chapter_id: chapterId,
+      event_name: event.event_name.trim(),
+      event_description: event.event_description?.trim(),
+      absolute_time: event.absolute_time?.trim(),
+      relative_time: event.relative_time?.trim(),
+      sort_order: timelineDAO.listByWork(workId).length + 1
+    })
+    timelineEvents++
+  }
+
+  return { planted, resolved, snapshots, timelineEvents }
 }
 
 export const FORESHADOWING_RESOLVE_SYSTEM_PROMPT = [
@@ -171,7 +207,7 @@ export function applyForeshadowingResolutions(
 
 export const MEMORY_EXTRACT_SYSTEM_PROMPT = [
   '从章节正文中提取叙事记忆体更新信息。',
-  '识别：新埋设的伏笔（标注 depth: shallow/normal/deep）、本章回收的伏笔、出场角色的状态变化。',
+  '识别：新埋设的伏笔（标注 depth: shallow/normal/deep）、本章回收的伏笔、出场角色的状态变化、时间推进与关键事件。',
   '',
   '角色快照的 numeric_stats 字段（极重要）：',
   '提取角色在本章结束时的所有数值类状态，包括但不限于：体力/气血/法力/灵力、等级/境界、积分/贡献点/信用度、金钱/资源数量、装备耐久度等。',
@@ -179,10 +215,11 @@ export const MEMORY_EXTRACT_SYSTEM_PROMPT = [
   '必须记录本章中发生变化的数值，以及与后续剧情可能产生冲突的关键数值。',
   '示例：[{"name":"体力","value":"50","unit":""},{"name":"信用度","value":"87","unit":"点"},{"name":"境界","value":"练气三层","unit":""}]',
   '若本章无数值类状态变化，numeric_stats 留空数组。',
+  'timeline_events 必须记录本章关键事件，以及发生时间或相对上一章的时间推进；没有明确绝对时间时填写 relative_time。',
   '',
   '输出 JSON：',
   '```json',
-  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":"","numeric_stats":[{"name":"","value":"","unit":""}]}]}',
+  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":"","numeric_stats":[{"name":"","value":"","unit":""}]}],"timeline_events":[{"event_name":"","event_description":"","absolute_time":"","relative_time":""}]}',
   '```',
   '若无某项则留空数组。'
 ].join('\n')

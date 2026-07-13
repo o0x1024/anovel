@@ -54,6 +54,8 @@ export function initSchema(): void {
       name VARCHAR(100) NOT NULL,
       description TEXT,
       sort INTEGER NOT NULL,
+      planned_start_chapter INTEGER,
+      planned_end_chapter INTEGER,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
@@ -71,6 +73,8 @@ export function initSchema(): void {
       sort INTEGER NOT NULL,
       status VARCHAR(20) DEFAULT 'draft',
       outline_diagnosis TEXT,
+      emotion_contract_json TEXT,
+      emotion_assessment_json TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE
@@ -234,6 +238,27 @@ export function initSchema(): void {
       snapshot_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS emotional_state_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      character_name VARCHAR(100) NOT NULL,
+      felt_state TEXT NOT NULL,
+      displayed_state TEXT NOT NULL,
+      unresolved_emotion TEXT NOT NULL,
+      protective_strategy TEXT NOT NULL,
+      behavioral_aftereffect TEXT NOT NULL,
+      beliefs_json TEXT,
+      relationships_json TEXT,
+      source_event TEXT NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_emotional_state_work_character
+      ON emotional_state_ledger(work_id, character_name, chapter_id);
 
     -- ============================================
     -- 资源约束账本（体力/法力/积分/等级/冷却等跨章节可变状态）

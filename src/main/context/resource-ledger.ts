@@ -1,4 +1,4 @@
-import { coreSettingDAO, resourceLedgerDAO, characterSnapshotDAO, type ChapterResourceBudgetInput, type ResourceConstraintInput } from '../db'
+import { coreSettingDAO, resourceLedgerDAO, characterSnapshotDAO, volumeChapterDAO, type ChapterResourceBudgetInput, type ResourceConstraintInput } from '../db'
 import { modelService } from '../model'
 import { extractJsonText } from './parse-json-extract'
 
@@ -81,7 +81,7 @@ function normalizeConstraint(item: unknown): ResourceConstraintInput | null {
     spend_rules_json: jsonArray(row.spendRules ?? row.spend_rules),
     recover_rules_json: jsonArray(row.recoverRules ?? row.recover_rules),
     source_types: Array.isArray(row.sourceTypes ?? row.source_types)
-      ? (row.sourceTypes ?? row.source_types as string[]).map(String).join(',')
+      ? ((row.sourceTypes ?? row.source_types) as unknown[]).map(String).join(',')
       : String(row.sourceTypes ?? row.source_types ?? '').trim() || null
   }
 }
@@ -93,6 +93,7 @@ export async function refreshResourceConstraints(workId: number, signal?: AbortS
     resourceLedgerDAO.replaceConstraints(workId, [])
     return 0
   }
+  const settingsText = settings.map(s => s.content).join('\n')
 
   const res = await modelService.chat(
     {
@@ -103,9 +104,12 @@ export async function refreshResourceConstraints(workId: number, signal?: AbortS
       systemPrompt: [
         '你是小说资源状态规则抽取器。请从核心设定中抽取所有需要跨章节跟踪的可变数值状态。',
         '只输出合法 JSON，不要 markdown，不要解释。',
-        '需要抽取：体力/法力/灵力/气血/精神力/系统能量/积分/金钱/物资/装备耐久/等级/境界/熟练度/好感度/声望/通缉度/冷却/次数/倒计时/污染值/理智值等。',
-        '不要抽取纯描述性标签；只有会变化、会限制行动、或有上下限/里程碑/冷却/次数要求的才抽取。',
-        '格式：{"resources":[{"owner":"主角","resource":"体力","unit":"%","initial":100,"min":0,"max":100,"hardRules":["第20章不低于50%"],"milestones":[{"chapter":20,"min":50}],"spendRules":["强行使用能力消耗10%-20%"],"recoverRules":["休整一晚最多恢复20%"],"sourceTypes":["golden_finger"]}]}',
+        '默认不创建数值资源。只有精确数值本身构成作品玩法或硬承诺时才抽取。',
+        '禁止抽取：成功率、概率、修为境界、能力阶段、容量上限、冷却时长、身份暴露程度、关系状态、叙事倒计时、泛化灵力或寿命压力。它们应使用阶段、条件和事件状态跟踪。',
+        '每项资源必须同时具备：原文直接证据、明确单位、初始值、可计算的增减规则，以及恢复/重置规则或不可恢复声明。缺一项就不得抽取。',
+        '寿命、生命、命运等叙事概念，只有设定明确给出当前数值、单位、可计算增减规则或期限时才抽取；“寿命有限”“损耗寿命”等泛化描述不得抽取。',
+        'evidence 必须逐字引用核心设定中同时包含资源名和量化规则的短句，禁止概括或补写。',
+        '格式：{"resources":[{"owner":"主角","resource":"系统积分","unit":"点","initial":100,"min":0,"max":1000,"hardRules":[],"milestones":[],"spendRules":["兑换物品扣除对应积分"],"recoverRules":["完成任务获得明确积分"],"sourceTypes":["golden_finger"],"evidence":"原文逐字证据"}]}',
         '如果没有需要跟踪的资源，输出 {"resources":[]}'
       ].join('\n'),
       prompt: [
@@ -123,6 +127,21 @@ export async function refreshResourceConstraints(workId: number, signal?: AbortS
   const resources = Array.isArray(parsed?.resources) ? parsed.resources : null
   if (!resources) throw new Error('资源约束抽取结果解析失败')
   const constraints = resources
+    .filter(item => {
+      if (!item || typeof item !== 'object') return false
+      const row = item as Record<string, unknown>
+      const evidence = String(row.evidence ?? '').trim()
+      const resource = String(row.resource ?? row.name ?? '').trim()
+      if (!evidence || !settingsText.includes(evidence)) return false
+      if (/成功率|概率|冷却|境界|修为|阶段|适配人数|容量|暴露程度|寿命/.test(resource)) return false
+      const hasUnit = String(row.unit ?? '').trim().length > 0
+      const hasInitial = readNumber(row.initial ?? row.initial_value) != null
+      const spendRules = row.spendRules ?? row.spend_rules
+      const recoverRules = row.recoverRules ?? row.recover_rules
+      const hasSpend = Array.isArray(spendRules) && spendRules.length > 0
+      const hasRecovery = Array.isArray(recoverRules) && recoverRules.length > 0
+      return hasUnit && hasInitial && hasSpend && hasRecovery
+    })
     .map(normalizeConstraint)
     .filter((x): x is ResourceConstraintInput => x != null)
   return resourceLedgerDAO.replaceConstraints(workId, constraints)
@@ -177,10 +196,10 @@ function normalizeBudget(item: unknown): ChapterResourceBudgetInput | null {
     end_min: readNumber(row.end_min ?? row.endMin),
     end_max: readNumber(row.end_max ?? row.endMax),
     allowed_events: Array.isArray(row.allowed_events ?? row.allowedEvents)
-      ? (row.allowed_events ?? row.allowedEvents as unknown[]).map(String).filter(Boolean).join('；')
+      ? ((row.allowed_events ?? row.allowedEvents) as unknown[]).map(String).filter(Boolean).join('；')
       : String(row.allowed_events ?? row.allowedEvents ?? '').trim() || null,
     forbidden_events: Array.isArray(row.forbidden_events ?? row.forbiddenEvents)
-      ? (row.forbidden_events ?? row.forbiddenEvents as unknown[]).map(String).filter(Boolean).join('；')
+      ? ((row.forbidden_events ?? row.forbiddenEvents) as unknown[]).map(String).filter(Boolean).join('；')
       : String(row.forbidden_events ?? row.forbiddenEvents ?? '').trim() || null,
     reason: String(row.reason ?? '').trim() || null
   }
@@ -217,13 +236,14 @@ function parseNumericStats(text: string | null): { name: string; value: number; 
     const arr = JSON.parse(text) as unknown
     if (!Array.isArray(arr)) return []
     return arr
-      .map(item => {
+      .map((item): { name: string; value: number; unit?: string } | null => {
         if (!item || typeof item !== 'object') return null
         const row = item as Record<string, unknown>
         const name = String(row.name ?? '').trim()
         const value = readNumber(row.value)
         if (!name || value == null) return null
-        return { name, value, unit: String(row.unit ?? '').trim() || undefined }
+        const unit = String(row.unit ?? '').trim()
+        return { name, value, ...(unit ? { unit } : {}) }
       })
       .filter((x): x is { name: string; value: number; unit?: string } => x != null)
   } catch {
@@ -241,8 +261,11 @@ export function runResourceConstraintGate(workId: number, chapterId: number): Re
   const blockers: string[] = []
   const warnings: string[] = []
   const snapshots = characterSnapshotDAO.listByWork(workId)
-    .filter(s => s.chapter_id <= chapterId)
+    .filter(s => s.chapter_id === chapterId)
     .sort((a, b) => b.chapter_id - a.chapter_id || b.id - a.id)
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const chapterOrdinal = chapters.findIndex(chapter => chapter.id === chapterId) + 1
+  const constraints = resourceLedgerDAO.listConstraints(workId)
 
   for (const budget of budgets) {
     const matched = snapshots.find(s => {
@@ -250,7 +273,19 @@ export function runResourceConstraintGate(workId: number, chapterId: number): Re
       return parseNumericStats(s.numeric_stats).some(st => resourceMatches(st.name, budget.resource))
     })
     if (!matched) {
-      warnings.push(`${budget.resource}：未找到正文后数值快照，无法确认是否落在预算区间`)
+      const unchangedAllowed = budget.start_min != null
+        && budget.start_max != null
+        && budget.end_min != null
+        && budget.end_max != null
+        && Math.max(budget.start_min, budget.end_min) <= Math.min(budget.start_max, budget.end_max)
+      if (unchangedAllowed) {
+        warnings.push(`${budget.resource}：本章未提取到章末快照，预算允许保持不变，按开章状态继承`)
+      } else {
+        blockers.push(
+          `${budget.resource}：预算要求从 ${budget.start_min}-${budget.start_max}${budget.unit || ''} `
+          + `变化到 ${budget.end_min}-${budget.end_max}${budget.unit || ''}，但本章未提取到章末数值快照`
+        )
+      }
       continue
     }
     const stat = parseNumericStats(matched.numeric_stats).find(st => resourceMatches(st.name, budget.resource))
@@ -260,6 +295,27 @@ export function runResourceConstraintGate(workId: number, chapterId: number): Re
     }
     if (budget.end_max != null && stat.value > budget.end_max) {
       blockers.push(`${budget.resource}=${stat.value}${stat.unit || budget.unit || ''} 高于本章预算上限 ${budget.end_max}${budget.unit || ''}`)
+    }
+    const constraint = constraints.find(row => resourceMatches(row.resource, budget.resource)
+      && (!budget.owner || !row.owner || row.owner.includes(budget.owner) || budget.owner.includes(row.owner)))
+    if (constraint?.min_value != null && stat.value < constraint.min_value) {
+      blockers.push(`${budget.resource}=${stat.value} 低于全书硬下限 ${constraint.min_value}`)
+    }
+    if (constraint?.max_value != null && stat.value > constraint.max_value) {
+      blockers.push(`${budget.resource}=${stat.value} 高于全书硬上限 ${constraint.max_value}`)
+    }
+    if (constraint?.milestones_json && chapterOrdinal > 0) {
+      try {
+        const milestones = JSON.parse(constraint.milestones_json) as Array<Record<string, unknown>>
+        for (const milestone of milestones.filter(item => Number(item.chapter) === chapterOrdinal)) {
+          const min = readNumber(milestone.min)
+          const max = readNumber(milestone.max)
+          if (min != null && stat.value < min) blockers.push(`${budget.resource} 未达到第 ${chapterOrdinal} 章里程碑下限 ${min}`)
+          if (max != null && stat.value > max) blockers.push(`${budget.resource} 超过第 ${chapterOrdinal} 章里程碑上限 ${max}`)
+        }
+      } catch {
+        blockers.push(`${budget.resource} 的里程碑配置不是合法 JSON`)
+      }
     }
   }
 

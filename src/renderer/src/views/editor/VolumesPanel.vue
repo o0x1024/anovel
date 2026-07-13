@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, inject } from 'vue'
+import { ref, computed, onActivated, watch, inject } from 'vue'
 import { useModelChat } from './useModelChat'
 import PanelTitle from '../../components/PanelTitle.vue'
 import MarkdownContent from '../../components/MarkdownContent.vue'
@@ -120,7 +120,13 @@ const volumeSystemPrompt = [
 
 const parseError = ref('')
 
-onMounted(loadVolumes)
+onActivated(() => {
+  void loadVolumes()
+})
+
+watch(() => props.workId, () => {
+  void loadVolumes()
+})
 
 watch(result, async (content) => {
   if (!content) {

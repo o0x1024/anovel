@@ -1,4 +1,5 @@
 import { extractJsonText } from './parse-json-extract'
+import { normalizeEmotionContract, type EmotionContract } from '../../shared/emotion-contract'
 
 export interface ParsedChapter {
   title: string
@@ -10,6 +11,7 @@ export interface ParsedChapter {
   characters?: string | null
   dramatic_contract?: DramaticContract | null
   tension_plan?: TensionPlan | null
+  emotion_contract?: EmotionContract | null
 }
 
 export interface ParsedSingleChapterOutline {
@@ -20,6 +22,7 @@ export interface ParsedSingleChapterOutline {
   pov_mode?: string | null
   characters?: string | null
   dramatic_contract?: DramaticContract | null
+  emotion_contract?: EmotionContract | null
 }
 
 export interface DramaticContract {
@@ -300,6 +303,7 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     row.dramatic_contract ?? row.dramaticContract ?? row.scene_contract ?? row.sceneContract
   )
   const tensionPlan = normalizeTensionPlan(row.tension_plan ?? row.tensionPlan)
+  const emotionContract = normalizeEmotionContract(row.emotion_contract ?? row.emotionContract)
   const numericState = extractNumericState(row)
   const blueprint = normalizeExecutionBlueprint(row)
   const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState, blueprint)
@@ -315,7 +319,8 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     pov_mode: row.pov_mode != null ? String(row.pov_mode) : null,
     characters: normalizeCharactersField(row.characters),
     dramatic_contract: dramaticContract,
-    tension_plan: tensionPlan
+    tension_plan: tensionPlan,
+    emotion_contract: emotionContract
   }
 }
 
@@ -357,6 +362,7 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
     const dramaticContract = normalizeDramaticContract(
       parsed.dramatic_contract ?? parsed.dramaticContract ?? parsed.scene_contract ?? parsed.sceneContract
     )
+    const emotionContract = normalizeEmotionContract(parsed.emotion_contract ?? parsed.emotionContract)
     const outline = buildOutlineFromParts(
       plotPoints,
       outlineRaw,
@@ -374,7 +380,8 @@ export function parseSingleChapterOutline(content: string): ParsedSingleChapterO
       next_hook: nextHook,
       pov_mode: parsed.pov_mode != null ? String(parsed.pov_mode) : null,
       characters: normalizeCharactersField(parsed.characters),
-      dramatic_contract: dramaticContract
+      dramatic_contract: dramaticContract,
+      emotion_contract: emotionContract
     }
   } catch {
     return null
