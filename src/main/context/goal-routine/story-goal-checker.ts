@@ -31,6 +31,10 @@ import { assessWholeNovel } from './novel-whole-evaluator'
 import type { EmotionBlindAssessment } from '../../../shared/emotion-contract'
 import { assessChapterEmotion } from './emotion-gate'
 import { ensureChapterEmotionContract } from './emotion-engine'
+import {
+  parseCachedQualityAssessment,
+  serializeQualityAssessment
+} from './chapter-assessment-cache'
 
 export interface StoryGoalConfig {
   /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
@@ -80,7 +84,7 @@ export const DEFAULT_STORY_GOAL_CONFIG: StoryGoalConfig = {
     QUALITY_AI_METRIC_DEFS.map(metric => [metric.key, 85])
   ) as Record<QualityAiMetricKey, number>,
   diagnoseBodyAfterGeneration: true,
-  humanReviewTitleHook: true,
+  humanReviewTitleHook: false,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
@@ -154,6 +158,7 @@ export interface GoalChapterDiagnostic {
   qualityHardFail: boolean
   gateBlockers: number
   antiAiViolations: number
+  antiAiViolationDetails: string[]
   emotionScore: number
   emotionPassed: boolean
 }
@@ -182,7 +187,8 @@ function collectFullBody(workId: number): string {
 export async function checkStoryGoal(
   workId: number,
   config: StoryGoalConfig,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
 ): Promise<GoalCheckResult> {
   const reasons: string[] = []
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
@@ -197,6 +203,7 @@ export async function checkStoryGoal(
     qualityHardFail: false,
     gateBlockers: 0,
     antiAiViolations: 0,
+    antiAiViolationDetails: [],
     emotionScore: -1,
     emotionPassed: false
   }))
@@ -206,6 +213,7 @@ export async function checkStoryGoal(
   const content = chapters.filter(c => c.content?.trim()).length
   const beatCompletion = total > 0 ? content / total : 0
   const expectedChapters = loadWritingPlan(workId).targetChapters
+  const chapterPlanComplete = isStory || expectedChapters <= 0 || total === expectedChapters
   if (total === 0) {
     reasons.push('尚无节拍')
   } else if (!isStory && expectedChapters > 0 && total !== expectedChapters) {
@@ -231,16 +239,40 @@ export async function checkStoryGoal(
   let qualityHardFail = false
   const modelOpts = storyGoalModelOpts(config)
 
-  if (content > 0 && content === total && config.qualityMin > 0) {
+  if (chapterPlanComplete && content > 0 && content === total && config.qualityMin > 0) {
     if (signal?.aborted) throw new Error('已取消')
     try {
       const scores: number[] = []
       let anyHardFail = false
       const allMetricFailures: string[] = []
       const qualityChapters = isStory ? chapters : selectNovelQualitySample(chapters)
-      for (const ch of qualityChapters) {
+      for (const [index, ch] of qualityChapters.entries()) {
         if (signal?.aborted) throw new Error('已取消')
-        const res = await diagnoseChapterQualityAi(workId, ch.id, ch.content ?? '', { thinkingEnabled: modelOpts?.thinkingEnabled })
+        const contentText = ch.content ?? ''
+        const cached = isStory
+          ? null
+          : parseCachedQualityAssessment(ch.quality_assessment_json, contentText)
+        onProgress?.(
+          `目标验收：${cached ? '复用' : '正在抽检'}正文质量 ${index + 1}/${qualityChapters.length}「${ch.title}」`
+        )
+        const res = cached
+          ? {
+              success: true,
+              scoreTotal: cached.scoreTotal,
+              hardFail: cached.hardFail,
+              report: cached.report
+            }
+          : await diagnoseChapterQualityAi(workId, ch.id, contentText, { thinkingEnabled: modelOpts?.thinkingEnabled })
+        if (!cached && res.success && typeof res.scoreTotal === 'number') {
+          volumeChapterDAO.updateChapter(ch.id, {
+            quality_assessment_json: serializeQualityAssessment({
+              content: contentText,
+              scoreTotal: res.scoreTotal,
+              hardFail: !!res.hardFail,
+              report: res.report
+            })
+          })
+        }
         const diag = chapterDiagnostics.find(d => d.chapterId === ch.id)
         if (res.success && typeof res.scoreTotal === 'number') {
           scores.push(res.scoreTotal)
@@ -314,10 +346,14 @@ export async function checkStoryGoal(
   if (config.checkAntiAiRules && fullBody.trim()) {
     for (const ch of chapters) {
       if (!ch.content?.trim()) continue
-      const count = checkAntiAiRuleViolations(workId, ch.content).length
+      const violations = checkAntiAiRuleViolations(workId, ch.content)
+      const count = violations.reduce((sum, violation) => sum + Math.max(1, violation.count ?? 1), 0)
       antiAiViolations += count
       const diag = chapterDiagnostics.find(item => item.chapterId === ch.id)
-      if (diag) diag.antiAiViolations = count
+      if (diag) {
+        diag.antiAiViolations = count
+        diag.antiAiViolationDetails = violations.map(violation => violation.detail)
+      }
     }
     if (antiAiViolations > 0) {
       reasons.push(`anti-AI 规则违规 ${antiAiViolations} 处`)
@@ -327,8 +363,8 @@ export async function checkStoryGoal(
   // ---- 6. 独立情绪盲读门禁（不再信任正文模型自报 intensity） ----
   const emotionScores: number[] = []
   const emotionFailures: string[] = []
-  if (content > 0) {
-    for (const chapter of chapters) {
+  if (chapterPlanComplete && content > 0) {
+    for (const [index, chapter] of chapters.entries()) {
       if (!chapter.content?.trim()) continue
       const diagnostic = chapterDiagnostics.find(item => item.chapterId === chapter.id)
       let assessment: EmotionBlindAssessment | null = null
@@ -338,6 +374,7 @@ export async function checkStoryGoal(
           : null
       } catch { assessment = null }
       if (!assessment) {
+        onProgress?.(`目标验收：正在补充情绪盲读 ${index + 1}/${chapters.length}「${chapter.title}」`)
         await ensureChapterEmotionContract(workId, chapter.id, config.goalDescription, signal)
         assessment = await assessChapterEmotion(workId, chapter.id, chapter.content, signal, true)
       }
@@ -372,7 +409,7 @@ export async function checkStoryGoal(
   let weakChapterTitles: string[] = []
   let storyIssues: string[] = []
 
-  if (isStory && content > 0 && content === total
+  if (chapterPlanComplete && isStory && content > 0 && content === total
     && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
     try {
       const assessment = await assessWholeStory(workId, config, signal)
@@ -405,9 +442,10 @@ export async function checkStoryGoal(
       storyIssues = [e instanceof Error ? e.message : String(e)]
       reasons.push(`整篇终审失败：${storyIssues[0]}`)
     }
-  } else if (!isStory && content > 0 && content === total
+  } else if (chapterPlanComplete && !isStory && content > 0 && content === total
     && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
     try {
+      onProgress?.('目标验收：正在进行整书结构、目标匹配与跨阶段盲读')
       const assessment = await assessWholeNovel(workId, config.goalDescription, signal)
       goalMatchScore = assessment.goalMatchScore
       goalMatchReason = assessment.goalMatchReason
@@ -441,7 +479,7 @@ export async function checkStoryGoal(
 
   // ---- 6. 试读卡点报告（全篇正文就绪时计算） ----
   let previewReport: string | null = null
-  if (content > 0 && content === total && config.previewRatio > 0) {
+  if (chapterPlanComplete && content > 0 && content === total && config.previewRatio > 0) {
     const work = workDAO.getById(workId)
     const mergedText = buildStoryMergedText(work?.description ?? '', chapters.map(c => ({ content: c.content ?? '' })))
     if (mergedText.trim()) {

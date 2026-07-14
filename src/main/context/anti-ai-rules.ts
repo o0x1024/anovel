@@ -101,6 +101,14 @@ export const SURFACE_ANTI_AI_PRESETS: AntiAiPreset[] = [
       before: '听到这句话，她整个人僵住了。愣了三秒，她心想，他怎么会知道？瞳孔骤缩，呼吸一滞。',
       after: '听到这句话，她握着杯子的手顿了一下。茶水晃出来，烫到指节。她没擦，也没说话。'
     }
+  },
+  {
+    label: '禁泛白类身体反应',
+    rule: '禁止用“指尖/指节/骨节泛白、发白、青白”“握到骨节发白”“指甲陷入掌心”等模板化身体反应代替情绪。没有独立剧情信息时直接删除；确有必要时，改成会产生具体后果、暴露人物意图或改变人物选择的动作。寒冷、失血、受伤等真实生理情境除外；不得换成呼吸一滞、身体僵住、瞳孔骤缩、颤抖或攥拳等同类套话',
+    demo: {
+      before: '她指节因为用力泛着青白，指甲深深陷入掌心。',
+      after: '她把已经签好的合同推了回去：“这个条件，我不认。”'
+    }
   }
 ]
 
@@ -427,6 +435,51 @@ export interface AntiAiRuleViolation {
   count?: number
 }
 
+export const BODY_REACTION_CLICHE_DIRECTIVE = '禁止用“指尖/指节/骨节泛白、发白、青白”或“指甲陷入掌心”等模板化身体反应代替情绪。无独立剧情信息就删除；确有必要则改成会产生后果、暴露意图或改变选择的动作。寒冷、失血、受伤等真实生理情境除外。不得改成呼吸一滞、身体僵住、瞳孔骤缩、颤抖或攥拳等另一套模板反应。'
+
+export interface BodyReactionClicheMatch {
+  /** 正文中的具体命中文本 */
+  matchText: string
+  /** 包含命中文本的完整句子，用于定点修复 */
+  sentence: string
+  start: number
+  end: number
+}
+
+const BODY_REACTION_CLICHE_PATTERN = /(?:指尖|指节|骨节)[^。！？!?。\n]{0,18}?(?:泛(?:着)?|发(?:着)?|呈(?:现|出)?|透(?:出)?|变(?:得|成)?|一片)?(?:青白|苍白|惨白|灰白|煞白|发白|泛白)|指甲(?:深深)?(?:陷|掐|嵌|刺)(?:进|入)?(?:了)?(?:掌心|手心)/g
+const PHYSIOLOGICAL_CONTEXT_PATTERN = /寒冷|寒风|冷风|冰冷|低温|冻(?:伤|僵|得)?|冰雪|失血|流血|出血|贫血|伤口|受伤|创伤|割伤|刺伤|骨折|疼痛|痛得|麻木|缺氧|窒息|中毒|休克|病变|病发|尸体|死者/
+
+/**
+ * 确定性定位“泛白类身体反应”。检测负责找候选，同句及相邻少量上下文
+ * 出现寒冷、失血、受伤等明确生理原因时豁免，避免误删有效的医疗/环境描写。
+ */
+export function detectBodyReactionCliches(content: string): BodyReactionClicheMatch[] {
+  if (!content.trim()) return []
+  const matches: BodyReactionClicheMatch[] = []
+  const sentencePattern = /[^。！？!?\n]+[。！？!?]?/g
+  let sentenceMatch: RegExpExecArray | null
+  while ((sentenceMatch = sentencePattern.exec(content)) !== null) {
+    const sentence = sentenceMatch[0]
+    const start = sentenceMatch.index
+    const contextStart = Math.max(0, start - 60)
+    const contextEnd = Math.min(content.length, start + sentence.length + 60)
+    const context = content.slice(contextStart, contextEnd)
+    if (PHYSIOLOGICAL_CONTEXT_PATTERN.test(context)) continue
+
+    BODY_REACTION_CLICHE_PATTERN.lastIndex = 0
+    let bodyMatch: RegExpExecArray | null
+    while ((bodyMatch = BODY_REACTION_CLICHE_PATTERN.exec(sentence)) !== null) {
+      matches.push({
+        matchText: bodyMatch[0],
+        sentence,
+        start: start + bodyMatch.index,
+        end: start + bodyMatch.index + bodyMatch[0].length
+      })
+    }
+  }
+  return matches
+}
+
 function calcSentenceLengthCV(text: string): number {
   const sentences = text.split(/[。！？!?…]+/).filter(s => s.trim().length > 0)
   if (sentences.length < 3) return 1
@@ -465,9 +518,19 @@ function countShortSentences(text: string): { total: number; short: number; rati
 /** 检测正文是否违反已配置的去 AI 味规则（生成后校验用） */
 export function checkAntiAiRuleViolations(workId: number, content: string): AntiAiRuleViolation[] {
   const rules = getAntiAiRules(workId)
-  if (!rules.length || !content.trim()) return []
+  if (!content.trim()) return []
 
   const violations: AntiAiRuleViolation[] = []
+
+  const bodyReactionCliches = detectBodyReactionCliches(content)
+  if (bodyReactionCliches.length > 0) {
+    const examples = [...new Set(bodyReactionCliches.map(item => item.matchText))].slice(0, 3)
+    violations.push({
+      rule: '禁泛白类身体反应',
+      detail: `含模板化身体反应 ${bodyReactionCliches.length} 处（${examples.map(item => `「${item}」`).join('、')}），应删除或改成会产生具体后果的动作`,
+      count: bodyReactionCliches.length
+    })
+  }
 
   if (rulesForbidEmDash(rules)) {
     const count = countEmDashes(content)

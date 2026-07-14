@@ -56,8 +56,28 @@ export class ForeshadowingDAO extends BaseDAO {
     ).changes > 0
   }
 
+  resolveMany(ids: number[], payoffChapterId: number, payoffLocation?: string): number {
+    const uniqueIds = [...new Set(ids)]
+    return this.transaction(() => uniqueIds.reduce((changes, id) => {
+      return changes + this.run(
+        "UPDATE foreshadowing SET status = 'resolved', payoff_chapter_id = ?, payoff_location = ? WHERE id = ?",
+        [payoffChapterId, payoffLocation ?? null, id]
+      ).changes
+    }, 0))
+  }
+
   updateStatus(id: number, status: ForeshadowingStatus): boolean {
     return this.run('UPDATE foreshadowing SET status = ? WHERE id = ?', [status, id]).changes > 0
+  }
+
+  updateStatusMany(ids: number[], status: ForeshadowingStatus): number {
+    const uniqueIds = [...new Set(ids)]
+    return this.transaction(() => uniqueIds.reduce((changes, id) => {
+      return changes + this.run(
+        'UPDATE foreshadowing SET status = ? WHERE id = ?',
+        [status, id]
+      ).changes
+    }, 0))
   }
 
   update(id: number, fields: Partial<Omit<ForeshadowingRow, 'id' | 'work_id' | 'create_time'>>): boolean {
@@ -77,6 +97,13 @@ export class ForeshadowingDAO extends BaseDAO {
 
   delete(id: number): boolean {
     return this.run('DELETE FROM foreshadowing WHERE id = ?', [id]).changes > 0
+  }
+
+  deleteMany(ids: number[]): number {
+    const uniqueIds = [...new Set(ids)]
+    return this.transaction(() => uniqueIds.reduce((changes, id) => {
+      return changes + this.run('DELETE FROM foreshadowing WHERE id = ?', [id]).changes
+    }, 0))
   }
 
   deleteByPlantChapter(workId: number, chapterId: number): number {

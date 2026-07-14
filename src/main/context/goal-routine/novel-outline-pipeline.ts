@@ -18,6 +18,8 @@ import { withGoalLoopModelOptions } from './story-goal-model'
 import { normalizeEmotionContract, validateEmotionContract } from '../../../shared/emotion-contract'
 import { EMOTION_CONTRACT_JSON_SHAPE } from './emotion-engine'
 import type { GoalCheckResult } from './story-goal-checker'
+import { goldenOutlineContract } from '../../../shared/golden-opening'
+import { retentionEvaluationRules, retentionPlanningRules } from './reader-retention'
 import {
   formatNovelScaleContract,
   novelScaleFingerprint,
@@ -25,6 +27,9 @@ import {
 } from './novel-scale-contract'
 
 const OUTLINE_BATCH_SIZE = 6
+const MAX_GATE_REPAIR_ROUNDS = 4
+const TARGET_CHAPTERS_PER_VOLUME = 42
+const MAX_CHAPTERS_PER_VOLUME = 50
 
 export interface NovelVolumeContract {
   name: string
@@ -39,9 +44,14 @@ export interface NovelVolumeContract {
 }
 
 export interface NovelOutlineProgressState {
-  version: 1
+  version: 2
   targetChapters: number
   volumePlan: NovelVolumeContract[]
+}
+
+export interface NovelVolumeRange {
+  startChapter: number
+  endChapter: number
 }
 
 export interface NovelGoalPersistentState {
@@ -132,7 +142,31 @@ function intField(row: Record<string, unknown>, key: string, label: string): num
 }
 
 function expectedVolumeCount(targetChapters: number): number {
-  return Math.max(1, Math.ceil(targetChapters / 30))
+  return Math.max(
+    1,
+    Math.round(targetChapters / TARGET_CHAPTERS_PER_VOLUME),
+    Math.ceil(targetChapters / MAX_CHAPTERS_PER_VOLUME)
+  )
+}
+
+/**
+ * 章节边界由程序确定，模型只负责设计每卷剧情。
+ * 余数从前往后每卷多分配一章，使任意两卷的长度差不超过 1。
+ */
+export function planNovelVolumeRanges(targetChapters: number): NovelVolumeRange[] {
+  if (!Number.isInteger(targetChapters) || targetChapters <= 0) {
+    throw new NovelPipelineError('CONTRACT_INVALID', '目标章节数必须是正整数')
+  }
+  const volumeCount = expectedVolumeCount(targetChapters)
+  const baseSize = Math.floor(targetChapters / volumeCount)
+  const remainder = targetChapters % volumeCount
+  let startChapter = 1
+  return Array.from({ length: volumeCount }, (_, index) => {
+    const size = baseSize + (index < remainder ? 1 : 0)
+    const range = { startChapter, endChapter: startChapter + size - 1 }
+    startChapter = range.endChapter + 1
+    return range
+  })
 }
 
 function validateVolumePlan(raw: unknown, targetChapters: number): NovelVolumeContract[] {
@@ -157,26 +191,24 @@ function validateVolumePlan(raw: unknown, targetChapters: number): NovelVolumeCo
       nextDebt: textField(row, 'nextDebt', label)
     }
   })
-  const expectedVolumes = expectedVolumeCount(targetChapters)
+  const expectedRanges = planNovelVolumeRanges(targetChapters)
+  const expectedVolumes = expectedRanges.length
   if (plan.length !== expectedVolumes) {
     throw new NovelPipelineError('CONTRACT_INVALID', `分卷合同必须包含 ${expectedVolumes} 卷，实际 ${plan.length} 卷`)
   }
 
-  let expected = 1
   const names = new Set<string>()
-  for (const volume of plan) {
+  for (let index = 0; index < plan.length; index++) {
+    const volume = plan[index]
+    const expected = expectedRanges[index]
     if (names.has(volume.name)) throw new NovelPipelineError('CONTRACT_INVALID', `分卷名称重复：${volume.name}`)
     names.add(volume.name)
-    if (volume.startChapter !== expected || volume.endChapter < volume.startChapter) {
+    if (volume.startChapter !== expected.startChapter || volume.endChapter !== expected.endChapter) {
       throw new NovelPipelineError(
         'CONTRACT_INVALID',
-        `分卷章节范围不连续：${volume.name} 应从第 ${expected} 章开始，实际为 ${volume.startChapter}-${volume.endChapter}`
+        `第 ${index + 1} 个分卷章节范围必须是 ${expected.startChapter}-${expected.endChapter}，实际为 ${volume.startChapter}-${volume.endChapter}`
       )
     }
-    expected = volume.endChapter + 1
-  }
-  if (expected - 1 !== targetChapters) {
-    throw new NovelPipelineError('CONTRACT_INVALID', `分卷合同只覆盖 ${expected - 1}/${targetChapters} 章`)
   }
   return plan
 }
@@ -188,7 +220,8 @@ async function generateVolumePlan(
   signal?: AbortSignal
 ): Promise<NovelVolumeContract[]> {
   const ctx = buildWorkContext(workId, { includeVolumes: false, includeCoreSettings: true })
-  const suggestedVolumes = expectedVolumeCount(targetChapters)
+  const plannedRanges = planNovelVolumeRanges(targetChapters)
+  const suggestedVolumes = plannedRanges.length
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       workId,
@@ -199,12 +232,14 @@ async function generateVolumePlan(
       systemPrompt: [
         '你是长篇小说总架构师。只输出合法 JSON 对象，不要 markdown、前言或解释。',
         `为 ${targetChapters} 章小说设计恰好 ${suggestedVolumes} 个连续分卷，不得减少或增加卷数。`,
-        '每卷必须形成阶段闭环，同时留下进入下一卷的新债务。章节范围必须从1开始、连续、无重叠并精确覆盖目标章节数。',
-        '格式：{"volumes":[{"name":"第一卷 名称","description":"本卷核心冲突与升级路径","startChapter":1,"endChapter":30,"objective":"主角阶段目标","midpoint":"中点反转","climax":"卷高潮与兑现","irreversibleCost":"永久代价","nextDebt":"留给下一卷的未偿债务"}]}'
+        '每卷必须形成阶段闭环，同时留下进入下一卷的新债务。',
+        'startChapter 和 endChapter 必须逐项照抄用户消息中的预设范围，不得重新分配、合并或拆分。',
+        `格式：{"volumes":[{"name":"第一卷 名称","description":"本卷核心冲突与升级路径","startChapter":${plannedRanges[0].startChapter},"endChapter":${plannedRanges[0].endChapter},"objective":"主角阶段目标","midpoint":"中点反转","climax":"卷高潮与兑现","irreversibleCost":"永久代价","nextDebt":"留给下一卷的未偿债务"}]}`
       ].join('\n'),
       prompt: [
         `【用户目标】\n${goal.trim() || '自动策划一部长篇小说'}`,
         `【目标章节数】${targetChapters}`,
+        `【不可修改的分卷章节范围】\n${JSON.stringify(plannedRanges, null, 2)}`,
         `【核心设定】\n${ctx.text.slice(0, 14000)}`
       ].join('\n\n')
     }),
@@ -255,6 +290,7 @@ async function reviseVolumePlan(
   report: string,
   signal?: AbortSignal
 ): Promise<NovelVolumeContract[]> {
+  const plannedRanges = planNovelVolumeRanges(targetChapters)
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       workId,
@@ -264,12 +300,14 @@ async function reviseVolumePlan(
       maxTokens: 6000,
       systemPrompt: [
         '你是长篇小说总架构修订师。只输出合法 JSON，不要 markdown 或解释。',
-        `必须保留恰好 ${expectedVolumeCount(targetChapters)} 卷，章节范围连续、无重叠并精确覆盖 1-${targetChapters} 章。`,
+        `必须保留恰好 ${plannedRanges.length} 卷。`,
+        'startChapter 和 endChapter 必须逐项照抄用户消息中的预设范围，不得重新分配、合并或拆分。',
         '逐项修复门禁报告；上一卷 nextDebt 必须直接驱动下一卷 objective；冲突、高潮、成长和不可逆代价必须逐卷升级。',
         '输出格式与输入相同：{"volumes":[...]}'
       ].join('\n'),
       prompt: [
         `【创作目标】\n${goal.trim() || '完成一部长篇小说'}`,
+        `【不可修改的分卷章节范围】\n${JSON.stringify(plannedRanges, null, 2)}`,
         `【当前分卷合同】\n${JSON.stringify({ volumes: plan }, null, 2)}`,
         `【门禁报告】\n${report}`
       ].join('\n\n')
@@ -283,6 +321,7 @@ async function reviseVolumePlan(
 
 function materializeVolumePlan(workId: number, plan: NovelVolumeContract[]): void {
   const existing = volumeChapterDAO.listVolumes(workId)
+  const canReconcileByPosition = volumeChapterDAO.listChaptersByWork(workId).length === 0
   for (let index = 0; index < plan.length; index++) {
     const contract = plan[index]
     const description = [
@@ -294,9 +333,14 @@ function materializeVolumePlan(workId: number, plan: NovelVolumeContract[]): voi
       `【跨卷债务】${contract.nextDebt}`,
       `【章节范围】${contract.startChapter}-${contract.endChapter}`
     ].join('\n')
-    const row = existing.find(item => item.name === contract.name)
+    // 尚未生成章节时复用原有空卷，避免规划版本升级后残留旧卷或重复建卷。
+    // 已有章节时仍按名称匹配，绝不静默搬迁或删除用户内容。
+    const row = canReconcileByPosition
+      ? existing[index]
+      : existing.find(item => item.name === contract.name)
     if (row) {
       volumeChapterDAO.updateVolume(row.id, {
+        name: contract.name,
         description,
         sort: index + 1,
         plannedStartChapter: contract.startChapter,
@@ -307,6 +351,11 @@ function materializeVolumePlan(workId: number, plan: NovelVolumeContract[]): voi
         startChapter: contract.startChapter,
         endChapter: contract.endChapter
       })
+    }
+  }
+  if (canReconcileByPosition) {
+    for (const obsolete of existing.slice(plan.length)) {
+      volumeChapterDAO.deleteVolume(obsolete.id)
     }
   }
 }
@@ -332,9 +381,7 @@ async function ensurePleasureEngineMatchesVolumePlan(
   const coversVolumes = plan.every(volume => current.includes(volume.name))
   if (state.pleasureVolumeFingerprint === fingerprint && scaleGate.valid && coversVolumes) return
 
-  let round = 0
-  while (true) {
-    round++
+  for (let round = 1; round <= MAX_GATE_REPAIR_ROUNDS; round++) {
     if (signal?.aborted) throw new Error('已取消')
     onProgress?.(`正在执行爽点机制与分卷大纲映射门禁（第 ${round} 轮）`)
     const response = await modelService.chat(
@@ -376,6 +423,10 @@ async function ensurePleasureEngineMatchesVolumePlan(
     onProgress?.(`爽点机制已覆盖 ${plan.length} 卷并对齐目标末章`)
     return
   }
+  throw new NovelPipelineError(
+    'CONTRACT_INVALID',
+    `爽点机制与分卷大纲连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未能对齐，请调整设定或模型后重试`
+  )
 }
 
 async function runVolumeChapterGate(
@@ -389,7 +440,7 @@ async function runVolumeChapterGate(
   if (!volume) throw new NovelPipelineError('PREREQUISITE_MISSING', `分卷「${contract.name}」尚未落库`)
   let rounds = 0
   let lastScore = -1
-  while (true) {
+  while (rounds < MAX_GATE_REPAIR_ROUNDS) {
     rounds++
     const chapters = volumeChapterDAO.listChapters(volume.id)
     if (chapters.length !== contract.endChapter - contract.startChapter + 1) {
@@ -484,6 +535,10 @@ async function runVolumeChapterGate(
       })
     }
   }
+  throw new NovelPipelineError(
+    'CONTRACT_INVALID',
+    `分卷「${contract.name}」章节情节连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未通过门禁（最终 ${lastScore} 分）`
+  )
 }
 
 function normalizeCharacters(value: unknown, chapterNumber: number): string[] {
@@ -763,6 +818,8 @@ async function generateChapterBatch(input: {
       systemPrompt: [
         '你是长篇小说章节结构编辑。只输出合法 JSON 对象，不要 markdown、前言、总结或解释。',
         `只生成第 ${input.start}-${input.end} 章，不得生成范围外章节。`,
+        goldenOutlineContract('novel', input.start, input.end),
+        retentionPlanningRules('novel'),
         `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须包含【开场状态】【必须覆盖】【禁止越界】【结尾落点】【连续性约束】。`,
         '每章必须有戏剧契约：目标、阻力、失败代价、中段转折、不可逆变化和结尾问题。',
         '每章必须有 emotion_contract：依恋锚点、事件意义、人物表里冲突、读者信息位置、有代价选择和跨章余波缺一不可。',
@@ -797,6 +854,56 @@ async function generateChapterBatch(input: {
   })
 }
 
+async function assessGoldenThreeOutlineBatch(
+  workId: number,
+  goal: string,
+  items: NovelOutlineBatchItem[],
+  signal?: AbortSignal
+): Promise<{ passed: boolean; score: number; issues: string[] }> {
+  const firstThree = items.slice(0, 3)
+  if (firstThree.length < 3) {
+    return { passed: false, score: 0, issues: ['首批章节未完整包含第1至3章'] }
+  }
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      step: 'goal_novel_golden_three_gate',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false,
+      temperature: 0,
+      maxTokens: 1600,
+      systemPrompt: [
+        '你是长篇网文黄金前三章门禁主编。只输出合法 JSON，不要 markdown 或解释。',
+        goldenOutlineContract('novel', 1, 3),
+        retentionEvaluationRules('novel'),
+        '必须联合判断三章是否形成“立钩子→扩承诺→首兑现”的连续因果链，而非分别给三篇大纲挑文笔问题。',
+        'score 低于85或存在 blocking_issues 时 passed=false。',
+        '格式：{"passed":false,"score":78,"blocking_issues":["第3章没有兑现前两章承诺"],"repair_direction":"可直接用于重生成的具体要求"}'
+      ].join('\n'),
+      prompt: [
+        `【用户目标】\n${goal.trim() || '自动策划一部长篇小说'}`,
+        `【黄金前三章大纲】\n${JSON.stringify(firstThree, null, 2)}`
+      ].join('\n\n')
+    }),
+    { stream: false, signal }
+  )
+  if (!response.success || !response.content?.trim()) {
+    throw new Error(`黄金前三章门禁失败：${response.error || '模型未返回内容'}`)
+  }
+  const parsed = parseObject(response.content, '黄金前三章门禁')
+  const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 0)))
+  const issues = Array.isArray(parsed.blocking_issues)
+    ? parsed.blocking_issues.map(String).map(value => value.trim()).filter(Boolean)
+    : []
+  const direction = String(parsed.repair_direction ?? '').trim()
+  if (parsed.passed !== true && direction) issues.push(direction)
+  return {
+    passed: parsed.passed === true && score >= 85 && issues.length === 0,
+    score,
+    issues
+  }
+}
+
 export async function prepareNovelVolumePlan(
   workId: number,
   goal: string,
@@ -805,14 +912,22 @@ export async function prepareNovelVolumePlan(
 ): Promise<{ volumes: number; revised: boolean }> {
   const targetChapters = loadWritingPlan(workId).targetChapters || 10
   const state = readNovelGoalState(workId)
-  let volumePlan = state.novelOutline?.targetChapters === targetChapters
-    ? state.novelOutline.volumePlan
-    : []
+  const compatibleOutline = state.novelOutline?.version === 2
+    && state.novelOutline.targetChapters === targetChapters
+    ? state.novelOutline
+    : undefined
+  if (!compatibleOutline && volumeChapterDAO.listChaptersByWork(workId).length > 0) {
+    throw new NovelPipelineError(
+      'PREREQUISITE_MISSING',
+      '分卷规划规则已升级，但作品已有章节，不能自动重新分卷；请先备份并确认现有章节的迁移方式'
+    )
+  }
+  let volumePlan = compatibleOutline?.volumePlan ?? []
   if (volumePlan.length === 0) {
     onProgress?.(`正在生成全书分卷大纲（${targetChapters} 章）`)
     volumePlan = await generateVolumePlan(workId, goal, targetChapters, signal)
     updateNovelGoalState(workId, {
-      novelOutline: { version: 1, targetChapters, volumePlan },
+      novelOutline: { version: 2, targetChapters, volumePlan },
       volumePlanChecked: false,
       volumeQualityReport: undefined,
       checkedChapterVolumes: undefined,
@@ -828,8 +943,8 @@ export async function prepareNovelVolumePlan(
   const latestState = readNovelGoalState(workId)
   if (!latestState.volumePlanChecked) {
     let gateRound = 0
-    let gate: Awaited<ReturnType<typeof diagnoseVolumePlan>>
-    while (true) {
+    let gate: Awaited<ReturnType<typeof diagnoseVolumePlan>> | undefined
+    while (gateRound < MAX_GATE_REPAIR_ROUNDS) {
       gateRound++
       onProgress?.(`正在诊断 ${volumePlan.length} 卷之间的逻辑与质量（第 ${gateRound} 轮）`)
       gate = await diagnoseVolumePlan(workId, goal, volumePlan, signal)
@@ -838,8 +953,14 @@ export async function prepareNovelVolumePlan(
       onProgress?.(`分卷质量门禁未通过，正在第 ${gateRound} 轮整体修订全书分卷大纲`)
       volumePlan = await reviseVolumePlan(workId, goal, targetChapters, volumePlan, gate.report, signal)
     }
+    if (!gate?.passed) {
+      throw new NovelPipelineError(
+        'CONTRACT_INVALID',
+        `全书分卷大纲连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未通过质量门禁，请调整设定或模型后重试`
+      )
+    }
     updateNovelGoalState(workId, {
-      novelOutline: { version: 1, targetChapters, volumePlan },
+      novelOutline: { version: 2, targetChapters, volumePlan },
       volumePlanChecked: true,
       volumeQualityReport: gate.report,
       checkedChapterVolumes: revised ? undefined : latestState.checkedChapterVolumes,
@@ -918,8 +1039,26 @@ export async function generateNextNovelOutlineBatch(
   if (!volume) throw new NovelPipelineError('CONTRACT_INVALID', `第 ${start} 章不属于任何分卷合同`)
   const end = Math.min(volume.endChapter, start + OUTLINE_BATCH_SIZE - 1)
   onProgress?.(`正在生成章节情节第 ${start}-${end} 章（剩余 ${targetChapters - existing.length} 章）`)
-  const correction = state.failure?.phase === 'generate_beats' ? state.failure.message : undefined
-  const items = await generateChapterBatch({ workId, goal, volume, start, end, correction, signal })
+  let correction = state.failure?.phase === 'generate_beats' ? state.failure.message : undefined
+  let items: NovelOutlineBatchItem[] = []
+  for (let round = 1; round <= MAX_GATE_REPAIR_ROUNDS; round++) {
+    items = await generateChapterBatch({ workId, goal, volume, start, end, correction, signal })
+    if (start !== 1 || end < 3) break
+    onProgress?.(`正在执行黄金前三章联合门禁（第 ${round} 轮）`)
+    const gate = await assessGoldenThreeOutlineBatch(workId, goal, items, signal)
+    if (gate.passed) {
+      onProgress?.(`黄金前三章联合门禁通过（${gate.score}分）`)
+      break
+    }
+    if (round === MAX_GATE_REPAIR_ROUNDS) {
+      throw new NovelPipelineError(
+        'CONTRACT_INVALID',
+        `黄金前三章连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未通过门禁：${gate.issues.join('；') || `${gate.score}分`}`
+      )
+    }
+    correction = `黄金前三章门禁未通过（${gate.score}分），必须整体重建第1至3章：${gate.issues.join('；')}`
+    onProgress?.(`黄金前三章未通过（${gate.score}分），正在整体重建首批章节`)
+  }
   const volumeIndex = volumePlan.findIndex(item => item.name === volume.name)
   novelOutlineDAO.commitBatch({
     workId,

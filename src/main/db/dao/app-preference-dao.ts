@@ -10,11 +10,20 @@ const GENERATION_PARAMS_KEY = 'generation_params'
 const PERPLEXITY_API_CONFIG_KEY = 'perplexity_api_config'
 const AUTO_OPTIMIZE_CONFIG_KEY = 'auto_optimize_config'
 const STEP_MODEL_OVERRIDES_KEY = 'step_model_overrides'
+const DEFAULT_NOVEL_STYLE_KEY = 'default_writing_style_novel'
+const DEFAULT_STORY_STYLE_KEY = 'default_writing_style_story'
 
 export interface GlobalLlmDefault {
   provider: string | null
   modelName: string | null
 }
+
+export interface DefaultWritingStyles {
+  novelStyleId: number | null
+  storyStyleId: number | null
+}
+
+export type WritingWorkType = 'novel' | 'story'
 
 export interface StepModelOverride {
   provider: string
@@ -70,6 +79,24 @@ export class AppPreferenceDAO extends BaseDAO {
     this.setPreference(GLOBAL_LLM_PROVIDER_KEY, provider)
     this.setPreference(GLOBAL_LLM_MODEL_KEY, modelName)
     return this.getGlobalLlmDefault()
+  }
+
+  getDefaultWritingStyles(): DefaultWritingStyles {
+    const parseStyleId = (raw: string | null): number | null => {
+      if (!raw) return null
+      const id = Number(raw)
+      return Number.isInteger(id) && id > 0 ? id : null
+    }
+    return {
+      novelStyleId: parseStyleId(this.getPreference(DEFAULT_NOVEL_STYLE_KEY)),
+      storyStyleId: parseStyleId(this.getPreference(DEFAULT_STORY_STYLE_KEY))
+    }
+  }
+
+  setDefaultWritingStyle(workType: WritingWorkType, styleId: number | null): DefaultWritingStyles {
+    const key = workType === 'story' ? DEFAULT_STORY_STYLE_KEY : DEFAULT_NOVEL_STYLE_KEY
+    this.setPreference(key, styleId === null ? null : String(styleId))
+    return this.getDefaultWritingStyles()
   }
 
   getGenerationParams(): GenerationParams {

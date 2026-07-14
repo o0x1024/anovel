@@ -168,8 +168,8 @@ const showCreateDialog = ref(false)
 const showEditDialog = ref(false)
 const newWork = ref({ title: '', description: '', genre: '', tags: '' })
 const newNovelLength = ref<NovelLength>(DEFAULT_NOVEL_LENGTH)
-const customTargetTotalWords = ref(workType === 'story' ? 30_000 : 800_000)
-const customTargetChapters = ref(workType === 'story' ? 10 : 200)
+const customTargetTotalWords = ref(workType === 'story' ? 15_000 : 800_000)
+const customTargetChapters = ref(workType === 'story' ? 5 : 200)
 const customWordsPerChapter = ref(workType === 'story' ? 3000 : 4000)
 const editWork = ref({
   id: 0,
@@ -585,8 +585,8 @@ function syncCustomTargetTotalWords() {
 function resetCreateForm() {
   newWork.value = { title: '', description: '', genre: '', tags: '' }
   newNovelLength.value = DEFAULT_NOVEL_LENGTH
-  customTargetTotalWords.value = workType === 'story' ? 30_000 : 800_000
-  customTargetChapters.value = workType === 'story' ? 10 : 200
+  customTargetTotalWords.value = workType === 'story' ? 15_000 : 800_000
+  customTargetChapters.value = workType === 'story' ? 5 : 200
   customWordsPerChapter.value = workType === 'story' ? 3000 : 4000
 }
 

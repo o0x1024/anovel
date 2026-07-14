@@ -10,7 +10,11 @@ export type { WritingStyleRow, StyleCreateInput } from './dao/style-dao'
 export { modelConfigDAO } from './dao/model-config-dao'
 export type { ModelConfigRow } from './dao/model-config-dao'
 export { appPreferenceDAO } from './dao/app-preference-dao'
-export type { GlobalLlmDefault } from './dao/app-preference-dao'
+export type {
+  GlobalLlmDefault,
+  DefaultWritingStyles,
+  WritingWorkType
+} from './dao/app-preference-dao'
 export { anchorDAO, ANCHOR_TYPES } from './dao/anchor-dao'
 export type { AnchorRow, AnchorCreateInput } from './dao/anchor-dao'
 export { ideaFragmentDAO, IDEA_TYPES } from './dao/idea-dao'

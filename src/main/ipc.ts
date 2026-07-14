@@ -103,6 +103,13 @@ export function registerIpcHandlers(): void {
       targetChapters: input.targetChapters,
       wordsPerChapter: input.wordsPerChapter
     })
+    const defaults = appPreferenceDAO.getDefaultWritingStyles()
+    const defaultStyleId = input.workType === 'story'
+      ? defaults.storyStyleId
+      : defaults.novelStyleId
+    if (defaultStyleId && writingStyleDAO.getById(defaultStyleId)) {
+      writingStyleDAO.setWorkStyle(id, defaultStyleId)
+    }
     return id
   })
   ipcMain.handle('work:update', (_e, id: number, input: Record<string, unknown>) => workDAO.update(id, input))
@@ -228,7 +235,12 @@ export function registerIpcHandlers(): void {
   })
   ipcMain.handle('style:delete', (_e, id: number) => {
     const ok = writingStyleDAO.delete(id)
-    if (ok) broadcastStyleChanged(null)
+    if (ok) {
+      const defaults = appPreferenceDAO.getDefaultWritingStyles()
+      if (defaults.novelStyleId === id) appPreferenceDAO.setDefaultWritingStyle('novel', null)
+      if (defaults.storyStyleId === id) appPreferenceDAO.setDefaultWritingStyle('story', null)
+      broadcastStyleChanged(null)
+    }
     return ok
   })
   ipcMain.handle('style:bindToWork', (_e, workId: number, styleId: number, curve?: string) =>
@@ -243,6 +255,24 @@ export function registerIpcHandlers(): void {
     writingStyleDAO.getWorkStyleBinding(workId))
   ipcMain.handle('style:setWorkEvolutionCurve', (_e, workId: number, curveJson: string | null) =>
     writingStyleDAO.setWorkEvolutionCurve(workId, curveJson))
+  ipcMain.handle('style:getDefaults', () => {
+    const defaults = appPreferenceDAO.getDefaultWritingStyles()
+    return {
+      novelStyleId: defaults.novelStyleId && writingStyleDAO.getById(defaults.novelStyleId)
+        ? defaults.novelStyleId
+        : null,
+      storyStyleId: defaults.storyStyleId && writingStyleDAO.getById(defaults.storyStyleId)
+        ? defaults.storyStyleId
+        : null
+    }
+  })
+  ipcMain.handle('style:setDefault', (_e, workType: 'novel' | 'story', styleId: number | null) => {
+    if (workType !== 'novel' && workType !== 'story') throw new Error('无效的作品类型')
+    if (styleId !== null && (!Number.isInteger(styleId) || !writingStyleDAO.getById(styleId))) {
+      throw new Error('所选文风不存在')
+    }
+    return appPreferenceDAO.setDefaultWritingStyle(workType, styleId)
+  })
   ipcMain.handle('style:generateFromDescription', (e, description: string) =>
     generateStyleFromDescription(description, { webContents: e.sender }))
 
@@ -487,8 +517,14 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('emotion:ensureContract', async (_e, workId: number, chapterId: number, goal = '') =>
     ensureChapterEmotionContract(workId, chapterId, goal))
-  ipcMain.handle('emotion:assessChapter', async (_e, workId: number, chapterId: number, content: string, persistLedger = false) =>
-    assessChapterEmotion(workId, chapterId, content, undefined, persistLedger))
+  ipcMain.handle('emotion:assessChapter', async (
+    _e,
+    workId: number,
+    chapterId: number,
+    content: string,
+    persistLedger = false,
+    persistAssessment = true
+  ) => assessChapterEmotion(workId, chapterId, content, undefined, persistLedger, persistAssessment))
 
   // ==================== 目标循环（goal routine）====================
   function isNovelWork(workId: number): boolean {

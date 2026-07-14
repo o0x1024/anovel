@@ -14,6 +14,7 @@ import { type WritingPlanStatus, volumePlanLabel, DEFAULT_WORDS_PER_CHAPTER } fr
 import { getPanelPage, setPanelPage } from '../../services/editorPanelPageState'
 import { outlineConstraintsForWordTarget } from '../../../../shared/outline-constraints'
 import { workUnitLabels } from '../../../../shared/work-terminology'
+import { goldenOutlineContract } from '../../../../shared/golden-opening'
 
 const props = defineProps<{ workId: number }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
@@ -152,6 +153,7 @@ const batchSystemPrompt = computed(() => {
       '【极度紧凑与高潮迭起约束 - 硬要求】',
       '短故事要求剧情极度紧凑，节奏极快。禁止安排任何平淡的“过渡节拍”或“日常水文”。',
       '每个节拍都必须有核心矛盾冲突或情绪爆发，爽点或反转必须一个接一个密集抛出。',
+      goldenOutlineContract('story', startNum, startNum + batchChapterCount.value - 1),
       '【输出格式 - 必须严格遵守】',
       '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
       'chapters 数组每一项为一个节拍（请勿输出“第X章”或“节拍X”字样，直接写节拍剧情标题即可）。',
@@ -170,6 +172,7 @@ const batchSystemPrompt = computed(() => {
 
   return [
     '根据当前分卷信息与作品创作上下文，生成该卷下的章节情节大纲。',
+    goldenOutlineContract('novel', startNum, startNum + batchChapterCount.value - 1),
     '【输出格式 - 必须严格遵守】',
     '只输出一个 JSON 对象；禁止 Markdown 章节标题、前置说明、思考过程，以及 ``` 代码块围栏。',
     'chapters 数组每一项为一章；不要把「卷X章节大纲」「分章情节」「章节结尾钩子」等文档标题当作 title。',

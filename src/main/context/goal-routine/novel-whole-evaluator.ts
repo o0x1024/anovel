@@ -2,6 +2,7 @@ import { modelService } from '../../model'
 import { volumeChapterDAO } from '../../db'
 import { extractJsonText } from '../parse-json-extract'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { retentionEvaluationRules } from './reader-retention'
 
 interface VolumeAssessment {
   volume: string
@@ -98,6 +99,7 @@ async function assessVolume(
       systemPrompt: [
         '你是长篇网文分卷终审编辑。根据章节合同、大纲和正文首尾抽样，检查本卷是否形成因果闭环、压力升级、阶段兑现和进入下一卷的新债务。',
         '同时识别重复任务结构、反派送人头、无代价获胜、连续水章、关系线停滞和伏笔久拖不决。',
+        retentionEvaluationRules('novel'),
         '只输出 JSON：{"structureScore":0,"escalationScore":0,"payoffScore":0,"continuityScore":0,"repetitionScore":0,"issues":[],"weakChapters":[],"summary":""}'
       ].join('\n'),
       prompt: `【分卷】${volumeName}\n\n${chapters.map(chapterEvidence).join('\n\n').slice(0, 50000)}`
@@ -145,7 +147,7 @@ export async function assessWholeNovel(
 
   const rhythmIssues = deterministicRhythmIssues(chapters)
   const sampleIndexes = new Set([
-    0, 1,
+    0, 1, 2,
     Math.floor(chapters.length * 0.25),
     Math.floor(chapters.length * 0.5),
     Math.floor(chapters.length * 0.75),
@@ -161,8 +163,10 @@ export async function assessWholeNovel(
       enrichNarrativeMemory: false,
       maxTokens: 2200,
       systemPrompt: [
-        '你是长篇小说整书终审。综合各卷报告与开头/四分之一/中点/四分之三/结局盲读样本评分。',
+        '你是长篇小说整书终审。综合各卷报告与黄金前三章/四分之一/中点/四分之三/结局盲读样本评分。',
+        '黄金前三章必须联合检查“第一章立钩子、第二章扩大承诺、第三章首次兑现并打开长线目标”，任一缺失都要列入 issues 和 weakChapterTitles。',
         '重点判断：用户目标是否贯穿、主线是否升级、高潮是否由前文因果触发、结局是否兑现、正文是否有追读感和人味。',
+        retentionEvaluationRules('novel'),
         '只输出 JSON：{"goalMatchScore":0,"goalMatchReason":"","overallStoryScore":0,"overallStoryReason":"","previewHookScore":0,"previewHookReason":"","proseReadScore":0,"proseReadReason":"","weakChapterTitles":[],"issues":[]}'
       ].join('\n'),
       prompt: [

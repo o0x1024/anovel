@@ -1,5 +1,18 @@
 export type EmotionArcRole = 'attach' | 'build' | 'hold' | 'break' | 'release' | 'aftertaste'
 
+export const EMOTION_ARC_ROLES: readonly EmotionArcRole[] = [
+  'attach', 'build', 'hold', 'break', 'release', 'aftertaste'
+]
+
+export const EMOTION_GAP_TYPES = ['reader_ahead', 'reader_equal', 'reader_behind'] as const
+
+/** 提示词与解析器共用的枚举约束，避免模型输出规则与代码校验规则漂移。 */
+export const EMOTION_CONTRACT_ENUM_RULE = [
+  `arc_role 只能是 ${EMOTION_ARC_ROLES.join('/')}`,
+  `gap_type 只能是 ${EMOTION_GAP_TYPES.join('/')}`,
+  'reader_state_before/after：valence -2..2，arousal 0..4，agency -2..2，certainty 0..4'
+].join('；')
+
 export interface EmotionStateVector {
   label: string
   valence: number
@@ -99,8 +112,34 @@ export interface EmotionBlindAssessment {
   repair_instruction: string
 }
 
-const ARC_ROLES = new Set<EmotionArcRole>(['attach', 'build', 'hold', 'break', 'release', 'aftertaste'])
-const GAP_TYPES = new Set<EmotionContract['information_position']['gap_type']>(['reader_ahead', 'reader_equal', 'reader_behind'])
+const ARC_ROLES = new Set<EmotionArcRole>(EMOTION_ARC_ROLES)
+const GAP_TYPES = new Set<EmotionContract['information_position']['gap_type']>(EMOTION_GAP_TYPES)
+
+const ARC_ROLE_ALIASES: Record<string, EmotionArcRole> = {
+  attach: 'attach', setup: 'attach', opening: 'attach', hook: 'attach',
+  build: 'build', rising: 'build', escalation: 'build', develop: 'build',
+  hold: 'hold', sustain: 'hold', pause: 'hold', transition: 'hold',
+  break: 'break', crisis: 'break', reversal: 'break', turn: 'break',
+  release: 'release', climax: 'release', payoff: 'release', catharsis: 'release',
+  aftertaste: 'aftertaste', resolution: 'aftertaste', denouement: 'aftertaste', aftermath: 'aftertaste', ending: 'aftertaste',
+  '开篇依恋': 'attach', '蓄力': 'build', '维持': 'hold', '破裂': 'break', '高潮': 'release', '兑现': 'release', '余味': 'aftertaste', '结局': 'aftertaste'
+}
+
+const GAP_TYPE_ALIASES: Record<string, EmotionContract['information_position']['gap_type']> = {
+  reader_ahead: 'reader_ahead', ahead: 'reader_ahead',
+  reader_equal: 'reader_equal', equal: 'reader_equal', aligned: 'reader_equal',
+  reader_behind: 'reader_behind', behind: 'reader_behind'
+}
+
+export function normalizeEmotionArcRole(value: unknown): EmotionArcRole | null {
+  const key = text(value).toLowerCase()
+  return ARC_ROLE_ALIASES[key] ?? null
+}
+
+function normalizeGapType(value: unknown): EmotionContract['information_position']['gap_type'] | null {
+  const key = text(value).toLowerCase()
+  return GAP_TYPE_ALIASES[key] ?? null
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -140,9 +179,9 @@ export function normalizeEmotionContract(value: unknown): EmotionContract | null
   const info = record(row.information_position)
   const before = stateVector(row.reader_state_before)
   const after = stateVector(row.reader_state_after)
-  const gap = text(info?.gap_type) as EmotionContract['information_position']['gap_type']
-  const arcRole = text(row.arc_role) as EmotionArcRole
-  if (!appraisal || !layers || !info || !before || !after || !GAP_TYPES.has(gap) || !ARC_ROLES.has(arcRole)) return null
+  const gap = normalizeGapType(info?.gap_type)
+  const arcRole = normalizeEmotionArcRole(row.arc_role)
+  if (!appraisal || !layers || !info || !before || !after || !gap || !arcRole || !GAP_TYPES.has(gap) || !ARC_ROLES.has(arcRole)) return null
 
   const contract: EmotionContract = {
     pov_character: text(row.pov_character),

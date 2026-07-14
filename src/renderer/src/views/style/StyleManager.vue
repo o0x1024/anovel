@@ -38,6 +38,11 @@ const loading = ref(true)
 const selectedId = ref<number | null>(null)
 const panelMode = ref<'detail' | 'create' | 'edit' | 'edit_step_rules' | 'ai_generate'>('detail')
 const saving = ref(false)
+const defaultStyleIds = ref<{ novelStyleId: number | null; storyStyleId: number | null }>({
+  novelStyleId: null,
+  storyStyleId: null
+})
+const defaultsSaving = ref<'novel' | 'story' | null>(null)
 
 const aiDescription = ref('')
 const aiGenerating = ref(false)
@@ -128,7 +133,7 @@ function formToStepRulesJson(sf: StepRulesForm): string | undefined {
 }
 
 function onStyleChanged(_id: unknown) {
-  void loadStyles().then(() => {
+  void Promise.all([loadStyles(), loadDefaultStyles()]).then(() => {
     if (typeof _id === 'number') {
       selectedId.value = _id
       panelMode.value = 'detail'
@@ -138,7 +143,7 @@ function onStyleChanged(_id: unknown) {
 
 onMounted(async () => {
   window.anovel.on('style:changed', onStyleChanged)
-  await loadStyles()
+  await Promise.all([loadStyles(), loadDefaultStyles()])
 })
 
 onUnmounted(() => {
@@ -167,6 +172,35 @@ async function loadStyles() {
     console.error('加载文风列表失败:', e)
   } finally {
     loading.value = false
+  }
+}
+
+async function loadDefaultStyles() {
+  try {
+    defaultStyleIds.value = await window.anovel.invoke('style:getDefaults') as {
+      novelStyleId: number | null
+      storyStyleId: number | null
+    }
+  } catch (e) {
+    console.error('加载默认文风失败:', e)
+  }
+}
+
+async function setDefaultStyle(workType: 'novel' | 'story') {
+  if (defaultsSaving.value) return
+  defaultsSaving.value = workType
+  const key = workType === 'novel' ? 'novelStyleId' : 'storyStyleId'
+  try {
+    defaultStyleIds.value = await window.anovel.invoke(
+      'style:setDefault',
+      workType,
+      defaultStyleIds.value[key]
+    ) as typeof defaultStyleIds.value
+  } catch (e) {
+    console.error('保存默认文风失败:', e)
+    await loadDefaultStyles()
+  } finally {
+    defaultsSaving.value = null
   }
 }
 
@@ -340,7 +374,7 @@ async function deleteStyle(style: Style) {
   if (!confirm(`删除文风「${style.name}」？`)) return
   try {
     await window.anovel.invoke('style:delete', style.id)
-    await loadStyles()
+    await Promise.all([loadStyles(), loadDefaultStyles()])
     panelMode.value = 'detail'
   } catch (e) {
     console.error('删除文风失败:', e)
@@ -402,6 +436,38 @@ function formatDate(dateStr: string): string {
             <font-awesome-icon icon="robot" class="w-3 h-3" />
             AI 生成
           </button>
+        </div>
+        <div class="mt-4 pt-3 border-t border-base-300 space-y-2">
+          <p class="text-xs font-medium text-base-content/60">新建作品默认文风</p>
+          <label class="block">
+            <span class="text-[11px] text-base-content/40">小说</span>
+            <select
+              v-model="defaultStyleIds.novelStyleId"
+              class="select select-bordered select-xs w-full mt-0.5"
+              :disabled="loading || defaultsSaving !== null"
+              @change="setDefaultStyle('novel')"
+            >
+              <option :value="null">不指定</option>
+              <option v-for="style in styles" :key="`novel-${style.id}`" :value="style.id">
+                {{ style.name }}
+              </option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="text-[11px] text-base-content/40">短故事</span>
+            <select
+              v-model="defaultStyleIds.storyStyleId"
+              class="select select-bordered select-xs w-full mt-0.5"
+              :disabled="loading || defaultsSaving !== null"
+              @change="setDefaultStyle('story')"
+            >
+              <option :value="null">不指定</option>
+              <option v-for="style in styles" :key="`story-${style.id}`" :value="style.id">
+                {{ style.name }}
+              </option>
+            </select>
+          </label>
+          <p class="text-[10px] leading-4 text-base-content/35">保存后，新建对应类型作品会自动绑定此文风。</p>
         </div>
       </div>
 

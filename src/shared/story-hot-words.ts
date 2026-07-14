@@ -1,8 +1,8 @@
 export const STORY_HOT_WORD_GROUPS = [
-  { label: '数字钩子', words: ['三天下跪', '二十万彩礼', '五年隐忍', '百亿身家'] },
-  { label: '情绪词', words: ['悔断肠', '当场撕破', '跪求原谅', '绝不回头', '发疯反击'] },
-  { label: '人设词', words: ['清醒女主', '疯批大佬', '天才萌宝', '恶毒假千金', '无恋爱脑'] },
-  { label: '剧情词', words: ['马甲掉落', '重生归来', '当众揭穿', '和离改嫁', '空间囤货'] }
+  { label: '数字钩子', words: [] },
+  { label: '情绪词', words: [] },
+  { label: '人设词', words: [] },
+  { label: '剧情词', words: [] }
 ] as const
 
 export const STORY_HOT_WORDS = STORY_HOT_WORD_GROUPS.flatMap(group => group.words)

@@ -3,6 +3,7 @@ import { modelService } from '../../model'
 import {
   type EmotionContract,
   type EmotionEngine,
+  EMOTION_CONTRACT_ENUM_RULE,
   formatEmotionContractForPrompt,
   normalizeEmotionContract
 } from '../../../shared/emotion-contract'
@@ -225,8 +226,7 @@ export async function ensureChapterEmotionContract(
         systemPrompt: [
           '你是场景情绪因果设计师。根据情节合同与跨章状态，为当前章生成可执行 emotion_contract。',
           '情绪必须来自“关切→触发→人物主观评价→表里冲突→有代价选择→读者推断→余波”，不能用情绪词浓度代替。',
-          'reader_state_before/after 的 valence -2..2，arousal 0..4，agency -2..2，certainty 0..4。',
-          'gap_type 只能是 reader_ahead/reader_equal/reader_behind；arc_role 只能是 attach/build/hold/break/release/aftertaste。',
+          EMOTION_CONTRACT_ENUM_RULE,
           `只输出 JSON：${JSON.stringify(EMOTION_CONTRACT_JSON_SHAPE)}`
         ].join('\n\n'),
         prompt: [

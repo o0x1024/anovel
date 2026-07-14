@@ -69,6 +69,8 @@ import {
 import { formatNovelScaleContract, validatePleasureEngineScale } from './novel-scale-contract'
 import { ensureEmotionEngine } from './emotion-engine'
 import { assessChapterEmotion, emotionRepairHint } from './emotion-gate'
+import { parseCachedQualityAssessment, serializeQualityAssessment } from './chapter-assessment-cache'
+import { retentionPackagingRules } from './reader-retention'
 
 import {
   NOVEL_GOAL_ROUTINE_PHASE_ORDER,
@@ -89,7 +91,7 @@ export interface GoalProgressEvent {
 }
 
 interface RepairPlan {
-  action: 'draft_missing' | 'expand' | 'compress' | 'deai' | 'quality' | 'goal_align'
+  action: 'draft_missing' | 'expand' | 'compress' | 'deai' | 'quality' | 'emotion' | 'goal_align'
   targetChapterIds: number[]
   hint: string
 }
@@ -119,6 +121,10 @@ const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string
 }
 
 const activeLoops = new Map<number, AbortController>()
+const MAX_SETTING_GENERATION_ROUNDS = 4
+const MAX_CHAPTER_QUALITY_ROUNDS = 4
+const MAX_CHAPTER_CONVERGENCE_ROUNDS = 3
+const MAX_REPAIR_STALL_ROUNDS = 3
 
 function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean {
   const text = `${goal}\n${mainline}`.trim()
@@ -166,6 +172,14 @@ function countWords(s: string): number {
   return s.replace(/[\s\p{Z}]/gu, '').length
 }
 
+function repairReasonSignature(reasons: string[]): string {
+  return reasons
+    .map(reason => reason.replace(/\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim())
+    .sort()
+    .join('|')
+    .slice(0, 1000)
+}
+
 async function materializeNovelSettings(
   workId: number,
   goal: string,
@@ -199,9 +213,9 @@ async function materializeNovelSettings(
 
   let count = 0
   for (const type of missing) {
-    while (true) {
+    for (let attempt = 1; attempt <= MAX_SETTING_GENERATION_ROUNDS; attempt++) {
       assertNotAborted(signal)
-      onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length})`)
+      onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length}，第 ${attempt} 轮)`)
       const existingText = targetTypes
         .filter(t => t !== type)
         .map(t => coreSettingDAO.getByType(workId, t)?.content?.trim() ? `## ${t}\n${coreSettingDAO.getByType(workId, t)?.content?.trim()}` : '')
@@ -228,11 +242,14 @@ async function materializeNovelSettings(
         }),
         { stream: false, signal }
       )
-      if (!res.success || !res.content?.trim()) break
+      if (!res.success || !res.content?.trim()) {
+        onProgress?.(`核心设定「${type}」第 ${attempt} 轮未返回有效内容${attempt < MAX_SETTING_GENERATION_ROUNDS ? '，正在重试' : ''}`)
+        continue
+      }
       if (type === 'pleasure_engine') {
         const scaleGate = validatePleasureEngineScale(workId, res.content.trim())
         if (!scaleGate.valid) {
-          onProgress?.(`爽点机制规模门禁未通过：${scaleGate.reason}，正在重新生成`)
+          onProgress?.(`爽点机制规模门禁未通过：${scaleGate.reason}${attempt < MAX_SETTING_GENERATION_ROUNDS ? '，正在重新生成' : ''}`)
           continue
         }
       }
@@ -297,7 +314,8 @@ async function generateNovelTitleHook(workId: number, goal: string, signal?: Abo
       systemPrompt: [
         '你是长篇小说书名与导语策划。根据已冻结的分卷和章节结构生成3套差异明显的候选，并给出推荐序号。只输出 JSON。',
         '格式：{"preferredIndex":0,"candidates":[{"title":"...","hook":"...","summary":"..."}]}',
-        'title 要爆款吸睛，hook 是 30 字以内导语，summary 是 100 字以内核心卖点；三套候选不得只是同义替换。'
+        'title 要爆款吸睛；hook 为 80-150 字长篇导语，必须同时承诺开篇核心冲突、主角差异和前三章首次兑现方向，但不能提前剧透终局；summary 是 100 字以内核心卖点；三套候选不得只是同义替换。',
+        retentionPackagingRules('novel')
       ].join('\n'),
       prompt: [
         `【用户创作目标】\n${goal.trim() || '请策划一部长篇小说。'}`,
@@ -405,10 +423,34 @@ async function repairNovelSettingsFromOverallCheck(
   return revised
 }
 
-function nextEmptyChapter(workId: number): { id: number; title: string } | null {
+interface PendingDraftChapter {
+  id: number
+  title: string
+  needsGeneration: boolean
+}
+
+function hasPassedEmotionAssessment(raw: string | null | undefined): boolean {
+  if (!raw) return false
+  try {
+    const parsed = JSON.parse(raw) as { passed?: unknown }
+    return parsed.passed === true
+  } catch {
+    return false
+  }
+}
+
+function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): PendingDraftChapter | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   for (const ch of chapters) {
-    if (!ch.content?.trim()) return { id: ch.id, title: ch.title }
+    const content = ch.content?.trim() ?? ''
+    if (!content) return { id: ch.id, title: ch.title, needsGeneration: true }
+
+    const cachedQuality = parseCachedQualityAssessment(ch.quality_assessment_json, content)
+    const qualityReady = !config.diagnoseBodyAfterGeneration || config.qualityMin <= 0 || !!cachedQuality
+    const emotionReady = hasPassedEmotionAssessment(ch.emotion_assessment_json)
+    if (!qualityReady || !emotionReady) {
+      return { id: ch.id, title: ch.title, needsGeneration: false }
+    }
   }
   return null
 }
@@ -425,7 +467,7 @@ async function diagnoseAndFixUntilPass(
   let bestScore = -1
   const failedMetrics: string[] = []
 
-  while (true) {
+  while (rounds < MAX_CHAPTER_QUALITY_ROUNDS) {
     assertNotAborted(signal)
     rounds++
     const ch = volumeChapterDAO.getChapter(chapterId)
@@ -445,8 +487,20 @@ async function diagnoseAndFixUntilPass(
           .filter(item => item.score < qualityMetricMins[item.key])
           .map(item => `${item.label} ${item.score}/${qualityMetricMins[item.key]}`)
       : []
+    const currentFailures = [...metricFailures]
+    if (res.hardFail) currentFailures.push('存在质量硬失败项')
+    if (res.scoreTotal < qualityMin) currentFailures.push(`质量总分 ${res.scoreTotal}/${qualityMin}`)
+    failedMetrics.splice(0, failedMetrics.length, ...currentFailures)
 
     if (!res.hardFail && res.scoreTotal >= qualityMin && metricFailures.length === 0) {
+      volumeChapterDAO.updateChapter(chapterId, {
+        quality_assessment_json: serializeQualityAssessment({
+          content: ch.content,
+          scoreTotal: res.scoreTotal,
+          hardFail: false,
+          report: res.report
+        })
+      })
       return { passed: true, finalScore: res.scoreTotal, rounds, failedMetrics }
     }
 
@@ -477,32 +531,111 @@ async function diagnoseAndFixUntilPass(
       fixed = stripDeterministicAiPatterns(fixed)
       volumeChapterDAO.updateChapterWithVersion(chapterId, {
         content: fixed,
-        word_count: countWords(fixed)
+        word_count: countWords(fixed),
+        emotion_assessment_json: null
       })
     } else {
       failedMetrics.push('修复未返回有效正文')
       onProgress?.(`「${ch.title}」第 ${rounds} 轮修复未返回有效正文，正在重新诊断`)
     }
   }
+  onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」连续 ${MAX_CHAPTER_QUALITY_ROUNDS} 轮未通过质量门禁`)
+  return { passed: false, finalScore: bestScore, rounds, failedMetrics: [...new Set(failedMetrics)] }
 }
 
-function cleanupEmDashesAfterPassedGate(workId: number, mode: 'comma' | 'remove' = 'comma'): { chapters: number; replaced: number } {
+function cleanupEmDashesAfterPassedGate(
+  workId: number,
+  mode: 'comma' | 'remove' = 'comma',
+  onlyChapterIds?: number[]
+): { chapters: number; replaced: number } {
   let chapters = 0
   let replaced = 0
+  const allowed = onlyChapterIds ? new Set(onlyChapterIds) : null
   const chaptersList = volumeChapterDAO.listChaptersByWork(workId)
   for (const ch of chaptersList) {
+    if (allowed && !allowed.has(ch.id)) continue
     if (!ch.content?.trim()) continue
     const before = countEmDashes(ch.content)
     if (before === 0) continue
     const cleaned = mode === 'remove' ? stripEmDashes(ch.content) : ch.content.replace(/——/g, '，')
     const after = countEmDashes(cleaned)
     if (after !== before) {
-      volumeChapterDAO.updateChapterWithVersion(ch.id, { content: cleaned, word_count: countWords(cleaned) })
+      volumeChapterDAO.updateChapterWithVersion(ch.id, {
+        content: cleaned,
+        word_count: countWords(cleaned),
+        emotion_assessment_json: null
+      })
       chapters++
       replaced += before - after
     }
   }
   return { chapters, replaced }
+}
+
+async function runChapterAcceptanceGate(
+  workId: number,
+  chapterId: number,
+  config: StoryGoalConfig,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<{ passed: boolean; qualityScore: number; rounds: number; failedMetrics: string[] }> {
+  let totalQualityRounds = 0
+  let qualityScore = -1
+  const failures: string[] = []
+
+  for (let convergenceRound = 1; convergenceRound <= MAX_CHAPTER_CONVERGENCE_ROUNDS; convergenceRound++) {
+    if (config.diagnoseBodyAfterGeneration && config.qualityMin > 0) {
+      const quality = await diagnoseAndFixUntilPass(
+        workId,
+        chapterId,
+        config.qualityMin,
+        config.qualityMetricMins,
+        signal,
+        onProgress
+      )
+      totalQualityRounds += quality.rounds
+      qualityScore = quality.finalScore
+      failures.push(...quality.failedMetrics)
+      if (!quality.passed) {
+        return { passed: false, qualityScore, rounds: totalQualityRounds, failedMetrics: [...new Set(failures)] }
+      }
+    }
+
+    const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma', [chapterId])
+    if (cleaned.replaced > 0) {
+      onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」清理破折号后正在重新执行质量门禁`)
+      failures.push(`清理破折号 ${cleaned.replaced} 处后需复验`)
+      continue
+    }
+    const chapter = volumeChapterDAO.getChapter(chapterId)
+    const assessment = await assessChapterEmotion(workId, chapterId, chapter?.content ?? '', signal, true)
+    if (assessment.passed) {
+      onProgress?.(`「${chapter?.title ?? chapterId}」质量与情绪门禁均已通过`)
+      return { passed: true, qualityScore, rounds: totalQualityRounds, failedMetrics: [] }
+    }
+
+    failures.push(`情绪门禁 ${assessment.score}分/${assessment.failure_layer}层`)
+    if (convergenceRound === MAX_CHAPTER_CONVERGENCE_ROUNDS) break
+    onProgress?.(
+      `「${chapter?.title ?? chapterId}」情绪门禁未通过（${assessment.score}分），正在修订并重新执行质量门禁`
+    )
+    const revised = await reviseBeatBody(workId, chapterId, {
+      signal,
+      workType: 'novel',
+      instruction: emotionRepairHint(assessment)
+    })
+    if (!revised.success) {
+      failures.push(revised.error || '情绪定向修订失败')
+      break
+    }
+  }
+
+  return {
+    passed: false,
+    qualityScore,
+    rounds: totalQualityRounds,
+    failedMetrics: [...new Set(failures)]
+  }
 }
 
 function buildNovelRepairPlan(workId: number, check: GoalCheckResult, config: StoryGoalConfig): RepairPlan {
@@ -515,6 +648,15 @@ function buildNovelRepairPlan(workId: number, check: GoalCheckResult, config: St
   const lowQuality = check.chapterDiagnostics.filter(d => d.qualityScore >= 0 && (d.qualityHardFail || d.qualityScore < config.qualityMin))
   if (lowQuality.length > 0) {
     return { action: 'quality', targetChapterIds: lowQuality.slice(0, 3).map(d => d.chapterId), hint: '提升低质量章节' }
+  }
+
+  const emotionFailures = check.chapterDiagnostics.filter(d => d.emotionScore >= 0 && !d.emotionPassed)
+  if (emotionFailures.length > 0) {
+    return {
+      action: 'emotion',
+      targetChapterIds: emotionFailures.slice(0, 3).map(d => d.chapterId),
+      hint: '按情绪盲读报告定向修复失败章节'
+    }
   }
 
   const gateFailures = check.chapterDiagnostics.filter(d => d.gateBlockers > 0 || d.antiAiViolations > 0)
@@ -563,6 +705,7 @@ async function executeNovelRepairPlan(
   workId: number,
   plan: RepairPlan,
   goal: string,
+  config: StoryGoalConfig,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<string> {
@@ -574,7 +717,11 @@ async function executeNovelRepairPlan(
       onProgress?.(`正在生成缺失章节「${ch?.title ?? chapterId}」`)
       const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, workType: 'novel' })
       if (!gen.success) throw new Error(gen.error || '生成失败')
-      summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字`)
+      const gate = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
+      if (!gate.passed) {
+        throw new Error(`「${ch?.title ?? chapterId}」补写后未通过质量与情绪门禁：${gate.failedMetrics.join('、')}`)
+      }
+      summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字，质量与情绪门禁通过`)
     }
     return summaries.join('；')
   }
@@ -584,12 +731,13 @@ async function executeNovelRepairPlan(
     assertNotAborted(signal)
     const ch = volumeChapterDAO.getChapter(chapterId)
     if (!ch) continue
+    let summary = ''
 
     if (plan.action === 'expand' || plan.action === 'compress') {
       onProgress?.(`正在${plan.action === 'expand' ? '扩写' : '压缩'}「${ch.title}」`)
       const gen = await reviseBeatBody(workId, chapterId, { signal, instruction: plan.hint, workType: 'novel' })
       if (!gen.success) throw new Error(gen.error || '字数修订失败')
-      summaries.push(`${ch.title} ${gen.wordCount}字`)
+      summary = `${ch.title} ${gen.wordCount}字`
     } else if (plan.action === 'quality') {
       onProgress?.(`正在定向精修「${ch.title}」`)
       const diagnosis = await diagnoseChapterQualityAi(workId, chapterId, ch.content ?? '', {
@@ -602,7 +750,19 @@ async function executeNovelRepairPlan(
         instruction: `根据以下质量诊断逐项修复，优先处理硬失败、因果、人设、设定、大纲覆盖和章末钩子：\n${diagnosis.report}`
       })
       if (!gen.success) throw new Error(gen.error || '质量修复失败')
-      summaries.push(`${ch.title} 已按诊断定向精修`)
+      summary = `${ch.title} 已按诊断定向精修`
+    } else if (plan.action === 'emotion') {
+      onProgress?.(`正在定向修复情绪门禁「${ch.title}」`)
+      let instruction = plan.hint
+      try {
+        const assessment = ch.emotion_assessment_json
+          ? JSON.parse(ch.emotion_assessment_json)
+          : null
+        if (assessment) instruction = emotionRepairHint(assessment)
+      } catch { /* 使用通用情绪修复提示 */ }
+      const gen = await reviseBeatBody(workId, chapterId, { signal, instruction, workType: 'novel' })
+      if (!gen.success) throw new Error(gen.error || '情绪修复失败')
+      summary = `${ch.title} 已按情绪盲读报告定向精修`
     } else if (plan.action === 'deai') {
       onProgress?.(`正在去AI/修复一致性「${ch.title}」`)
       const gate = runConsistencyGate(workId, chapterId, ch.content ?? '')
@@ -613,7 +773,7 @@ async function executeNovelRepairPlan(
         workType: 'novel'
       })
       if (!gen.success) throw new Error(gen.error || '修复失败')
-      summaries.push(`${ch.title} 已修复`)
+      summary = `${ch.title} 已修复`
     } else {
       onProgress?.(`正在优化目标匹配「${ch.title}」`)
       const gen = await reviseBeatBody(workId, chapterId, {
@@ -622,8 +782,14 @@ async function executeNovelRepairPlan(
         workType: 'novel'
       })
       if (!gen.success) throw new Error(gen.error || '优化失败')
-      summaries.push(`${ch.title} 已优化`)
+      summary = `${ch.title} 已优化`
     }
+
+    const acceptance = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
+    if (!acceptance.passed) {
+      throw new Error(`「${ch.title}」修订后未通过质量与情绪门禁：${acceptance.failedMetrics.join('、')}`)
+    }
+    summaries.push(`${summary}，复验通过`)
   }
   return summaries.join('；') || '无需修复'
 }
@@ -885,85 +1051,60 @@ export async function runNovelGoalLoop(
             : `本批生成 ${res.created} 章，剩余 ${res.remaining} 章`, 'running')
           phase = res.complete ? 'generate_title_hook' : 'generate_beats'
         } else if (phase === 'draft_body') {
-          const chapter = nextEmptyChapter(workId)
+          const chapter = nextPendingDraftChapter(workId, fullConfig)
           if (!chapter) {
             emit('正文已全部生成，进入目标验收', 'running')
             phase = 'goal_check'
           } else {
-            emit(`正在生成正文「${chapter.title}」`, 'running')
-            const gen = await generateBeatBody(workId, chapter.id, { signal: controller.signal, goalDescription: fullConfig.goalDescription, workType: 'novel' })
-            if (!gen.success) throw new Error(gen.error || '正文生成失败')
-            let finalMemory: BeatGenResult['memoryExtracted'] = gen.memoryExtracted
-            let shouldSyncFinalMemory = !finalMemory
-            const memMsg = finalMemory ? ` · 记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收` : ''
-            goalRoutineDAO.appendTurn({
-              work_id: workId, turn_no: turn, phase, action: 'draft',
-              target_chapter_id: chapter.id,
-              summary: `生成「${chapter.title}」${gen.wordCount}字${memMsg}`
-            })
-            emit(`生成「${chapter.title}」${gen.wordCount}字${memMsg}`, 'running')
-
-            if (fullConfig.diagnoseBodyAfterGeneration && fullConfig.qualityMin > 0) {
-              const diagResult = await diagnoseAndFixUntilPass(
-                workId,
-                chapter.id,
-                fullConfig.qualityMin,
-                fullConfig.qualityMetricMins,
-                controller.signal,
-                msg => emit(msg, 'running')
-              )
-              const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma')
-              const cleanMsg = cleaned.replaced > 0 ? `；破折号已替换 ${cleaned.replaced} 处` : ''
-              shouldSyncFinalMemory = true
+            let finalMemory: BeatGenResult['memoryExtracted']
+            let shouldSyncFinalMemory = true
+            if (chapter.needsGeneration) {
+              emit(`正在生成正文「${chapter.title}」`, 'running')
+              const gen = await generateBeatBody(workId, chapter.id, { signal: controller.signal, goalDescription: fullConfig.goalDescription, workType: 'novel' })
+              if (!gen.success) throw new Error(gen.error || '正文生成失败')
+              finalMemory = gen.memoryExtracted
+              shouldSyncFinalMemory = !finalMemory
+              const memMsg = finalMemory ? ` · 记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收` : ''
               goalRoutineDAO.appendTurn({
-                work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
+                work_id: workId, turn_no: turn, phase, action: 'draft',
                 target_chapter_id: chapter.id,
-                score: diagResult.finalScore >= 0 ? diagResult.finalScore : null,
-                summary: diagResult.passed
-                  ? `「${chapter.title}」诊断通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
-                  : `「${chapter.title}」诊断未完全通过（${diagResult.finalScore}分，${diagResult.rounds}轮）${cleanMsg}`
+                summary: `生成「${chapter.title}」${gen.wordCount}字${memMsg}`
               })
-              if (!diagResult.passed) {
-                clearChapterNarrativeMemory(workId, chapter.id)
-                volumeChapterDAO.updateChapterWithVersion(chapter.id, {
-                  content: '',
-                  word_count: 0,
-                  status: 'draft'
-                })
-                throw new Error(
-                  `「${chapter.title}」AI 诊断未达到 ${fullConfig.qualityMin} 分，禁止进入下一章`
-                  + `；最终 ${diagResult.finalScore} 分，失败指标：${[...new Set(diagResult.failedMetrics)].join('、') || '综合质量未达标'}`
-                )
-              }
+              emit(`生成「${chapter.title}」${gen.wordCount}字${memMsg}`, 'running')
+            } else {
+              goalRoutineDAO.appendTurn({
+                work_id: workId, turn_no: turn, phase, action: 'diagnose_resume',
+                target_chapter_id: chapter.id,
+                summary: `检测到「${chapter.title}」已有正文但缺少完整验收，恢复质量与情绪门禁`
+              })
+              emit(`「${chapter.title}」正文已存在但尚未完整验收，正在补跑质量与情绪门禁`, 'running')
             }
 
-            let emotionPassed = false
-            for (let emotionRound = 1; emotionRound <= 3; emotionRound++) {
-              const latest = volumeChapterDAO.getChapter(chapter.id)
-              const assessment = await assessChapterEmotion(workId, chapter.id, latest?.content ?? '', controller.signal, true)
-              if (assessment.passed) {
-                emotionPassed = true
-                goalRoutineDAO.appendTurn({
-                  work_id: workId, turn_no: turn, phase, action: 'emotion_gate',
-                  target_chapter_id: chapter.id, score: assessment.score,
-                  summary: `「${chapter.title}」情绪盲读通过（${assessment.score}分，第${emotionRound}轮）`
-                })
-                emit(`「${chapter.title}」情绪盲读通过（${assessment.score}分）`, 'running')
-                break
-              }
-              emit(`「${chapter.title}」情绪盲读未通过（${assessment.score}分），正在按${assessment.failure_layer}层修订`, 'running')
-              const revised = await reviseBeatBody(workId, chapter.id, {
-                signal: controller.signal, workType: 'novel', instruction: emotionRepairHint(assessment)
-              })
-              if (!revised.success) throw new Error(revised.error || '情绪定向修订失败')
-              shouldSyncFinalMemory = true
-            }
-            if (!emotionPassed) {
+            const acceptance = await runChapterAcceptanceGate(
+              workId,
+              chapter.id,
+              fullConfig,
+              controller.signal,
+              msg => emit(msg, 'running')
+            )
+            shouldSyncFinalMemory = true
+            goalRoutineDAO.appendTurn({
+              work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
+              target_chapter_id: chapter.id,
+              score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
+              summary: acceptance.passed
+                ? `「${chapter.title}」质量与情绪门禁通过（质量 ${acceptance.qualityScore} 分，累计诊断 ${acceptance.rounds} 轮）`
+                : `「${chapter.title}」质量与情绪门禁未通过：${acceptance.failedMetrics.join('、')}`
+            })
+            if (!acceptance.passed) {
               clearChapterNarrativeMemory(workId, chapter.id)
               volumeChapterDAO.updateChapterWithVersion(chapter.id, {
                 content: '', word_count: 0, status: 'draft', emotion_assessment_json: null
               })
-              throw new Error(`「${chapter.title}」情绪门禁连续3轮未通过，禁止进入下一章`)
+              throw new Error(
+                `「${chapter.title}」连续 ${MAX_CHAPTER_CONVERGENCE_ROUNDS} 轮未通过质量与情绪联合门禁，禁止进入下一章`
+                + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
+              )
             }
 
             if (shouldSyncFinalMemory) {
@@ -990,11 +1131,25 @@ export async function runNovelGoalLoop(
               throw new Error(`章节最终门禁未通过：${finalBlockers.join('；')}`)
             }
 
-            phase = nextEmptyChapter(workId) ? 'draft_body' : 'goal_check'
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'acceptance_complete',
+              target_chapter_id: chapter.id,
+              score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
+              summary: `「${chapter.title}」全部门禁完成，可进入下一章`
+            })
+            phase = nextPendingDraftChapter(workId, fullConfig) ? 'draft_body' : 'goal_check'
           }
         } else if (phase === 'goal_check') {
           emit('正在进行目标验收（质量/字数/门禁/目标匹配）', 'running')
-          lastCheck = await checkStoryGoal(workId, fullConfig, controller.signal)
+          lastCheck = await checkStoryGoal(
+            workId,
+            fullConfig,
+            controller.signal,
+            msg => emit(msg, 'running')
+          )
           updateNovelGoalState(workId, { lastCheck })
           goalRoutineDAO.update(workId, {
             last_quality_score: lastCheck.qualityScore >= 0 ? lastCheck.qualityScore : null,
@@ -1006,6 +1161,18 @@ export async function runNovelGoalLoop(
             summary: lastCheck.met ? '目标达成' : lastCheck.reasons.join('；')
           })
 
+          const expectedChapters = loadWritingPlan(workId).targetChapters
+          if (expectedChapters > 0 && lastCheck.totalBeats < expectedChapters) {
+            emit(`章节数量不完整：${lastCheck.totalBeats}/${expectedChapters}，返回章节情节生成`, 'running')
+            phase = 'generate_beats'
+            continue
+          }
+          if (lastCheck.contentBeats < lastCheck.totalBeats) {
+            emit(`正文未全部完成：${lastCheck.contentBeats}/${lastCheck.totalBeats}，返回正文生成`, 'running')
+            phase = 'draft_body'
+            continue
+          }
+
           if (lastCheck.met) {
             updateNovelGoalState(workId, { repairPlan: undefined, repairStall: undefined })
             const cleanup = cleanupEmDashesAfterPassedGate(workId, 'comma')
@@ -1015,22 +1182,39 @@ export async function runNovelGoalLoop(
                 summary: `门禁通过后自动替换破折号：${cleanup.chapters} 个章节 ${cleanup.replaced} 处`
               })
               emit(`门禁通过后已自动替换破折号：${cleanup.chapters} 个章节 ${cleanup.replaced} 处`, 'running')
-              lastCheck = await checkStoryGoal(workId, fullConfig, controller.signal)
+              lastCheck = await checkStoryGoal(
+                workId,
+                fullConfig,
+                controller.signal,
+                msg => emit(msg, 'running')
+              )
               updateNovelGoalState(workId, { lastCheck })
             }
 
-            goalRoutineDAO.setStatus(workId, 'goal_met')
-            emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
-            return
+            if (lastCheck.met) {
+              goalRoutineDAO.setStatus(workId, 'goal_met')
+              emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
+              return
+            }
+            goalRoutineDAO.update(workId, { goal_met: false })
+            emit(`清理后复验未通过：${lastCheck.reasons.join('；')}`, 'running')
           }
 
           emit(`未达标：${lastCheck.reasons.join('；')}`, 'running')
           phase = 'repair_plan'
         } else if (phase === 'repair_plan') {
-          const signature = lastCheck!.reasons.slice().sort().join('|').slice(0, 1000)
+          const signature = repairReasonSignature(lastCheck!.reasons)
           const previousStall = readNovelGoalState(workId).repairStall
           const stallCount = previousStall?.signature === signature ? previousStall.count + 1 : 1
           updateNovelGoalState(workId, { repairStall: { signature, count: stallCount } })
+          if (stallCount >= MAX_REPAIR_STALL_ROUNDS) {
+            goalRoutineDAO.setStatus(workId, 'paused')
+            emit(
+              `相同验收问题已连续 ${stallCount} 轮未改善，目标循环已暂停：${lastCheck!.reasons.join('；')}`,
+              'paused'
+            )
+            return
+          }
           const plan = buildNovelRepairPlan(workId, lastCheck!, fullConfig)
           updateNovelGoalState(workId, { repairPlan: plan })
           goalRoutineDAO.appendTurn({
@@ -1045,7 +1229,14 @@ export async function runNovelGoalLoop(
           const plan = (parsed.repairPlan as RepairPlan | undefined)
             ?? buildNovelRepairPlan(workId, lastCheck!, fullConfig)
           emit(`正在执行修复：${plan.action}`, 'running')
-          const summary = await executeNovelRepairPlan(workId, plan, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          const summary = await executeNovelRepairPlan(
+            workId,
+            plan,
+            fullConfig.goalDescription,
+            fullConfig,
+            controller.signal,
+            msg => emit(msg, 'running')
+          )
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: plan.action,
             target_chapter_id: plan.targetChapterIds[0] ?? null,
@@ -1084,6 +1275,11 @@ export async function runNovelGoalLoop(
         updateNovelGoalState(workId, {
           failure: { phase: attemptedPhase, signature, count: failureCount, message: msg }
         })
+        if (failureCount >= MAX_REPAIR_STALL_ROUNDS) {
+          goalRoutineDAO.setStatus(workId, 'paused')
+          emit(`「${attemptedPhase}」连续 ${failureCount} 次执行失败，目标循环已暂停：${msg}`, 'paused')
+          return
+        }
         emit(`「${attemptedPhase}」第 ${failureCount} 次执行失败，将在下一轮继续自动重试：${msg}`, 'running')
       }
     }

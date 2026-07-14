@@ -32,6 +32,22 @@ function clamp(value: unknown, min = 0, max = 100): number {
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.round(n))) : 0
 }
 
+/**
+ * 情绪评分协议统一使用百分制。部分模型会受 arousal 的 0-4 约束影响，
+ * 误把同一 JSON 中的质量分也输出为 0-5 或 0-10；这里兼容旧响应，
+ * 同时保留正常的 0-100 分结果。
+ */
+function normalizePercentScores(values: unknown[]): number[] {
+  const scores = values.map(value => clamp(value))
+  const maxScore = Math.max(0, ...scores)
+  const scale = maxScore <= 5 ? 20 : maxScore <= 10 ? 10 : 1
+  return scores.map(score => clamp(score * scale))
+}
+
+function normalizePercentScore(value: unknown): number {
+  return normalizePercentScores([value])[0] ?? 0
+}
+
 function list(value: unknown, limit = 10): string[] {
   return Array.isArray(value) ? value.map(String).map(item => item.trim()).filter(Boolean).slice(0, limit) : []
 }
@@ -68,7 +84,8 @@ async function blindRead(
         '去标签测试：假设删除“悲伤/愤怒/恐惧/感动”等直接标签，判断情绪是否仍能由关切、事件意义、视角细节、潜台词、选择与代价推出。',
         'attachment_score 判断读者是否有具体理由在乎；causal_earnedness_score 判断情绪是否由前因挣得；inferability_score 判断去标签后是否成立。',
         'modulation_score 判断是否有蓄力、停顿、转折、释放和恢复；residue_score 判断情绪是否改变后续行为、关系或信念。',
-        '只输出 JSON：{"attachment_score":0,"causal_earnedness_score":0,"inferability_score":0,"pov_immediacy_score":0,"subtext_score":0,"modulation_score":0,"residue_score":0,"actual_reader_curve":[{"range":"P1-P3","emotion":"","arousal":0,"evidence":""}],"reader_cares_about":"","reader_hopes":"","reader_fears":"","blocking_issues":[]}',
+        '所有 *_score 都必须使用 0-100 的整数百分制：80 表示通过，65 以下表示硬伤。禁止使用 0-5 或 0-10 量表。只有 actual_reader_curve[].arousal 使用 0-4。',
+        '只输出 JSON：{"attachment_score":80,"causal_earnedness_score":80,"inferability_score":80,"pov_immediacy_score":80,"subtext_score":80,"modulation_score":80,"residue_score":80,"actual_reader_curve":[{"range":"P1-P3","emotion":"","arousal":0,"evidence":""}],"reader_cares_about":"","reader_hopes":"","reader_fears":"","blocking_issues":[]}',
         'arousal 只能是0-4。blocking_issues 必须引用段落编号；没有具体希望或害怕结果时必须列为阻塞。'
       ].join('\n\n'),
       prompt: numberedParagraphs(content)
@@ -84,14 +101,24 @@ async function blindRead(
       arousal: clamp(row.arousal, 0, 4), evidence: String(row.evidence ?? '').trim()
     }
   }).filter(item => item.range && item.emotion && item.evidence)
+  const [attachmentScore, causalEarnednessScore, inferabilityScore, povImmediacyScore,
+    subtextScore, modulationScore, residueScore] = normalizePercentScores([
+    parsed.attachment_score,
+    parsed.causal_earnedness_score,
+    parsed.inferability_score,
+    parsed.pov_immediacy_score,
+    parsed.subtext_score,
+    parsed.modulation_score,
+    parsed.residue_score
+  ])
   return {
-    attachmentScore: clamp(parsed.attachment_score),
-    causalEarnednessScore: clamp(parsed.causal_earnedness_score),
-    inferabilityScore: clamp(parsed.inferability_score),
-    povImmediacyScore: clamp(parsed.pov_immediacy_score),
-    subtextScore: clamp(parsed.subtext_score),
-    modulationScore: clamp(parsed.modulation_score),
-    residueScore: clamp(parsed.residue_score),
+    attachmentScore,
+    causalEarnednessScore,
+    inferabilityScore,
+    povImmediacyScore,
+    subtextScore,
+    modulationScore,
+    residueScore,
     actualReaderCurve: curve,
     readerCaresAbout: String(parsed.reader_cares_about ?? '').trim(),
     readerHopes: String(parsed.reader_hopes ?? '').trim(),
@@ -114,7 +141,8 @@ async function compareTarget(
       systemPrompt: [
         '你是情绪目标差异审计员。只比较预定 emotion_contract 与独立盲读结果，不重新想象原文。',
         'failure_layer 只能是 attachment/arc/scene/continuity/prose/none。选择需要返工的最高层级。',
-        '只输出 JSON：{"target_alignment_score":0,"failure_layer":"scene","blocking_issues":[],"repair_instruction":"可直接执行且限定范围的修订要求"}',
+        'target_alignment_score 必须使用 0-100 的整数百分制：80 表示通过，65 以下表示硬伤。禁止使用 0-5 或 0-10 量表。',
+        '只输出 JSON：{"target_alignment_score":80,"failure_layer":"scene","blocking_issues":[],"repair_instruction":"可直接执行且限定范围的修订要求"}',
         '若盲读者不在乎，attachment；情绪峰谷位置错误，arc；触发/评价/选择缺失，scene；前章余波断裂，continuity；结构成立但表达直白或视角远，prose。'
       ].join('\n\n'),
       prompt: `【目标契约】\n${JSON.stringify(contract, null, 2)}\n\n【盲读结果】\n${JSON.stringify(blind, null, 2)}`
@@ -125,7 +153,7 @@ async function compareTarget(
   const layer = String(parsed.failure_layer ?? 'scene') as EmotionFailureLayer
   const validLayer: EmotionFailureLayer = ['attachment', 'arc', 'scene', 'continuity', 'prose', 'none'].includes(layer) ? layer : 'scene'
   return {
-    score: clamp(parsed.target_alignment_score),
+    score: normalizePercentScore(parsed.target_alignment_score),
     failureLayer: validLayer,
     issues: list(parsed.blocking_issues),
     repairInstruction: String(parsed.repair_instruction ?? '').trim()
@@ -174,7 +202,8 @@ export async function assessChapterEmotion(
   chapterId: number,
   content: string,
   signal?: AbortSignal,
-  persistLedger = true
+  persistLedger = true,
+  persistAssessment = true
 ): Promise<EmotionBlindAssessment> {
   const contract = loadChapterEmotionContract(chapterId)
   if (!contract) throw new Error('章节缺少 emotion_contract，禁止情绪验收')
@@ -211,10 +240,12 @@ export async function assessChapterEmotion(
   const averageArousal = blind.actualReaderCurve.length > 0
     ? blind.actualReaderCurve.reduce((sum, point) => sum + point.arousal, 0) / blind.actualReaderCurve.length
     : 0
-  volumeChapterDAO.updateChapter(chapterId, {
-    emotion_assessment_json: JSON.stringify(assessment),
-    emotion_intensity: Math.max(1, Math.min(10, Math.round(1 + averageArousal * 2.25)))
-  })
+  if (persistAssessment) {
+    volumeChapterDAO.updateChapter(chapterId, {
+      emotion_assessment_json: JSON.stringify(assessment),
+      emotion_intensity: Math.max(1, Math.min(10, Math.round(1 + averageArousal * 2.25)))
+    })
+  }
   if (assessment.passed && persistLedger) await extractEmotionalLedger(workId, chapterId, content, contract, signal)
   return assessment
 }

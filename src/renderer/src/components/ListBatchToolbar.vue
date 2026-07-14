@@ -32,6 +32,7 @@ const emit = defineEmits<{
       已选 <span class="font-semibold text-base-content">{{ selectedCount }}</span> / {{ selectableCount }}
     </span>
     <div class="flex gap-2 ml-auto">
+      <slot name="actions" />
       <button
         type="button"
         class="btn btn-outline btn-error btn-xs"

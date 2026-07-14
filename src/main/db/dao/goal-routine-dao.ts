@@ -120,6 +120,14 @@ export class GoalRoutineDAO extends BaseDAO {
     )
   }
 
+  listChapterIdsByAction(workId: number, action: string): number[] {
+    return this.all<{ target_chapter_id: number }>(
+      `SELECT DISTINCT target_chapter_id FROM goal_routine_turns
+       WHERE work_id = ? AND action = ? AND target_chapter_id IS NOT NULL`,
+      [workId, action]
+    ).map(row => row.target_chapter_id)
+  }
+
   listAll(): GoalRoutineStateRow[] {
     return this.all<GoalRoutineStateRow>(
       'SELECT * FROM goal_routine_states ORDER BY update_time DESC'

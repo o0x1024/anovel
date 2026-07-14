@@ -58,7 +58,7 @@ const DEFAULT_CONFIG: GoalConfig = {
     QUALITY_AI_METRIC_DEFS.map(metric => [metric.key, 85])
   ) as Record<QualityAiMetricKey, number>,
   diagnoseBodyAfterGeneration: true,
-  humanReviewTitleHook: true,
+  humanReviewTitleHook: false,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
   maxTurns: 60,
@@ -163,31 +163,6 @@ const lastMessage = ref('')
 const lastStatus = ref('')
 const lastCheck = ref<GoalCheckResult | null>(null)
 
-interface TitleHookReviewCandidate {
-  title: string
-  hook: string
-  summary?: string
-}
-
-const titleHookReview = computed(() => {
-  if (props.workType === 'novel') return null
-  const raw = state.value?.state_json
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as {
-      titleHookCandidates?: TitleHookReviewCandidate[]
-      titleHookPreferredIndex?: number
-    }
-    if (!Array.isArray(parsed.titleHookCandidates) || parsed.titleHookCandidates.length === 0) return null
-    return {
-      candidates: parsed.titleHookCandidates,
-      preferredIndex: Number.isInteger(parsed.titleHookPreferredIndex) ? parsed.titleHookPreferredIndex! : 0
-    }
-  } catch {
-    return null
-  }
-})
-
 const statusLabel = computed(() => {
   const s = state.value?.status
   const map: Record<string, string> = {
@@ -212,7 +187,6 @@ const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_pha
 
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
-  if (titleHookReview.value) return false
   const s = state.value?.status
   if (!s || s === 'goal_met' || s === 'timeout') return false
   if (running.value && s === 'running') return false
@@ -304,8 +278,31 @@ async function refreshState() {
   turns.value = res.turns
   if (res.state?.state_json) {
     try {
-      const runtime = JSON.parse(res.state.state_json) as { lastCheck?: GoalCheckResult }
+      const runtime = JSON.parse(res.state.state_json) as {
+        lastCheck?: GoalCheckResult
+        liveProgress?: {
+          turn: number
+          phase: string
+          status: string
+          message: string
+          updatedAt: string
+        }
+      }
       lastCheck.value = runtime.lastCheck ?? null
+      if (runtime.liveProgress?.message) {
+        lastMessage.value = runtime.liveProgress.message
+        lastStatus.value = runtime.liveProgress.status
+        liveTurn.value = runtime.liveProgress.status === 'running'
+          ? {
+              workId: props.workId,
+              turn: runtime.liveProgress.turn,
+              maxTurns: res.state.max_turns,
+              phase: runtime.liveProgress.phase,
+              status: runtime.liveProgress.status,
+              message: runtime.liveProgress.message
+            }
+          : null
+      }
     } catch {
       lastCheck.value = null
     }
@@ -395,14 +392,6 @@ async function continueRepair() {
   await resume()
 }
 
-async function selectTitleHook(index: number) {
-  if (running.value) return
-  await window.anovel.invoke('goal:selectTitleHook', props.workId, index)
-  lastMessage.value = '书名导语已确认，可从「整体自检」继续运行'
-  phasePickerTouched.value = false
-  await refreshState()
-}
-
 async function copyEvaluationData() {
   try {
     const data = await window.anovel.invoke('goal:getEvaluationData', props.workId)
@@ -446,7 +435,7 @@ watch(config, saveConfig, { deep: true })
 </script>
 
 <template>
-  <div class="w-full max-w-3xl mx-auto space-y-5">
+  <div class="w-full min-w-0 space-y-5">
     <div class="flex items-center gap-3">
       <div class="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center text-primary">
         <font-awesome-icon icon="rotate" class="text-lg" />
@@ -520,13 +509,8 @@ watch(config, saveConfig, { deep: true })
           <p class="text-[11px] text-base-content/40 leading-relaxed">
             开启后每{{ workType === 'novel' ? '章' : '拍' }}正文生成完会立即诊断并尝试修复；关闭则跳过，直接进入下一{{ workType === 'novel' ? '章' : '拍' }}生成。
           </p>
-          <label v-if="workType === 'story'" class="flex items-center justify-between gap-3 text-xs cursor-pointer">
-            <span>书名导语由作者确认</span>
-            <input v-model="config.humanReviewTitleHook" type="checkbox" :disabled="running"
-              class="checkbox checkbox-xs checkbox-primary" />
-          </label>
           <p v-if="workType === 'story'" class="text-[11px] text-base-content/40 leading-relaxed">
-            开启后系统先做交换位置盲评，再暂停展示全部候选；确认后从整体自检继续。
+            书名与导语会经过交换位置盲评，并自动采用优胜方案继续运行。
           </p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>总质量分下限</span>
@@ -633,7 +617,7 @@ watch(config, saveConfig, { deep: true })
       </div>
 
       <div class="flex gap-2 pt-2 border-t border-base-300/60">
-        <button v-if="!running" class="btn btn-primary btn-sm gap-2" :disabled="!!titleHookReview" @click="start">
+        <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
           {{ state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环' }}
         </button>
@@ -652,33 +636,6 @@ watch(config, saveConfig, { deep: true })
         <button v-if="!running" class="btn btn-ghost btn-sm gap-2 ml-auto" @click="copyEvaluationData">
           <font-awesome-icon icon="clipboard-check" class="w-3.5 h-3.5" />
           复制评测记录
-        </button>
-      </div>
-    </div>
-
-    <!-- 书名导语人工确认 -->
-    <div v-if="titleHookReview" class="card bg-base-200 border border-primary/40 shadow-sm p-5 space-y-3">
-      <div class="flex items-center gap-2">
-        <font-awesome-icon icon="wand-magic-sparkles" class="w-4 h-4 text-primary" />
-        <h4 class="font-semibold text-sm">确认书名与导语</h4>
-        <span class="badge badge-xs badge-primary ml-auto">盲评推荐已标记</span>
-      </div>
-      <p class="text-xs text-base-content/50">选择会进入你的创作决策记录；确认后点击“断点续跑”继续整体自检。</p>
-      <div class="space-y-2">
-        <button
-          v-for="(candidate, index) in titleHookReview.candidates"
-          :key="`${candidate.title}-${index}`"
-          type="button"
-          class="w-full text-left rounded-xl border bg-base-100 p-3 transition hover:border-primary"
-          :class="index === titleHookReview.preferredIndex ? 'border-primary ring-1 ring-primary/30' : 'border-base-300'"
-          @click="selectTitleHook(index)"
-        >
-          <div class="flex items-center gap-2">
-            <span class="font-semibold text-sm">{{ candidate.title }}</span>
-            <span v-if="index === titleHookReview.preferredIndex" class="badge badge-xs badge-primary">系统推荐</span>
-          </div>
-          <p class="text-xs text-base-content/70 whitespace-pre-wrap leading-relaxed mt-2">{{ candidate.hook }}</p>
-          <p v-if="candidate.summary" class="text-[11px] text-base-content/40 mt-2">{{ candidate.summary }}</p>
         </button>
       </div>
     </div>

@@ -24,6 +24,13 @@ import { formatBodyWordTargetLine, countWords } from '../../../../shared/body-wo
 import { formatBodyPromptLines, workUnitLabels, buildMergedStoryText } from '../../../../shared/work-terminology'
 import { formatPreviewAnchorReport } from '../../../../shared/story-preview-anchor'
 import { BODY_GENERATION_SYSTEM, STORY_BODY_GENERATION_SYSTEM } from '../../../../shared/body-generation-prompt'
+import {
+  assessHookBodyOverlap,
+  goldenOpeningLabel,
+  goldenOpeningSystemExtra,
+  goldenOpeningUserSection,
+  type GoldenOpeningWorkType
+} from '../../../../shared/golden-opening'
 import { DEFAULT_AUTO_OPTIMIZE_CONFIG } from '../../../../shared/auto-optimize-config'
 import type { AutoOptimizeConfig } from '../../../../shared/auto-optimize-config'
 import type { EmotionBlindAssessment } from '../../../../shared/emotion-contract'
@@ -64,6 +71,8 @@ const selectedVolume = ref<number | null>(null)
 const selectedChapterId = ref<number | null>(null)
 const workType = ref<string | null>(null)
 const workDescription = ref<string>('')
+const openingDesign = ref('')
+const allChapterOrderIds = ref<number[]>([])
 const wordTarget = ref(4000)
 
 const currentPage = ref(1)
@@ -188,7 +197,6 @@ const qualityAiReport = ref('')
 const qualityAiMetrics = ref<QualityAiMetrics | null>(null)
 const emotionAssessment = ref<EmotionBlindAssessment | null>(null)
 const worldviewViolations = ref<{ rule: string; detail: string }[]>([])
-const runningV15Checks = ref(false)
 const runningCritique = ref(false)
 const savingChapter = ref(false)
 const extractingMemory = ref(false)
@@ -232,6 +240,7 @@ const versionHistoryRef = ref<InstanceType<typeof ChapterVersionHistory> | null>
 const workReferenceText = ref('')
 const workRefSaving = ref(false)
 const chapterAssistantOpen = ref(false)
+const generatingBody = ref(false)
 
 const { loading, result, error, contextBudget, chat } = useModelChat(() => props.workId)
 const { showToast } = useToast()
@@ -282,8 +291,50 @@ function pickSelectedChapterId(fallbackId: number | null): number | null {
   return chapters.value[0].id
 }
 
-const bodySystemPrompt = computed(() => workType.value === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM)
+const goldenWorkType = computed<GoldenOpeningWorkType>(() => workType.value === 'story' ? 'story' : 'novel')
+const selectedOrdinal = computed(() => {
+  if (selectedChapterId.value == null) return 0
+  const index = allChapterOrderIds.value.indexOf(selectedChapterId.value)
+  return index < 0 ? 0 : index + 1
+})
+const bodySystemPrompt = computed(() => {
+  const base = workType.value === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM
+  const extra = goldenOpeningSystemExtra(goldenWorkType.value, selectedOrdinal.value)
+  return extra ? `${base}\n\n${extra}` : base
+})
 const bodyLabels = computed(() => workUnitLabels(workType.value))
+
+const goldenOpeningAssessment = computed(() => {
+  const label = goldenOpeningLabel(goldenWorkType.value, selectedOrdinal.value)
+  if (!label) return null
+  const overlap = goldenWorkType.value === 'story'
+    ? assessHookBodyOverlap(workDescription.value, result.value)
+    : null
+  const overlapIssue = overlap?.applicable && !overlap.passed ? overlap.issue : ''
+  if (!qualityAiMetrics.value) return { label, status: 'pending' as const, issue: overlapIssue }
+  return {
+    label,
+    status: !qualityAiMetrics.value.hardFail && !overlapIssue ? 'passed' as const : 'failed' as const,
+    issue: overlapIssue || (qualityAiMetrics.value.hardFail ? '本章未通过包含黄金开篇专项规则在内的质量门禁。' : '')
+  }
+})
+
+async function reloadGoldenOpeningContext() {
+  const allChapters = await window.anovel.invoke('chapter:listByWork', props.workId) as Array<{ id: number; sort?: number }>
+  allChapterOrderIds.value = allChapters.map(chapter => chapter.id)
+  if (workType.value !== 'story') {
+    openingDesign.value = ''
+    return
+  }
+  try {
+    const workspace = await window.anovel.invoke('incubator:getState', props.workId) as {
+      activeDraftSlots?: Array<{ slotKey: string; content: string }>
+    }
+    openingDesign.value = workspace.activeDraftSlots?.find(slot => slot.slotKey === 'opening')?.content?.trim() ?? ''
+  } catch {
+    openingDesign.value = ''
+  }
+}
 
 watch(wordTarget, async (value) => {
   if (selectedChapterId.value) await refreshBudgetPreview(selectedChapterId.value)
@@ -309,6 +360,7 @@ onMounted(async () => {
   const work = await window.anovel.invoke('work:get', props.workId) as { work_type?: string; description?: string | null } | null
   workType.value = work?.work_type ?? null
   workDescription.value = work?.description?.trim() ?? ''
+  await reloadGoldenOpeningContext()
 
   volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
 
@@ -372,6 +424,7 @@ onActivated(async () => {
   }
   const work = await window.anovel.invoke('work:get', props.workId) as { description?: string | null } | null
   workDescription.value = work?.description?.trim() ?? ''
+  await reloadGoldenOpeningContext()
 })
 
 const unsubscribeBodyDelivery = onBodyContentDelivered((chapterId, content) => {
@@ -462,6 +515,23 @@ function buildWordTargetLine(): string {
   return formatBodyWordTargetLine(wordTarget.value)
 }
 
+function buildSelectedBodyPrompt(ch: Chapter, vol?: { name?: string; description?: string | null }): string {
+  const base = formatBodyPromptLines(workType.value, {
+    volName: vol?.name,
+    volDescription: vol?.description,
+    chapterTitle: ch.title,
+    outline: ch.outline,
+    wordTargetLine: buildWordTargetLine()
+  }).join('\n\n')
+  const goldenSection = goldenOpeningUserSection({
+    workType: goldenWorkType.value,
+    ordinal: selectedOrdinal.value,
+    hook: workDescription.value,
+    openingDesign: openingDesign.value
+  })
+  return [base, goldenSection].filter(Boolean).join('\n\n')
+}
+
 async function refreshBudgetPreview(chapterId: number) {
   const ch = chapters.value.find(c => c.id === chapterId)
   if (!ch) {
@@ -469,13 +539,7 @@ async function refreshBudgetPreview(chapterId: number) {
     return
   }
   const vol = volumes.value.find(v => v.id === ch.volume_id)
-  const prompt = formatBodyPromptLines(workType.value, {
-    volName: vol?.name,
-    volDescription: vol?.description,
-    chapterTitle: ch.title,
-    outline: ch.outline,
-    wordTargetLine: buildWordTargetLine()
-  }).join('\n\n')
+  const prompt = buildSelectedBodyPrompt(ch, vol)
 
   const report = await window.anovel.invoke('context:estimateBudget', {
     prompt,
@@ -577,36 +641,32 @@ function budgetPressureClass(pressure: BudgetPreview['pressure']): string {
 
 async function generateBody() {
   const ch = selectedChapter.value
-  if (!ch) return
-
-  await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
-
-  const vol = volumes.value.find(v => v.id === ch.volume_id)
-  const prompt = formatBodyPromptLines(workType.value, {
-    volName: vol?.name,
-    volDescription: vol?.description,
-    chapterTitle: ch.title,
-    outline: ch.outline,
-    wordTargetLine: buildWordTargetLine()
-  }).join('\n\n')
-
-  lastPrompt.value = prompt
-  critiqueResult.value = null
-  qualityResult.value = null
-  qualityAiReport.value = ''
-  qualityAiMetrics.value = null
-  emotionAssessment.value = null
-  worldviewViolations.value = []
-  gateResult.value = null
-  humanizeMsg.value = ''
-  humanizeHint.value = ''
-
-  await refreshBudgetPreview(ch.id)
+  if (!ch || generatingBody.value) return
 
   const chapterId = ch.id
+  generatingBody.value = true
+  error.value = ''
   beginBodyGeneration(chapterId, props.workId)
   try {
-    await chat(prompt, bodySystemPrompt.value, 'body_generation', {
+    await window.anovel.invoke('emotion:ensureContract', props.workId, chapterId, '')
+
+    const vol = volumes.value.find(v => v.id === ch.volume_id)
+    const prompt = buildSelectedBodyPrompt(ch, vol)
+
+    lastPrompt.value = prompt
+    critiqueResult.value = null
+    qualityResult.value = null
+    qualityAiReport.value = ''
+    qualityAiMetrics.value = null
+    emotionAssessment.value = null
+    worldviewViolations.value = []
+    gateResult.value = null
+    humanizeMsg.value = ''
+    humanizeHint.value = ''
+
+    await refreshBudgetPreview(chapterId)
+
+    const response = await chat(prompt, bodySystemPrompt.value, 'body_generation', {
       ...bodyModelParams(),
       workContextOptions: {
         includeVolumes: true,
@@ -617,6 +677,10 @@ async function generateBody() {
       volumeId: ch.volume_id,
       enrichNarrativeMemory: true
     })
+    if (!response.success) {
+      showToast('error', response.error || '正文生成失败')
+      return
+    }
     let content = result.value
     if (content && autoHumanize.value) {
       content = await applyHumanize(content)
@@ -629,10 +693,25 @@ async function generateBody() {
     if (content) {
       cacheBodyContent(chapterId, content)
       if (selectedChapterId.value === chapterId) {
-        await runPostGenerateChecks(content)
+        await recheckAntiAiViolations(content)
+      }
+      try {
+        emotionAssessment.value = await window.anovel.invoke(
+          'emotion:assessChapter', props.workId, chapterId, content, false, false
+        ) as EmotionBlindAssessment
+        if (!emotionAssessment.value.passed) {
+          showToast('warning', `正文已生成，情绪门禁未通过（${emotionAssessment.value.score}分），请先诊断修订再保存`)
+        }
+      } catch (emotionError) {
+        showToast('error', `正文已生成，但情绪门禁诊断失败：${emotionError instanceof Error ? emotionError.message : String(emotionError)}`)
       }
     }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    error.value = `正文生成失败：${message}`
+    showToast('error', error.value)
   } finally {
+    generatingBody.value = false
     endBodyGeneration()
   }
 }
@@ -999,35 +1078,6 @@ async function recheckAntiAiViolations(content: string) {
   ) as AntiAiViolation[]
 }
 
-async function runPostGenerateChecks(content: string) {
-  await recheckAntiAiViolations(content)
-  runningV15Checks.value = true
-  try {
-    const chId = selectedChapterId.value!
-    const [quality, aiQuality, worldview, emotion] = await Promise.all([
-      window.anovel.invoke('quality:diagnose', props.workId, chId, content),
-      window.anovel.invoke('quality:diagnoseAI', props.workId, chId, content, { ...diagModelParams(), wordTarget: wordTarget.value }),
-      window.anovel.invoke('narrative:checkWorldview', props.workId, content),
-      window.anovel.invoke('emotion:assessChapter', props.workId, chId, content, false)
-    ])
-    qualityResult.value = quality as QualityResult
-    const ai = aiQuality as { success: boolean; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: QualityAiMetrics['breakdown'] }
-    if (ai.success) {
-      qualityAiReport.value = ai.report ?? ''
-      qualityAiMetrics.value = {
-        scoreTotal: ai.scoreTotal ?? 0,
-        hardFail: ai.hardFail ?? false,
-        cappedByGate: ai.cappedByGate ?? false,
-        breakdown: ai.scoreBreakdown
-      }
-    }
-    worldviewViolations.value = worldview as { rule: string; detail: string }[]
-    emotionAssessment.value = emotion as EmotionBlindAssessment
-  } finally {
-    runningV15Checks.value = false
-  }
-}
-
 async function runDualChannelCritique() {
   if (!result.value.trim() || !selectedChapterId.value || runningCritique.value) return
   runningCritique.value = true
@@ -1077,7 +1127,7 @@ async function runQualityAI() {
     }
     if (aiRes.success) {
       if (aiRes.preprocessedContent) {
-        updateGeneratedContent(aiRes.preprocessedContent)
+        await updateGeneratedContent(aiRes.preprocessedContent)
       }
       qualityAiReport.value = aiRes.report || ''
       if (typeof aiRes.scoreTotal === 'number' && typeof aiRes.hardFail === 'boolean') {
@@ -1089,6 +1139,18 @@ async function runQualityAI() {
         }
       } else {
         qualityAiMetrics.value = null
+      }
+      if (autoOptimizeConfig.value.enabled) {
+        result.value = await runAutoOptimize(result.value)
+        await recheckAntiAiViolations(result.value)
+      }
+      try {
+        await window.anovel.invoke('emotion:ensureContract', props.workId, chId, '')
+        emotionAssessment.value = await window.anovel.invoke(
+          'emotion:assessChapter', props.workId, chId, result.value, false, false
+        ) as EmotionBlindAssessment
+      } catch (emotionError) {
+        showToast('error', `质量诊断已完成，但情绪门禁诊断失败：${emotionError instanceof Error ? emotionError.message : String(emotionError)}`)
       }
       await nextTick()
       crossChapterReportRef.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -1253,35 +1315,34 @@ async function extractNarrativeMemory(chapterId: number, content: string) {
 
 async function saveToChapter() {
   const ch = selectedChapter.value
-  if (!ch) return
+  if (!ch || savingChapter.value) return
 
   const isClearing = !result.value.trim()
-
-  if (!isClearing) {
-    await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
-    const emotion = await window.anovel.invoke(
-      'emotion:assessChapter', props.workId, ch.id, result.value, false
-    ) as EmotionBlindAssessment
-    emotionAssessment.value = emotion
-    if (!emotion.passed) {
-      alert(`情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}`)
-      return
-    }
-    const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
-    gateResult.value = gate
-    if (!gate.passed) {
-      const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
-      if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
-    } else if (gate.warnings.length > 0) {
-      const msg = gate.warnings.slice(0, 5).join('\n')
-      if (!confirm(`保存前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续保存？`)) return
-    }
-  }
-
   savingChapter.value = true
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   try {
+    if (!isClearing) {
+      await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
+      const emotion = await window.anovel.invoke(
+        'emotion:assessChapter', props.workId, ch.id, result.value, false, false
+      ) as EmotionBlindAssessment
+      emotionAssessment.value = emotion
+      if (!emotion.passed) {
+        alert(`情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}`)
+        return
+      }
+      const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
+      gateResult.value = gate
+      if (!gate.passed) {
+        const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
+        if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
+      } else if (gate.warnings.length > 0) {
+        const msg = gate.warnings.slice(0, 5).join('\n')
+        if (!confirm(`保存前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续保存？`)) return
+      }
+    }
+
     const wordCount = countWords(result.value)
     const updateFields: Record<string, unknown> = {
       content: result.value,
@@ -1291,8 +1352,10 @@ async function saveToChapter() {
     await window.anovel.invoke('chapter:update', ch.id, updateFields)
     if (!isClearing) {
       emotionAssessment.value = await window.anovel.invoke(
-        'emotion:assessChapter', props.workId, ch.id, result.value, true
+        'emotion:assessChapter', props.workId, ch.id, result.value, true, true
       ) as EmotionBlindAssessment
+    } else {
+      emotionAssessment.value = null
     }
     const idx = chapters.value.findIndex(c => c.id === ch.id)
     if (idx >= 0) {
@@ -1320,6 +1383,10 @@ async function saveToChapter() {
     if (fp.success) {
       fingerprintMsg.value = `文风偏差 ${fp.score}（${fp.styleName}）`
     }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    showToast('error', `保存失败：${message}`)
+    return
   } finally {
     savingChapter.value = false
   }
@@ -1341,7 +1408,7 @@ async function updateGeneratedContent(content: string) {
     content = await applyAutoRewrite(content)
   }
   result.value = content
-  void runPostGenerateChecks(content)
+  void recheckAntiAiViolations(content)
 }
 
 function onAntiAiRulesAdded() {
@@ -1757,11 +1824,11 @@ function generatePreviewReport() {
               </button>
               <button
                 class="btn btn-primary btn-sm gap-1"
-                :disabled="loading"
+                :disabled="generatingBody || loading"
                 @click="generateBody"
               >
-                <font-awesome-icon :icon="loading ? 'spinner' : 'pen-nib'" :spin="loading" class="w-3.5 h-3.5" />
-                {{ loading ? '生成中...' : 'AI 生成' }}
+                <font-awesome-icon :icon="generatingBody || loading ? 'spinner' : 'pen-nib'" :spin="generatingBody || loading" class="w-3.5 h-3.5" />
+                {{ generatingBody || loading ? '生成中...' : 'AI 生成' }}
               </button>
               <button
                 class="btn btn-outline btn-primary btn-sm gap-1"
@@ -1794,25 +1861,6 @@ function generatePreviewReport() {
                 <input v-model="autoRewrite" type="checkbox" class="checkbox checkbox-xs checkbox-primary" />
                 <span class="text-base-content/60">深度去AI</span>
               </label>
-              <div class="flex items-center gap-1" title="生成后自动运行 AI 诊断与优化，直到分项评分达到目标">
-                <label class="flex items-center gap-1 text-xs cursor-pointer">
-                  <input
-                    v-model="autoOptimizeConfig.enabled"
-                    type="checkbox"
-                    class="checkbox checkbox-xs checkbox-primary"
-                    @change="saveAutoOptimizeConfig({ enabled: autoOptimizeConfig.enabled })"
-                  />
-                  <span class="text-base-content/60" :class="{ 'text-primary font-medium': autoOptimizeConfig.enabled }">自动优化</span>
-                </label>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs px-1"
-                  title="设置自动优化目标"
-                  @click="autoOptimizeModalOpen = true"
-                >
-                  <font-awesome-icon icon="cog" class="w-3 h-3" />
-                </button>
-              </div>
               <button
                 v-if="result.trim()"
                 type="button"
@@ -1828,7 +1876,7 @@ function generatePreviewReport() {
                 v-if="result.trim()"
                 type="button"
                 class="btn btn-accent btn-xs gap-1"
-                :disabled="styleRewriting || loading"
+                :disabled="styleRewriting || generatingBody || loading"
                 title="先运行 AI 诊断，再按诊断建议精准 Patch 修改（等同于 AI 诊断 + 按建议修改）"
                 @click="styleRewrite"
               >
@@ -1843,6 +1891,25 @@ function generatePreviewReport() {
                 <font-awesome-icon :icon="runningQualityAI ? 'spinner' : 'clipboard-check'" :spin="runningQualityAI" class="w-3 h-3" />
                 {{ runningQualityAI ? '诊断中...' : 'AI 诊断' }}
               </button>
+              <div class="flex items-center gap-1" title="运行 AI 诊断后自动优化，直到分项评分达到目标">
+                <label class="flex items-center gap-1 text-xs cursor-pointer">
+                  <input
+                    v-model="autoOptimizeConfig.enabled"
+                    type="checkbox"
+                    class="checkbox checkbox-xs checkbox-primary"
+                    @change="saveAutoOptimizeConfig({ enabled: autoOptimizeConfig.enabled })"
+                  />
+                  <span class="text-base-content/60" :class="{ 'text-primary font-medium': autoOptimizeConfig.enabled }">诊断后自动优化</span>
+                </label>
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-xs px-1"
+                  title="设置自动优化目标"
+                  @click="autoOptimizeModalOpen = true"
+                >
+                  <font-awesome-icon icon="cog" class="w-3 h-3" />
+                </button>
+              </div>
               <button
                 type="button"
                 class="btn btn-ghost btn-xs gap-1"
@@ -1856,7 +1923,7 @@ function generatePreviewReport() {
               <button
                 v-if="qualityAiReport"
                 class="btn btn-warning btn-xs gap-1"
-                :disabled="applyingFixes || loading"
+                :disabled="applyingFixes || generatingBody || loading"
                 @click="applyDiagnosisFixes"
               >
                 <font-awesome-icon :icon="applyingFixes ? 'spinner' : 'wrench'" :spin="applyingFixes" class="w-3 h-3" />
@@ -1866,7 +1933,7 @@ function generatePreviewReport() {
                 v-if="result.trim() && isWordCountShort"
                 type="button"
                 class="btn btn-warning btn-xs gap-1 btn-outline"
-                :disabled="adjustingWordCount || loading"
+                :disabled="adjustingWordCount || generatingBody || loading"
                 title="字数严重不足（偏离目标>10%），由 AI 合理丰富细节以扩充字数"
                 @click="adjustWordCount('expand')"
               >
@@ -1877,7 +1944,7 @@ function generatePreviewReport() {
                 v-if="result.trim() && isWordCountLong"
                 type="button"
                 class="btn btn-warning btn-xs gap-1 btn-outline"
-                :disabled="adjustingWordCount || loading"
+                :disabled="adjustingWordCount || generatingBody || loading"
                 title="字数严重超标（偏离目标>10%），由 AI 裁剪注水以精简字数"
                 @click="adjustWordCount('compress')"
               >
@@ -2081,6 +2148,35 @@ function generatePreviewReport() {
                 </span>
               </summary>
               <div class="collapse-content space-y-2 pb-3">
+                <div
+                  v-if="goldenOpeningAssessment"
+                  class="rounded-lg border p-2 text-xs"
+                  :class="goldenOpeningAssessment.status === 'passed'
+                    ? 'border-success/40 bg-success/5'
+                    : goldenOpeningAssessment.status === 'failed'
+                      ? 'border-error/40 bg-error/5'
+                      : 'border-warning/30 bg-warning/5'"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="font-medium">{{ goldenOpeningAssessment.label }}</span>
+                    <span
+                      class="badge badge-sm"
+                      :class="goldenOpeningAssessment.status === 'passed'
+                        ? 'badge-success'
+                        : goldenOpeningAssessment.status === 'failed'
+                          ? 'badge-error'
+                          : 'badge-warning'"
+                    >
+                      {{ goldenOpeningAssessment.status === 'passed' ? '专项通过' : goldenOpeningAssessment.status === 'failed' ? '专项失败' : '待质量验收' }}
+                    </span>
+                  </div>
+                  <p v-if="goldenOpeningAssessment.issue" class="mt-1 text-error">
+                    {{ goldenOpeningAssessment.issue }}
+                  </p>
+                  <p v-else-if="goldenOpeningAssessment.status === 'pending'" class="mt-1 text-base-content/50">
+                    本次生成已注入对应黄金区合同；运行质量诊断后显示验收结果。
+                  </p>
+                </div>
                 <div v-if="contextBudget" class="rounded-lg border border-base-300 p-2 text-xs">
                   <p class="font-medium mb-1">本次生成上下文</p>
                   <p :class="budgetPressureClass(contextBudget.pressure)">
@@ -2097,7 +2193,6 @@ function generatePreviewReport() {
                     {{ issue.chapterTitle ? `「${issue.chapterTitle}」` : '' }}{{ issue.message }}
                   </p>
                 </div>
-                <p v-if="runningV15Checks" class="text-xs text-base-content/40">质量诊断运行中...</p>
                 <div class="flex items-center gap-2">
                   <button
                     type="button"

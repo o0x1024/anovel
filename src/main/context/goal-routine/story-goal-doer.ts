@@ -14,9 +14,12 @@ import { formatBodyPromptLines } from '../../../shared/work-terminology'
 import {
   BODY_GENERATION_SYSTEM,
   STORY_BODY_GENERATION_SYSTEM,
-  STORY_BODY_GENERATION_OPENING_EXTRA,
   extractEmotionIntensity
 } from '../../../shared/body-generation-prompt'
+import {
+  goldenOpeningSystemExtra,
+  goldenOpeningUserSection
+} from '../../../shared/golden-opening'
 import { humanizeText } from '../humanize-text'
 import { loadWritingPlan } from '../writing-plan'
 import {
@@ -34,17 +37,26 @@ import { formatChapterResourceBudgetsForPrompt, runResourceConstraintGate } from
 import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
 import { runConsistencyGate } from '../consistency-gate'
 import { emotionExecutionCard, ensureChapterEmotionContract } from './emotion-engine'
+import { retentionProseRules } from './reader-retention'
+import {
+  BODY_REACTION_CLICHE_DIRECTIVE,
+  detectBodyReactionCliches
+} from '../anti-ai-rules'
+import { extractJsonText } from '../parse-json-extract'
 
 export interface BeatGenResult {
   success: boolean
   content: string
   wordCount: number
+  antiAiRepairs?: number
+  antiAiRepairRounds?: number
   memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
 
 export interface GenerateBeatBodyOptions {
   signal?: AbortSignal
+  onProgress?: (message: string) => void
   goalDescription?: string
   extraHint?: string
   workType?: 'novel' | 'story'
@@ -62,12 +74,119 @@ function countWords(s: string): number {
   return s.replace(/\s/g, '').length
 }
 
+interface BodyReactionRepairResult {
+  content: string
+  repairs: number
+  rounds: number
+  remaining: number
+}
+
+interface BodyReactionReplacement {
+  original?: unknown
+  replacement?: unknown
+}
+
+const MAX_BODY_REACTION_REPAIR_ROUNDS = 2
+
+/**
+ * 只让模型返回命中句子的 replacement，再由程序定点应用。
+ * 避免为清理一句套话而重写整拍，导致事实、伏笔或人物状态漂移。
+ */
+async function repairBodyReactionCliches(
+  workId: number,
+  chapterId: number,
+  initialContent: string,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<BodyReactionRepairResult> {
+  let content = initialContent
+  let repairs = 0
+  let rounds = 0
+
+  for (let round = 1; round <= MAX_BODY_REACTION_REPAIR_ROUNDS; round++) {
+    if (signal?.aborted) break
+    const violations = detectBodyReactionCliches(content)
+    if (violations.length === 0) break
+    rounds = round
+    const sentences = [...new Set(violations.map(item => item.sentence))]
+    onProgress?.(`检测到 ${violations.length} 处泛白类模板反应，正在定点修复（${round}/${MAX_BODY_REACTION_REPAIR_ROUNDS}）`)
+    const response = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        chapterId,
+        step: 'body_style_rewrite',
+        maxTokens: Math.max(1200, sentences.join('').length * 3),
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        systemPrompt: [
+          '你是小说正文定点修订器。只处理列出的命中句子，不得改动其他正文。',
+          BODY_REACTION_CLICHE_DIRECTIVE,
+          '无独立剧情信息的命中句子，replacement 返回空字符串。',
+          '如命中句子还承载对话、选择、道具变化或因果信息，只删掉套话并保留这些信息。',
+          '严禁补写呼吸一滞、身体僵住、瞳孔骤缩、颤抖、攥拳、嘴角上扬等替代套话。',
+          '只返回 JSON：{"replacements":[{"original":"必须与输入句子逐字一致","replacement":"修订后完整句子或空字符串"}]}'
+        ].join('\n'),
+        prompt: `【待定点修订的句子】\n${JSON.stringify(sentences, null, 2)}`
+      }),
+      { stream: false, signal }
+    )
+    if (!response.success || !response.content?.trim()) {
+      appLogger.warn('goal_routine', '泛白类身体反应定点修复未返回结果', {
+        workId, chapterId, round, error: response.error
+      })
+      continue
+    }
+
+    let parsed: unknown
+    try {
+      const json = extractJsonText(response.content)
+      parsed = json ? JSON.parse(json) : null
+    } catch {
+      parsed = null
+    }
+    const replacements = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { replacements?: unknown }).replacements)
+        ? (parsed as { replacements: unknown[] }).replacements
+        : []
+
+    let appliedThisRound = 0
+    for (const raw of replacements as BodyReactionReplacement[]) {
+      if (typeof raw?.original !== 'string' || typeof raw.replacement !== 'string') continue
+      const original = raw.original
+      const replacement = raw.replacement
+      if (!sentences.includes(original) || !content.includes(original) || original === replacement) continue
+      // 模型若只是把一种禁用变体换成另一种，拒绝应用该 patch。
+      if (replacement && detectBodyReactionCliches(replacement).length > 0) continue
+      content = content.split(original).join(replacement)
+      appliedThisRound++
+    }
+    repairs += appliedThisRound
+    onProgress?.(`泛白类模板反应第 ${round} 轮已修复 ${appliedThisRound} 句，剩余 ${detectBodyReactionCliches(content).length} 处`)
+    appLogger.info('goal_routine', '泛白类身体反应定点修复', {
+      workId,
+      chapterId,
+      round,
+      detected: violations.length,
+      applied: appliedThisRound,
+      remaining: detectBodyReactionCliches(content).length
+    })
+  }
+
+  return {
+    content,
+    repairs,
+    rounds,
+    remaining: detectBodyReactionCliches(content).length
+  }
+}
+
 /** 检测当前节拍是否为全篇第一节拍（按 sort 排序） */
-function isFirstBeat(workId: number, chapterId: number): boolean {
+function unitOrdinal(workId: number, chapterId: number): number {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  if (chapters.length === 0) return false
-  const sorted = [...chapters].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
-  return sorted[0]?.id === chapterId
+  if (chapters.length === 0) return 0
+  const index = chapters.findIndex(chapter => chapter.id === chapterId)
+  return index < 0 ? 0 : index + 1
 }
 
 /** 从孵化器读取「黄金开局」slot 内容 */
@@ -138,9 +257,9 @@ function buildBodyPrompt(
   if (!ch) return null
   const volumes = volumeChapterDAO.listVolumes(workId)
   const vol = volumes.find(v => v.id === ch.volume_id)
-  const firstBeat = isFirstBeat(workId, chapterId)
-  const openingSlot = workType === 'story' && firstBeat ? getOpeningSlotContent(workId) : ''
-  const hookText = firstBeat ? getWorkHook(workId) : ''
+  const ordinal = unitOrdinal(workId, chapterId)
+  const openingSlot = workType === 'story' && ordinal === 1 ? getOpeningSlotContent(workId) : ''
+  const hookText = ordinal === 1 ? getWorkHook(workId) : ''
   const dramaticContract = getDramaticContractPrompt(ch.outline_diagnosis)
   const work = workDAO.getById(workId)
   const genrePolicy = formatGenrePolicy(
@@ -162,11 +281,11 @@ function buildBodyPrompt(
         : '',
       extraHint?.trim() ? `【本次修复要求】\n${extraHint.trim()}` : '',
       genrePolicy,
+      retentionProseRules(workType),
       dramaticContract,
       emotionCard,
       resourceBudget,
-      openingSlot ? `【黄金开局设计 - 必须严格执行】\n${openingSlot}` : '',
-      hookText ? `【本篇导语（已确定的前台钩子风格）】\n${hookText}\n本拍正文开头须与导语的情绪烈度和冲突切入点保持一致，但不得重复导语中已写的场景和台词，须从导语结束处自然衔接、继续推进剧情。` : ''
+      goldenOpeningUserSection({ workType, ordinal, hook: hookText, openingDesign: openingSlot })
     ].filter(Boolean)
   ).join('\n\n')
 }
@@ -180,7 +299,7 @@ export async function generateBeatBody(
   chapterId: number,
   options: GenerateBeatBodyOptions = {}
 ): Promise<BeatGenResult> {
-  const { signal, goalDescription, extraHint, workType = 'story', wordTargetOverride } = options
+  const { signal, onProgress, goalDescription, extraHint, workType = 'story', wordTargetOverride } = options
   await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
   const plan = loadWritingPlan(workId)
   const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
@@ -189,11 +308,10 @@ export async function generateBeatBody(
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
-  const firstBeat = isFirstBeat(workId, chapterId)
+  const ordinal = unitOrdinal(workId, chapterId)
   const baseSystemPrompt = workType === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM
-  const systemPrompt = firstBeat
-    ? baseSystemPrompt + STORY_BODY_GENERATION_OPENING_EXTRA
-    : baseSystemPrompt
+  const openingExtra = goldenOpeningSystemExtra(workType, ordinal)
+  const systemPrompt = [baseSystemPrompt, openingExtra, BODY_REACTION_CLICHE_DIRECTIVE].filter(Boolean).join('\n\n')
 
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -218,7 +336,7 @@ export async function generateBeatBody(
     return { success: false, content: '', wordCount: 0, error: response.error || '生成失败' }
   }
 
-  return persistGeneratedBody(workId, chapterId, response.content, workType, signal)
+  return persistGeneratedBody(workId, chapterId, response.content, workType, signal, onProgress)
 }
 
 async function persistGeneratedBody(
@@ -226,7 +344,8 @@ async function persistGeneratedBody(
   chapterId: number,
   rawContent: string,
   workType: 'novel' | 'story',
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
 ): Promise<BeatGenResult> {
   let content = normalizeModelBodyOutput(rawContent.trim(), 'body_generation')
 
@@ -237,6 +356,20 @@ async function persistGeneratedBody(
   try {
     content = humanizeText(content)
   } catch { /* humanize 失败不阻断 */ }
+
+  // 在写库和提取叙事记忆之前定点清理，避免模板反应污染伏笔/角色快照。
+  const antiAiRepair = await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
+  if (antiAiRepair.remaining > 0) {
+    return {
+      success: false,
+      content: '',
+      wordCount: 0,
+      antiAiRepairs: antiAiRepair.repairs,
+      antiAiRepairRounds: antiAiRepair.rounds,
+      error: `泛白类身体反应经 ${antiAiRepair.rounds} 轮定点修复仍剩 ${antiAiRepair.remaining} 处，已否决当前候选`
+    }
+  }
+  content = antiAiRepair.content
 
   const wordCount = countWords(content)
 
@@ -304,7 +437,14 @@ async function persistGeneratedBody(
     }
   }
 
-  return { success: true, content, wordCount, memoryExtracted }
+  return {
+    success: true,
+    content,
+    wordCount,
+    memoryExtracted,
+    antiAiRepairs: antiAiRepair.repairs,
+    antiAiRepairRounds: antiAiRepair.rounds
+  }
 }
 
 /** 基于当前正文做定向修订；与首次生成共用同一套记忆、资源和时间线提交门禁。 */

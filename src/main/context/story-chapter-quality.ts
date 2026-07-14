@@ -1,3 +1,5 @@
+import { retentionEvaluationRules } from './goal-routine/reader-retention'
+
 export const STORY_QUALITY_AI_SYSTEM_PROMPT = [
   '你是番茄平台爆款短故事资深主编，对该章进行严苛的网感与情绪张力诊断。',
   '短故事与长篇小说不同，必须"起步即冲刺"，要求极高的情绪浓度、密集的钩子和去AI化的流畅表达。',
@@ -51,6 +53,8 @@ export const STORY_QUALITY_AI_SYSTEM_PROMPT = [
   '### J. 对话信息密度',
   '- 对话是否全是无营养的"水话"？',
   '- 对话必须像刀子一样，能展示冲突、性格或直接推动打脸/绿茶行为。',
+  '',
+  retentionEvaluationRules('story'),
   '',
   '### K. 大纲覆盖度',
   '- 预定大纲节点是否完成？',

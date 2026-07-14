@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import ListBatchToolbar from '../../../components/ListBatchToolbar.vue'
 import {
   useListSelection,
   confirmBatchDelete,
-  confirmDeleteAll,
-  runBatchDelete
+  confirmDeleteAll
 } from '../../../composables/useListSelection'
 
 const props = defineProps<{ workId: number }>()
@@ -31,8 +30,17 @@ const showForm = ref(false)
 const newItem = ref({ description: '', plant_chapter_id: null as number | null, plant_location: '', depth: 'normal' })
 const resolvingId = ref<number | null>(null)
 const resolveChapterId = ref<number | null>(null)
+const batchResolving = ref(false)
+const batchResolveChapterId = ref<number | null>(null)
 
 const selection = useListSelection(items)
+const selectedResolvableCount = computed(() =>
+  selection.getSelectedItems().filter(item => item.status !== 'resolved').length
+)
+const selectedAbandonableCount = computed(() =>
+  selection.getSelectedItems()
+    .filter(item => item.status !== 'resolved' && item.status !== 'abandoned').length
+)
 
 const depthLabels: Record<string, string> = { shallow: '浅', normal: '普通', deep: '深' }
 const statusLabels: Record<string, string> = {
@@ -69,21 +77,49 @@ async function createItem() {
   await loadItems()
 }
 
-async function deleteItem(id: number, skipConfirm = false) {
-  if (!skipConfirm && !confirm('删除此伏笔？')) return
+async function deleteItem(id: number) {
+  if (!confirm('删除此伏笔？')) return
   await window.anovel.invoke('foreshadowing:delete', id)
 }
 
 async function deleteSelectedItems() {
   const selected = selection.getSelectedItems()
   if (!(await confirmBatchDelete(selected.length, '伏笔'))) return
-  await runBatchDelete(selected, item => deleteItem(item.id, true))
+  await window.anovel.invoke('foreshadowing:deleteMany', selected.map(item => item.id))
   await loadItems()
 }
 
 async function deleteAllItems() {
   if (!(await confirmDeleteAll(items.value.length, '伏笔'))) return
-  await runBatchDelete(items.value, item => deleteItem(item.id, true))
+  await window.anovel.invoke('foreshadowing:deleteMany', items.value.map(item => item.id))
+  await loadItems()
+}
+
+function startBatchResolve() {
+  const eligible = selection.getSelectedItems().filter(item => item.status !== 'resolved')
+  if (eligible.length === 0) return
+  batchResolveChapterId.value = chapters.value[0]?.id ?? null
+  batchResolving.value = true
+}
+
+async function confirmBatchResolve() {
+  if (!batchResolveChapterId.value) return
+  const ids = selection.getSelectedItems()
+    .filter(item => item.status !== 'resolved')
+    .map(item => item.id)
+  if (ids.length === 0) return
+  await window.anovel.invoke('foreshadowing:resolveMany', ids, batchResolveChapterId.value)
+  batchResolving.value = false
+  await loadItems()
+}
+
+async function abandonSelectedItems() {
+  const eligible = selection.getSelectedItems()
+    .filter(item => item.status !== 'resolved' && item.status !== 'abandoned')
+  if (eligible.length === 0) return
+  if (!confirm(`确定放弃选中的 ${eligible.length} 条伏笔？`)) return
+  await window.anovel.invoke('foreshadowing:updateStatusMany', eligible.map(item => item.id), 'abandoned')
+  batchResolving.value = false
   await loadItems()
 }
 
@@ -128,7 +164,35 @@ function chapterTitle(id: number | null) {
       @toggle-all="selection.toggleAll()"
       @delete-selected="deleteSelectedItems"
       @delete-all="deleteAllItems"
-    />
+    >
+      <template #actions>
+        <button
+          type="button"
+          class="btn btn-outline btn-primary btn-xs"
+          :disabled="selectedResolvableCount === 0 || chapters.length === 0"
+          @click="startBatchResolve"
+        >
+          批量回收<span v-if="selectedResolvableCount">（{{ selectedResolvableCount }}）</span>
+        </button>
+        <button
+          type="button"
+          class="btn btn-outline btn-warning btn-xs"
+          :disabled="selectedAbandonableCount === 0"
+          @click="abandonSelectedItems"
+        >
+          批量放弃<span v-if="selectedAbandonableCount">（{{ selectedAbandonableCount }}）</span>
+        </button>
+      </template>
+    </ListBatchToolbar>
+
+    <div v-if="batchResolving" class="card bg-base-100 border border-primary/40 p-3 flex-row flex-wrap gap-2 items-center">
+      <span class="text-sm">将选中的未回收伏笔标记为已回收，回收章节：</span>
+      <select v-model="batchResolveChapterId" class="select select-bordered select-sm flex-1 min-w-[160px]">
+        <option v-for="ch in chapters" :key="ch.id" :value="ch.id">{{ ch.title }}</option>
+      </select>
+      <button class="btn btn-primary btn-sm" :disabled="!batchResolveChapterId" @click="confirmBatchResolve">确认回收</button>
+      <button class="btn btn-ghost btn-sm" @click="batchResolving = false">取消</button>
+    </div>
 
     <div v-if="showForm" class="card bg-base-100 border border-base-300 p-4 space-y-2">
       <textarea v-model="newItem.description" rows="2" class="textarea textarea-bordered w-full textarea-sm" placeholder="伏笔描述..." />

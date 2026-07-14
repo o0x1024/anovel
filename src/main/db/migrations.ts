@@ -755,6 +755,9 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     if (hasTable(db, 'chapters') && !hasColumn(db, 'chapters', 'emotion_assessment_json')) {
       db.exec(`ALTER TABLE chapters ADD COLUMN emotion_assessment_json TEXT`)
     }
+    if (hasTable(db, 'chapters') && !hasColumn(db, 'chapters', 'quality_assessment_json')) {
+      db.exec(`ALTER TABLE chapters ADD COLUMN quality_assessment_json TEXT`)
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS emotional_state_ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

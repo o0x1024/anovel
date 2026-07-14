@@ -59,6 +59,11 @@ import { parseQualityAiScoreReport, parseQualityAiPatchResponse, type QualityAiP
 import { loadWritingPlan } from './context/writing-plan'
 import { bodyWordCountBounds, countWords } from '../shared/body-word-target'
 import {
+  assessHookBodyOverlap,
+  goldenOpeningLabel,
+  goldenOpeningSystemExtra
+} from '../shared/golden-opening'
+import {
   SURPRISE_SYSTEM_PROMPT,
   DISRUPTOR_SYSTEM_PROMPT,
   GENRE_DEVIATION_PROMPT,
@@ -289,11 +294,14 @@ export async function diagnoseChapterQualityAi(
   content: string,
   modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number },
   sender?: import('electron').WebContents
-): Promise<{ success: boolean; error?: string; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: unknown; preprocessedContent?: string }> {
+): Promise<{ success: boolean; error?: string; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: unknown; preprocessedContent?: string; goldenOpening?: { label: string; passed: boolean; issues: string[] } }> {
   const gate = diagnoseChapterQuality(workId, chapterId, content)
   const styleCtx = buildStyleDiagnosisContext(workId)
   const workInfo = workDAO.getById(workId)
   const isStory = workInfo?.work_type === 'story'
+  const allChapters = volumeChapterDAO.listChaptersByWork(workId)
+  const chapterOrdinal = allChapters.findIndex(chapter => chapter.id === chapterId) + 1
+  const openingLabel = goldenOpeningLabel(isStory ? 'story' : 'novel', chapterOrdinal)
 
   const preprocessedContent = stripDeterministicAiPatterns(content)
   const diagnosisContent = preprocessedContent
@@ -321,11 +329,10 @@ export async function diagnoseChapterQualityAi(
   if (anchorSection) sections.push('', anchorSection)
   const logicCtx = buildContentLogicContext(workId, chapterId)
   if (logicCtx) sections.push('', logicCtx)
-  if (isStory) {
-    const allChapters = volumeChapterDAO.listChaptersByWork(workId)
-    const sorted = [...allChapters].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0))
-    if (sorted[0]?.id === chapterId) {
-      sections.push('', '【本拍为全篇第一节拍 - 黄金开局，钩子强度要求最高，前300字无冲突直接切入即硬失败】')
+  if (openingLabel) {
+    sections.push('', `【${openingLabel} - 专项门禁】`, goldenOpeningSystemExtra(isStory ? 'story' : 'novel', chapterOrdinal))
+    if (!isStory) {
+      sections.push('若本章没有完成上述对应职责，必须加入 failed_rules，并将 hard_fail 设为 true。')
     }
   }
   const prompt = sections.join('\n')
@@ -352,8 +359,24 @@ export async function diagnoseChapterQualityAi(
     ? parseStoryQualityAiScoreBreakdown(reconciled.report)
     : parseQualityAiScoreReport(reconciled.report)
 
+  const overlap = isStory && chapterOrdinal === 1
+    ? assessHookBodyOverlap(workInfo?.description ?? '', diagnosisContent)
+    : null
+  const overlapFailed = Boolean(overlap?.applicable && !overlap.passed)
+  const scoreTotal = overlapFailed ? Math.min(reconciled.scoreTotal, 40) : reconciled.scoreTotal
+  const hardFail = reconciled.hardFail || overlapFailed
   const scoreBreakdown = parsed
-    ? { ...parsed, scoreTotal: reconciled.scoreTotal, hardFail: reconciled.hardFail }
+    ? {
+        ...parsed,
+        scoreTotal,
+        hardFail,
+        failedRules: overlapFailed
+          ? [...new Set([...parsed.failedRules, overlap!.issue])]
+          : parsed.failedRules,
+        topIssues: overlapFailed
+          ? [{ id: 'opening_hook_duplication', evidence: overlap!.issue, fixHint: '删除复述段，直接从导语之后的新动作、新信息或新后果开始。' }, ...parsed.topIssues]
+          : parsed.topIssues
+      }
     : null
 
   if (parsed?.anchorAlignment?.length) {
@@ -374,11 +397,16 @@ export async function diagnoseChapterQualityAi(
 
   return {
     success: true,
-    report: reconciled.report,
-    scoreTotal: reconciled.scoreTotal,
-    hardFail: reconciled.hardFail,
-    cappedByGate: reconciled.capped,
+    report: overlapFailed ? `${reconciled.report}\n\n【黄金开头确定性门禁】${overlap!.issue}` : reconciled.report,
+    scoreTotal,
+    hardFail,
+    cappedByGate: reconciled.capped || overlapFailed,
     scoreBreakdown,
+    goldenOpening: openingLabel ? {
+      label: openingLabel,
+      passed: !hardFail,
+      issues: overlapFailed ? [overlap!.issue] : []
+    } : undefined,
     ...(preprocessedContent !== content ? { preprocessedContent } : {})
   }
 }
@@ -393,12 +421,18 @@ export function registerV15IpcHandlers(): void {
     foreshadowingDAO.create(input as Parameters<typeof foreshadowingDAO.create>[0]))
   ipcMain.handle('foreshadowing:resolve', (_e, id: number, payoffChapterId: number, payoffLocation?: string) =>
     foreshadowingDAO.resolve(id, payoffChapterId, payoffLocation))
+  ipcMain.handle('foreshadowing:resolveMany', (_e, ids: number[], payoffChapterId: number, payoffLocation?: string) =>
+    foreshadowingDAO.resolveMany(ids, payoffChapterId, payoffLocation))
   ipcMain.handle('foreshadowing:updateStatus', (_e, id: number, status: string) =>
     foreshadowingDAO.updateStatus(id, status as 'pending' | 'partial' | 'resolved' | 'abandoned'))
+  ipcMain.handle('foreshadowing:updateStatusMany', (_e, ids: number[], status: string) =>
+    foreshadowingDAO.updateStatusMany(ids, status as 'pending' | 'partial' | 'resolved' | 'abandoned'))
   ipcMain.handle('foreshadowing:update', (_e, id: number, fields: Record<string, unknown>) =>
     foreshadowingDAO.update(id, fields as never))
   ipcMain.handle('foreshadowing:delete', (_e, id: number) =>
     foreshadowingDAO.delete(id))
+  ipcMain.handle('foreshadowing:deleteMany', (_e, ids: number[]) =>
+    foreshadowingDAO.deleteMany(ids))
 
   // ==================== 角色状态快照 ====================
   ipcMain.handle('snapshot:listByWork', (_e, workId: number) =>

@@ -30,6 +30,7 @@ export interface ChapterRow {
   outline_diagnosis: string | null
   emotion_contract_json: string | null
   emotion_assessment_json: string | null
+  quality_assessment_json: string | null
   create_time: string
   update_time: string
 }
@@ -185,6 +186,7 @@ export class VolumeChapterDAO extends BaseDAO {
     outline_diagnosis?: string | null
     emotion_contract_json?: string | null
     emotion_assessment_json?: string | null
+    quality_assessment_json?: string | null
   }): boolean {
     const sets: string[] = []
     const vals: unknown[] = []
@@ -210,6 +212,13 @@ export class VolumeChapterDAO extends BaseDAO {
     if (fields.outline_diagnosis !== undefined) { sets.push('outline_diagnosis = ?'); vals.push(fields.outline_diagnosis) }
     if (fields.emotion_contract_json !== undefined) { sets.push('emotion_contract_json = ?'); vals.push(fields.emotion_contract_json) }
     if (fields.emotion_assessment_json !== undefined) { sets.push('emotion_assessment_json = ?'); vals.push(fields.emotion_assessment_json) }
+    if (fields.quality_assessment_json !== undefined) { sets.push('quality_assessment_json = ?'); vals.push(fields.quality_assessment_json) }
+    if (fields.content !== undefined && fields.emotion_assessment_json === undefined) {
+      sets.push('emotion_assessment_json = NULL')
+    }
+    if (fields.content !== undefined && fields.quality_assessment_json === undefined) {
+      sets.push('quality_assessment_json = NULL')
+    }
     if (sets.length === 0) return false
     sets.push("update_time = datetime('now')")
     vals.push(id)
@@ -375,6 +384,7 @@ export class VolumeChapterDAO extends BaseDAO {
     next_hook?: string | null; pov_mode?: string | null; characters?: string | null
     outline_diagnosis?: string | null
     emotion_contract_json?: string | null; emotion_assessment_json?: string | null
+    quality_assessment_json?: string | null
   }, versionMeta?: { model_type?: string; style_id?: number; generation_round?: number }): boolean {
     const current = this.getChapter(chapterId)
     if (current) {

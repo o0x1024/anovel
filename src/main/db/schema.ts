@@ -75,6 +75,7 @@ export function initSchema(): void {
       outline_diagnosis TEXT,
       emotion_contract_json TEXT,
       emotion_assessment_json TEXT,
+      quality_assessment_json TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (volume_id) REFERENCES volumes(id) ON DELETE CASCADE
