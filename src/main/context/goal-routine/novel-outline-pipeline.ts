@@ -294,6 +294,91 @@ export interface NovelOutlineBatchResult {
   volumeReadyForDraft?: string
 }
 
+export type NovelVolumeWorkflowCheckpoint =
+  | {
+      kind: 'generate_outline' | 'outline_gate' | 'draft_body' | 'body_gate'
+      volume: NovelVolumeContract
+      outlinedChapters: number
+      expectedChapters: number
+      nextChapter?: number
+    }
+  | { kind: 'complete' }
+
+/**
+ * 从持久化作品数据重建按卷流水线的唯一合法交接点。
+ *
+ * 运行状态中的 pendingChapterVolumeGate 只是断点加速信息，不能决定正确性；
+ * 即使用户误点“启动新一轮”或应用在门禁中退出，也必须先处理最早一个未冻结卷，
+ * 不能越过它生成后续卷或正文。
+ */
+export function resolveNovelVolumeWorkflowCheckpoint(
+  volumePlan: NovelVolumeContract[],
+  chapters: Array<{ volume_name: string; content?: string | null }>,
+  checkedChapterVolumes: string[] = [],
+  checkedBodyVolumes: string[] = []
+): NovelVolumeWorkflowCheckpoint {
+  const plannedNames = new Set(volumePlan.map(volume => volume.name))
+  const unknownChapter = chapters.find(chapter => !plannedNames.has(chapter.volume_name))
+  if (unknownChapter) {
+    throw new NovelPipelineError(
+      'CONTRACT_INVALID',
+      `章节所属分卷「${unknownChapter.volume_name}」不在当前分卷合同中`
+    )
+  }
+
+  const checkedOutlines = new Set(checkedChapterVolumes)
+  const checkedBodies = new Set(checkedBodyVolumes)
+  for (let index = 0; index < volumePlan.length; index++) {
+    const volume = volumePlan[index]
+    const expectedChapters = volume.endChapter - volume.startChapter + 1
+    const volumeChapters = chapters.filter(chapter => chapter.volume_name === volume.name)
+    const outlinedChapters = volumeChapters.length
+    if (outlinedChapters > expectedChapters) {
+      throw new NovelPipelineError(
+        'CONTRACT_INVALID',
+        `分卷「${volume.name}」已有 ${outlinedChapters} 章，超过合同上限 ${expectedChapters} 章`
+      )
+    }
+
+    if (outlinedChapters < expectedChapters) {
+      const laterNames = new Set(volumePlan.slice(index + 1).map(item => item.name))
+      const laterChapter = chapters.find(chapter => laterNames.has(chapter.volume_name))
+      if (laterChapter) {
+        throw new NovelPipelineError(
+          'CONTRACT_INVALID',
+          `分卷「${volume.name}」章节情节尚未完整，不能存在后续分卷「${laterChapter.volume_name}」的章节`
+        )
+      }
+      if (checkedOutlines.has(volume.name) || checkedBodies.has(volume.name)) {
+        throw new NovelPipelineError(
+          'CONTRACT_INVALID',
+          `分卷「${volume.name}」章节数量不完整，但仍带有已冻结标记`
+        )
+      }
+      return {
+        kind: 'generate_outline',
+        volume,
+        outlinedChapters,
+        expectedChapters,
+        nextChapter: volume.startChapter + outlinedChapters
+      }
+    }
+
+    if (!checkedOutlines.has(volume.name)) {
+      return { kind: 'outline_gate', volume, outlinedChapters, expectedChapters }
+    }
+
+    const bodyComplete = volumeChapters.every(chapter => Boolean(chapter.content?.trim()))
+    if (!bodyComplete) {
+      return { kind: 'draft_body', volume, outlinedChapters, expectedChapters }
+    }
+    if (!checkedBodies.has(volume.name)) {
+      return { kind: 'body_gate', volume, outlinedChapters, expectedChapters }
+    }
+  }
+  return { kind: 'complete' }
+}
+
 export function planNovelChapterBatch(
   start: number,
   volumeEnd: number,
@@ -2308,6 +2393,13 @@ export async function generateNextNovelOutlineBatch(
     throw new NovelPipelineError('PREREQUISITE_MISSING', `爽点机制分卷映射门禁未通过：${pleasureGate.reason || '映射版本不一致'}`)
   }
 
+  const workflow = resolveNovelVolumeWorkflowCheckpoint(
+    volumePlan,
+    existing,
+    alignedState.checkedChapterVolumes,
+    alignedState.checkedBodyVolumes
+  )
+
   const checkCompletedVolume = async (contract: NovelVolumeContract): Promise<{ volume: string; score: number; rounds: number }> => {
     updateNovelGoalState(workId, { pendingChapterVolumeGate: contract.name })
     const result = await runVolumeChapterGate(workId, goal, contract, signal, onProgress)
@@ -2320,10 +2412,8 @@ export async function generateNextNovelOutlineBatch(
     return { volume: contract.name, ...result }
   }
 
-  if (state.pendingChapterVolumeGate) {
-    const pending = volumePlan.find(item => item.name === state.pendingChapterVolumeGate)
-    if (!pending) throw new NovelPipelineError('CONTRACT_INVALID', `待诊断分卷不存在：${state.pendingChapterVolumeGate}`)
-    const volumeGate = await checkCompletedVolume(pending)
+  if (workflow.kind === 'outline_gate') {
+    const volumeGate = await checkCompletedVolume(workflow.volume)
     const refreshed = volumeChapterDAO.listChaptersByWork(workId)
     return {
       created: 0,
@@ -2331,27 +2421,31 @@ export async function generateNextNovelOutlineBatch(
       remaining: targetChapters - refreshed.length,
       complete: refreshed.length === targetChapters,
       volumeGate,
-      volumeReadyForDraft: pending.name
+      volumeReadyForDraft: workflow.volume.name
     }
   }
 
-  if (existing.length === targetChapters) {
-    const finalVolume = volumePlan.at(-1)!
-    const checked = readNovelGoalState(workId).checkedChapterVolumes ?? []
-    const volumeGate = checked.includes(finalVolume.name) ? undefined : await checkCompletedVolume(finalVolume)
+  if (workflow.kind === 'draft_body' || workflow.kind === 'body_gate') {
+    return {
+      created: 0,
+      reused: existing.length,
+      remaining: targetChapters - existing.length,
+      complete: existing.length === targetChapters,
+      volumeReadyForDraft: workflow.volume.name
+    }
+  }
+
+  if (workflow.kind === 'complete') {
     return {
       created: 0,
       reused: existing.length,
       remaining: 0,
-      complete: true,
-      volumeGate,
-      volumeReadyForDraft: finalVolume.name
+      complete: true
     }
   }
 
-  const start = existing.length + 1
-  const volume = volumePlan.find(item => start >= item.startChapter && start <= item.endChapter)
-  if (!volume) throw new NovelPipelineError('CONTRACT_INVALID', `第 ${start} 章不属于任何分卷合同`)
+  const volume = workflow.volume
+  const start = workflow.nextChapter!
   const batchProfile = planNovelChapterBatch(
     start,
     volume.endChapter,

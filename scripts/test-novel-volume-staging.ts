@@ -15,6 +15,7 @@ import {
   planNovelVolumeGateWindows,
   planNovelVolumeRanges,
   replaceUniqueRepairText,
+  resolveNovelVolumeWorkflowCheckpoint,
   selectNovelVolumeGateRepairTargets,
   validatePartialVolumePlan,
   volumeGenerationProfile
@@ -242,5 +243,46 @@ assert.equal(nextPhaseAfterNovelOutlineCheckpoint({
   titleHookApplied: true,
   allOutlinesComplete: false
 }), 'generate_beats')
+
+const workflowPlan = [
+  { ...contract(0), startChapter: 1, endChapter: 43 },
+  { ...contract(1), startChapter: 44, endChapter: 86 }
+]
+const workflowChapters = (volumeName: string, count: number, withBody = false) =>
+  Array.from({ length: count }, () => ({ volume_name: volumeName, content: withBody ? '正文' : '' }))
+const firstVolumeCount = workflowPlan[0].endChapter - workflowPlan[0].startChapter + 1
+const secondVolumePartial = workflowChapters(workflowPlan[1].name, 9)
+
+// 即使误启动后已越界生成第二卷，最早未通过的第一卷门禁仍必须被重建。
+assert.equal(resolveNovelVolumeWorkflowCheckpoint(
+  workflowPlan,
+  [...workflowChapters(workflowPlan[0].name, firstVolumeCount), ...secondVolumePartial]
+).kind, 'outline_gate')
+
+// 第一卷章节门禁通过但正文未完成时，不得继续第二卷章节情节。
+assert.equal(resolveNovelVolumeWorkflowCheckpoint(
+  workflowPlan,
+  [...workflowChapters(workflowPlan[0].name, firstVolumeCount), ...secondVolumePartial],
+  [workflowPlan[0].name]
+).kind, 'draft_body')
+
+// 正文齐全但卷末正文门禁未通过时，也必须停在第一卷检查点。
+assert.equal(resolveNovelVolumeWorkflowCheckpoint(
+  workflowPlan,
+  [...workflowChapters(workflowPlan[0].name, firstVolumeCount, true), ...secondVolumePartial],
+  [workflowPlan[0].name]
+).kind, 'body_gate')
+
+const secondVolumeCheckpoint = resolveNovelVolumeWorkflowCheckpoint(
+  workflowPlan,
+  [...workflowChapters(workflowPlan[0].name, firstVolumeCount, true), ...secondVolumePartial],
+  [workflowPlan[0].name],
+  [workflowPlan[0].name]
+)
+assert.equal(secondVolumeCheckpoint.kind, 'generate_outline')
+if (secondVolumeCheckpoint.kind === 'generate_outline') {
+  assert.equal(secondVolumeCheckpoint.volume.name, workflowPlan[1].name)
+  assert.equal(secondVolumeCheckpoint.nextChapter, 53)
+}
 
 console.log('novel volume staging tests passed')

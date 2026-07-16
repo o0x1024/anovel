@@ -63,6 +63,7 @@ import {
   prepareNovelVolumePlan,
   NovelPipelineError,
   readNovelGoalState,
+  resolveNovelVolumeWorkflowCheckpoint,
   updateNovelGoalState,
 } from './novel-outline-pipeline'
 import { formatNovelScaleContract, validatePleasureEngineScale } from './novel-scale-contract'
@@ -478,12 +479,6 @@ function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): Pendi
     }
   }
   return null
-}
-
-function isPendingChapterInCheckedOutlineVolume(workId: number, chapterId: number): boolean {
-  const chapter = volumeChapterDAO.listChaptersByWork(workId).find(item => item.id === chapterId)
-  if (!chapter) return false
-  return (readNovelGoalState(workId).checkedChapterVolumes ?? []).includes(chapter.volume_name)
 }
 
 function phaseAfterCurrentDraftWindow(workId: number): Phase {
@@ -1176,9 +1171,7 @@ export async function runNovelGoalLoop(
       : {}),
     ...(!resume ? {
       failure: undefined,
-      repairStall: undefined,
-      chapterVolumeGateCheckpoint: undefined,
-      pendingChapterVolumeGate: undefined
+      repairStall: undefined
     } : {})
   })
   if (!resume && !explicitPhase && volumeChapterDAO.listChaptersByWork(workId).length === 0) {
@@ -1190,6 +1183,9 @@ export async function runNovelGoalLoop(
       failure: undefined,
       overallRepairRounds: 0,
       repairStall: undefined,
+      checkedChapterVolumes: undefined,
+      pendingChapterVolumeGate: undefined,
+      chapterVolumeGateCheckpoint: undefined,
       checkedBodyVolumes: undefined,
       titleHookCandidates: undefined,
       titleHookPreferredIndex: undefined,
@@ -1372,37 +1368,49 @@ export async function runNovelGoalLoop(
           phase = 'generate_beats'
         } else if (phase === 'generate_beats') {
           const outlinedChapters = volumeChapterDAO.listChaptersByWork(workId)
-          const lastOutlinedChapter = outlinedChapters.at(-1)
           const outlineState = readNovelGoalState(workId)
-          if (lastOutlinedChapter
-            && outlineState.checkedChapterVolumes?.includes(lastOutlinedChapter.volume_name)
-            && !outlineState.checkedBodyVolumes?.includes(lastOutlinedChapter.volume_name)) {
-            const volumeChapters = outlinedChapters.filter(chapter => chapter.volume_id === lastOutlinedChapter.volume_id)
-            if (volumeChapters.length > 0 && volumeChapters.every(chapter => chapter.content?.trim())) {
-              const checkpoint = await runVolumeBodyCheckpoint(
-                workId,
-                lastOutlinedChapter.id,
-                fullConfig.goalDescription,
-                controller.signal,
-                msg => emit(msg, 'running')
+          const workflow = outlineState.novelOutline
+            ? resolveNovelVolumeWorkflowCheckpoint(
+                outlineState.novelOutline.volumePlan,
+                outlinedChapters,
+                outlineState.checkedChapterVolumes,
+                outlineState.checkedBodyVolumes
               )
-              if (!checkpoint.passed) {
-                emit(`恢复分卷检查点后需要重写尾部窗口：${checkpoint.summary}`, 'running')
-                phase = 'draft_body'
-                continue
-              }
+            : undefined
+          if (workflow?.kind === 'body_gate') {
+            const volumeChapters = outlinedChapters.filter(chapter => chapter.volume_name === workflow.volume.name)
+            const lastVolumeChapter = volumeChapters.at(-1)
+            if (!lastVolumeChapter) {
+              throw new NovelPipelineError('CONTRACT_INVALID', `分卷「${workflow.volume.name}」缺少正文检查点章节`)
             }
+            const checkpoint = await runVolumeBodyCheckpoint(
+              workId,
+              lastVolumeChapter.id,
+              fullConfig.goalDescription,
+              controller.signal,
+              msg => emit(msg, 'running')
+            )
+            if (!checkpoint.passed) {
+              emit(`恢复分卷检查点后需要重写尾部窗口：${checkpoint.summary}`, 'running')
+              phase = 'draft_body'
+              continue
+            }
+            emit(`「${workflow.volume.name}」正文检查点已冻结，允许规划下一卷`, 'running')
+            continue
           }
-          const pendingOutlinedChapter = nextPendingDraftChapter(workId, fullConfig)
-          if (pendingOutlinedChapter && isPendingChapterInCheckedOutlineVolume(workId, pendingOutlinedChapter.id)) {
-            const state = readNovelGoalState(workId)
-            phase = state.titleHookApplied ? 'draft_body' : 'generate_title_hook'
+          if (workflow?.kind === 'draft_body') {
+            phase = outlineState.titleHookApplied ? 'draft_body' : 'generate_title_hook'
             emit(
-              state.titleHookApplied
+              outlineState.titleHookApplied
                 ? '当前分卷章节情节已冻结，转入该卷正文生成'
                 : '首卷章节情节已冻结，先生成书名导语再写正文',
               'running'
             )
+            continue
+          }
+          if (workflow?.kind === 'complete') {
+            phase = 'goal_check'
+            emit('全部分卷章节情节、正文及卷末检查点均已冻结，进入整书目标验收', 'running')
             continue
           }
           const res = await generateNextNovelOutlineBatch(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
@@ -1427,6 +1435,30 @@ export async function runNovelGoalLoop(
             allOutlinesComplete: res.complete
           })
         } else if (phase === 'draft_body') {
+          const draftState = readNovelGoalState(workId)
+          const draftChapters = volumeChapterDAO.listChaptersByWork(workId)
+          const workflow = draftState.novelOutline
+            ? resolveNovelVolumeWorkflowCheckpoint(
+                draftState.novelOutline.volumePlan,
+                draftChapters,
+                draftState.checkedChapterVolumes,
+                draftState.checkedBodyVolumes
+              )
+            : undefined
+          if (workflow && workflow.kind !== 'draft_body') {
+            phase = workflow.kind === 'complete' ? 'goal_check' : 'generate_beats'
+            emit(
+              workflow.kind === 'outline_gate'
+                ? `「${workflow.volume.name}」章节门禁尚未通过，禁止生成正文`
+                : workflow.kind === 'generate_outline'
+                  ? `「${workflow.volume.name}」章节情节尚未完整，禁止生成正文`
+                  : workflow.kind === 'body_gate'
+                    ? `「${workflow.volume.name}」正文完整，先执行卷末检查点`
+                    : '全部分卷已冻结，进入整书目标验收',
+              'running'
+            )
+            continue
+          }
           const chapter = nextPendingDraftChapter(workId, fullConfig)
           if (!chapter) {
             phase = phaseAfterCurrentDraftWindow(workId)
@@ -1437,6 +1469,13 @@ export async function runNovelGoalLoop(
               'running'
             )
           } else {
+            const chapterRow = draftChapters.find(item => item.id === chapter.id)
+            if (!chapterRow || !workflow || chapterRow.volume_name !== workflow.volume.name) {
+              throw new NovelPipelineError(
+                'CONTRACT_INVALID',
+                `正文目标章节不属于当前已冻结分卷「${workflow?.kind === 'draft_body' ? workflow.volume.name : '未知'}」`
+              )
+            }
             let finalMemory: BeatGenResult['memoryExtracted']
             let shouldSyncFinalMemory = true
             if (chapter.needsGeneration) {
