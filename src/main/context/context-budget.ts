@@ -391,6 +391,16 @@ export function collectPromptSections(
       })
       : null))
     : null
+  if (memory?.sections.systemicState) {
+    sections.push(systemRuleSection({
+      key: 'systemic_story_state',
+      label: '承重故事状态与反重复约束',
+      priority: 3,
+      renderOrder: 18,
+      text: memory.sections.systemicState,
+      trimStrategy: 'none'
+    }))
+  }
   if (memory?.sections.chapterMeta) {
     sections.push(userContextSection({
       key: 'chapter_meta',

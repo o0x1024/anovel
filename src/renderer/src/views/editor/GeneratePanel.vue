@@ -1531,11 +1531,11 @@ async function copyCompleteStory() {
   isExportingStory.value = true
   try {
     const beatContents = chapters.value
-      .filter(ch => ch.content && ch.content.trim() !== '')
-      .map(ch => ch.content!.trim())
+      .map(ch => getCachedBodyContent(ch.id)?.trim() || ch.content?.trim() || '')
+      .filter(Boolean)
 
     if (beatContents.length === 0) {
-      alert('所有节拍均无正文，无法复制！')
+      alert(workType.value === 'story' ? '所有节拍均无正文，无法复制！' : '当前分卷所有章节均无正文，无法复制！')
       return
     }
 
@@ -1544,7 +1544,9 @@ async function copyCompleteStory() {
       : beatContents.join('\n\n')
 
     await navigator.clipboard.writeText(fullText)
-    alert('合并成功！已复制全文到剪贴板，请直接粘贴到发布平台。')
+    alert(workType.value === 'story'
+      ? '合并成功！已复制全文到剪贴板，请直接粘贴到发布平台。'
+      : '合并成功！已复制当前分卷到剪贴板，请直接粘贴到发布平台。')
   } catch (err) {
     alert('复制失败: ' + String(err))
   } finally {
@@ -1713,6 +1715,18 @@ function generatePreviewReport() {
               </template>
             </div>
           </details>
+
+          <div v-if="workType !== 'story'" class="shrink-0 mt-3">
+            <button
+              type="button"
+              class="btn btn-primary btn-block btn-sm gap-2"
+              :disabled="isExportingStory || chapters.length === 0"
+              @click="copyCompleteStory"
+            >
+              <font-awesome-icon :icon="isExportingStory ? 'spinner' : 'copy'" :spin="isExportingStory" class="w-3.5 h-3.5" />
+              {{ isExportingStory ? '合并复制中...' : '一键合并并复制当前分卷' }}
+            </button>
+          </div>
 
           <div v-if="workType === 'story'" class="shrink-0 mt-3 space-y-2">
             <button

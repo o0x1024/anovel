@@ -1174,7 +1174,7 @@ function onProtocolChange(protocol: ProviderProtocol) {
               </div>
 
               <div class="param-item">
-                <span class="param-label">最大生成令牌数 (Max Tokens)</span>
+                <span class="param-label">最大生成令牌数 (Max Tokens 全局上限)</span>
                 <div class="param-slider-row">
                   <input
                     v-model.number="maxTokens"
@@ -1194,7 +1194,7 @@ function onProtocolChange(protocol: ProviderProtocol) {
                     @blur="clampGenerationParam('maxTokens')"
                   />
                 </div>
-                <p class="param-desc">限制 AI 单次回复的最大长度；滑块上限 32768，可手动输入更大值（最高 200000）</p>
+                <p class="param-desc">作为所有 AI 请求的全局输出上限；各任务会在此上限内按复杂度动态分配预算。滑块上限 32768，可手动输入更大值（最高 200000）</p>
               </div>
 
               <div class="param-item">

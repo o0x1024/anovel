@@ -110,6 +110,81 @@ export interface EmotionBlindAssessment {
   failure_layer: EmotionFailureLayer
   blocking_issues: string[]
   repair_instruction: string
+  /** 持久化完整性元数据；旧数据可缺省。 */
+  outcome_meta?: {
+    content_hash: string
+    ledger_complete: boolean
+    ledger_schema_version: number
+  }
+}
+
+export const EMOTION_LEDGER_SCHEMA_VERSION = 2
+
+export interface EmotionLedgerBeliefChange {
+  belief: string
+  change: string
+}
+
+export interface EmotionLedgerRelationshipChange {
+  character: string
+  state: string
+}
+
+export interface EmotionLedgerState {
+  character_name: string
+  felt_state: string
+  displayed_state: string
+  unresolved_emotion: string
+  protective_strategy: string
+  behavioral_aftereffect: string
+  belief_changes: EmotionLedgerBeliefChange[]
+  relationship_changes: EmotionLedgerRelationshipChange[]
+  source_event: string
+}
+
+/** 模型原生结构化输出与应用层校验共用同一份 Schema。 */
+export const EMOTION_LEDGER_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['states'],
+  properties: {
+    states: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: [
+          'character_name', 'felt_state', 'displayed_state', 'unresolved_emotion',
+          'protective_strategy', 'behavioral_aftereffect', 'belief_changes',
+          'relationship_changes', 'source_event'
+        ],
+        properties: {
+          character_name: { type: 'string', minLength: 1 },
+          felt_state: { type: 'string', minLength: 1 },
+          displayed_state: { type: 'string' },
+          unresolved_emotion: { type: 'string' },
+          protective_strategy: { type: 'string' },
+          behavioral_aftereffect: { type: 'string', minLength: 1 },
+          belief_changes: {
+            type: 'array',
+            items: {
+              type: 'object', additionalProperties: false, required: ['belief', 'change'],
+              properties: { belief: { type: 'string' }, change: { type: 'string' } }
+            }
+          },
+          relationship_changes: {
+            type: 'array',
+            items: {
+              type: 'object', additionalProperties: false, required: ['character', 'state'],
+              properties: { character: { type: 'string' }, state: { type: 'string' } }
+            }
+          },
+          source_event: { type: 'string', minLength: 1 }
+        }
+      }
+    }
+  }
 }
 
 const ARC_ROLES = new Set<EmotionArcRole>(EMOTION_ARC_ROLES)

@@ -15,7 +15,7 @@ import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
-  generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO
+  generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO, storyHarnessDAO
 } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
@@ -578,7 +578,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:getState', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
     const turns = goalRoutineDAO.listTurns(workId, 30)
-    return { state: state ?? null, turns }
+    const harnessIssues = isNovelWork(workId) ? [] : storyHarnessDAO.listIssues(workId)
+    return { state: state ?? null, turns, harnessIssues }
   })
   ipcMain.handle('goal:getEvaluationData', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
@@ -593,7 +594,14 @@ export function registerIpcHandlers(): void {
       work: work ? { id: work.id, title: work.title, genre: work.genre, tags: work.tags, workType: work.work_type } : null,
       config,
       evaluations: Array.isArray(runtime.evaluationHistory) ? runtime.evaluationHistory : [],
-      turns: goalRoutineDAO.listTurns(workId, 200)
+      turns: goalRoutineDAO.listTurns(workId, 200),
+      harness: isNovelWork(workId)
+        ? undefined
+        : {
+            issues: storyHarnessDAO.listIssues(workId),
+            candidates: storyHarnessDAO.listCandidatesByWork(workId, 200),
+            releaseSnapshots: storyHarnessDAO.listReleaseSnapshots(workId)
+          }
     }
   })
   ipcMain.handle('goal:isRunning', (_e, workId: number) => {

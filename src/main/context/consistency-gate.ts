@@ -36,10 +36,8 @@ export function runConsistencyGate(
   warnings.push(...qualityHints.warnings)
   blockers.push(...qualityHints.blockers)
 
-  if (isNovel) {
-    const timelineEvents = timelineDAO.listByWork(workId).filter(event => event.chapter_id === chapterId)
-    if (timelineEvents.length === 0) blockers.push('时间线：本章缺少关键事件与时间推进记录')
-  }
+  const timelineEvents = timelineDAO.listByWork(workId).filter(event => event.chapter_id === chapterId)
+  if (timelineEvents.length === 0) blockers.push(`时间线：本${isNovel ? '章' : '拍'}缺少关键事件与时间推进记录`)
 
   return {
     passed: blockers.length === 0,

@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync } from 'fs'
 import { closeDatabase } from '../db/connection'
 import {
   workDAO, coreSettingDAO, volumeChapterDAO, anchorDAO, ideaFragmentDAO,
-  foreshadowingDAO, timelineDAO, aiFavoriteDAO
+  foreshadowingDAO, timelineDAO, aiFavoriteDAO, storyStateDAO
 } from '../db'
 import type { WorkStepTemperatureConfig } from '../../shared/work-step-temperature'
 
@@ -24,6 +24,18 @@ export interface WorkBackupBundle {
   snapshots: { character_name: string; chapter_sort: number; volume_sort: number; location?: string | null; mental_state?: string | null; known_info?: string | null; numeric_stats?: string | null }[]
   timeline: { event_name: string; event_description?: string | null; absolute_time?: string | null; relative_time?: string | null }[]
   favorites: { source_step: string; source_label: string; title?: string | null; content: string }[]
+  storyStateFacts?: {
+    volume_sort: number; chapter_sort: number; entity: string; key: string
+    valueType: 'number' | 'enum' | 'boolean' | 'set' | 'text'; value: unknown
+    transition: 'create' | 'update' | 'increase' | 'decrease' | 'unlock' | 'complete' | 'invalidate'
+    irreversible?: boolean; evidence?: string | null
+  }[]
+  chapterPatterns?: {
+    volume_sort: number; chapter_sort: number; conflictType: string; protagonistMethod: string
+    antagonistTactic: string; antagonistOutcome: string; opponentAdjustment: string
+    locationType: string; hookType: string; costType: string; relationshipDelta: string
+    volumeObjectiveDelta: string; payoffType: 'debt' | 'partial' | 'major' | 'aftertaste'
+  }[]
   stepTemperature?: WorkStepTemperatureConfig
 }
 
@@ -34,6 +46,10 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
   const settings = coreSettingDAO.listByWork(workId).map(s => ({ type: s.type, content: s.content }))
   const volumes = volumeChapterDAO.listVolumes(workId)
   const allChapters = volumeChapterDAO.listChaptersByWork(workId)
+  const chapterLocation = new Map(allChapters.map(chapter => {
+    const volume = volumes.find(item => item.id === chapter.volume_id)
+    return [chapter.id, { volume_sort: volume?.sort ?? 0, chapter_sort: chapter.sort }]
+  }))
 
   return {
     version: 1,
@@ -82,6 +98,40 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
       title: f.title,
       content: f.content
     })),
+    storyStateFacts: storyStateDAO.listFactsByWork(workId).flatMap(fact => {
+      const location = chapterLocation.get(fact.chapter_id)
+      if (!location) return []
+      let value: unknown = fact.value_json
+      try { value = JSON.parse(fact.value_json) } catch { /* 保留原值 */ }
+      return [{
+        ...location,
+        entity: fact.entity,
+        key: fact.state_key,
+        valueType: fact.value_type,
+        value,
+        transition: fact.transition,
+        irreversible: Boolean(fact.irreversible),
+        evidence: fact.evidence
+      }]
+    }),
+    chapterPatterns: storyStateDAO.listFingerprintsByWork(workId).flatMap(pattern => {
+      const location = chapterLocation.get(pattern.chapter_id)
+      if (!location) return []
+      return [{
+        ...location,
+        conflictType: pattern.conflict_type,
+        protagonistMethod: pattern.protagonist_method,
+        antagonistTactic: pattern.antagonist_tactic,
+        antagonistOutcome: pattern.antagonist_outcome,
+        opponentAdjustment: pattern.opponent_adjustment,
+        locationType: pattern.location_type,
+        hookType: pattern.hook_type,
+        costType: pattern.cost_type,
+        relationshipDelta: pattern.relationship_delta,
+        volumeObjectiveDelta: pattern.volume_objective_delta,
+        payoffType: pattern.payoff_type
+      }]
+    }),
     stepTemperature: workDAO.getStepTemperature(workId)
   }
 }
@@ -97,10 +147,12 @@ export function importWorkBundle(bundle: WorkBackupBundle): number {
     coreSettingDAO.upsert(workId, s.type, s.content)
   }
 
+  const importedChapters = new Map<string, number>()
   for (const vol of bundle.volumes) {
     const volId = volumeChapterDAO.createVolume(workId, vol.name, vol.description ?? undefined, vol.sort)
     for (const ch of vol.chapters) {
       const chId = volumeChapterDAO.createChapter(volId, ch.title, ch.outline ?? undefined, ch.sort)
+      importedChapters.set(`${vol.sort}:${ch.sort}`, chId)
       volumeChapterDAO.updateChapter(chId, {
         content: ch.content ?? undefined,
         outline: ch.outline ?? undefined,
@@ -136,7 +188,38 @@ export function importWorkBundle(bundle: WorkBackupBundle): number {
   }
 
   for (const e of bundle.timeline) {
-    timelineDAO.create({ work_id: workId, ...e })
+    timelineDAO.create({
+      work_id: workId,
+      event_name: e.event_name,
+      event_description: e.event_description ?? undefined,
+      absolute_time: e.absolute_time ?? undefined,
+      relative_time: e.relative_time ?? undefined
+    })
+  }
+
+  const factsByChapter = new Map<number, NonNullable<WorkBackupBundle['storyStateFacts']>>()
+  for (const fact of bundle.storyStateFacts ?? []) {
+    const chapterId = importedChapters.get(`${fact.volume_sort}:${fact.chapter_sort}`)
+    if (!chapterId) continue
+    const group = factsByChapter.get(chapterId) ?? []
+    group.push(fact)
+    factsByChapter.set(chapterId, group)
+  }
+  for (const [chapterId, facts] of factsByChapter) {
+    storyStateDAO.replaceChapterFacts(workId, chapterId, facts.map(fact => ({
+      entity: fact.entity,
+      key: fact.key,
+      valueType: fact.valueType,
+      value: fact.value,
+      transition: fact.transition,
+      irreversible: fact.irreversible,
+      evidence: fact.evidence ?? undefined
+    })))
+  }
+  for (const pattern of bundle.chapterPatterns ?? []) {
+    const chapterId = importedChapters.get(`${pattern.volume_sort}:${pattern.chapter_sort}`)
+    if (!chapterId) continue
+    storyStateDAO.replaceFingerprint(workId, chapterId, pattern)
   }
 
   for (const fav of bundle.favorites) {

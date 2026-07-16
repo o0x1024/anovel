@@ -5,6 +5,16 @@ import { buildOpenAICompatibleBody } from '../../shared/kimi-api-params'
 import { openAICompatibleAuthHeaders } from '../../shared/mimo-api-params'
 import { consumeSseStream, isAbortError, parseAxiosErrorMessage } from './stream-utils'
 
+function normalizeFinishReason(value: unknown): ModelResponse['finishReason'] {
+  const reason = String(value ?? '').toLowerCase()
+  if (!reason) return undefined
+  if (reason === 'stop' || reason === 'end_turn' || reason === 'stop_sequence') return 'stop'
+  if (reason === 'length' || reason === 'max_tokens' || reason === 'max_token') return 'length'
+  if (reason.includes('safety') || reason.includes('content_filter')) return 'content_filter'
+  if (reason.includes('tool')) return 'tool'
+  return 'unknown'
+}
+
 /**
  * OpenAI 兼容适配器
  * DeepSeek / OpenAI / 第三方中转均使用相同的 chat completions API 格式
@@ -39,16 +49,31 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       }
 
       const body = buildOpenAICompatibleBody(resolvedModel, messages, request, { stream: false })
+      if (request.responseSchema) {
+        body.response_format = {
+          type: 'json_schema',
+          json_schema: {
+            name: request.responseSchema.name,
+            strict: request.responseSchema.strict !== false,
+            schema: request.responseSchema.schema
+          }
+        }
+      }
 
-      const response = await axios.post(
-        url,
-        body,
-        {
+      const requestOptions = {
           headers: openAICompatibleAuthHeaders(options?.modelType ?? 'openai', apiKey),
           timeout: 240000,
           signal: options?.signal
-        }
-      )
+      }
+      let response
+      try {
+        response = await axios.post(url, body, requestOptions)
+      } catch (error: unknown) {
+        const status = (error as { response?: { status?: number } }).response?.status
+        if (!request.responseSchema || (status !== 400 && status !== 422)) throw error
+        delete body.response_format
+        response = await axios.post(url, body, requestOptions)
+      }
 
       const data = response.data
       const message = data.choices?.[0]?.message as {
@@ -66,6 +91,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: this.protocol,
+        finishReason: normalizeFinishReason(data.choices?.[0]?.finish_reason),
         usage: {
           promptTokens: data.usage?.prompt_tokens ?? 0,
           completionTokens: data.usage?.completion_tokens ?? 0
@@ -110,6 +136,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
     let content = ''
     let promptTokens = 0
     let completionTokens = 0
+    let finishReason: ModelResponse['finishReason']
 
     try {
       const streamBody = buildOpenAICompatibleBody(model, messages, request, { stream: true })
@@ -128,7 +155,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       await consumeSseStream(response.data, (data) => {
         try {
           const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta?: { content?: string; reasoning_content?: string; reasoning?: string } }>
+            choices?: Array<{ finish_reason?: string; delta?: { content?: string; reasoning_content?: string; reasoning?: string } }>
             usage?: { prompt_tokens?: number; completion_tokens?: number }
           }
           if (parsed.usage) {
@@ -136,6 +163,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
             completionTokens = parsed.usage.completion_tokens ?? completionTokens
           }
           const deltaObj = parsed.choices?.[0]?.delta
+          finishReason = normalizeFinishReason(parsed.choices?.[0]?.finish_reason) ?? finishReason
           const thinkingDelta = deltaObj?.reasoning_content ?? deltaObj?.reasoning
           if (thinkingDelta) {
             options?.onThinkingDelta?.(thinkingDelta)
@@ -154,6 +182,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: this.protocol,
+        finishReason,
         usage: { promptTokens, completionTokens },
         durationMs: Date.now() - startTime
       }
@@ -228,6 +257,10 @@ function buildGeminiRequestBody(
     temperature: request.temperature ?? 0.7
   }
   if (request.topP != null) genConfig.topP = request.topP
+  if (request.responseSchema) {
+    genConfig.responseMimeType = 'application/json'
+    genConfig.responseJsonSchema = request.responseSchema.schema
+  }
   // Gemini 多数模型不支持 frequencyPenalty / presencePenalty，传入会触发 400
   const model = options?.model ?? ''
   if (geminiSupportsThoughtSummaries(model)) {
@@ -275,11 +308,24 @@ export class GeminiAdapter implements ModelAdapter {
       }
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
-      const response = await axios.post(url, body, {
+      const requestOptions = {
         headers: { 'Content-Type': 'application/json' },
         timeout: 240000,
         signal: options?.signal
-      })
+      }
+      let response
+      try {
+        response = await axios.post(url, body, requestOptions)
+      } catch (error: unknown) {
+        const status = (error as { response?: { status?: number } }).response?.status
+        if (!request.responseSchema || (status !== 400 && status !== 422)) throw error
+        const generationConfig = body.generationConfig as Record<string, unknown> | undefined
+        if (generationConfig) {
+          delete generationConfig.responseMimeType
+          delete generationConfig.responseJsonSchema
+        }
+        response = await axios.post(url, body, requestOptions)
+      }
 
       const data = response.data
       let content = ''
@@ -292,6 +338,7 @@ export class GeminiAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: 'gemini',
+        finishReason: normalizeFinishReason(data.candidates?.[0]?.finishReason),
         usage: {
           promptTokens: data.usageMetadata?.promptTokenCount ?? 0,
           completionTokens: data.usageMetadata?.candidatesTokenCount ?? 0
@@ -329,6 +376,7 @@ export class GeminiAdapter implements ModelAdapter {
     options?: AdapterChatOptions
   ): Promise<ModelResponse> {
     let content = ''
+    let finishReason: ModelResponse['finishReason']
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`
 
     try {
@@ -342,8 +390,9 @@ export class GeminiAdapter implements ModelAdapter {
       await consumeSseStream(response.data, (data) => {
         try {
           const parsed = JSON.parse(data) as {
-            candidates?: Array<{ content?: { parts?: GeminiContentPart[] } }> | null
+            candidates?: Array<{ finishReason?: string; content?: { parts?: GeminiContentPart[] } }> | null
           }
+          finishReason = normalizeFinishReason(parsed.candidates?.[0]?.finishReason) ?? finishReason
           // 思考阶段部分 chunk 的 candidates 为 null，跳过即可
           dispatchGeminiParts(parsed.candidates?.[0]?.content?.parts, {
             onThinkingDelta: options?.onThinkingDelta,
@@ -359,6 +408,7 @@ export class GeminiAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: 'gemini',
+        finishReason,
         durationMs: Date.now() - startTime
       }
     } catch (error: unknown) {
@@ -441,6 +491,7 @@ export class AnthropicAdapter implements ModelAdapter {
       const data = response.data as {
         content?: Array<{ type?: string; text?: string }>
         usage?: { input_tokens?: number; output_tokens?: number }
+        stop_reason?: string
       }
       const content = (data.content ?? [])
         .filter(block => block.type === 'text' || !block.type)
@@ -451,6 +502,7 @@ export class AnthropicAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: 'anthropic',
+        finishReason: normalizeFinishReason(data.stop_reason),
         usage: {
           promptTokens: data.usage?.input_tokens ?? 0,
           completionTokens: data.usage?.output_tokens ?? 0
@@ -492,6 +544,7 @@ export class AnthropicAdapter implements ModelAdapter {
     let content = ''
     let promptTokens = 0
     let completionTokens = 0
+    let finishReason: ModelResponse['finishReason']
 
     try {
       const response = await axios.post(url, { ...body, stream: true }, {
@@ -505,7 +558,7 @@ export class AnthropicAdapter implements ModelAdapter {
         try {
           const parsed = JSON.parse(data) as {
             type?: string
-            delta?: { type?: string; text?: string }
+            delta?: { type?: string; text?: string; stop_reason?: string }
             message?: { usage?: { input_tokens?: number; output_tokens?: number } }
             usage?: { input_tokens?: number; output_tokens?: number }
           }
@@ -513,6 +566,7 @@ export class AnthropicAdapter implements ModelAdapter {
             content += parsed.delta.text
             options?.onDelta?.(parsed.delta.text)
           }
+          finishReason = normalizeFinishReason(parsed.delta?.stop_reason) ?? finishReason
           const usage = parsed.usage ?? parsed.message?.usage
           if (usage) {
             promptTokens = usage.input_tokens ?? promptTokens
@@ -527,6 +581,7 @@ export class AnthropicAdapter implements ModelAdapter {
         success: true,
         content,
         modelType: 'anthropic',
+        finishReason,
         usage: { promptTokens, completionTokens },
         durationMs: Date.now() - startTime
       }

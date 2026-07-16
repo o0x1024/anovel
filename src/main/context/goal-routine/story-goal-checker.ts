@@ -11,7 +11,7 @@ import { runResourceConstraintGate } from '../resource-ledger'
 import { getWritingStats } from '../writing-stats'
 import { loadWritingPlan } from '../writing-plan'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
-import { volumeChapterDAO, workDAO } from '../../db'
+import { coreSettingDAO, storyHarnessDAO, volumeChapterDAO, workDAO } from '../../db'
 import {
   parseStoryQualityAiScoreBreakdown,
   type StoryQualityAiScoreItem,
@@ -26,15 +26,32 @@ import { bodyWordCountBounds, isTotalWordCountInTargetRange } from '../../../sha
 import { storyGoalModelOpts } from './story-goal-model'
 import { formatPreviewAnchorReport } from '../../../shared/story-preview-anchor'
 import { buildStoryMergedText } from '../../../shared/work-terminology'
-import { assessWholeStory, type StoryWeakestLayer } from './story-whole-evaluator'
+import {
+  assessWholeStory,
+  type StoryForensicIssue,
+  type StoryWeakestLayer
+} from './story-whole-evaluator'
 import { assessWholeNovel } from './novel-whole-evaluator'
+import type { NovelSystemIssue } from '../../../shared/novel-systemic-types'
 import type { EmotionBlindAssessment } from '../../../shared/emotion-contract'
-import { assessChapterEmotion } from './emotion-gate'
+import {
+  ensureChapterEmotionOutcome,
+  emotionContentHash,
+  isEmotionOutcomeComplete,
+  parseStoredEmotionAssessment
+} from './emotion-gate'
 import { ensureChapterEmotionContract } from './emotion-engine'
 import {
   parseCachedQualityAssessment,
   serializeQualityAssessment
 } from './chapter-assessment-cache'
+import {
+  detectStorySettingContradictions,
+  detectStoryTextIntegrityIssues,
+  shouldBlockStoryAntiAi,
+  type StoryHarnessIssue,
+  type StoryHarnessScope
+} from '../../../shared/story-harness'
 
 export interface StoryGoalConfig {
   /** 用户自由文字目标（题材/风格/情节要求）——驱动生成并参与最终语义验收 */
@@ -123,6 +140,9 @@ export interface GoalCheckResult {
   weakestLayer: StoryWeakestLayer
   weakChapterTitles: string[]
   storyIssues: string[]
+  storyHardBlockers: string[]
+  forensicIssues: StoryForensicIssue[]
+  systemicIssues: NovelSystemIssue[]
   previewReport: string | null
   chapterDiagnostics: GoalChapterDiagnostic[]
   reasons: string[]
@@ -142,11 +162,14 @@ const STORY_CRITICAL_METRICS = new Set<StoryQualityAiMetricKey>([
  */
 export function failedCriticalStoryMetrics(
   items: StoryQualityAiScoreItem[],
-  qualityMin: number
+  qualityMin: number,
+  options: { finalBeat?: boolean } = {}
 ): string[] {
   const criticalFloor = Math.max(60, qualityMin - 15)
   return items
-    .filter(item => STORY_CRITICAL_METRICS.has(item.key) && item.score < criticalFloor)
+    .filter(item => STORY_CRITICAL_METRICS.has(item.key)
+      && !(options.finalBeat && item.key === 'hook_density')
+      && item.score < criticalFloor)
     .map(item => `${item.label}:${item.score}`)
 }
 
@@ -194,6 +217,7 @@ export async function checkStoryGoal(
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const fullBody = collectFullBody(workId)
   const isStory = workDAO.getById(workId)?.work_type === 'story'
+  const harnessIssues: StoryHarnessIssue[] = []
   const parseBreakdown = isStory ? parseStoryQualityAiScoreBreakdown : parseQualityAiScoreReport
   const chapterDiagnostics: GoalChapterDiagnostic[] = chapters.map(ch => ({
     chapterId: ch.id,
@@ -220,6 +244,35 @@ export async function checkStoryGoal(
     reasons.push(`章节数量不完整：${total}/${expectedChapters}`)
   } else if (config.requireAllBeatsContent && content < total) {
     reasons.push(`节拍未全部完成：${content}/${total} 有正文`)
+  }
+
+  // ---- 1.5 确定性完整性与设定矛盾：先于所有模型评分执行 ----
+  if (isStory) {
+    chapters.forEach((chapter, index) => {
+      if (!chapter.content?.trim()) return
+      harnessIssues.push(...detectStoryTextIntegrityIssues(chapter.content, {
+        chapterId: chapter.id,
+        finalBeat: index === chapters.length - 1
+      }))
+    })
+    const settings = coreSettingDAO.listByWork(workId)
+      .map(row => `${row.type}\n${row.content}`)
+      .join('\n')
+    const engineStructured = coreSettingDAO.getByType(workId, 'story_engine')?.structured_content
+    let settingResolutions = ''
+    if (engineStructured?.trim()) {
+      try {
+        const engine = JSON.parse(engineStructured) as Record<string, unknown>
+        settingResolutions = Array.isArray(engine.setting_resolutions)
+          ? engine.setting_resolutions.map(String).join('\n')
+          : ''
+      } catch { /* 旧版 story_engine 没有结构化消歧，按未解决处理 */ }
+    }
+    harnessIssues.push(...detectStorySettingContradictions(`${settings}\n${fullBody}`, settingResolutions))
+    const deterministicBlockers = harnessIssues.filter(issue => issue.severity === 'blocker')
+    if (deterministicBlockers.length > 0) {
+      reasons.push(`确定性成稿门禁 ${deterministicBlockers.length} 项阻塞：${deterministicBlockers.map(issue => `${issue.code}/${issue.message}`).join('；')}`)
+    }
   }
 
   // ---- 2. 完成度：字数（±10% 容差，与单章正文一致） ----
@@ -287,7 +340,8 @@ export async function checkStoryGoal(
             if (isStory) {
               for (const failed of failedCriticalStoryMetrics(
                 breakdown.items as StoryQualityAiScoreItem[],
-                config.qualityMin
+                config.qualityMin,
+                { finalBeat: ch.id === chapters[chapters.length - 1]?.id }
               )) {
                 allMetricFailures.push(`${ch.title}/${failed}`)
               }
@@ -356,7 +410,12 @@ export async function checkStoryGoal(
       }
     }
     if (antiAiViolations > 0) {
-      reasons.push(`anti-AI 规则违规 ${antiAiViolations} 处`)
+      const blockingChapters = isStory
+        ? chapterDiagnostics.filter(diag => shouldBlockStoryAntiAi(diag.antiAiViolations, diag.wordCount))
+        : chapterDiagnostics.filter(diag => diag.antiAiViolations > 0)
+      if (blockingChapters.length > 0) {
+        reasons.push(`anti-AI 规则达到阻塞阈值：${blockingChapters.map(diag => `${diag.title}${diag.antiAiViolations}处`).join('、')}`)
+      }
     }
   }
 
@@ -367,16 +426,15 @@ export async function checkStoryGoal(
     for (const [index, chapter] of chapters.entries()) {
       if (!chapter.content?.trim()) continue
       const diagnostic = chapterDiagnostics.find(item => item.chapterId === chapter.id)
-      let assessment: EmotionBlindAssessment | null = null
-      try {
-        assessment = chapter.emotion_assessment_json
-          ? JSON.parse(chapter.emotion_assessment_json) as EmotionBlindAssessment
-          : null
-      } catch { assessment = null }
-      if (!assessment) {
+      let assessment: EmotionBlindAssessment | null = parseStoredEmotionAssessment(chapter.emotion_assessment_json)
+      const needsOutcome = !assessment
+        || (assessment.passed && !isEmotionOutcomeComplete(chapter.id, chapter.content, chapter.emotion_assessment_json))
+        || (assessment.outcome_meta?.content_hash != null
+          && assessment.outcome_meta.content_hash !== emotionContentHash(chapter.content))
+      if (needsOutcome) {
         onProgress?.(`目标验收：正在补充情绪盲读 ${index + 1}/${chapters.length}「${chapter.title}」`)
         await ensureChapterEmotionContract(workId, chapter.id, config.goalDescription, signal)
-        assessment = await assessChapterEmotion(workId, chapter.id, chapter.content, signal, true)
+        assessment = await ensureChapterEmotionOutcome(workId, chapter.id, chapter.content, signal)
       }
       if (!assessment) {
         emotionFailures.push(`${chapter.title}:缺少情绪盲读验收`)
@@ -408,6 +466,9 @@ export async function checkStoryGoal(
   let weakestLayer: StoryWeakestLayer = 'scene'
   let weakChapterTitles: string[] = []
   let storyIssues: string[] = []
+  let storyHardBlockers: string[] = []
+  let forensicIssues: StoryForensicIssue[] = []
+  let systemicIssues: NovelSystemIssue[] = []
 
   if (chapterPlanComplete && isStory && content > 0 && content === total
     && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
@@ -424,6 +485,32 @@ export async function checkStoryGoal(
       weakestLayer = assessment.weakestLayer
       weakChapterTitles = assessment.weakChapterTitles
       storyIssues = assessment.issues
+      storyHardBlockers = assessment.hardBlockers
+      forensicIssues = assessment.forensicIssues
+      const chapterIdsByTitle = new Map(chapters.map(chapter => [chapter.title, chapter.id]))
+      for (const issue of forensicIssues) {
+        const scope: StoryHarnessScope = issue.scope === 'beat_cluster'
+          ? 'cluster'
+          : issue.scope === 'story_engine'
+            ? 'engine'
+            : issue.scope
+        harnessIssues.push({
+          code: issue.code,
+          severity: 'blocker',
+          scope,
+          chapterIds: issue.chapterTitles
+            .map(title => chapterIdsByTitle.get(title))
+            .filter((id): id is number => id != null),
+          evidence: issue.evidence,
+          message: issue.message,
+          expectedResult: issue.recommendedAction,
+          invariants: ['未被证据点名的正文与既有事实保持不变']
+        })
+      }
+
+      if (storyHardBlockers.length > 0) {
+        reasons.push(`整篇法医审计发现 ${storyHardBlockers.length} 项硬伤：${storyHardBlockers.join('；')}`)
+      }
 
       if (config.goalMatchMin > 0 && config.goalDescription.trim() && goalMatchScore < config.goalMatchMin) {
         reasons.push(`创作目标匹配度 ${goalMatchScore} 低于下限 ${config.goalMatchMin}：${goalMatchReason}`)
@@ -457,7 +544,18 @@ export async function checkStoryGoal(
       proseReadReason = assessment.proseReadReason
       weakChapterTitles = assessment.weakChapterTitles
       storyIssues = assessment.issues
+      systemicIssues = assessment.systemicIssues
+      storyHardBlockers = systemicIssues
+        .filter(issue => issue.severity === 'blocker')
+        .map(issue => `${issue.code}：${issue.message}`)
       weakestLayer = 'storyline'
+      if (storyHardBlockers.length > 0) {
+        reasons.push(`整书确定性审计发现 ${storyHardBlockers.length} 项硬伤：${storyHardBlockers.join('；')}`)
+      }
+      const systemicWarnings = systemicIssues.filter(issue => issue.severity === 'warning')
+      if (systemicWarnings.length > 0) {
+        reasons.push(`整书模式审计发现 ${systemicWarnings.length} 项需修复：${systemicWarnings.map(issue => `${issue.code}：${issue.message}`).join('；')}`)
+      }
       if (config.goalMatchMin > 0 && config.goalDescription.trim() && goalMatchScore < config.goalMatchMin) {
         reasons.push(`创作目标匹配度 ${goalMatchScore} 低于下限 ${config.goalMatchMin}：${goalMatchReason}`)
       }
@@ -496,6 +594,7 @@ export async function checkStoryGoal(
     }
   }
 
+  if (isStory) storyHarnessDAO.syncIssues(workId, harnessIssues)
   const met = reasons.length === 0
   return {
     met,
@@ -520,6 +619,9 @@ export async function checkStoryGoal(
     weakestLayer,
     weakChapterTitles,
     storyIssues,
+    storyHardBlockers,
+    forensicIssues,
+    systemicIssues,
     previewReport,
     chapterDiagnostics,
     reasons

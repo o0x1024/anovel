@@ -335,6 +335,15 @@ export async function diagnoseChapterQualityAi(
       sections.push('若本章没有完成上述对应职责，必须加入 failed_rules，并将 hard_fail 设为 true。')
     }
   }
+  const isFinalStoryBeat = isStory && chapterOrdinal > 0 && chapterOrdinal === allChapters.length
+  if (isFinalStoryBeat) {
+    sections.push(
+      '',
+      '【本拍为全篇最终拍 - 结局优先规则】',
+      '最终拍必须回答核心问题、完成主线闭环并留下由既有代价产生的余味。不得为了提高钩子分新增反派、任务、证据、联姻或续集问题。',
+      'hook_density 与 reader_question 在最终拍改为评估“闭环兑现的阅读满足感与余味”，没有续集悬念本身不得扣分，也不得据此 hard_fail。'
+    )
+  }
   const prompt = sections.join('\n')
 
   const res = await modelService.chat({
@@ -363,8 +372,13 @@ export async function diagnoseChapterQualityAi(
     ? assessHookBodyOverlap(workInfo?.description ?? '', diagnosisContent)
     : null
   const overlapFailed = Boolean(overlap?.applicable && !overlap.passed)
+  const finalClosureOnlyFailure = Boolean(
+    isFinalStoryBeat
+    && parsed?.failedRules.length
+    && parsed.failedRules.every(rule => /章末无悬念|平淡收尾|读者追问|续集|钩子/i.test(rule))
+  )
   const scoreTotal = overlapFailed ? Math.min(reconciled.scoreTotal, 40) : reconciled.scoreTotal
-  const hardFail = reconciled.hardFail || overlapFailed
+  const hardFail = (reconciled.hardFail && !finalClosureOnlyFailure) || overlapFailed
   const scoreBreakdown = parsed
     ? {
         ...parsed,

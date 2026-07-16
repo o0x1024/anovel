@@ -4,8 +4,23 @@ import { extractJsonText } from '../parse-json-extract'
 import type { StoryGoalConfig } from './story-goal-checker'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
+import { detectStoryMetaResidues } from './story-continuity-gate'
+import { formatStoryContractForPrompt } from './story-contract'
+import { requestStructuredModelOutput } from './structured-model-output'
 
 export type StoryWeakestLayer = 'storyline' | 'beat' | 'scene' | 'paragraph'
+export type StoryForensicScope = 'sentence' | 'scene' | 'beat_cluster' | 'story_engine'
+
+export interface StoryForensicIssue {
+  code: string
+  scope: StoryForensicScope
+  chapterTitles: string[]
+  repairChapterTitles: string[]
+  evidence: string[]
+  message: string
+  repairable: boolean
+  recommendedAction: string
+}
 
 export interface StoryWholeAssessment {
   goalMatchScore: number
@@ -19,6 +34,8 @@ export interface StoryWholeAssessment {
   weakestLayer: StoryWeakestLayer
   weakChapterTitles: string[]
   issues: string[]
+  hardBlockers: string[]
+  forensicIssues: StoryForensicIssue[]
 }
 
 interface ProseBlindRead {
@@ -37,6 +54,69 @@ interface StoryChunkSummary {
 
 const CHUNK_CHAR_LIMIT = 12_000
 const DIRECT_BODY_CHAR_LIMIT = 18_000
+const STORY_CHUNK_SUMMARY_SCHEMA = {
+  type: 'object',
+  required: ['summary', 'promises', 'payoffs', 'issues'],
+  properties: {
+    summary: { type: 'string' }, promises: { type: 'array' },
+    payoffs: { type: 'array' }, issues: { type: 'array' }
+  }
+}
+const STORY_PROSE_BLIND_SCHEMA = {
+  type: 'object',
+  required: ['score', 'reason', 'issues'],
+  properties: { score: { type: 'integer' }, reason: { type: 'string' }, issues: { type: 'array' } }
+}
+const STORY_WHOLE_EVALUATION_SCHEMA = {
+  type: 'object',
+  required: [
+    'goal_match_score', 'goal_match_reason', 'overall_story_score', 'overall_story_reason',
+    'preview_hook_score', 'preview_hook_reason', 'weakest_layer', 'weak_chapter_titles', 'issues'
+  ],
+  properties: {
+    goal_match_score: { type: 'integer' }, goal_match_reason: { type: 'string' },
+    overall_story_score: { type: 'integer' }, overall_story_reason: { type: 'string' },
+    preview_hook_score: { type: 'integer' }, preview_hook_reason: { type: 'string' },
+    weakest_layer: { type: 'string' }, weak_chapter_titles: { type: 'array' }, issues: { type: 'array' }
+  }
+}
+const STORY_FORENSIC_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    hard_blockers: {
+      type: 'array',
+      maxItems: 12,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          code: {
+            type: 'string',
+            enum: [
+              'TIMELINE_CONTRADICTION', 'SPATIAL_JUMP', 'DUPLICATED_EVENT',
+              'EVIDENCE_STATE_REGRESSION', 'KNOWLEDGE_REGRESSION', 'OBSTACLE_BYPASS',
+              'DEUS_EX_MACHINA', 'UNPAYED_CORE_PROMISE', 'UNFORESHADOWED_NEW_ARC',
+              'META_RESIDUE', 'BROKEN_CLIMAX_MECHANISM', 'OTHER_HARD_BLOCKER'
+            ]
+          },
+          scope: { type: 'string', enum: ['sentence', 'scene', 'beat_cluster', 'story_engine'] },
+          chapter_titles: { type: 'array', items: { type: 'string' } },
+          repair_chapter_titles: { type: 'array', items: { type: 'string' } },
+          evidence: { type: 'array', items: { type: 'string' } },
+          message: { type: 'string' },
+          repairable: { type: 'boolean' },
+          recommended_action: { type: 'string' }
+        },
+        required: [
+          'code', 'scope', 'chapter_titles', 'repair_chapter_titles',
+          'evidence', 'message', 'repairable', 'recommended_action'
+        ]
+      }
+    }
+  },
+  required: ['hard_blockers']
+} as const
 
 function clampScore(value: unknown): number {
   const n = Number(value)
@@ -118,33 +198,41 @@ async function summarizeChunk(
   chunk: { range: string; text: string },
   signal?: AbortSignal
 ): Promise<StoryChunkSummary> {
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
+  let parsed: Record<string, unknown>
+  try {
+    parsed = await requestStructuredModelOutput<Record<string, unknown>>({
       workId,
-      step: 'story_whole_chunk_summary',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 1400,
-      systemPrompt: [
-        '你是短故事整篇评审的证据提取员。只提取文本中实际发生的内容，不补写，不给虚高评价。',
-        '只输出 JSON：{"summary":"因果剧情摘要","promises":["读者承诺/悬念"],"payoffs":["已兑现内容"],"issues":["结构或连续性问题"]}'
-      ].join('\n'),
-      prompt: `【范围】${chunk.range}\n\n【正文】\n${chunk.text}`
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) {
-    throw new Error(res.error || `整篇评审分段摘要失败：${chunk.range}`)
-  }
-  const parsed = parseJsonObject(res.content)
-  if (!parsed) {
+      label: `整篇评审分段摘要 ${chunk.range}`,
+      signal,
+      request: (attempt, error) => modelService.chat(
+        withGoalLoopModelOptions(workId, {
+          workId,
+          step: 'story_whole_chunk_summary',
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          temperature: 0,
+          maxTokens: 1800,
+          forceThinkingDisabled: true,
+          responseSchema: { name: 'story_chunk_summary', schema: STORY_CHUNK_SUMMARY_SCHEMA, strict: false },
+          systemPrompt: [
+            '你是短故事整篇评审的证据提取员。只提取文本中实际发生的内容，不补写，不给虚高评价。',
+            '只输出 JSON：{"summary":"因果剧情摘要","promises":["读者承诺/悬念"],"payoffs":["已兑现内容"],"issues":["结构或连续性问题"]}'
+          ].join('\n'),
+          prompt: [
+            `【范围】${chunk.range}\n\n【正文】\n${chunk.text}`,
+            attempt > 1 ? `【格式重试】${error}。缩短摘要并返回完整 JSON。` : ''
+          ].filter(Boolean).join('\n\n')
+        }),
+        { stream: false, signal }
+      )
+    })
+  } catch (error) {
     return {
       range: chunk.range,
-      summary: res.content.trim().slice(0, 1600),
+      summary: `${chunk.text.slice(0, 900)}\n…\n${chunk.text.slice(-900)}`,
       promises: [],
       payoffs: [],
-      issues: ['分段摘要未返回结构化 JSON']
+      issues: [`分段摘要评估器失败，已保留首尾原文证据：${error instanceof Error ? error.message : String(error)}`]
     }
   }
   return {
@@ -173,6 +261,134 @@ function blindReadSamples(text: string): string {
   }).join('\n\n')
 }
 
+function continuityBoundaryEvidence(blocks: Array<{ title: string; text: string }>): string {
+  return blocks.map((block, index) => {
+    const previous = index > 0 ? blocks[index - 1] : null
+    return [
+      `【边界 ${index + 1}：${previous?.title ?? '全篇开头'} → ${block.title}】`,
+      previous ? `上一拍结尾：\n${previous.text.slice(-1600)}` : '',
+      `本拍开头：\n${block.text.slice(0, 2000)}`
+    ].filter(Boolean).join('\n')
+  }).join('\n\n')
+}
+
+async function assessStoryForensics(
+  workId: number,
+  blocks: Array<{ title: string; outline: string; text: string }>,
+  mergedBody: string,
+  extractedEvidence: string,
+  signal?: AbortSignal
+): Promise<StoryForensicIssue[]> {
+  const deterministic: StoryForensicIssue[] = blocks.flatMap(block =>
+    detectStoryMetaResidues(block.text).map(message => ({
+      code: 'META_RESIDUE',
+      scope: 'sentence' as const,
+      chapterTitles: [block.title],
+      repairChapterTitles: [block.title],
+      evidence: [message],
+      message,
+      repairable: true,
+      recommendedAction: '只改写生成提示残留，保留剧情事实'
+    }))
+  )
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      step: 'story_forensic_audit',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false,
+      temperature: 0,
+      maxTokens: 1800,
+      responseSchema: { name: 'story_forensic_audit', schema: STORY_FORENSIC_JSON_SCHEMA, strict: true },
+      systemPrompt: [
+        '你是短故事整篇法医审计员。只报告有原文证据、足以否决成稿的硬伤，不评价文笔，不用小瑕疵凑数。',
+        '硬伤包括：时间线互相矛盾；人物或道具空间无过渡跳变；同一关键事件重复发生；证据状态/人物知识倒退；前文制造的关键阻碍被后文直接跳过；主角胜利依赖反派降智、临时权威、巧合或终局新证据；核心承诺未回收；结尾突然开启未经铺垫的新主线；生成提示残留。',
+        '证据流程略有戏剧化可以接受，但若证据本身无法证明主张，或处理结果无任何已铺垫依据，属于硬伤。',
+        'code 必须从以下固定集合选择：TIMELINE_CONTRADICTION、SPATIAL_JUMP、DUPLICATED_EVENT、EVIDENCE_STATE_REGRESSION、KNOWLEDGE_REGRESSION、OBSTACLE_BYPASS、DEUS_EX_MACHINA、UNPAYED_CORE_PROMISE、UNFORESHADOWED_NEW_ARC、META_RESIDUE、BROKEN_CLIMAX_MECHANISM、OTHER_HARD_BLOCKER。',
+        'scope 只允许 sentence/scene/beat_cluster/story_engine。chapter_titles 是证据位置，repair_chapter_titles 是实际必须修改的最小节拍集。',
+        '单句时间/数字错误用sentence；单场证据或知情断裂用scene；需要“前面铺垫+后面兑现”联动用beat_cluster；合同或高潮机制本身不可行才用story_engine。',
+        '只输出 JSON：{"hard_blockers":[{"code":"TIMELINE_CONTRADICTION","scope":"sentence","chapter_titles":["原样标题"],"repair_chapter_titles":["原样标题"],"evidence":["证据A","证据B"],"message":"硬伤说明","repairable":true,"recommended_action":"最小修复动作"}]}。无硬伤输出空数组。'
+      ].join('\n\n'),
+      prompt: [
+        formatStoryContractForPrompt(workId),
+        `【节拍蓝图】\n${JSON.stringify(blocks.map((block, index) => ({
+          ref: block.title === '导语' ? '导语' : `第${index + (blocks[0]?.title === '导语' ? 0 : 1)}拍`,
+          title: block.title,
+          outline: block.outline
+        })), null, 2)}`,
+        extractedEvidence,
+        continuityBoundaryEvidence(blocks),
+        `【全篇结尾】\n${mergedBody.slice(-5200)}`
+      ].join('\n\n')
+    }),
+    { stream: false, signal }
+  )
+  const evaluatorError = (message: string): StoryForensicIssue => ({
+    code: 'FORENSIC_EVALUATOR_ERROR', scope: 'story_engine', chapterTitles: [], repairChapterTitles: [],
+    evidence: [message], message: '整篇法医审计结果无法验证', repairable: false,
+    recommendedAction: '重试审计，不得因评估器失败删除正文'
+  })
+  if (!response.success || !response.content?.trim()) {
+    return [...deterministic, evaluatorError(response.error || '整篇法医审计无返回')]
+  }
+  try {
+    const parsed = parseJsonObject(response.content)
+    if (!parsed) throw new Error('整篇法医审计返回格式无效')
+    if (!Array.isArray(parsed.hard_blockers)) throw new Error('整篇法医审计缺少 hard_blockers 数组')
+    const rawIssues = parsed.hard_blockers.slice(0, 12)
+    const storyBlocks = blocks.filter(block => block.title !== '导语')
+    const resolveTitles = (value: unknown): string[] => {
+      const values = Array.isArray(value) ? value.map(String) : []
+      return [...new Set(values.flatMap(item => {
+        const exact = blocks.find(block => block.title === item.trim())
+        if (exact) return [exact.title]
+        const ordinal = /第(\d+)拍/.exec(item)?.[1]
+        if (ordinal) return [storyBlocks[Number(ordinal) - 1]?.title].filter(Boolean) as string[]
+        return blocks.filter(block => block.title.includes(item) || item.includes(block.title)).map(block => block.title)
+      }))]
+    }
+    const aiIssues = rawIssues.map((item, index): StoryForensicIssue | null => {
+      if (typeof item === 'string') {
+        const titles = resolveTitles([item])
+        return {
+          code: `FORENSIC_${index + 1}`, scope: 'beat_cluster', chapterTitles: titles,
+          repairChapterTitles: titles, evidence: [item], message: item, repairable: true,
+          recommendedAction: '修复定位节拍及必要铺垫，再做整篇复验'
+        }
+      }
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return null
+      const row = item as Record<string, unknown>
+      const rawScope = String(row.scope ?? '')
+      const scope: StoryForensicScope = ['sentence', 'scene', 'beat_cluster', 'story_engine'].includes(rawScope)
+        ? rawScope as StoryForensicScope : 'beat_cluster'
+      const chapterTitles = resolveTitles(row.chapter_titles)
+      const repairTitles = resolveTitles(row.repair_chapter_titles)
+      const message = String(row.message ?? '').trim()
+      if (!message) return null
+      return {
+        code: String(row.code ?? `FORENSIC_${index + 1}`).trim() || `FORENSIC_${index + 1}`,
+        scope,
+        chapterTitles,
+        repairChapterTitles: repairTitles.length > 0 ? repairTitles : chapterTitles,
+        evidence: stringList(row.evidence, 6),
+        message,
+        // 是否需要发动机级重建由 scope 决定，避免模型把可局部修复的问题误标成不可修复。
+        repairable: scope !== 'story_engine',
+        recommendedAction: String(row.recommended_action ?? '').trim() || '按最小作用域修复并整篇复验'
+      }
+    }).filter((item): item is StoryForensicIssue => item != null)
+    if (aiIssues.length !== rawIssues.length) throw new Error('整篇法医审计包含无效问题项')
+    const unique = new Map<string, StoryForensicIssue>()
+    for (const item of [...deterministic, ...aiIssues]) {
+      const key = `${item.code}:${item.repairChapterTitles.join(',')}:${item.message}`
+      if (!unique.has(key)) unique.set(key, item)
+    }
+    return [...unique.values()]
+  } catch {
+    return [...deterministic, evaluatorError('整篇法医审计返回格式无效')]
+  }
+}
+
 async function assessProseBlindRead(
   workId: number,
   mergedBody: string,
@@ -180,28 +396,35 @@ async function assessProseBlindRead(
   signal?: AbortSignal
 ): Promise<ProseBlindRead> {
   const policy = resolveStoryGenrePolicy(genreText)
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_prose_blind_read',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 1500,
-      systemPrompt: [
-        '你是独立短故事盲读编辑。你看不到标题、大纲、评分表和剧情摘要，只按普通读者阅读原文切片。',
-        '重点识别：重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
-        '格式完整、反转数量和问号不能加分。只有自然、可信、能让人继续读的原文才能高分。',
-        formatGenrePolicy(policy, 'evaluationRules'),
-        '只输出 JSON：{"score":75,"reason":"一句话总评","issues":["带原文现象的具体问题"]}'
-      ].join('\n\n'),
-      prompt: blindReadSamples(mergedBody)
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(res.error || '原文盲读失败')
-  const parsed = parseJsonObject(res.content)
-  if (!parsed) throw new Error('原文盲读返回 JSON 解析失败')
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: '原文盲读',
+    signal,
+    request: (attempt, error) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_prose_blind_read',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1800,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_prose_blind_read', schema: STORY_PROSE_BLIND_SCHEMA, strict: false },
+        systemPrompt: [
+          '你是独立短故事盲读编辑。你看不到标题、大纲、评分表和剧情摘要，只按普通读者阅读原文切片。',
+          '重点识别：重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
+          '格式完整、反转数量和问号不能加分。只有自然、可信、能让人继续读的原文才能高分。',
+          formatGenrePolicy(policy, 'evaluationRules'),
+          '只输出 JSON：{"score":75,"reason":"一句话总评","issues":["带原文现象的具体问题"]}'
+        ].join('\n\n'),
+        prompt: [
+          blindReadSamples(mergedBody),
+          attempt > 1 ? `【格式重试】${error}。返回更短的完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
   return {
     score: clampScore(parsed.score),
     reason: String(parsed.reason ?? '').trim(),
@@ -248,7 +471,9 @@ export async function assessWholeStory(
       proseReadReason: '尚无正文',
       weakestLayer: 'storyline',
       weakChapterTitles: [],
-      issues: ['尚无正文']
+      issues: ['尚无正文'],
+      hardBlockers: ['尚无正文'],
+      forensicIssues: []
     }
   }
 
@@ -279,18 +504,29 @@ export async function assessWholeStory(
   ].join('\n'))
   const genreText = [work?.genre ?? '', work?.tags ?? '', config.goalDescription].join('\n')
   const proseRead = await assessProseBlindRead(workId, mergedBody, genreText, signal)
+  const forensicIssues = await assessStoryForensics(workId, publishedBlocks, mergedBody, evidence, signal)
+  const hardBlockers = forensicIssues.map(issue =>
+    `${issue.code}：${issue.message}${issue.evidence.length > 0 ? `（${issue.evidence.join('；')}）` : ''}`
+  )
 
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: '整篇终审',
+    signal,
+    request: (attempt, error) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
       workId,
       step: 'story_whole_evaluation',
       enrichWorkContext: false,
       enrichNarrativeMemory: false,
       temperature: 0,
-      maxTokens: 2600,
+      maxTokens: 3200,
+      forceThinkingDisabled: true,
+      responseSchema: { name: 'story_whole_evaluation', schema: STORY_WHOLE_EVALUATION_SCHEMA, strict: false },
       systemPrompt: [
         '你是独立短故事终审主编。必须依据给出的正文或逐段证据评估整篇，而不是按局部文笔印象给分。',
         '重点检查：开篇承诺、因果升级、中段变化、人物选择、高潮兑现、伏笔回收、结局闭环与余味。',
+        '对手必须基于自身信息做出至少一次有效反制并造成真实损害；主角必须因此调整计划。若对手只挑衅、自曝、拆开明知危险的证据或等待公开处刑，整篇不得高分。',
         'preview_hook_score 判断目标试读点结束时，读者是否已经获得阶段兑现，同时产生继续阅读的具体问题；不能只因问号、感叹号或刺激词给高分。',
         'weakest_layer 只能是 storyline、beat、scene、paragraph；选择真正应返工的最高层级。',
         '只输出合法 JSON。分数为 0-100 整数，不得因为格式完整而默认高分。',
@@ -304,17 +540,14 @@ export async function assessWholeStory(
         evidence,
         `【开篇证据】\n${opening}`,
         `【${Math.round(config.previewRatio * 100)}% 试读边界前后】\n${preview}`,
-        `【结尾证据】\n${ending}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-
-  if (!res.success || !res.content?.trim()) {
-    throw new Error(res.error || '整篇终审失败')
-  }
-  const parsed = parseJsonObject(res.content)
-  if (!parsed) throw new Error('整篇终审返回 JSON 解析失败')
+        `【结尾证据】\n${ending}`,
+        hardBlockers.length > 0 ? `【法医审计硬伤 - 不得忽略】\n${hardBlockers.join('\n')}` : '',
+        attempt > 1 ? `【格式重试】${error}。压缩理由并返回完整 JSON。` : ''
+      ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
 
   return {
     goalMatchScore: config.goalDescription.trim() ? clampScore(parsed.goal_match_score) : 100,
@@ -327,6 +560,8 @@ export async function assessWholeStory(
     proseReadReason: proseRead.reason,
     weakestLayer: normalizeLayer(parsed.weakest_layer),
     weakChapterTitles: stringList(parsed.weak_chapter_titles, 4),
-    issues: [...stringList(parsed.issues, 10), ...proseRead.issues].slice(0, 12)
+    issues: [...hardBlockers, ...stringList(parsed.issues, 10), ...proseRead.issues].slice(0, 16),
+    hardBlockers,
+    forensicIssues
   }
 }

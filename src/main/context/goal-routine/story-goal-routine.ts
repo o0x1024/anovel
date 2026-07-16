@@ -17,7 +17,14 @@
  */
 import { BrowserWindow, type WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO } from '../../db'
+import {
+  volumeChapterDAO,
+  goalRoutineDAO,
+  coreSettingDAO,
+  workDAO,
+  appPreferenceDAO,
+  storyHarnessDAO
+} from '../../db'
 import { modelService } from '../../model'
 import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
 import { buildWorkContext } from '../work-context'
@@ -50,7 +57,11 @@ import {
   type StoryGoalConfig,
   type GoalCheckResult
 } from './story-goal-checker'
-import { generateBeatBody, extractNarrativeMemoryAfterGeneration } from './story-goal-doer'
+import {
+  commitStoryBodyCandidate,
+  generateBeatBody,
+  extractNarrativeMemoryAfterGeneration
+} from './story-goal-doer'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { parseStoryQualityAiScoreBreakdown } from '../../../shared/story-quality-score'
 import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
@@ -82,16 +93,57 @@ import { clearChapterNarrativeMemory } from '../memory-cleanup'
 import { recordTasteChoice } from '../taste-profile'
 import { bodyWordCountBounds } from '../../../shared/body-word-target'
 import { ensureStoryEngine } from './story-engine-gate'
+import { ensureStoryContract, formatStoryContractForPrompt, getStoryContract } from './story-contract'
 import { EMOTION_CONTRACT_JSON_SHAPE, ensureEmotionEngine } from './emotion-engine'
 import {
   EMOTION_CONTRACT_ENUM_RULE,
   validateEmotionContract,
   type EmotionBlindAssessment
 } from '../../../shared/emotion-contract'
-import { assessChapterEmotion, emotionRepairHint, EMOTION_GATE_MIN_SCORE } from './emotion-gate'
+import {
+  assessChapterEmotion,
+  emotionRepairHint,
+  ensureChapterEmotionOutcome,
+  EMOTION_GATE_MIN_SCORE
+} from './emotion-gate'
 import { formatGenrePolicy, resolveStoryGenrePolicy, tensionCurveForBeat, validateTensionPlans } from './story-genre-policy'
 import { resetFailedStoryStructure } from './story-structure-reset'
+import { routeStoryForensicRepair } from './story-forensic-repair'
+import type { StoryForensicIssue } from './story-whole-evaluator'
+import {
+  BEAT_CONTRACT_MAX_TOKENS,
+  BEAT_SKELETON_MAX_TOKENS,
+  BEAT_STAGE_MAX_ATTEMPTS,
+  beatGateRecoveryForFailureCount,
+  type BeatGateRecovery,
+  compactBeatSkeletons,
+  exactStageCountError,
+  mergeStagedBeat,
+  mergeStoryBlueprintDiagnosis,
+  storyBeatStageKey
+} from './story-beat-staging'
 import { retentionEvaluationRules, retentionPackagingRules, retentionPlanningRules } from './reader-retention'
+import { validateStoryContinuityContracts } from '../../../shared/story-hard-guards'
+import {
+  routeStoryContinuityEscalation,
+  type StoryContinuityEscalationRoute
+} from './story-continuity-escalation'
+import type { StoryContinuityRepairEvent } from './story-goal-doer'
+import {
+  STRUCTURAL_REPAIR_MAX_ATTEMPTS,
+  STORY_ROUTINE_FAILURE_LIMIT,
+  StructuralRepairError,
+  classifyStructuralRepairParseFailure,
+  routineFailureSignature,
+  structuralRepairTokenBudget
+} from './story-structural-repair-policy'
+import { GoalPhaseExhaustedError } from './goal-phase-error'
+import {
+  resolveStoryModelCapability,
+  stableStoryHash,
+  STORY_HARNESS_MAX_TURNS,
+  canStartStoryFallbackEpoch
+} from '../../../shared/story-harness'
 
 export type Phase = GoalRoutinePhase
 
@@ -111,17 +163,44 @@ interface RepairPlan {
   targetWordCounts?: Record<number, number>
   hint: string
   issues?: string[]
+  forensicIssues?: StoryForensicIssue[]
+  forensicFingerprint?: string
+  continuityEscalation?: boolean
 }
 
 interface RoutineRuntimeState {
   lastCheck?: GoalCheckResult
   repairPlan?: RepairPlan
   overallRepairRounds?: number
+  wholeAuditCount?: number
   lastCheckComposite?: number
   lastCheckSignature?: string
   stagnantChecks?: number
   structuralResetCount?: number
   structuralFeedback?: string
+  forceBeatRebuild?: boolean
+  beatGateFailureCount?: number
+  pendingMemoryChapterIds?: number[]
+  memoryCompensationAttempts?: Record<string, number>
+  automationEpoch?: number
+  forensicRepairStall?: { fingerprint: string; count: number }
+  continuityRepairFailure?: {
+    chapterId: number
+    blockers: string[]
+    attempts: number
+    fingerprint?: string
+    escalationCount?: number
+    updatedAt: string
+  }
+  continuityPendingRepair?: RepairPlan
+  executionFailure?: {
+    phase: Phase
+    signature: string
+    count: number
+    message: string
+    updatedAt: string
+  }
+  terminalReason?: 'needs_manual_editor'
   titleHookCandidates?: TitleHookCandidate[]
   titleHookPreferredIndex?: number
   liveProgress?: {
@@ -136,6 +215,14 @@ interface RoutineRuntimeState {
     score: number
     issues: string[]
     chapters: ParsedChapter[]
+    updatedAt: string
+  }
+  beatGenerationStage?: {
+    key: string
+    round: number
+    gateFeedback: string
+    skeletons: ParsedChapter[]
+    enriched: ParsedChapter[]
     updatedAt: string
   }
   evaluationHistory?: Array<{
@@ -192,6 +279,10 @@ const STORY_SETTING_PROMPTS: Record<(typeof STORY_SETTING_TYPES)[number], string
 const activeLoops = new Map<number, AbortController>()
 const MAX_STAGNANT_CHECKS = 2
 const MAX_BEAT_GENERATION_ROUNDS = 4
+const MAX_INCUBATOR_GATE_REPAIR_ROUNDS = 4
+const CHARACTER_CARD_FORMAT_ATTEMPTS = 2
+const OVERALL_CHECK_FORMAT_ATTEMPTS = 2
+const MAX_OVERALL_SETTING_REPAIR_ROUNDS = 3
 
 function readRuntimeState(workId: number): RoutineRuntimeState {
   const raw = goalRoutineDAO.getByWork(workId)?.state_json
@@ -210,6 +301,44 @@ function patchRuntimeState(workId: number, patch: Partial<RoutineRuntimeState>):
   const next = { ...readRuntimeState(workId), ...patch }
   goalRoutineDAO.update(workId, { state_json: JSON.stringify(next) })
   return next
+}
+
+async function compensatePendingStoryMemory(workId: number, signal?: AbortSignal): Promise<void> {
+  const runtime = readRuntimeState(workId)
+  const pending = [...new Set(runtime.pendingMemoryChapterIds ?? [])]
+  const chapterId = pending[0]
+  if (chapterId == null) return
+  if (signal?.aborted) throw new Error('已取消')
+  const attempts = { ...(runtime.memoryCompensationAttempts ?? {}) }
+  const key = String(chapterId)
+  if ((attempts[key] ?? 0) >= 2) {
+    patchRuntimeState(workId, {
+      pendingMemoryChapterIds: pending.filter(id => id !== chapterId),
+      memoryCompensationAttempts: attempts
+    })
+    return
+  }
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  if (!chapter?.content?.trim()) {
+    patchRuntimeState(workId, { pendingMemoryChapterIds: pending.filter(id => id !== chapterId) })
+    return
+  }
+  try {
+    await extractNarrativeMemoryAfterGeneration(workId, chapterId, chapter.content, signal)
+    delete attempts[key]
+    patchRuntimeState(workId, {
+      pendingMemoryChapterIds: pending.filter(id => id !== chapterId),
+      memoryCompensationAttempts: attempts
+    })
+    appLogger.info('goal_routine', '短故事叙事记忆旁路补偿成功', { workId, chapterId })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    attempts[key] = (attempts[key] ?? 0) + 1
+    patchRuntimeState(workId, { pendingMemoryChapterIds: pending, memoryCompensationAttempts: attempts })
+    appLogger.warn('goal_routine', '短故事叙事记忆旁路补偿未通过，不回滚正文', {
+      workId, chapterId, attempts: attempts[key], error: error instanceof Error ? error.message : String(error)
+    })
+  }
 }
 
 export function isGoalLoopRunning(workId: number): boolean {
@@ -473,11 +602,21 @@ export async function runStorylineGate(
 
     lastReason = formatGateFailureReasons(gate)
 
+    if (repairRounds >= MAX_INCUBATOR_GATE_REPAIR_ROUNDS) {
+      throw new GoalPhaseExhaustedError(
+        `孵化门禁连续 ${MAX_INCUBATOR_GATE_REPAIR_ROUNDS} 轮修复仍未收敛：${lastReason}`
+      )
+    }
+
     onProgress?.(`AI 门禁未通过，正在自动修复主线槽位（第 ${repairRounds + 1} 轮，达标前持续修复）`)
+    const beforeFingerprint = stableStoryHash(slotContext(workId))
     const fix = await runGateFix(workId, gate, { sessionTitle: '目标循环门禁自动修复' }, getGoalLoopModelOpts(workId))
     assertNotAborted(signal)
     if (fix.error || fix.applied <= 0) {
       throw new Error(`孵化门禁自动修复失败：${fix.error || '未应用任何槽位修复'}；门禁问题：${lastReason}`)
+    }
+    if (stableStoryHash(slotContext(workId)) === beforeFingerprint) {
+      throw new GoalPhaseExhaustedError(`孵化门禁报告已应用修复但槽位内容没有变化；门禁问题：${lastReason}`)
     }
     repairRounds++
     const labels = fix.slotKeys.map(k => getIncubatorSlotLabel(k, 'story')).join('、')
@@ -505,29 +644,49 @@ async function generateCharacterCards(
 ): Promise<number> {
   assertNotAborted(signal)
   const ctx = buildWorkContext(workId, { includeCoreSettings: true, includeIdea: true })
-  const prompt = [
+  const basePrompt = [
     ctx.text || '（请先填写故事方向）',
     goal.trim() ? `## 用户创作目标\n${goal.trim()}` : ''
   ].filter(Boolean).join('\n\n')
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      prompt,
-      systemPrompt: CHARACTER_CARDS_AI_PROMPT,
-      workId,
-      step: 'character_cards_generate',
-      enrichWorkContext: false
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(res.error || '主角人设卡片生成失败')
-  const parsed = parseCharacterCardsFromAi(res.content)
-  if (parsed.length === 0) throw new Error('AI 返回成功，但未能解析人设卡片')
-  const sanitized = sanitizeCharacterCards(parsed)
-  const validation = validateCharacterCards(sanitized.cards)
-  if (!validation.valid) throw new Error(`人设卡片未通过结构校验：${validation.errors[0] ?? '未知错误'}`)
-  const cards = sanitized.cards.filter(c => c.role === 'protagonist')
-  saveCharacterCards(workId, cards.length > 0 ? cards : sanitized.cards)
-  return cards.length > 0 ? cards.length : sanitized.cards.length
+  let lastError = '未知错误'
+  for (let attempt = 1; attempt <= CHARACTER_CARD_FORMAT_ATTEMPTS; attempt++) {
+    const res = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        prompt: [
+          basePrompt,
+          attempt > 1 ? `【上一轮无效】${lastError}。重新输出完整且更短的人设卡结构，不要解释。` : ''
+        ].filter(Boolean).join('\n\n'),
+        systemPrompt: CHARACTER_CARDS_AI_PROMPT,
+        workId,
+        step: 'character_cards_generate',
+        enrichWorkContext: false
+      }),
+      { stream: false, signal }
+    )
+    if (!res.success || !res.content?.trim()) {
+      lastError = res.error || '主角人设卡片生成无返回'
+      continue
+    }
+    if (res.finishReason === 'length') {
+      lastError = '人设卡输出达到长度上限'
+      continue
+    }
+    const parsed = parseCharacterCardsFromAi(res.content)
+    if (parsed.length === 0) {
+      lastError = 'AI 返回成功，但未能解析人设卡片'
+      continue
+    }
+    const sanitized = sanitizeCharacterCards(parsed)
+    const validation = validateCharacterCards(sanitized.cards)
+    if (!validation.valid) {
+      lastError = `人设卡片未通过结构校验：${validation.errors[0] ?? '未知错误'}`
+      continue
+    }
+    const cards = sanitized.cards.filter(c => c.role === 'protagonist')
+    saveCharacterCards(workId, cards.length > 0 ? cards : sanitized.cards)
+    return cards.length > 0 ? cards.length : sanitized.cards.length
+  }
+  throw new Error(`主角人设卡连续 ${CHARACTER_CARD_FORMAT_ATTEMPTS} 次无效：${lastError}`)
 }
 
 function buildTitleHookPrompt(workId: number, goal: string): string {
@@ -579,39 +738,129 @@ function applyTitleHook(workId: number, picked: TitleHookCandidate): void {
   })
 }
 
+const TITLE_HOOK_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['candidates'],
+  properties: {
+    candidates: {
+      type: 'array', minItems: 5, maxItems: 5,
+      items: {
+        type: 'object',
+        required: ['title', 'hook', 'type', 'summary', 'tags'],
+        properties: {
+          title: { type: 'string' }, hook: { type: 'string' }, type: { type: 'string' }, summary: { type: 'string' },
+          tags: { type: 'object' }
+        }
+      }
+    }
+  }
+}
+const TITLE_HOOK_GATE_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['valid_indices', 'issues'],
+  properties: {
+    valid_indices: { type: 'array', items: { type: 'integer' } },
+    issues: { type: 'array', items: { type: 'string' } }
+  }
+}
+
 async function generateTitleHook(
   workId: number,
   goal: string,
   signal?: AbortSignal
 ): Promise<{ preferred: TitleHookCandidate; preferredIndex: number; candidates: TitleHookCandidate[] }> {
   assertNotAborted(signal)
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      prompt: buildTitleHookPrompt(workId, goal),
-      systemPrompt: [
-        '你是番茄短故事的顶流爆款编辑，深谙爆款流量密码。',
-        '基于大纲孵化设定、节拍大纲和创作目标，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的短故事书名与导语组合。',
-        '书名必须强网感、直击人性弱点、带爽感/反差/悬念/场景刺激。',
-        '导语是放在全篇正文最开头、独立于编号节拍之外的"钩子段落"，交待核心故事、留住用户。',
-        '导语 150-300 字，前三句建立明确冲突或异常；叙事视角服从用户目标与正文设定，未指定时优先第一人称；结尾留下具体追问。',
-        '导语是独立于正文节拍之外的开篇钩子，发布时置于第一节拍之前。须用最具冲击力的场景直切核心冲突，让读者3秒内被抓住，产生强烈的追读冲动。',
-        '导语必须是一个完整的场景片段（包含对话、动作/心声等形式），而非概括性介绍；读者读完导语就要产生"然后呢"的强烈冲动。',
-        retentionPackagingRules('story'),
-        storyHotWordPromptSection(),
-        storyCategoryPromptSection(),
-        '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评","tags":{"main_category":"主分类","plot":["情节分类"],"character":["角色分类"],"emotion":["情绪分类"],"setting":["背景分类"]}}]}'
-      ].join('\n'),
-      workId,
-      step: 'story_title_hook_gen',
-      enrichWorkContext: false
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(res.error || '爆款书名导语生成失败')
-  const candidates = parseTitleHookCandidates(res.content)
-  if (candidates.length === 0) throw new Error('AI 返回成功，但未能解析书名导语候选')
-  const picked = await selectPreferredTitleHook(workId, goal, candidates, signal)
-  return { preferred: picked, preferredIndex: Math.max(0, candidates.indexOf(picked)), candidates }
+  let lastIssue = ''
+  for (let round = 1; round <= 3; round++) {
+    const res = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        prompt: [buildTitleHookPrompt(workId, goal), lastIssue ? `【上一轮硬伤】${lastIssue}` : ''].filter(Boolean).join('\n\n'),
+        systemPrompt: [
+          '你是番茄短故事的顶流爆款编辑，深谙爆款流量密码。',
+          '基于大纲孵化设定、节拍大纲和创作目标，生成 5 个能瞬间抓住读者眼球、让其产生极强追读冲动的短故事书名与导语组合。',
+          '书名必须强网感、直击人性弱点、带爽感/反差/悬念/场景刺激。',
+          '导语是放在全篇正文最开头、独立于编号节拍之外的钩子场景，不是剧情摘要。',
+          '导语 150-300 字，前三句建立明确冲突或异常；叙事视角服从用户目标与正文设定，未指定时优先第一人称；结尾留下具体追问。',
+          '导语必须包含当下动作、对话或感官细节，展示一张牌但至少隐藏两张核心牌。',
+          '禁止按时间顺序概括全篇；禁止罗列完整计划、全部证据、所有帮手和高潮解法；禁止提前宣布反派如何失败。',
+          '禁止“从A到B再到C，每一步都在我的计划里”式总结。读者应知道冲突和异常应对，但不知道终局答案。',
+          retentionPackagingRules('story'),
+          storyHotWordPromptSection(),
+          storyCategoryPromptSection(),
+          '必须且只能输出合法 JSON：{"candidates":[{"title":"书名","hook":"导语正文","type":"类型","summary":"一句点评","tags":{"main_category":"主分类","plot":["情节分类"],"character":["角色分类"],"emotion":["情绪分类"],"setting":["背景分类"]}}]}'
+        ].join('\n'),
+        workId,
+        step: 'story_title_hook_gen',
+        enrichWorkContext: false,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_title_hook_candidates', schema: TITLE_HOOK_RESPONSE_SCHEMA, strict: false }
+      }),
+      { stream: false, signal }
+    )
+    if (!res.success || !res.content?.trim()) {
+      lastIssue = res.error || '爆款书名导语生成无返回'
+      continue
+    }
+    if (res.finishReason === 'length') {
+      lastIssue = '书名导语候选输出达到长度上限，请压缩每条导语后重新生成完整 JSON'
+      continue
+    }
+    let candidates: TitleHookCandidate[] = []
+    try {
+      candidates = parseTitleHookCandidates(res.content)
+    } catch (error) {
+      lastIssue = `候选 JSON 格式无效：${error instanceof Error ? error.message : String(error)}`
+      continue
+    }
+    if (candidates.length === 0) {
+      lastIssue = '未返回可解析候选'
+      continue
+    }
+    const gate = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_title_hook_gate',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1000,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_title_hook_gate', schema: TITLE_HOOK_GATE_RESPONSE_SCHEMA, strict: false },
+        systemPrompt: [
+          '你是短故事导语防剧透门禁。逐项判断是否为具体钩子场景，而非全篇摘要。',
+          '若导语罗列完整计划、全部证据/帮手、高潮解法、反派最终下场，或只用概括句交代故事，必须淘汰。',
+          '只输出 JSON：{"valid_indices":[0],"issues":["候选1泄露..."]}'
+        ].join('\n'),
+        prompt: `${formatStoryContractForPrompt(workId)}\n\n【候选】\n${JSON.stringify(candidates.map((candidate, index) => ({ index, title: candidate.title, hook: candidate.hook })), null, 2)}`
+      }),
+      { stream: false, signal }
+    )
+    if (!gate.success || !gate.content?.trim()) {
+      lastIssue = gate.error || '导语门禁无返回'
+      continue
+    }
+    if (gate.finishReason === 'length') {
+      lastIssue = '导语防剧透门禁输出被截断'
+      continue
+    }
+    try {
+      const json = extractJsonText(gate.content.trim()) ?? gate.content.trim()
+      const parsed = JSON.parse(json) as { valid_indices?: unknown; issues?: unknown }
+      const validIndices = Array.isArray(parsed.valid_indices)
+        ? parsed.valid_indices.map(Number).filter(index => Number.isInteger(index) && index >= 0 && index < candidates.length)
+        : []
+      const valid = validIndices.map(index => candidates[index])
+      if (valid.length === 0) {
+        lastIssue = Array.isArray(parsed.issues) ? parsed.issues.join('；') : '全部候选泄露终局或属于剧情摘要'
+        continue
+      }
+      const picked = await selectPreferredTitleHook(workId, goal, valid, signal)
+      return { preferred: picked, preferredIndex: Math.max(0, valid.indexOf(picked)), candidates: valid }
+    } catch {
+      lastIssue = '导语门禁返回格式无效'
+    }
+  }
+  throw new GoalPhaseExhaustedError(`书名导语连续3轮未通过防剧透门禁：${lastIssue}`)
 }
 
 export function applyGoalTitleHookSelection(workId: number, candidateIndex: number): TitleHookCandidate {
@@ -658,21 +907,40 @@ async function runOverallSelfCheck(
   assertNotAborted(signal)
   const prompt = buildSettingsQualityInput(workId)
   if (!prompt.replace(/（尚未设定）|（无活跃锚点）/g, '').trim()) throw new Error('请先填写故事方向或核心设定后再运行自检')
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      prompt,
-      systemPrompt: STORY_OVERALL_CHECK_SYSTEM_PROMPT,
-      workId,
-      step: 'settings_overall_check',
-      enrichWorkContext: false
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(res.error || '整体自检失败')
-  recordQualityCheck(workId, {
-    overall: { report: res.content, checkedAt: new Date().toISOString() }
-  })
-  return { report: res.content, conclusion: parseQualityConclusion(res.content) }
+  let lastError = '整体自检未返回可解析结论'
+  for (let attempt = 1; attempt <= OVERALL_CHECK_FORMAT_ATTEMPTS; attempt++) {
+    const res = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        prompt: [
+          prompt,
+          attempt > 1 ? `【格式重试】${lastError}。保留审查结论，但必须按要求给出可解析的最终结论字段。` : ''
+        ].filter(Boolean).join('\n\n'),
+        systemPrompt: STORY_OVERALL_CHECK_SYSTEM_PROMPT,
+        workId,
+        step: 'settings_overall_check',
+        enrichWorkContext: false
+      }),
+      { stream: false, signal }
+    )
+    if (!res.success || !res.content?.trim()) {
+      lastError = res.error || '整体自检无返回'
+      continue
+    }
+    if (res.finishReason === 'length') {
+      lastError = '整体自检输出达到长度上限'
+      continue
+    }
+    const conclusion = parseQualityConclusion(res.content)
+    if (!conclusion) {
+      lastError = '整体自检缺少可解析的 verdict、overallScore 或 blockingCount'
+      continue
+    }
+    recordQualityCheck(workId, {
+      overall: { report: res.content, checkedAt: new Date().toISOString() }
+    })
+    return { report: res.content, conclusion }
+  }
+  throw new Error(`整体自检连续 ${OVERALL_CHECK_FORMAT_ATTEMPTS} 次评估器输出无效：${lastError}`)
 }
 
 async function repairSettingsFromOverallCheck(
@@ -763,6 +1031,12 @@ function buildBeatBatchSystemPrompt(wordsPerChapter: number, genreText: string, 
     '- dramatic_contract.irreversible_change：本拍结束后局面发生的不可逆变化，这是防流水账的核心字段。',
     '- dramatic_contract.payoff_or_debt：本拍兑现了什么爽点，或欠下什么更大的情绪债。',
     '- dramatic_contract.next_question：读者结尾最想立刻知道的问题，必须与 next_hook 一致。',
+    '【跨拍连续性合同 - 硬约束】',
+    '- 每拍必须输出 continuity_contract，明确时间、起止地点、入场/离场事实、人物新获信息、证据或道具状态变化。',
+    '- 第二拍起 elapsed_from_previous 必须明确；上一拍 exit_facts 必须能与下一拍 entry_facts 无矛盾衔接，已经发生的关键事件不得换个说法再次发生。',
+    '- 中段节拍必须写 opponent_action、opponent_reasoning、damage_to_protagonist、protagonist_adjustment；对手必须造成真实损害，主角必须因此调整计划。',
+    '- recap_forbidden 列出读者已经知道、正文不得再次完整复述的信息。',
+    '- 最后一拍必须回收全篇故事合同的 must_resolve，不得引入 forbidden_final_threads；next_question 可以为空，余味不能变成新主线。',
     '【每拍情绪契约 - 读者状态变化硬约束】',
     '- emotion_contract 不是情绪标签，必须形成“依恋依据→触发→人物评价→表里冲突→选择与代价→读者推断→余波”。',
     '- 每拍必须区分人物真实感受、愿意承认、对外表现和压抑内容；四项不得写成同义句。',
@@ -772,12 +1046,106 @@ function buildBeatBatchSystemPrompt(wordsPerChapter: number, genreText: string, 
     '【输出格式 - 必须严格遵守】',
     '只输出一个 JSON 对象；禁止 Markdown 标题、前置说明、思考过程，以及 ``` 代码块围栏。',
     'chapters 数组每一项为一个节拍（请勿输出"第X章"或"节拍X"字样，直接写节拍剧情标题即可）。',
-    `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、dramatic_contract、tension_plan、emotion_contract、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。`,
+    `每章字段：title、plot_points（${oc.pointsMin}-${oc.pointsMax} 条情节节点数组）、dramatic_contract、continuity_contract、tension_plan、emotion_contract、beat_role、foreshadow_target、next_hook、characters（本章出场角色名数组）。`,
     'beat_role: A(爽点释放)/B(推进冲突)/C(反转铺垫)，禁止使用 transition',
     `【长度】每项 plot_points 合计 ${oc.charsMin}-${oc.charsMax} 字梗概（每节拍目标 ${wordsPerChapter} 字正文），禁止正文级长文。`,
     `emotion_contract 格式：${JSON.stringify(EMOTION_CONTRACT_JSON_SHAPE)}`,
-    `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"dramatic_contract":{"scene_promise":"...","protagonist_want":"...","obstacle":"...","stakes":"...","info_gap":"...","pressure_escalation":"...","turn":"...","irreversible_change":"...","payoff_or_debt":"...","next_question":"..."},"tension_plan":{"phase":"蓄力与受阻","level":6,"payoff_type":"debt"},"emotion_contract":${JSON.stringify(EMOTION_CONTRACT_JSON_SHAPE)},"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}`
+    `格式：{"chapters":[{"title":"节拍剧情标题","plot_points":["节点1","节点2","节点3"],"dramatic_contract":{"scene_promise":"...","protagonist_want":"...","obstacle":"...","stakes":"...","info_gap":"...","pressure_escalation":"...","turn":"...","irreversible_change":"...","payoff_or_debt":"...","next_question":"..."},"continuity_contract":{"time_anchor":"...","elapsed_from_previous":"...","start_location":"...","end_location":"...","entry_facts":["..."],"exit_facts":["..."],"knowledge_changes":["..."],"evidence_changes":["..."],"opponent_action":"...","opponent_reasoning":"...","damage_to_protagonist":"...","protagonist_adjustment":"...","recap_forbidden":["..."]},"tension_plan":{"phase":"蓄力与受阻","level":6,"payoff_type":"debt"},"emotion_contract":${JSON.stringify(EMOTION_CONTRACT_JSON_SHAPE)},"beat_role":"B","foreshadow_target":"...","next_hook":"...","characters":["角色A","角色B"]}]}`
   ].join('\n')
+}
+
+const BEAT_STAGE_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  required: ['chapters'],
+  properties: {
+    chapters: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['title', 'plot_points'],
+        properties: {
+          title: { type: 'string' },
+          plot_points: { type: 'array', items: { type: 'string' } }
+        },
+        additionalProperties: true
+      }
+    }
+  },
+  additionalProperties: false
+}
+
+/**
+ * 第一阶段只决定全篇事件链，避免模型在同一次请求里为所有节拍展开几十个合同字段。
+ */
+function buildBeatSkeletonSystemPrompt(wordsPerChapter: number, genreText: string, beatCount: number): string {
+  const oc = outlineConstraintsForWordTarget(wordsPerChapter)
+  const policy = resolveStoryGenrePolicy(genreText)
+  const curve = Array.from({ length: beatCount }, (_, index) => {
+    const point = tensionCurveForBeat(index + 1, beatCount)
+    return `- 第${index + 1}拍：${point.phase}，张力 ${point.min}-${point.max}`
+  }).join('\n')
+  return [
+    '你是短故事节拍架构师。本阶段只生成全篇事件骨架，不生成正文，也不生成任何 contract 字段。',
+    `必须恰好输出 ${beatCount} 个连续节拍；每拍都要改变关系、认知、风险、证据或权力状态。`,
+    '第一拍直接进入核心冲突；中段必须出现对手有效反制并造成真实损害；最后一拍完成核心冲突和承诺回收。',
+    '相邻节拍必须因果相接，已经发生的关键事件不得换个说法重复发生。',
+    formatGenrePolicy(policy, 'beatRules'),
+    retentionPlanningRules('story'),
+    `【张力曲线】\n${curve}`,
+    `每拍 plot_points 必须为 ${oc.pointsMin}-${oc.pointsMax} 条，总计 ${oc.charsMin}-${oc.charsMax} 字。`,
+    '只输出合法 JSON，不要 Markdown、说明或思考过程。',
+    '只允许以下字段：title、plot_points、beat_role、foreshadow_target、next_hook、characters。',
+    '格式：{"chapters":[{"title":"冲突场景标题","plot_points":["事件节点1","事件节点2","事件节点3"],"beat_role":"B","foreshadow_target":"伏笔或回收目标","next_hook":"下一拍具体问题","characters":["角色A"]}]}'
+  ].join('\n')
+}
+
+async function generateBeatStage(
+  workId: number,
+  volumeId: number,
+  request: { prompt: string; systemPrompt: string; maxTokens: number },
+  label: string,
+  signal?: AbortSignal,
+  validate?: (chapters: ParsedChapter[]) => string | null
+): Promise<ParsedChapter[]> {
+  let lastError = ''
+  for (let attempt = 1; attempt <= BEAT_STAGE_MAX_ATTEMPTS; attempt++) {
+    assertNotAborted(signal)
+    const response = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        prompt: [
+          request.prompt,
+          lastError ? `【上一请求失败】${lastError}\n请缩短表达并重新输出完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n'),
+        systemPrompt: request.systemPrompt,
+        step: 'volume_chapters_batch',
+        workId,
+        volumeId,
+        maxTokens: request.maxTokens,
+        responseSchema: {
+          name: label.includes('骨架') ? 'story_beat_skeletons' : 'story_beat_contract',
+          schema: BEAT_STAGE_RESPONSE_SCHEMA,
+          strict: false
+        },
+        // basePrompt 已包含冻结故事合同；禁止再次灌入整套核心设定和分卷，避免重复上下文。
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false
+      }),
+      { stream: false, signal }
+    )
+    if (response.success && response.content?.trim()) {
+      const parsed = parseChapterSuggestions(response.content.trim())
+      if (parsed.length > 0) {
+        const validationError = validate?.(parsed) ?? null
+        if (!validationError) return parsed
+        lastError = validationError
+      } else {
+        lastError = `${label}返回 JSON 无法解析`
+      }
+    } else {
+      lastError = response.error || `${label}模型未返回内容`
+    }
+  }
+  throw new Error(`${label}连续 ${BEAT_STAGE_MAX_ATTEMPTS} 次失败：${lastError}`)
 }
 
 interface BeatGateResult {
@@ -855,7 +1223,8 @@ function buildBeatGatePrompt(goalDescription: string, chapters: ParsedChapter[])
       characters: chapter.characters,
       dramatic_contract: chapter.dramatic_contract,
       tension_plan: chapter.tension_plan,
-      emotion_contract: chapter.emotion_contract
+      emotion_contract: chapter.emotion_contract,
+      continuity_contract: chapter.continuity_contract
     })), null, 2)
   ].filter(Boolean).join('\n\n')
 }
@@ -868,15 +1237,16 @@ async function runBeatGate(
 ): Promise<BeatGateResult> {
   assertNotAborted(signal)
   const tensionIssues = validateTensionPlans(chapters)
+  const continuityIssues = validateStoryContinuityContracts(chapters)
   const emotionIssues = chapters.flatMap((chapter, index) => chapter.emotion_contract
     ? validateEmotionContract(chapter.emotion_contract).map(issue => `第${index + 1}拍${issue}`)
     : [`第${index + 1}拍缺少 emotion_contract`])
-  if (tensionIssues.length > 0 || emotionIssues.length > 0) {
+  if (tensionIssues.length > 0 || emotionIssues.length > 0 || continuityIssues.length > 0) {
     return {
       passed: false,
       score: 60,
-      blockingIssues: [...tensionIssues, ...emotionIssues],
-      suggestions: ['按全篇张力曲线重分 tension_plan，并为每拍重建完整情绪因果契约']
+      blockingIssues: [...tensionIssues, ...emotionIssues, ...continuityIssues],
+      suggestions: ['按全篇张力曲线重分 tension_plan，并为每拍重建完整情绪因果与跨拍连续性合同']
     }
   }
   const res = await modelService.chat(
@@ -887,13 +1257,16 @@ async function runBeatGate(
         '只输出合法 JSON，不要输出 markdown、解释或代码块。',
         '',
         '【硬性通过条件】',
-        '1. 每拍都必须有完整 dramatic_contract，尤其是 protagonist_want、obstacle、stakes、pressure_escalation、turn、irreversible_change、next_question。',
+        '1. 每拍都必须有完整 dramatic_contract，尤其是 protagonist_want、obstacle、stakes、pressure_escalation、turn、irreversible_change；仅最终拍允许 next_question 为空。',
         '2. 每拍必须是一场有目标、阻力、选择和后果的戏，不能只是事件顺序、设定解释、地点移动或背景补充。',
-        '3. 每拍结尾必须让局面发生不可逆变化，且 next_question/next_hook 能驱动读者继续看。',
+        '3. 每拍结尾必须让局面发生不可逆变化；非最终拍的 next_question/next_hook 必须驱动追读，最终拍必须闭环且不得强行续钩子。',
         '4. 全篇节拍之间必须形成压力递增和因果推进，不能每拍相互独立。',
         '5. 第一拍必须直接切入极端冲突，不能慢热铺垫。',
         '6. 每拍必须有 tension_plan；全篇必须存在蓄力、部分兑现、高潮兑现和余味，禁止所有拍都标成高潮。',
         '7. 每拍必须有完整 emotion_contract；读者依恋、事件意义、人物表里冲突、有代价选择和下一拍余波缺一不可。',
+        '8. 每拍必须有完整 continuity_contract；逐拍核对时间、地点、已完成事件、人物知识和证据状态，相邻拍存在矛盾即 blocking issue。',
+        '9. 中段必须有基于对手已知信息的有效反制，并实际破坏主角计划；只有挑衅、自曝、下跪或等待主角公布证据不算反制。',
+        '10. 最终拍必须完成核心冲突和承诺回收，不得突然引入新反派、新任务或续集钩子。',
         retentionEvaluationRules('story'),
         '',
         '【评分】',
@@ -935,41 +1308,76 @@ function formatBeatGateFeedback(gate: BeatGateResult): string {
 async function generateBeatCandidatesWithGate(
   workId: number,
   volumeId: number,
-  systemPrompt: string,
+  skeletonSystemPrompt: string,
+  contractSystemPrompt: string,
   basePrompt: string,
   goalDescription: string,
+  beatCount: number,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<{ chapters: ParsedChapter[]; gate: BeatGateResult; rounds: number; degraded: boolean }> {
-  let gateFeedback = ''
+  const stageKey = storyBeatStageKey(basePrompt, beatCount)
+  const storedStage = readRuntimeState(workId).beatGenerationStage
+  const resumableStage = storedStage?.key === stageKey && storedStage.skeletons.length === beatCount
+    ? storedStage
+    : undefined
+  let gateFeedback = resumableStage?.gateFeedback ?? ''
   let best: { chapters: ParsedChapter[]; gate: BeatGateResult; round: number } | null = null
 
-  for (let round = 1; round <= MAX_BEAT_GENERATION_ROUNDS; round++) {
+  for (let round = resumableStage?.round ?? 1; round <= MAX_BEAT_GENERATION_ROUNDS; round++) {
     assertNotAborted(signal)
-    onProgress?.(`正在生成节拍大纲（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`)
+    const isResume = resumableStage?.round === round
+    onProgress?.(isResume
+      ? `正在恢复节拍契约补全（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`
+      : `正在生成节拍骨架（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`)
     const prompt = [
       basePrompt,
       gateFeedback ? `【上一轮门禁反馈 - 必须全部修复】\n${gateFeedback}` : ''
     ].filter(Boolean).join('\n\n')
 
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        prompt,
-        systemPrompt,
-        step: 'volume_chapters_batch',
-        workId,
-        volumeId,
-        workContextOptions: { includeVolumes: true }
-      }),
-      { stream: false, signal }
-    )
+    const skeletons = isResume
+      ? resumableStage.skeletons
+      : await generateBeatStage(workId, volumeId, {
+          prompt,
+          systemPrompt: skeletonSystemPrompt,
+          maxTokens: BEAT_SKELETON_MAX_TOKENS
+        }, '节拍骨架', signal, chapters => exactStageCountError(chapters.length, beatCount, '节拍骨架'))
 
-    if (!response.success || !response.content?.trim()) {
-      throw new Error(response.error || '节拍生成失败')
+    const parsed: ParsedChapter[] = isResume ? [...resumableStage.enriched] : []
+    const compactSkeletons = compactBeatSkeletons(skeletons)
+    const contractContext = basePrompt.replace(/\n请输出完整 chapters 数组。?\s*$/, '')
+    if (!isResume) {
+      patchRuntimeState(workId, {
+        beatGenerationStage: {
+          key: stageKey, round, gateFeedback, skeletons, enriched: [], updatedAt: new Date().toISOString()
+        }
+      })
     }
-
-    const parsed = parseChapterSuggestions(response.content.trim())
-    if (parsed.length === 0) throw new Error('节拍解析为空')
+    for (let index = parsed.length; index < skeletons.length; index++) {
+      assertNotAborted(signal)
+      const skeleton = skeletons[index]
+      onProgress?.(`正在补全节拍契约 ${index + 1}/${skeletons.length}（第 ${round} 轮）`)
+      const candidates = await generateBeatStage(workId, volumeId, {
+        systemPrompt: [
+          contractSystemPrompt,
+          '本次只补全指定的一个节拍。必须沿用给定 title 和事件骨架，只输出包含一个元素的 chapters 数组。',
+          '不得扩写正文；所有文本字段用一句话完成。plot_points 只需将给定 plot_outline 压缩为 3-5 条。'
+        ].join('\n\n'),
+        prompt: [
+          contractContext,
+          `【全篇节拍骨架 - 只读】\n${JSON.stringify(compactSkeletons, null, 2)}`,
+          `【当前只补全第 ${index + 1} 拍】\n${JSON.stringify(compactSkeletons[index], null, 2)}`
+        ].join('\n\n'),
+        maxTokens: BEAT_CONTRACT_MAX_TOKENS
+      }, `第 ${index + 1} 拍契约补全`, signal,
+      chapters => exactStageCountError(chapters.length, 1, '单拍契约返回'))
+      parsed.push(mergeStagedBeat(skeleton, candidates[0]))
+      patchRuntimeState(workId, {
+        beatGenerationStage: {
+          key: stageKey, round, gateFeedback, skeletons, enriched: parsed, updatedAt: new Date().toISOString()
+        }
+      })
+    }
 
     onProgress?.(`正在运行节拍 AI 门禁（第 ${round} 轮，达标前持续重生）`)
     const gate = await runBeatGate(workId, goalDescription, parsed, signal)
@@ -989,20 +1397,20 @@ async function generateBeatCandidatesWithGate(
       })
     }
     if (gate.passed) {
-      patchRuntimeState(workId, { beatGenerationDraft: undefined })
+      patchRuntimeState(workId, { beatGenerationDraft: undefined, beatGenerationStage: undefined })
       onProgress?.(`节拍 AI 门禁通过（${gate.score}分，第 ${round} 轮）`)
       return { chapters: parsed, gate, rounds: round, degraded: false }
     }
 
     const issueSummary = gate.blockingIssues.slice(0, 2).join('；') || '未达到门禁标准'
     onProgress?.(`节拍门禁第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮未通过（${gate.score}分）：${issueSummary}`)
+    patchRuntimeState(workId, { beatGenerationStage: undefined })
     if (round === MAX_BEAT_GENERATION_ROUNDS) {
       const fallback = best ?? { chapters: parsed, gate, round }
       patchRuntimeState(workId, { beatGenerationDraft: undefined })
-      onProgress?.(
-        `节拍门禁 ${MAX_BEAT_GENERATION_ROUNDS} 轮未通过，自动采用最佳候选（第 ${fallback.round} 轮，${fallback.gate.score}分）并继续`
+      throw new Error(
+        `节拍门禁连续 ${MAX_BEAT_GENERATION_ROUNDS} 轮未通过，禁止降级进入正文；最佳候选 ${fallback.gate.score} 分：${fallback.gate.blockingIssues.join('；')}`
       )
-      return { ...fallback, rounds: round, degraded: true }
     }
     gateFeedback = formatBeatGateFeedback(gate)
   }
@@ -1016,9 +1424,14 @@ async function ensureBeats(
   goalDescription: string,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ created: number; error?: string; warning?: string }> {
+): Promise<{ created: number; error?: string; warning?: string; recovery?: BeatGateRecovery }> {
   const existing = volumeChapterDAO.listChaptersByWork(workId)
-  if (existing.some(c => c.content?.trim())) return { created: 0 }
+  const runtime = readRuntimeState(workId)
+  const forceBeatRebuild = runtime.forceBeatRebuild === true
+  if (!forceBeatRebuild && existing.some(c => c.content?.trim())) return { created: 0 }
+  if (!getStoryContract(workId)) {
+    await ensureStoryContract(workId, goalDescription, '', signal, onProgress)
+  }
 
   let volumes = volumeChapterDAO.listVolumes(workId)
   let volumeId = volumes[0]?.id
@@ -1029,17 +1442,19 @@ async function ensureBeats(
 
   const plan = loadWritingPlan(workId)
   const wpc = plan.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER
-  const suggestedCount = plan.targetChapters > 0
+  const configuredCount = plan.targetChapters > 0
     ? Math.max(1, Math.round(plan.targetChapters))
     : 5
+  const suggestedCount = forceBeatRebuild && existing.length > 0 ? existing.length : configuredCount
 
   const vol = volumes[0]
   const work = workDAO.getById(workId)
   const genreText = [work?.genre, work?.tags, goalDescription].filter(Boolean).join('\n')
-  const structuralFeedback = readRuntimeState(workId).structuralFeedback?.trim() ?? ''
+  const structuralFeedback = runtime.structuralFeedback?.trim() ?? ''
   onProgress?.(`正在生成节拍大纲（约 ${suggestedCount} 个节拍）`)
   const prompt = [
     `【短故事一镜到底】当前需要将其拆解为连续的情节节拍，共约 ${suggestedCount} 个节拍。`,
+    formatStoryContractForPrompt(workId),
     goalDescription.trim() ? `【短故事创作目标】${goalDescription.trim()}，请据此拆解节拍（题材/风格/情节走向须贴合目标）` : '',
     structuralFeedback ? `【上一版整篇失败反馈 - 本轮必须从结构上解决】\n${structuralFeedback}` : '',
     vol.description ? `主线说明：${vol.description}` : '',
@@ -1053,9 +1468,11 @@ async function ensureBeats(
     const gated = await generateBeatCandidatesWithGate(
       workId,
       volumeId,
+      buildBeatSkeletonSystemPrompt(wpc, genreText, suggestedCount),
       buildBeatBatchSystemPrompt(wpc, genreText, suggestedCount),
       prompt,
       goalDescription,
+      suggestedCount,
       signal,
       onProgress
     )
@@ -1065,7 +1482,21 @@ async function ensureBeats(
       gateWarning = `节拍门禁未达标，已自动采用最佳候选（${gated.gate.score}分）`
     }
   } catch (e) {
-    return { created: 0, error: e instanceof Error ? e.message : String(e) }
+    const error = e instanceof Error ? e.message : String(e)
+    if (/节拍门禁连续/.test(error)) {
+      const failureCount = (readRuntimeState(workId).beatGateFailureCount ?? 0) + 1
+      const recovery = beatGateRecoveryForFailureCount(failureCount)
+      const feedback = recovery === 'simplify'
+        ? [
+            error,
+            '【Harness 自动降复杂度】只保留一个核心冲突、一个倒计时、一个承重证据载体和最少必要人物。',
+            '每拍最多一次地点迁移和一次证据持有状态变化；最终拍只兑现核心冲突，不得新增人物、任务或续集钩子。'
+          ].join('\n')
+        : error
+      patchRuntimeState(workId, { beatGateFailureCount: failureCount, structuralFeedback: feedback })
+      return { created: 0, warning: error, recovery }
+    }
+    return { created: 0, error }
   }
 
   const items = parsed.map(p => ({
@@ -1076,12 +1507,26 @@ async function ensureBeats(
     next_hook: p.next_hook ?? null,
     characters: p.characters ?? null,
     emotion_contract_json: p.emotion_contract ? JSON.stringify(p.emotion_contract) : null,
-      outline_diagnosis: p.dramatic_contract || p.tension_plan
-        ? JSON.stringify({ dramatic_contract: p.dramatic_contract, tension_plan: p.tension_plan, emotion_contract: p.emotion_contract })
+      outline_diagnosis: p.dramatic_contract || p.continuity_contract || p.tension_plan
+        ? JSON.stringify({ dramatic_contract: p.dramatic_contract, continuity_contract: p.continuity_contract, tension_plan: p.tension_plan, emotion_contract: p.emotion_contract })
         : null
   }))
-  volumeChapterDAO.batchCreateChapters(volumeId, items, existing.length > 0 ? 'replace' : 'append')
-  if (structuralFeedback) patchRuntimeState(workId, { structuralFeedback: undefined })
+  if (forceBeatRebuild && existing.length === items.length) {
+    volumeChapterDAO.rewriteStoryBeatsPreservingVersions(existing.map((chapter, index) => ({
+      chapterId: chapter.id,
+      ...items[index]
+    })))
+    existing.forEach(chapter => clearChapterNarrativeMemory(workId, chapter.id))
+  } else {
+    volumeChapterDAO.batchCreateChapters(volumeId, items, existing.length > 0 ? 'replace' : 'append')
+  }
+  if (structuralFeedback || forceBeatRebuild) {
+    patchRuntimeState(workId, {
+      structuralFeedback: undefined,
+      forceBeatRebuild: undefined,
+      beatGateFailureCount: undefined
+    })
+  }
   onProgress?.(`已回填 ${items.length} 个节拍到节拍大纲（门禁 ${gateRounds} 轮）`)
   return { created: items.length, warning: gateWarning }
 }
@@ -1105,11 +1550,18 @@ function cleanupEmDashesAfterPassedGate(workId: number, mode: 'comma' | 'delete'
     if (count <= 0) continue
     const cleaned = stripEmDashes(content, mode)
     if (cleaned === content) continue
-    volumeChapterDAO.updateChapterWithVersion(ch.id, {
+    const candidateId = storyHarnessDAO.createCandidate({
+      workId,
+      chapterId: ch.id,
       content: cleaned,
-      word_count: cleaned.replace(/\s/g, '').length,
-      status: ch.status ?? 'completed'
+      wordCount: cleaned.replace(/\s/g, '').length,
+      baseContent: content,
+      sourceStep: 'deterministic_em_dash_cleanup'
     })
+    storyHarnessDAO.markCandidate(candidateId, 'semantic_passed', {
+      checks: { deterministicCleanup: 'em_dash', consistencyGate: gate }
+    })
+    if (!storyHarnessDAO.acceptCandidate(candidateId)) continue
     changedChapters++
     replaced += count
   }
@@ -1195,9 +1647,11 @@ async function diagnoseAndFixUntilPass(
 ): Promise<DiagnoseFixResult> {
   let round = 0
   let bestCandidate: DiagnoseCandidate | undefined
+  const storyChapters = volumeChapterDAO.listChaptersByWork(workId)
   const chTitle = volumeChapterDAO.getChapter(chapterId)?.title ?? `#${chapterId}`
+  const isFinalBeat = storyChapters[storyChapters.length - 1]?.id === chapterId
 
-  const maxRounds = 4
+  const maxRounds = resolveStoryModelCapability(getGoalLoopModelOpts(workId)).maxIssueRepairs + 1
   while (round < maxRounds) {
     assertNotAborted(signal)
     round++
@@ -1210,12 +1664,24 @@ async function diagnoseAndFixUntilPass(
 
     const deterministicClean = stripDeterministicAiPatterns(content)
     if (deterministicClean !== content) {
-      content = deterministicClean
-      volumeChapterDAO.updateChapterWithVersion(chapterId, {
-        content,
-        word_count: content.replace(/\s/g, '').length,
-        status: 'completed'
-      })
+      const committed = await commitStoryBodyCandidate(
+        workId,
+        chapterId,
+        deterministicClean,
+        signal,
+        onProgress
+      )
+      if (!committed.success) {
+        return {
+          passed: false,
+          rounds: round,
+          finalScore: 0,
+          emotionScore: 0,
+          bestRound: round,
+          failedMetrics: [`确定性清理候选未通过：${committed.error ?? '未知错误'}`]
+        }
+      }
+      content = committed.content
       onProgress?.(`「${chTitle}」已自动删除形容词回环递进等 AI 典型句式`)
     }
 
@@ -1231,7 +1697,7 @@ async function diagnoseAndFixUntilPass(
     const breakdown = diagRes.report ? parseStoryQualityAiScoreBreakdown(diagRes.report) : null
     const items = breakdown?.items ?? []
 
-    const failedMetrics = failedCriticalStoryMetrics(items, qualityMin)
+    const failedMetrics = failedCriticalStoryMetrics(items, qualityMin, { finalBeat: isFinalBeat })
     if (diagRes.scoreTotal < qualityMin) failedMetrics.unshift(`总分:${diagRes.scoreTotal}`)
     const emotionAssessment = await assessChapterEmotion(workId, chapterId, content, signal, true)
     if (!emotionAssessment.passed) failedMetrics.push(`情绪门禁:${emotionAssessment.score}`)
@@ -1242,7 +1708,8 @@ async function diagnoseAndFixUntilPass(
       qualityScore: diagRes.scoreTotal,
       emotionScore: emotionAssessment.score,
       emotionPassed: emotionAssessment.passed,
-      qualityPassed: diagRes.scoreTotal >= qualityMin && failedCriticalStoryMetrics(items, qualityMin).length === 0,
+      qualityPassed: diagRes.scoreTotal >= qualityMin
+        && failedCriticalStoryMetrics(items, qualityMin, { finalBeat: isFinalBeat }).length === 0,
       hardFail: !!diagRes.hardFail,
       failedMetrics: [...failedMetrics],
       emotionAssessmentJson: JSON.stringify(emotionAssessment)
@@ -1316,12 +1783,11 @@ async function diagnoseAndFixUntilPass(
     }
 
     if (patched !== content) {
-      const wordCount = patched.replace(/\s/g, '').length
-      volumeChapterDAO.updateChapterWithVersion(chapterId, {
-        content: patched,
-        word_count: wordCount,
-        status: 'completed'
-      })
+      const committed = await commitStoryBodyCandidate(workId, chapterId, patched, signal, onProgress)
+      if (!committed.success) {
+        onProgress?.(`「${chTitle}」修复候选未通过提交门禁：${committed.error ?? '未知错误'}`)
+        break
+      }
       onProgress?.(`「${chTitle}」修复完成（第${round}轮，${patchApplied}条patches + LLM修复）`)
     }
   }
@@ -1335,16 +1801,26 @@ async function diagnoseAndFixUntilPass(
       failedMetrics: ['正文诊断未返回有效结果']
     }
   }
-  volumeChapterDAO.updateChapterWithVersion(chapterId, {
-    content: bestCandidate.content,
-    word_count: bestCandidate.content.replace(/\s/g, '').length,
-    status: 'completed',
-    emotion_assessment_json: bestCandidate.emotionAssessmentJson
-  })
-  // 诊断修订会改变正文；恢复最佳候选后同步重建记忆，避免后续节拍读取到初稿状态。
+  const currentContent = volumeChapterDAO.getChapter(chapterId)?.content?.trim() ?? ''
+  if (currentContent !== bestCandidate.content.trim()) {
+    const restored = await commitStoryBodyCandidate(
+      workId,
+      chapterId,
+      bestCandidate.content,
+      signal,
+      onProgress
+    )
+    if (!restored.success) {
+      appLogger.warn('goal_routine', '最佳候选恢复未通过完整提交门禁，保留当前正式正文', {
+        workId, chapterId, error: restored.error
+      })
+    }
+  }
+  const acceptedContent = volumeChapterDAO.getChapter(chapterId)?.content?.trim() ?? bestCandidate.content
+  // 诊断修订会改变正文；按最终正式正文同步重建记忆，避免候选与记忆错位。
   clearChapterNarrativeMemory(workId, chapterId)
   try {
-    await extractNarrativeMemoryAfterGeneration(workId, chapterId, bestCandidate.content, signal)
+    await extractNarrativeMemoryAfterGeneration(workId, chapterId, acceptedContent, signal)
   } catch (error) {
     appLogger.warn('goal_routine', '保留最佳正文后重建叙事记忆失败（不阻断后续生成）', {
       workId,
@@ -1352,6 +1828,8 @@ async function diagnoseAndFixUntilPass(
       error: error instanceof Error ? error.message : String(error)
     })
   }
+  // 正文回滚会使旧盲读和账本失效；必须在记忆清理后重新原子提交情绪结果。
+  await assessChapterEmotion(workId, chapterId, acceptedContent, signal, true, true)
   onProgress?.(
     `「${chTitle}」已达到 ${maxRounds} 轮修复上限，保留第 ${bestCandidate.round} 轮最佳候选` +
     `（正文质量 ${bestCandidate.qualityScore} 分，情绪 ${bestCandidate.emotionScore} 分）`
@@ -1379,6 +1857,26 @@ function buildRepairPlan(workId: number, check: GoalCheckResult | undefined): Re
   }
 
   const reasons = check?.reasons.join('；') ?? ''
+  if (/确定性成稿门禁/.test(reasons)) {
+    const issues = storyHarnessDAO.listIssues(workId).filter(issue => issue.status !== 'resolved')
+    const targetChapterIds = [...new Set(issues.flatMap(issue => {
+      try {
+        const value = JSON.parse(issue.chapter_ids_json ?? '[]')
+        return Array.isArray(value) ? value.filter(Number.isInteger) as number[] : []
+      } catch {
+        return []
+      }
+    }))]
+    const engineLevel = issues.some(issue => issue.scope === 'engine')
+    return {
+      action: engineLevel ? 'storyline' : 'paragraph',
+      targetChapterIds: targetChapterIds.length > 0
+        ? targetChapterIds.slice(0, 2)
+        : pickWeakChapters(workId, check, 2),
+      hint: `只修复确定性门禁列出的证据，不得改动其他已通过事实。${issues.map(issue => `${issue.code}：${issue.message}；验收结果：${issue.expected_result ?? ''}`).join('；')}`,
+      issues: issues.map(issue => `${issue.code}：${issue.message}`)
+    }
+  }
   if (/情绪门禁未通过/.test(reasons)) {
     for (const chapter of volumeChapterDAO.listChaptersByWork(workId)) {
       if (!chapter.emotion_assessment_json) continue
@@ -1457,7 +1955,7 @@ function buildRepairPlan(workId: number, check: GoalCheckResult | undefined): Re
     }
   }
 
-  if (/anti-AI 规则违规/.test(reasons)) {
+  if (/anti-AI 规则(?:违规|达到阻塞阈值)/.test(reasons)) {
     const violatingDiagnostics = check?.chapterDiagnostics
       .filter(diagnostic => diagnostic.antiAiViolations > 0) ?? []
     const targetChapterIds = violatingDiagnostics.map(diagnostic => diagnostic.chapterId)
@@ -1501,51 +1999,152 @@ async function reviseBeatBlueprints(
     .filter((chapter): chapter is NonNullable<typeof chapter> => chapter != null)
   if (targets.length === 0) return 0
 
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_repair_blueprint',
-      enrichWorkContext: true,
-      enrichNarrativeMemory: true,
-      temperature: 0.2,
-      maxTokens: 2600,
-      systemPrompt: [
-        buildBeatBatchSystemPrompt(
-          loadWritingPlan(workId).wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER,
-          [workDAO.getById(workId)?.genre, workDAO.getById(workId)?.tags, goal].filter(Boolean).join('\n'),
-          volumeChapterDAO.listChaptersByWork(workId).length
-        ),
-        '这是结构修复，只返回指定节拍，title 必须与输入完全一致。保留已通过的事实与人物关系，修复终审指出的主线/节拍问题。'
-      ].join('\n\n'),
-      prompt: [
-        `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
-        `【整篇终审问题】\n${plan.hint}`,
-        `【待修复节拍】\n${JSON.stringify(targets.map(chapter => ({ title: chapter.title, outline: chapter.outline })), null, 2)}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(res.error || '结构层节拍修复失败')
-  const parsed = parseChapterSuggestions(res.content.trim())
-  let updated = 0
-  for (const candidate of parsed) {
-    const target = targets.find(chapter => chapter.title === candidate.title)
-    if (!target) continue
-    volumeChapterDAO.updateChapterWithVersion(target.id, {
-      outline: candidate.outline,
-      beat_role: candidate.beat_role ?? null,
-      foreshadow_target: candidate.foreshadow_target ?? null,
-      next_hook: candidate.next_hook ?? null,
-      characters: candidate.characters ?? null,
-      emotion_contract_json: candidate.emotion_contract ? JSON.stringify(candidate.emotion_contract) : null,
-      outline_diagnosis: candidate.dramatic_contract || candidate.tension_plan
-        ? JSON.stringify({ dramatic_contract: candidate.dramatic_contract, tension_plan: candidate.tension_plan, emotion_contract: candidate.emotion_contract })
-        : null
-    })
-    updated++
+  const userMaxTokens = appPreferenceDAO.getGenerationParams().maxTokens
+  let previousFailure = ''
+  for (let attempt = 1; attempt <= STRUCTURAL_REPAIR_MAX_ATTEMPTS; attempt++) {
+    const maxTokens = structuralRepairTokenBudget(userMaxTokens, targets.length, attempt)
+    const res = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_repair_blueprint',
+        enrichWorkContext: true,
+        enrichNarrativeMemory: true,
+        temperature: 0.2,
+        maxTokens,
+        responseSchema: {
+          name: 'story_structural_repair',
+          strict: false,
+          schema: {
+            type: 'object',
+            required: ['chapters'],
+            properties: {
+              chapters: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  required: ['id', 'title', 'plot_points'],
+                  properties: {
+                    id: { type: 'integer' },
+                    title: { type: 'string' },
+                    plot_points: { type: 'array', items: { type: 'string' } }
+                  },
+                  additionalProperties: true
+                }
+              }
+            },
+            additionalProperties: false
+          }
+        },
+        systemPrompt: [
+          '你是短故事结构修复编辑。只输出一个合法 JSON 对象，不要 Markdown、解释或思考过程。',
+          '只返回输入中的待修复节拍；每项 id 必须原样返回，title 也必须保持原样。id 是唯一匹配依据。',
+          '保留未被问题证据否定的事实、人物关系和前后拍边界，只修复指出的因果、时间、地点、知识与证据状态问题。',
+          '每项返回完整字段：id、title、plot_points、dramatic_contract、continuity_contract、tension_plan、emotion_contract、beat_role、foreshadow_target、next_hook、characters。',
+          'plot_points 为 3-5 条；其余文本字段每项只写一句，禁止正文级展开，以确保 JSON 能完整结束。',
+          `emotion_contract 枚举必须遵守：${EMOTION_CONTRACT_ENUM_RULE}`,
+          '格式：{"chapters":[{"id":123,"title":"原题","plot_points":["节点1","节点2","节点3"],"dramatic_contract":{},"continuity_contract":{},"tension_plan":{"phase":"主动选择与逼近高潮","level":8,"payoff_type":"partial"},"emotion_contract":{},"beat_role":"B","foreshadow_target":"","next_hook":"具体追问","characters":["角色"]}]}'
+        ].join('\n'),
+        prompt: [
+          `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
+          `【结构修复证据】\n${plan.hint}`,
+          previousFailure
+            ? `【上一请求失败】\n${previousFailure}\n本轮必须进一步压缩文字并输出闭合 JSON。`
+            : '',
+          `【待修复节拍】\n${JSON.stringify(targets.map(chapter => ({
+            id: chapter.id,
+            title: chapter.title,
+            outline: chapter.outline,
+            beat_role: chapter.beat_role,
+            foreshadow_target: chapter.foreshadow_target,
+            next_hook: chapter.next_hook,
+            outline_diagnosis: chapter.outline_diagnosis,
+            ...(plan.continuityEscalation
+              ? {
+                  current_text_opening: chapter.content?.slice(0, 1200) ?? '',
+                  current_text_ending: chapter.content?.slice(-1800) ?? ''
+                }
+              : {})
+          })), null, 2)}`
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+    if (!res.success || !res.content?.trim()) throw new Error(res.error || '结构层节拍修复失败')
+
+    const parsed = parseChapterSuggestions(res.content.trim())
+    if (parsed.length === 0) {
+      const failure = classifyStructuralRepairParseFailure({
+        content: res.content,
+        completionTokens: res.usage?.completionTokens,
+        maxTokens,
+        finishReason: res.finishReason
+      })
+      previousFailure = failure.message
+      if (attempt < STRUCTURAL_REPAIR_MAX_ATTEMPTS) {
+        appLogger.warn('goal_routine', '结构修复响应无效，扩大任务预算后有限重试', {
+          workId,
+          attempt,
+          code: failure.code,
+          maxTokens,
+          nextMaxTokens: structuralRepairTokenBudget(userMaxTokens, targets.length, attempt + 1)
+        })
+        continue
+      }
+      throw failure
+    }
+
+    const matched = targets.map(target => ({
+      target,
+      candidate: parsed.find(candidate => candidate.id === target.id)
+        ?? parsed.find(candidate => candidate.id == null && candidate.title === target.title)
+    }))
+    const missing = matched.filter(item => !item.candidate)
+    if (missing.length > 0) {
+      const failure = new StructuralRepairError(
+        'STRUCTURE_TARGET_MISMATCH',
+        `结构修复缺少目标节拍 ID：${missing.map(item => item.target.id).join('、')}`
+      )
+      previousFailure = failure.message
+      if (attempt < STRUCTURAL_REPAIR_MAX_ATTEMPTS) continue
+      throw failure
+    }
+
+    let changed = 0
+    for (const { target, candidate: matchedCandidate } of matched) {
+      const candidate = matchedCandidate!
+      if (candidate.title !== target.title) {
+        appLogger.warn('goal_routine', '结构修复按 ID 匹配成功，但模型改写了标题；保留数据库原标题', {
+          workId,
+          chapterId: target.id,
+          expectedTitle: target.title,
+          returnedTitle: candidate.title
+        })
+      }
+      const nextFields = {
+        outline: candidate.outline,
+        beat_role: candidate.beat_role ?? target.beat_role ?? null,
+        foreshadow_target: candidate.foreshadow_target ?? target.foreshadow_target ?? null,
+        next_hook: candidate.next_hook ?? target.next_hook ?? null,
+        characters: candidate.characters ?? target.characters ?? null,
+        emotion_contract_json: candidate.emotion_contract
+          ? JSON.stringify(candidate.emotion_contract)
+          : target.emotion_contract_json ?? null,
+        outline_diagnosis: mergeStoryBlueprintDiagnosis(target.outline_diagnosis, candidate)
+      }
+      const unchanged = nextFields.outline === (target.outline ?? '')
+        && nextFields.beat_role === (target.beat_role ?? null)
+        && nextFields.foreshadow_target === (target.foreshadow_target ?? null)
+        && nextFields.next_hook === (target.next_hook ?? null)
+        && nextFields.characters === (target.characters ?? null)
+        && nextFields.emotion_contract_json === (target.emotion_contract_json ?? null)
+        && nextFields.outline_diagnosis === (target.outline_diagnosis ?? null)
+      if (unchanged) continue
+      volumeChapterDAO.updateChapterWithVersion(target.id, nextFields)
+      changed++
+    }
+    return changed
   }
-  if (updated === 0) throw new Error('结构层修复未返回可匹配的节拍标题')
-  return updated
+  throw new StructuralRepairError('STRUCTURE_PATCH_EMPTY', '结构修复未返回可应用补丁')
 }
 
 function pickWeakChapters(workId: number, check: GoalCheckResult | undefined, limit: number): number[] {
@@ -1571,9 +2170,13 @@ async function executeRepairPlan(
   workId: number,
   plan: RepairPlan,
   goal: string,
-  signal?: AbortSignal
-): Promise<string> {
-  if (plan.targetChapterIds.length === 0) return '无可修复节拍'
+  signal?: AbortSignal,
+  onContinuityEvent?: (chapterId: number, event: StoryContinuityRepairEvent) => void
+): Promise<{
+  summary: string
+  continuityFailure?: { chapterId: number; blockers: string[]; attempts: number }
+}> {
+  if (plan.targetChapterIds.length === 0) return { summary: '无可修复节拍' }
   const summaries: string[] = []
   const originals = new Map(plan.targetChapterIds.map(id => [id, volumeChapterDAO.getChapter(id)]))
   const revisedBlueprints = await reviseBeatBlueprints(workId, plan, goal, signal)
@@ -1586,11 +2189,29 @@ async function executeRepairPlan(
       signal,
       goalDescription: goal,
       extraHint: plan.hint,
-      wordTargetOverride: plan.targetWordCounts?.[chapterId]
+      wordTargetOverride: plan.targetWordCounts?.[chapterId],
+      onContinuityEvent: event => onContinuityEvent?.(chapterId, event)
     })
+    if (!gen.success && gen.requiresEscalation) {
+      return {
+        summary: `${ch?.title ?? chapterId} 连续性候选修复未收敛，准备提升修复层级`,
+        continuityFailure: {
+          chapterId,
+          blockers: gen.continuityBlockers ?? [gen.error || '连续性修复未通过'],
+          attempts: gen.continuityRepairRounds ?? 0
+        }
+      }
+    }
     if (!gen.success) throw new Error(gen.error || '修复生成失败')
     if (!baseline) {
       summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字`)
+      continue
+    }
+
+    if (plan.forensicIssues?.length || plan.continuityEscalation) {
+      // 法医修复候选保留在章节版本历史中，不用通用文风偏好将其回退。
+      // 是否真正消除硬伤由下一轮整篇法医审计判定。
+      summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字（结构升级候选，待整篇复验）`)
       continue
     }
 
@@ -1611,36 +2232,49 @@ async function executeRepairPlan(
       }
     }
 
-    clearChapterNarrativeMemory(workId, chapterId)
-    volumeChapterDAO.updateChapterWithVersion(chapterId, {
+    const restoreCandidateId = storyHarnessDAO.createCandidate({
+      workId,
+      chapterId,
       content: baseline,
-      word_count: baseline.replace(/\s/g, '').length,
-      status: 'completed',
-      ...((plan.action === 'storyline' || plan.action === 'beat') && original
-        ? {
-            outline: original.outline ?? '',
-            beat_role: original.beat_role ?? null,
-            foreshadow_target: original.foreshadow_target ?? null,
-            next_hook: original.next_hook ?? null,
-            characters: original.characters ?? null,
-            outline_diagnosis: original.outline_diagnosis ?? null,
-            emotion_contract_json: original.emotion_contract_json ?? null,
-            emotion_assessment_json: original.emotion_assessment_json ?? null
-          }
-        : {})
+      wordCount: baseline.replace(/\s/g, '').length,
+      baseContent: current?.content,
+      sourceStep: 'pairwise_baseline_restore'
     })
+    storyHarnessDAO.markCandidate(restoreCandidateId, 'semantic_passed', {
+      checks: { pairwiseComparison: comparison, restoredAcceptedBaseline: true }
+    })
+    if (!storyHarnessDAO.acceptCandidate(restoreCandidateId)) {
+      throw new Error(`「${ch?.title ?? chapterId}」基线候选原子恢复失败`)
+    }
+    if ((plan.action === 'storyline' || plan.action === 'beat') && original) {
+      volumeChapterDAO.updateChapterWithVersion(chapterId, {
+        outline: original.outline ?? '',
+        beat_role: original.beat_role ?? null,
+        foreshadow_target: original.foreshadow_target ?? null,
+        next_hook: original.next_hook ?? null,
+        characters: original.characters ?? null,
+        outline_diagnosis: original.outline_diagnosis ?? null,
+        emotion_contract_json: original.emotion_contract_json ?? null,
+        emotion_assessment_json: original.emotion_assessment_json ?? null
+      })
+    }
+    clearChapterNarrativeMemory(workId, chapterId)
     try {
       await extractNarrativeMemoryAfterGeneration(workId, chapterId, baseline, signal)
+      await ensureChapterEmotionOutcome(workId, chapterId, baseline, signal)
     } catch (error) {
-      appLogger.warn('goal_routine', '回滚后重建叙事记忆失败', {
+      appLogger.warn('goal_routine', '回滚后重建叙事记忆或情绪账本失败', {
         workId,
         chapterId,
         error: error instanceof Error ? error.message : String(error)
       })
+      throw error
     }
     summaries.push(`${ch?.title ?? chapterId} 已回滚（${comparison.preferCandidate ? '新版情绪门禁未通过' : comparison.reason}）`)
   }
-  return `${revisedBlueprints > 0 ? `修订 ${revisedBlueprints} 个节拍蓝图；` : ''}${summaries.join('；')}`
+  return {
+    summary: `${revisedBlueprints > 0 ? `修订 ${revisedBlueprints} 个节拍蓝图；` : ''}${summaries.join('；')}`
+  }
 }
 
 const VALID_PHASES: Phase[] = GOAL_ROUTINE_PHASE_ORDER
@@ -1708,13 +2342,6 @@ export async function runStoryGoalLoop(
     turn = existing.turn_count ?? 0
     const savedPhase = existing.current_phase as Phase
     phase = explicitPhase ?? (VALID_PHASES.includes(savedPhase) ? savedPhase : 'materialize_settings')
-    // 轮次用尽后续跑：保留阶段断点，重置轮次计数以便获得新一轮预算
-    if (existing.status === 'timeout' || turn >= fullConfig.maxTurns) {
-      appLogger.info('goal_routine', '轮次上限后续跑，重置轮次计数', {
-        workId, phase, previousTurn: turn, maxTurns: fullConfig.maxTurns
-      })
-      turn = 0
-    }
     appLogger.info('goal_routine', '目标循环断点续跑', { workId, phase, turn, config: fullConfig })
   } else if (explicitPhase && existing) {
     const saved = existing.goal_config_json
@@ -1729,6 +2356,11 @@ export async function runStoryGoalLoop(
     turn = 0
     phase = explicitPhase ?? 'materialize_settings'
   }
+
+  fullConfig.maxTurns = Math.min(
+    STORY_HARNESS_MAX_TURNS,
+    Math.max(1, Math.floor(Number(fullConfig.maxTurns) || DEFAULT_STORY_GOAL_CONFIG.maxTurns))
+  )
 
   const controller = new AbortController()
   activeLoops.set(workId, controller)
@@ -1766,6 +2398,114 @@ export async function runStoryGoalLoop(
     broadcastProgress('goal:progress', ev)
   }
 
+  const recordContinuityEvent = (
+    chapterId: number,
+    chapterTitle: string,
+    event: StoryContinuityRepairEvent
+  ) => {
+    const action = event.type === 'rejected'
+      ? 'continuity_gate'
+      : event.type === 'repaired'
+        ? 'continuity_repair'
+        : event.type === 'passed'
+          ? 'continuity_pass'
+          : 'continuity_retry'
+    const summary = event.type === 'rejected'
+      ? `「${chapterTitle}」候选第 ${event.candidateRound} 轮连续性门禁未通过，已保存候选版本：${event.blockers.join('；')}`
+      : event.type === 'repaired'
+        ? `「${chapterTitle}」已按上一轮阻塞证据生成第 ${event.candidateRound} 轮定向修复候选（${event.wordCount}字）`
+        : event.type === 'passed'
+          ? `「${chapterTitle}」候选第 ${event.candidateRound} 轮跨拍连续性门禁通过`
+          : `「${chapterTitle}」连续性评估器无效，保留候选并重试审计：${event.blockers.join('；')}`
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase,
+      action,
+      target_chapter_id: chapterId,
+      summary
+    })
+  }
+
+  const escalateContinuityFailure = async (
+    chapterId: number,
+    blockers: string[],
+    attempts: number
+  ): Promise<StoryContinuityEscalationRoute> => {
+    const sourcePhase = phase
+    const chapters = volumeChapterDAO.listChaptersByWork(workId)
+    const runtime = readRuntimeState(workId)
+    const previous = runtime.continuityRepairFailure?.fingerprint
+      ? {
+          fingerprint: runtime.continuityRepairFailure.fingerprint,
+          count: runtime.continuityRepairFailure.escalationCount ?? 0
+        }
+      : undefined
+    const route = routeStoryContinuityEscalation(
+      chapters.map(chapter => chapter.id),
+      chapterId,
+      blockers,
+      previous
+    )
+    const plan: RepairPlan = {
+      action: route.mode === 'engine' || route.mode === 'storyline' || route.mode === 'simplify' ? 'storyline' : 'beat',
+      targetChapterIds: route.targetChapterIds,
+      hint: route.hint,
+      issues: blockers,
+      continuityEscalation: true
+    }
+    patchRuntimeState(workId, {
+      continuityRepairFailure: {
+        chapterId,
+        blockers,
+        attempts,
+        fingerprint: route.fingerprint,
+        escalationCount: route.count,
+        updatedAt: new Date().toISOString()
+      },
+      structuralFeedback: route.hint
+    })
+
+    if (route.mode === 'contract') {
+      coreSettingDAO.deleteByWorkAndTypes(workId, ['story_contract'])
+      emit('连续性问题已升级到故事合同，正在自动重建合同', 'running')
+      await ensureStoryContract(
+        workId,
+        fullConfig.goalDescription,
+        route.hint,
+        controller.signal,
+        message => emit(message, 'running')
+      )
+      patchRuntimeState(workId, { repairPlan: plan })
+      phase = 'repair_execute'
+    } else if (route.mode === 'engine') {
+      coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
+      patchRuntimeState(workId, { continuityPendingRepair: plan })
+      phase = 'story_engine_gate'
+    } else if (route.mode === 'storyline' || route.mode === 'simplify') {
+      patchRuntimeState(workId, {
+        repairPlan: undefined,
+        continuityPendingRepair: undefined,
+        forceBeatRebuild: true
+      })
+      phase = 'generate_beats'
+    } else {
+      patchRuntimeState(workId, { repairPlan: plan })
+      phase = 'repair_execute'
+    }
+
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase: sourcePhase,
+      action: 'continuity_escalate',
+      target_chapter_id: chapterId,
+      summary: `连续性候选层修复未收敛，自动升级到 ${route.mode} 层（同类第 ${route.count} 次）：${route.hint}`
+    })
+    emit(`连续性修复未收敛，已自动升级到 ${route.mode} 层继续运行`, 'running')
+    return route
+  }
+
   appLogger.info('goal_routine', '目标循环启动', { workId, config: fullConfig })
 
   try {
@@ -1782,10 +2522,55 @@ export async function runStoryGoalLoop(
       emit(`已自动采用待确认书名「${preferred.title}」，继续整体自检`, 'running')
     }
 
-    while (turn < fullConfig.maxTurns) {
+    while (true) {
       if (controller.signal.aborted) {
         goalRoutineDAO.setStatus(workId, 'cancelled')
         emit('已取消', 'cancelled')
+        return
+      }
+
+      if (turn >= fullConfig.maxTurns) {
+        const runtime = readRuntimeState(workId)
+        const automationEpoch = runtime.automationEpoch ?? 0
+        if (canStartStoryFallbackEpoch(automationEpoch)) {
+          const nextEpoch = automationEpoch + 1
+          const fallbackFeedback = [
+            `自动生产第 ${nextEpoch + 1} 阶段：上一阶段已耗尽局部预算，现强制降低故事复杂度并重建全篇。`,
+            '只保留一个核心冲突、一个倒计时、一个证据载体和最少必要人物；删除非必要身份反转、巧合式官方到场与重复打脸。',
+            '每拍最多一次地点迁移和一次证据状态变化；结局只兑现核心冲突，不开新线。'
+          ].join('\n')
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'auto_simplify_rollover',
+            summary: `首阶段 ${fullConfig.maxTurns} 轮预算耗尽，自动进入降复杂度重建阶段 ${nextEpoch + 1}`
+          })
+          patchRuntimeState(workId, {
+            automationEpoch: nextEpoch,
+            forceBeatRebuild: true,
+            structuralFeedback: fallbackFeedback,
+            repairPlan: undefined,
+            continuityRepairFailure: undefined,
+            continuityPendingRepair: undefined,
+            terminalReason: undefined
+          })
+          turn = 0
+          phase = 'generate_beats'
+          goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
+          emit('首阶段预算耗尽，已自动降复杂度并开启一次有界的全篇重建，不需要人工介入', 'running')
+          continue
+        }
+        goalRoutineDAO.appendTurn({
+          work_id: workId,
+          turn_no: turn,
+          phase,
+          action: 'budget_exhausted',
+          summary: `已使用 ${fullConfig.maxTurns} 轮硬预算，自动修复停止，等待人工编辑决策`
+        })
+        patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
+        goalRoutineDAO.setStatus(workId, 'paused')
+        emit('目标循环已达到硬预算上限，正文和候选均已保留；需要人工编辑后从指定阶段继续', 'paused')
         return
       }
 
@@ -1860,6 +2645,13 @@ export async function runStoryGoalLoop(
             score: result.score,
             summary: `故事发动机通过（${result.score}分，${result.rounds}轮）`
           })
+          await ensureStoryContract(
+            workId,
+            fullConfig.goalDescription,
+            runtime.structuralFeedback ?? '',
+            controller.signal,
+            message => emit(message, 'running')
+          )
           phase = 'emotion_engine_gate'
         } else if (phase === 'emotion_engine_gate') {
           const result = await ensureEmotionEngine(
@@ -1875,6 +2667,35 @@ export async function runStoryGoalLoop(
         } else if (phase === 'generate_beats') {
           const res = await ensureBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           if (res.error) throw new Error(res.error)
+          if (res.recovery === 'retry_beats') {
+            emit('节拍门禁未通过，保留故事发动机并在节拍层定向重建', 'running')
+            phase = 'generate_beats'
+            continue
+          }
+          if (res.recovery === 'rebuild_contract') {
+            coreSettingDAO.deleteByWorkAndTypes(workId, ['story_contract'])
+            emit('节拍层两次未收敛，保留故事发动机，仅重建全篇合同后继续', 'running')
+            phase = 'generate_beats'
+            continue
+          }
+          if (res.recovery === 'simplify') {
+            emit('节拍层仍未收敛，已自动降复杂度并继续在节拍层重建', 'running')
+            phase = 'generate_beats'
+            continue
+          }
+          if (res.recovery === 'rebuild_engine') {
+            coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'storyline',
+              summary: res.warning ?? '节拍硬门禁未通过，回退故事发动机'
+            })
+            emit('节拍硬门禁未通过，已回退故事发动机重建', 'running')
+            phase = 'story_engine_gate'
+            continue
+          }
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
@@ -1920,6 +2741,12 @@ export async function runStoryGoalLoop(
           } else {
             const runtime = readRuntimeState(workId)
             const repairRound = runtime.overallRepairRounds ?? 0
+            if (repairRound >= MAX_OVERALL_SETTING_REPAIR_ROUNDS) {
+              throw new GoalPhaseExhaustedError(
+                `核心设定整体自检经过 ${MAX_OVERALL_SETTING_REPAIR_ROUNDS} 轮定向修订仍未通过`
+                + `；最后结论：${conclusionText}`
+              )
+            }
             const revised = await repairSettingsFromOverallCheck(
               workId,
               result.report,
@@ -1938,29 +2765,71 @@ export async function runStoryGoalLoop(
             phase = 'generate_character_cards'
           }
         } else if (phase === 'draft_body') {
+          const pendingRepair = readRuntimeState(workId).continuityPendingRepair
+          if (pendingRepair) {
+            patchRuntimeState(workId, {
+              repairPlan: pendingRepair,
+              continuityPendingRepair: undefined
+            })
+            emit('故事发动机已重建，继续执行连续性结构升级计划', 'running')
+            phase = 'repair_execute'
+            continue
+          }
+          await compensatePendingStoryMemory(workId, controller.signal)
           const beat = nextEmptyBeat(workId)
           if (!beat) {
             emit('正文已全部生成，进入目标验收', 'running')
             phase = 'goal_check'
           } else {
             emit(`正在生成正文「${beat.title}」`, 'running')
+            const continuityFailure = readRuntimeState(workId).continuityRepairFailure
             const gen = await generateBeatBody(workId, beat.id, {
               signal: controller.signal,
               goalDescription: fullConfig.goalDescription,
-              onProgress: message => emit(`「${beat.title}」${message}`, 'running')
+              extraHint: continuityFailure?.chapterId === beat.id && continuityFailure.blockers.length > 0
+                ? `【上一次连续性修复仍未收敛】\n${continuityFailure.blockers.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n本次初稿必须从源头规避这些问题。`
+                : undefined,
+              onProgress: message => emit(`「${beat.title}」${message}`, 'running'),
+              onContinuityEvent: event => recordContinuityEvent(beat.id, beat.title, event)
             })
+            if (!gen.success && gen.requiresEscalation) {
+              const blockers = gen.continuityBlockers ?? [gen.error || '连续性修复未通过']
+              await escalateContinuityFailure(
+                beat.id,
+                blockers,
+                gen.continuityRepairRounds ?? 0
+              )
+              continue
+            }
             if (!gen.success) throw new Error(gen.error || '正文生成失败')
+            if (continuityFailure?.chapterId === beat.id) {
+              patchRuntimeState(workId, {
+                continuityRepairFailure: undefined,
+                continuityPendingRepair: undefined
+              })
+            }
             const mem = gen.memoryExtracted
-            const memMsg = mem ? ` · 记忆体：+${mem.planted}伏笔/${mem.snapshots}快照/${mem.foreshadowingResolved}回收` : ''
+            if (gen.memoryPending) {
+              const runtime = readRuntimeState(workId)
+              patchRuntimeState(workId, {
+                pendingMemoryChapterIds: [...new Set([...(runtime.pendingMemoryChapterIds ?? []), beat.id])]
+              })
+            }
+            const memMsg = gen.memoryPending
+              ? ' · 记忆体：待旁路补偿（正文已安全提交）'
+              : mem ? ` · 记忆体：+${mem.planted}伏笔/${mem.snapshots}快照/${mem.foreshadowingResolved}回收` : ''
             const antiAiMsg = gen.antiAiRepairs
               ? ` · 套话定点修复：${gen.antiAiRepairs}句/${gen.antiAiRepairRounds ?? 1}轮`
+              : ''
+            const continuityMsg = gen.continuityRepairRounds
+              ? ` · 连续性定向修复 ${gen.continuityRepairRounds} 轮`
               : ''
             goalRoutineDAO.appendTurn({
               work_id: workId, turn_no: turn, phase, action: 'draft',
               target_chapter_id: beat.id,
-              summary: `生成「${beat.title}」${gen.wordCount}字${antiAiMsg}${memMsg}`
+              summary: `生成「${beat.title}」${gen.wordCount}字${antiAiMsg}${continuityMsg}${memMsg}`
             })
-            emit(`生成「${beat.title}」${gen.wordCount}字${antiAiMsg}${memMsg}`, 'running')
+            emit(`生成「${beat.title}」${gen.wordCount}字${antiAiMsg}${continuityMsg}${memMsg}`, 'running')
 
             // 正文生成后可选：AI 诊断 + 修复循环，总分达标且承重项无硬伤即停
             if (fullConfig.diagnoseBodyAfterGeneration && fullConfig.qualityMin > 0) {
@@ -2022,6 +2891,8 @@ export async function runStoryGoalLoop(
           })
 
           const runtime = readRuntimeState(workId)
+          const capability = resolveStoryModelCapability(getGoalLoopModelOpts(workId))
+          const wholeAuditCount = (runtime.wholeAuditCount ?? 0) + 1
           const composite = goalCheckComposite(lastCheck)
           const signature = goalCheckSignature(lastCheck)
           const noMeaningfulGain = runtime.lastCheckComposite != null
@@ -2046,6 +2917,7 @@ export async function runStoryGoalLoop(
             lastCheckComposite: composite,
             lastCheckSignature: signature,
             stagnantChecks,
+            wholeAuditCount,
             evaluationHistory
           })
 
@@ -2073,6 +2945,8 @@ export async function runStoryGoalLoop(
               }
             }
 
+            const snapshotId = storyHarnessDAO.createReleaseSnapshot(workId)
+            patchRuntimeState(workId, { terminalReason: undefined })
             goalRoutineDAO.setStatus(workId, 'goal_met')
 
             // 试读卡点报告
@@ -2083,16 +2957,112 @@ export async function runStoryGoalLoop(
                 summary: `试读卡点报告（目标比例 ${previewRatioPct}%）已生成`
               })
             }
-            emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 整篇${lastCheck.overallStoryScore} · 原文盲读${lastCheck.proseReadScore} · 试读追读力${lastCheck.previewHookScore} · 目标匹配${lastCheck.goalMatchScore} · 节拍${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords} · 试读${previewRatioPct}%`, 'goal_met')
+            emit(`目标达成并冻结发布快照 #${snapshotId}：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 整篇${lastCheck.overallStoryScore} · 原文盲读${lastCheck.proseReadScore} · 试读追读力${lastCheck.previewHookScore} · 目标匹配${lastCheck.goalMatchScore} · 节拍${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords} · 试读${previewRatioPct}%`, 'goal_met')
             return
           }
+
+          if (wholeAuditCount >= capability.maxWholeAudits) {
+            patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'audit_budget_exhausted',
+              summary: `整篇审计已达到 ${capability.maxWholeAudits} 次上限，停止自动改稿：${lastCheck.reasons.join('；')}`
+            })
+            goalRoutineDAO.setStatus(workId, 'paused')
+            emit(`整篇审计已达到 ${capability.maxWholeAudits} 次上限，已保留正文和问题账本，等待人工编辑`, 'paused')
+            return
+          }
+
+          if ((lastCheck.storyHardBlockers?.length ?? 0) > 0) {
+            const feedback = lastCheck.storyHardBlockers.join('；')
+            const chapters = volumeChapterDAO.listChaptersByWork(workId)
+            const issues: StoryForensicIssue[] = lastCheck.forensicIssues?.length
+              ? lastCheck.forensicIssues
+              : [{
+                  code: 'LEGACY_FORENSIC_BLOCKER', scope: 'beat_cluster',
+                  chapterTitles: [], repairChapterTitles: [], evidence: [feedback], message: feedback,
+                  repairable: true, recommendedAction: '定位最小节拍簇并动态修复'
+                }]
+            const firstRoute = routeStoryForensicRepair(chapters, issues, 1)
+            const previousForensic = runtime.forensicRepairStall
+            const forensicCount = previousForensic?.fingerprint === firstRoute.fingerprint
+              ? previousForensic.count + 1 : 1
+            const route = routeStoryForensicRepair(chapters, issues, forensicCount)
+            patchRuntimeState(workId, {
+              forensicRepairStall: { fingerprint: route.fingerprint, count: forensicCount },
+              stagnantChecks: 0,
+              lastCheckComposite: undefined,
+              lastCheckSignature: undefined
+            })
+
+            if (route.mode === 'retry_audit') {
+              if (forensicCount >= 3 && issues.some(issue => issue.code === 'FORENSIC_EVALUATOR_ERROR')) {
+                goalRoutineDAO.appendTurn({
+                  work_id: workId, turn_no: turn, phase, action: 'forensic_retry',
+                  summary: '法医评估器连续返回无效，保留全部原文并自动继续独立复核'
+                })
+                emit('法医评估器暂时不可用，已保留全部原文并继续自动复核', 'running')
+                phase = 'goal_check'
+                continue
+              }
+              goalRoutineDAO.appendTurn({
+                work_id: workId, turn_no: turn, phase, action: 'check',
+                summary: `法医全局硬伤首次告警，保留原文并进行第 ${forensicCount + 1} 次独立复核：${feedback}`
+              })
+              emit('法医审计需要独立复核，已保留全部原文', 'running')
+              phase = 'goal_check'
+              continue
+            }
+
+            if (route.mode === 'reset_beats' || route.mode === 'reset_engine') {
+              const returnToEngine = route.mode === 'reset_engine'
+              const deleted = resetFailedStoryStructure(workId)
+              if (returnToEngine) {
+                coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
+              }
+              patchRuntimeState(workId, { structuralFeedback: route.hint })
+              goalRoutineDAO.appendTurn({
+                work_id: workId, turn_no: turn, phase,
+                action: returnToEngine ? 'storyline' : 'beat',
+                summary: `同一法医证据连续 ${forensicCount} 轮未消除，才升级删除 ${deleted} 个节拍并回退到${returnToEngine ? '故事发动机' : '整组节拍'}`
+              })
+              emit(`法医动态修复未收敛，已逐级升级到${returnToEngine ? '故事发动机' : '整组节拍'}重建`, 'running')
+              phase = returnToEngine ? 'story_engine_gate' : 'generate_beats'
+              continue
+            }
+
+            const plan: RepairPlan = {
+              action: route.action,
+              targetChapterIds: route.targetChapterIds,
+              hint: route.hint,
+              issues: issues.map(issue => `${issue.code}：${issue.message}`),
+              forensicIssues: issues,
+              forensicFingerprint: route.fingerprint
+            }
+            patchRuntimeState(workId, { repairPlan: plan })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: route.action,
+              target_chapter_id: route.targetChapterIds[0] ?? null,
+              summary: `整篇法医审计阻止交付，保留原文并执行第 ${forensicCount} 轮动态修复：${route.hint}`
+            })
+            emit(`法医审计发现硬伤，正在动态修复 ${route.targetChapterIds.length} 个节拍，其他原文保留`, 'running')
+            phase = 'repair_execute'
+            continue
+          }
+
+          if (runtime.forensicRepairStall) patchRuntimeState(workId, { forensicRepairStall: undefined })
 
           if (stagnantChecks >= MAX_STAGNANT_CHECKS) {
             const resetCount = runtime.structuralResetCount ?? 0
             const feedback = [lastCheck.reasons.join('；'), ...lastCheck.storyIssues].filter(Boolean).join('；')
             const deleted = resetFailedStoryStructure(workId)
             const returnToEngine = lastCheck.weakestLayer === 'storyline'
-            if (returnToEngine) coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'emotion_engine'])
+            if (returnToEngine) coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
             patchRuntimeState(workId, {
               structuralResetCount: resetCount + 1,
               structuralFeedback: feedback,
@@ -2128,15 +3098,80 @@ export async function runStoryGoalLoop(
           const row = goalRoutineDAO.getByWork(workId)
           const parsed = row?.state_json ? JSON.parse(row.state_json) as { repairPlan?: RepairPlan } : {}
           const plan = parsed.repairPlan ?? buildRepairPlan(workId, lastCheck)
+          const capability = resolveStoryModelCapability(getGoalLoopModelOpts(workId))
+          const plannedCodes = new Set(plan.forensicIssues?.map(issue => issue.code) ?? [])
+          const plannedChapterIds = new Set(plan.targetChapterIds)
+          const relevantLedgerIssues = storyHarnessDAO.listIssues(workId).filter(issue => {
+            const chapterIds = (() => {
+              try {
+                const value = JSON.parse(issue.chapter_ids_json ?? '[]')
+                return Array.isArray(value) ? value.filter(Number.isInteger) as number[] : []
+              } catch {
+                return []
+              }
+            })()
+            return plannedCodes.has(issue.code)
+              || (plan.issues ?? []).some(text => text.includes(issue.code))
+              || chapterIds.some(chapterId => plannedChapterIds.has(chapterId))
+          })
+          const stalledIssue = relevantLedgerIssues.find(issue => issue.status === 'stalled')
+          if (stalledIssue) {
+            patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'issue_stalled',
+              target_chapter_id: plan.targetChapterIds[0] ?? null,
+              summary: `${stalledIssue.code} 已达到 ${stalledIssue.attempts} 次定向修复上限，停止自动改稿`
+            })
+            goalRoutineDAO.setStatus(workId, 'paused')
+            emit(`问题 ${stalledIssue.code} 已达到自动修复上限；已保留全部正文，等待人工编辑`, 'paused')
+            return
+          }
+          for (const issue of relevantLedgerIssues.filter(issue => issue.status === 'open')) {
+            storyHarnessDAO.incrementIssueAttempt(
+              workId,
+              issue.issue_key,
+              capability.maxIssueRepairs
+            )
+          }
           emit(`正在执行修复：${plan.action}`, 'running')
-          const summary = await executeRepairPlan(workId, plan, fullConfig.goalDescription, controller.signal)
+          const execution = await executeRepairPlan(
+            workId,
+            plan,
+            fullConfig.goalDescription,
+            controller.signal,
+            (chapterId, event) => {
+              const chapter = volumeChapterDAO.getChapter(chapterId)
+              recordContinuityEvent(chapterId, chapter?.title ?? String(chapterId), event)
+            }
+          )
+          if (execution.continuityFailure) {
+            await escalateContinuityFailure(
+              execution.continuityFailure.chapterId,
+              execution.continuityFailure.blockers,
+              execution.continuityFailure.attempts
+            )
+            continue
+          }
+          const summary = execution.summary
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: plan.action,
             target_chapter_id: plan.targetChapterIds[0] ?? null,
             summary
           })
           emit(`执行修复：${summary}`, 'running')
+          if (plan.continuityEscalation) {
+            patchRuntimeState(workId, {
+              continuityRepairFailure: undefined,
+              continuityPendingRepair: undefined
+            })
+          }
           phase = 'goal_check'
+        }
+        if (readRuntimeState(workId).executionFailure) {
+          patchRuntimeState(workId, { executionFailure: undefined })
         }
       } catch (e) {
         if (controller.signal.aborted) {
@@ -2149,14 +3184,45 @@ export async function runStoryGoalLoop(
         goalRoutineDAO.appendTurn({
           work_id: workId, turn_no: turn, phase, action: 'error', summary: msg
         })
+        const previousFailure = readRuntimeState(workId).executionFailure
+        const signature = routineFailureSignature(attemptedPhase, e)
+        const failureCount = previousFailure?.phase === attemptedPhase && previousFailure.signature === signature
+          ? previousFailure.count + 1
+          : 1
+        patchRuntimeState(workId, {
+          executionFailure: {
+            phase: attemptedPhase,
+            signature,
+            count: failureCount,
+            message: msg,
+            updatedAt: new Date().toISOString()
+          }
+        })
+        const phaseBudgetExhausted = e instanceof GoalPhaseExhaustedError
+        if (phaseBudgetExhausted || failureCount >= STORY_ROUTINE_FAILURE_LIMIT) {
+          goalRoutineDAO.setStatus(workId, 'paused')
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'failure_pause',
+            summary: phaseBudgetExhausted
+              ? `「${attemptedPhase}」阶段内部修复预算已耗尽，目标循环安全暂停：${msg}`
+              : `「${attemptedPhase}」连续 ${failureCount} 次发生同类异常，目标循环已自动暂停：${msg}`
+          })
+          emit(
+            phaseBudgetExhausted
+              ? `「${attemptedPhase}」阶段内部修复预算已耗尽，已安全暂停：${msg}`
+              : `「${attemptedPhase}」连续 ${failureCount} 次发生同类异常，已自动暂停：${msg}`,
+            'paused'
+          )
+          return
+        }
         emit(`轮次异常：${msg}`, 'running')
-        emit(`「${attemptedPhase}」执行异常，将在下一轮继续自动重试`, 'running')
+        emit(`「${attemptedPhase}」第 ${failureCount} 次发生同类异常，将有限重试；连续 ${STORY_ROUTINE_FAILURE_LIMIT} 次后自动暂停`, 'running')
       }
     }
 
-    // 轮次上限
-    goalRoutineDAO.setStatus(workId, 'timeout')
-    emit(`已达轮次上限 ${fullConfig.maxTurns}，停止`, 'timeout')
   } finally {
     clearGoalLoopModelOpts(workId)
     activeLoops.delete(workId)

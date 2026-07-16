@@ -45,6 +45,7 @@ export interface ChapterVersionRow {
   model_type: string | null
   style_id: number | null
   generation_round: number
+  snapshot_json: string | null
   create_time: string
 }
 
@@ -175,9 +176,9 @@ export class VolumeChapterDAO extends BaseDAO {
   }
 
   updateChapter(id: number, fields: {
-    title?: string; outline?: string; content?: string; word_count?: number; status?: string
+    title?: string; outline?: string | null; content?: string | null; word_count?: number; status?: string
     sort?: number; volume_id?: number; expectedUpdateTime?: string
-    emotion_intensity?: number
+    emotion_intensity?: number | null
     beat_role?: string | null
     foreshadow_target?: string | null
     next_hook?: string | null
@@ -194,7 +195,7 @@ export class VolumeChapterDAO extends BaseDAO {
     if (fields.outline !== undefined) { sets.push('outline = ?'); vals.push(fields.outline) }
     if (fields.content !== undefined) {
       sets.push('content = ?')
-      vals.push(normalizeBodyParagraphSpacing(fields.content))
+      vals.push(fields.content == null ? null : normalizeBodyParagraphSpacing(fields.content))
     }
     if (fields.word_count !== undefined) { sets.push('word_count = ?'); vals.push(fields.word_count) }
     if (fields.status !== undefined) { sets.push('status = ?'); vals.push(fields.status) }
@@ -227,7 +228,13 @@ export class VolumeChapterDAO extends BaseDAO {
       sql += ` AND update_time = ?`
       vals.push(fields.expectedUpdateTime)
     }
-    return this.run(sql, vals).changes > 0
+    return this.transaction(() => {
+      const changed = this.run(sql, vals).changes > 0
+      if (changed && fields.content !== undefined) {
+        this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [id])
+      }
+      return changed
+    })
   }
 
   deleteChapter(id: number): boolean {
@@ -278,6 +285,41 @@ export class VolumeChapterDAO extends BaseDAO {
         ids.push(id)
       }
       return ids
+    })
+  }
+
+  /** 全篇结构重建时原子替换节拍，同时把旧正文保存在版本历史中。 */
+  rewriteStoryBeatsPreservingVersions(items: Array<{
+    chapterId: number
+    title: string
+    outline: string
+    beat_role?: string | null
+    foreshadow_target?: string | null
+    next_hook?: string | null
+    characters?: string | null
+    outline_diagnosis?: string | null
+    emotion_contract_json?: string | null
+  }>): number {
+    return this.transaction(() => {
+      for (const item of items) {
+        if (!this.getChapter(item.chapterId)) throw new Error(`节拍不存在：${item.chapterId}`)
+        this.updateChapterWithVersion(item.chapterId, {
+          title: item.title,
+          outline: item.outline,
+          content: '',
+          word_count: 0,
+          status: 'draft',
+          beat_role: item.beat_role ?? null,
+          foreshadow_target: item.foreshadow_target ?? null,
+          next_hook: item.next_hook ?? null,
+          characters: item.characters ?? null,
+          outline_diagnosis: item.outline_diagnosis ?? null,
+          emotion_contract_json: item.emotion_contract_json ?? null,
+          emotion_assessment_json: null,
+          quality_assessment_json: null
+        })
+      }
+      return items.length
     })
   }
 
@@ -362,24 +404,29 @@ export class VolumeChapterDAO extends BaseDAO {
   createVersion(chapterId: number, data: {
     outline?: string; content?: string; word_count?: number
     model_type?: string; style_id?: number; generation_round?: number
+    snapshot?: ChapterRow
   }): number {
+    const snapshot = data.snapshot ?? this.getChapter(chapterId)
     const latest = this.get<{ v: number }>(
       'SELECT COALESCE(MAX(version_number), 0) + 1 AS v FROM chapter_versions WHERE chapter_id = ?',
       [chapterId]
     )
     return this.insert(
-      `INSERT INTO chapter_versions (chapter_id, version_number, outline, content, word_count, model_type, style_id, generation_round)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chapter_versions (
+        chapter_id, version_number, outline, content, word_count,
+        model_type, style_id, generation_round, snapshot_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [chapterId, latest?.v ?? 1, data.outline ?? null, data.content ?? null,
-        data.word_count ?? 0, data.model_type ?? null, data.style_id ?? null, data.generation_round ?? 1]
+        data.word_count ?? 0, data.model_type ?? null, data.style_id ?? null, data.generation_round ?? 1,
+        snapshot ? JSON.stringify(snapshot) : null]
     )
   }
 
   /** 带版本快照的更新：修改前自动保存当前内容为历史版本 */
   updateChapterWithVersion(chapterId: number, fields: {
-    title?: string; outline?: string; content?: string; word_count?: number; status?: string
+    title?: string; outline?: string | null; content?: string | null; word_count?: number; status?: string
     sort?: number; volume_id?: number; expectedUpdateTime?: string
-    emotion_intensity?: number
+    emotion_intensity?: number | null
     beat_role?: string | null; foreshadow_target?: string | null
     next_hook?: string | null; pov_mode?: string | null; characters?: string | null
     outline_diagnosis?: string | null
@@ -394,10 +441,40 @@ export class VolumeChapterDAO extends BaseDAO {
         word_count: current.word_count ?? 0,
         model_type: versionMeta?.model_type,
         style_id: versionMeta?.style_id,
-        generation_round: versionMeta?.generation_round ?? 1
+        generation_round: versionMeta?.generation_round ?? 1,
+        snapshot: current
       })
     }
     return this.updateChapter(chapterId, fields)
+  }
+
+  /** 多章定点修复：任一版本快照或章节更新失败时整批回滚。 */
+  updateChaptersWithVersionsAtomic(items: Array<{
+    chapterId: number
+    fields: Parameters<VolumeChapterDAO['updateChapterWithVersion']>[1]
+    versionMeta?: Parameters<VolumeChapterDAO['updateChapterWithVersion']>[2]
+  }>): Array<{ chapterId: number; versionId: number }> {
+    return this.transaction(() => {
+      const versions: Array<{ chapterId: number; versionId: number }> = []
+      for (const item of items) {
+        const current = this.getChapter(item.chapterId)
+        if (!current) throw new Error(`章节不存在：${item.chapterId}`)
+        const versionId = this.createVersion(item.chapterId, {
+          outline: current.outline ?? undefined,
+          content: current.content ?? undefined,
+          word_count: current.word_count ?? 0,
+          model_type: item.versionMeta?.model_type,
+          style_id: item.versionMeta?.style_id,
+          generation_round: item.versionMeta?.generation_round ?? 1,
+          snapshot: current
+        })
+        if (!this.updateChapter(item.chapterId, item.fields)) {
+          throw new Error(`章节原子更新失败：${item.chapterId}`)
+        }
+        versions.push({ chapterId: item.chapterId, versionId })
+      }
+      return versions
+    })
   }
 
   restoreVersion(chapterId: number, versionId: number): boolean {
@@ -406,12 +483,50 @@ export class VolumeChapterDAO extends BaseDAO {
       [versionId, chapterId]
     )
     if (!version) return false
+    if (version.snapshot_json) {
+      try {
+        const snapshot = JSON.parse(version.snapshot_json) as Partial<ChapterRow>
+        return this.updateChapter(chapterId, {
+          title: snapshot.title,
+          outline: snapshot.outline,
+          content: snapshot.content,
+          word_count: snapshot.word_count,
+          status: snapshot.status,
+          sort: snapshot.sort,
+          volume_id: snapshot.volume_id,
+          emotion_intensity: snapshot.emotion_intensity,
+          beat_role: snapshot.beat_role,
+          foreshadow_target: snapshot.foreshadow_target,
+          next_hook: snapshot.next_hook,
+          pov_mode: snapshot.pov_mode,
+          characters: snapshot.characters,
+          outline_diagnosis: snapshot.outline_diagnosis,
+          emotion_contract_json: snapshot.emotion_contract_json,
+          emotion_assessment_json: snapshot.emotion_assessment_json,
+          quality_assessment_json: snapshot.quality_assessment_json
+        })
+      } catch {
+        return false
+      }
+    }
     this.updateChapter(chapterId, {
       outline: version.outline ?? undefined,
       content: version.content ?? undefined,
       word_count: version.word_count
     })
     return true
+  }
+
+  /** 回滚一批自动修复；任一快照缺失或恢复失败时整批回滚。 */
+  restoreVersionsAtomic(items: Array<{ chapterId: number; versionId: number }>): number {
+    return this.transaction(() => {
+      for (const item of [...items].reverse()) {
+        if (!this.restoreVersion(item.chapterId, item.versionId)) {
+          throw new Error(`章节完整快照回滚失败：${item.chapterId}/${item.versionId}`)
+        }
+      }
+      return items.length
+    })
   }
 }
 

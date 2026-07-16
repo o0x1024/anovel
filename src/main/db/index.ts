@@ -31,6 +31,15 @@ export { characterSnapshotDAO } from './dao/character-snapshot-dao'
 export type { CharacterSnapshotRow } from './dao/character-snapshot-dao'
 export { emotionalStateDAO } from './dao/emotional-state-dao'
 export type { EmotionalStateLedgerRow, EmotionalStateLedgerInput } from './dao/emotional-state-dao'
+export { storyStateDAO } from './dao/story-state-dao'
+export type { StoryStateFactRow, ChapterPatternFingerprintRow } from './dao/story-state-dao'
+export { storyHarnessDAO } from './dao/story-harness-dao'
+export type {
+  StoryGenerationCandidateRow,
+  StoryIssueLedgerRow,
+  StoryReleaseSnapshotRow,
+  StoryCandidateStatus
+} from './dao/story-harness-dao'
 export { timelineDAO } from './dao/timeline-dao'
 export type { TimelineEventRow } from './dao/timeline-dao'
 export { anchorAlignmentDAO } from './dao/anchor-alignment-dao'

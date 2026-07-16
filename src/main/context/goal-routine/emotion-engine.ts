@@ -9,9 +9,22 @@ import {
 } from '../../../shared/emotion-contract'
 import { extractJsonText } from '../parse-json-extract'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { requestStructuredModelOutput } from './structured-model-output'
+import { GoalPhaseExhaustedError } from './goal-phase-error'
 
 const EMOTION_ENGINE_MAX_ROUNDS = 4
 const EMOTION_CONTRACT_MAX_ROUNDS = 3
+
+const EMOTION_ENGINE_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['passed', 'score', 'blocking_issues', 'engine'],
+  properties: {
+    passed: { type: 'boolean' },
+    score: { type: 'integer', minimum: 0, maximum: 100 },
+    blocking_issues: { type: 'array', items: { type: 'string' } },
+    engine: { type: 'object' }
+  }
+}
 
 const EMOTION_CONTRACT_JSON_SHAPE = {
   pov_character: '视角人物',
@@ -133,28 +146,40 @@ export async function ensureEmotionEngine(
   const source = sourceContext(workId)
   if (!source.trim()) throw new Error('情绪发动机缺少人物与故事设定')
   let feedback = ''
+  let lastBlockers = ''
   for (let round = 1; round <= EMOTION_ENGINE_MAX_ROUNDS; round++) {
     if (signal?.aborted) throw new Error('已取消')
     onProgress?.(`正在运行情绪发动机门禁（第 ${round}/${EMOTION_ENGINE_MAX_ROUNDS} 轮）`)
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId, step: 'emotion_engine_gate', enrichWorkContext: false, enrichNarrativeMemory: false,
-        temperature: 0.15, maxTokens: 3000,
-        systemPrompt: [
-          '你是小说情绪因果主编。设计的不是情绪词和刺激强度，而是读者为何在乎、人物如何评价事件、选择如何付出代价、情绪如何积累与兑现。',
-          `作品类型：${workType === 'story' ? '短故事' : '长篇小说'}。短故事快速建立具体依恋；长篇必须支持跨卷关系积累、回调和余波。`,
-          '必须区分角色情绪、角色外显、叙述策略和读者情绪。低唤醒场景必须承担依恋、预感、亲密或余味功能。',
-          '只输出 JSON：{"passed":false,"score":0,"blocking_issues":[],"engine":{"target_reader":"","emotional_promise":{"primary":"","counter_emotion":"","catharsis":"","aftertaste":""},"core_emotional_question":"","attachment_contracts":[{"subject":"","valued_object":"","why_reader_cares":"","vulnerability":"","admiration_evidence":"","contradiction":"","credible_loss":""}],"core_inner_conflict":{"wanted":"","needed":"","feared_truth":"","protective_lie":""},"arc_principles":[],"recurring_anchors":[]}}',
-          '通过条件：至少一个可观察的依恋合同；核心情绪问题不可用单次反转轻易解决；宣泄由人物选择和代价挣得；存在反情绪、恢复段和结局余味；不得使用“极致情绪、情绪拉满”等空话。',
-          'score 低于85或有 blocking_issues 时 passed=false。'
-        ].join('\n\n'),
-        prompt: [`【创作目标】${goal.trim() || '让读者持续在乎人物与结果'}`, `【作品设定】\n${source}`, feedback].filter(Boolean).join('\n\n')
-      }), { stream: false, signal }
-    )
-    if (!response.success || !response.content?.trim()) throw new Error(response.error || '情绪发动机无返回')
-    const parsed = parseObject(response.content, '情绪发动机')
+    const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+      workId,
+      label: '情绪发动机',
+      signal,
+      request: (attempt, formatError) => modelService.chat(
+        withGoalLoopModelOptions(workId, {
+          workId, step: 'emotion_engine_gate', enrichWorkContext: false, enrichNarrativeMemory: false,
+          temperature: 0.1, maxTokens: 3600, forceThinkingDisabled: true,
+          responseSchema: { name: 'emotion_engine_gate', schema: EMOTION_ENGINE_RESPONSE_SCHEMA, strict: false },
+          systemPrompt: [
+            '你是小说情绪因果主编。设计的不是情绪词和刺激强度，而是读者为何在乎、人物如何评价事件、选择如何付出代价、情绪如何积累与兑现。',
+            '若故事发动机含 setting_resolutions，必须把它视为上游冲突的权威口径，不得沿用被其覆盖的旧事实。',
+            `作品类型：${workType === 'story' ? '短故事' : '长篇小说'}。短故事快速建立具体依恋；长篇必须支持跨卷关系积累、回调和余波。`,
+            '必须区分角色情绪、角色外显、叙述策略和读者情绪。低唤醒场景必须承担依恋、预感、亲密或余味功能。',
+            '只输出 JSON：{"passed":false,"score":0,"blocking_issues":[],"engine":{"target_reader":"","emotional_promise":{"primary":"","counter_emotion":"","catharsis":"","aftertaste":""},"core_emotional_question":"","attachment_contracts":[{"subject":"","valued_object":"","why_reader_cares":"","vulnerability":"","admiration_evidence":"","contradiction":"","credible_loss":""}],"core_inner_conflict":{"wanted":"","needed":"","feared_truth":"","protective_lie":""},"arc_principles":[],"recurring_anchors":[]}}',
+            '通过条件：至少一个可观察的依恋合同；核心情绪问题不可用单次反转轻易解决；宣泄由人物选择和代价挣得；存在反情绪、恢复段和结局余味；不得使用“极致情绪、情绪拉满”等空话。',
+            'score 低于85或有 blocking_issues 时 passed=false。'
+          ].join('\n\n'),
+          prompt: [
+            `【创作目标】${goal.trim() || '让读者持续在乎人物与结果'}`,
+            `【作品设定】\n${source}`,
+            feedback,
+            attempt > 1 ? `【格式重试】${formatError}。缩短表述并重新输出完整 JSON。` : ''
+          ].filter(Boolean).join('\n\n')
+        }), { stream: false, signal }
+      )
+    })
     const score = Math.max(0, Math.min(100, Math.round(Number(parsed.score) || 0)))
     const blockers = stringList(parsed.blocking_issues)
+    lastBlockers = blockers.join('；') || `第 ${round} 轮结构或评分未达标`
     const engine = normalizeEmotionEngine(parsed.engine)
     if (parsed.passed === true && score >= 85 && blockers.length === 0 && engine) {
       coreSettingDAO.upsertStructured(
@@ -166,7 +191,7 @@ export async function ensureEmotionEngine(
     }
     feedback = `【上一轮阻塞，必须重建】\n${JSON.stringify({ score, blockers, engine: parsed.engine }, null, 2)}`
   }
-  throw new Error(`情绪发动机 ${EMOTION_ENGINE_MAX_ROUNDS} 轮仍未通过`)
+  throw new GoalPhaseExhaustedError(`情绪发动机 ${EMOTION_ENGINE_MAX_ROUNDS} 轮仍未通过；最后阻断：${lastBlockers}`)
 }
 
 export function loadChapterEmotionContract(chapterId: number): EmotionContract | null {
@@ -239,7 +264,14 @@ export async function ensureChapterEmotionContract(
         ].filter(Boolean).join('\n\n')
       }), { stream: false, signal }
     )
-    if (!response.success || !response.content?.trim()) throw new Error(response.error || '情绪契约生成无返回')
+    if (!response.success || !response.content?.trim()) {
+      feedback = `【上一轮调用失败】${response.error || '情绪契约生成无返回'}。重新输出完整 JSON。`
+      continue
+    }
+    if (response.finishReason === 'length') {
+      feedback = '【上一轮输出截断】缩短各字段并重新输出完整 JSON。'
+      continue
+    }
     let contract: EmotionContract | null = null
     try { contract = normalizeEmotionContract(parseObject(response.content, '情绪契约')) } catch { contract = null }
     if (contract) {

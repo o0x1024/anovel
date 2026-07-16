@@ -1,8 +1,9 @@
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, anchorDAO, emotionalStateDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, anchorDAO, emotionalStateDAO, storyStateDAO } from '../db'
 import { coreSettingDAO } from '../db'
 import { formatCharacterCardsForChapter, resolveChapterCharacterNames } from './character-cards'
 import { getPreviousChapterContext } from './chapter-continuity'
 import { MAX_ACTIVE_ANCHORS } from './writing-techniques'
+import { selectRelevantStoryFacts, selectRelevantTimelineEvents } from './novel-memory-retrieval'
 
 const DEPTH_LABELS: Record<string, string> = {
   shallow: '浅伏笔',
@@ -18,6 +19,7 @@ const BEAT_ROLE_LABELS: Record<string, string> = {
 }
 
 export interface NarrativeMemorySections {
+  systemicState: string
   chapterMeta: string
   foreshadowing: string
   snapshots: string
@@ -49,6 +51,7 @@ export function buildNarrativeMemorySections(
   const { includeChapterOutline = true } = options
   const isBodyGenerationMemory = !includeChapterOutline
   const empty: NarrativeMemorySections = {
+    systemicState: '',
     chapterMeta: '',
     foreshadowing: '',
     snapshots: '',
@@ -99,6 +102,32 @@ export function buildNarrativeMemorySections(
       if (includeChapterOutline && ch.outline?.trim()) {
         metaParts.push('【当前章节大纲】', ch.outline)
       }
+
+      const allFacts = storyStateDAO.listFactsByWork(workId)
+      const selectedFacts = selectRelevantStoryFacts(allFacts, chapterText, focusCharacterNames)
+      const systemicParts: string[] = []
+      if (selectedFacts.length > 0) {
+        const stateLines = selectedFacts.map(fact => {
+          let value = fact.value_json
+          try { value = JSON.stringify(JSON.parse(fact.value_json), null, 0) } catch { /* 保留原值 */ }
+          return `- ${fact.entity}.${fact.state_key}=${value}（${fact.transition}${fact.irreversible ? '，不可逆' : ''}${fact.evidence ? `；证据:${fact.evidence}` : ''}）`
+        })
+        systemicParts.push(
+          `【承重故事状态账本 - 相关性检索 ${selectedFacts.length} 条；正文不得回退、重复完成或重复解锁】`,
+          stateLines.join('\n')
+        )
+      }
+
+      const recentPatterns = storyStateDAO.listFingerprintsByWork(workId).slice(-8)
+      if (recentPatterns.length > 0) {
+        systemicParts.push(
+          '【最近章节模式 - 本章必须避免同构重复】',
+          recentPatterns.map(pattern =>
+            `- 冲突:${pattern.conflict_type}；解法:${pattern.protagonist_method}；对手:${pattern.antagonist_tactic}；钩子:${pattern.hook_type}；代价:${pattern.cost_type}`
+          ).join('\n')
+        )
+      }
+      sections.systemicState = systemicParts.join('\n\n')
       sections.chapterMeta = metaParts.join('\n\n')
     }
   }
@@ -191,11 +220,16 @@ export function buildNarrativeMemorySections(
     ].filter(Boolean).join('\n')
   }
 
-  const timeline = timelineDAO.listByWork(workId)
-  timelineEventCount = timeline.length
+  const allTimeline = timelineDAO.listByWork(workId)
+  timelineEventCount = allTimeline.length
+  const timeline = isBodyGenerationMemory
+    ? selectRelevantTimelineEvents(allTimeline, chapterText, focusCharacterNames)
+    : allTimeline
   if (timeline.length > 0) {
     sections.timeline = [
-      '【故事时间线约束】',
+      isBodyGenerationMemory
+        ? `【故事时间线约束 - 相关性检索 ${timeline.length}/${allTimeline.length} 条】`
+        : '【故事时间线约束】',
       ...timeline.map(e => {
         const time = e.absolute_time || e.relative_time || '未标注时间'
         const ch = e.chapter_id ? `（章节#${e.chapter_id}）` : ''
@@ -210,6 +244,7 @@ export function buildNarrativeMemorySections(
   }
 
   const joined = [
+    sections.systemicState,
     sections.chapterMeta,
     sections.foreshadowing,
     sections.snapshots,

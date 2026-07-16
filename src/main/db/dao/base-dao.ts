@@ -5,8 +5,10 @@ import { getDatabase } from '../connection'
  * 基础 DAO 类，提供通用的数据库操作
  */
 export abstract class BaseDAO {
+  constructor(private readonly injectedDatabase?: Database.Database) {}
+
   protected get db(): Database.Database {
-    return getDatabase()
+    return this.injectedDatabase ?? getDatabase()
   }
 
   /**

@@ -44,6 +44,14 @@ export interface ModelRequest {
   maxTokens?: number
   temperature?: number
   thinkingEnabled?: boolean
+  /** 严格结构化短输出可强制关闭思考，优先级高于全局/步骤模型设置。 */
+  forceThinkingDisabled?: boolean
+  /** 请求提供商原生 JSON Schema 结构化输出；不支持时适配器自动降级。 */
+  responseSchema?: {
+    name: string
+    schema: Record<string, unknown>
+    strict?: boolean
+  }
 
   /** 频率惩罚：惩罚已出现 token 的重复使用，增加词汇多样性 (-2~2) */
   frequencyPenalty?: number
@@ -90,6 +98,8 @@ export interface ModelResponse {
     completionTokens: number
   }
   durationMs?: number
+  /** 提供商返回的归一化结束原因；length 表示达到输出上限而截断。 */
+  finishReason?: 'stop' | 'length' | 'content_filter' | 'tool' | 'unknown'
   contextBudget?: ContextBudgetReport
   cancelled?: boolean
 }

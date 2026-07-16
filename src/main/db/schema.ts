@@ -202,9 +202,74 @@ export function initSchema(): void {
       model_type VARCHAR(20),
       style_id INTEGER,
       generation_round INTEGER DEFAULT 1,
+      snapshot_json TEXT,
       create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
     );
+
+    -- ============================================
+    -- 短故事 Harness：候选沙箱 / 问题账本 / 发布快照（V4.2）
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS story_generation_candidates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      base_content_hash VARCHAR(80),
+      content TEXT NOT NULL,
+      word_count INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(24) NOT NULL DEFAULT 'generated',
+      source_step VARCHAR(50) NOT NULL DEFAULT 'body_generation',
+      attempt_no INTEGER NOT NULL DEFAULT 1,
+      checks_json TEXT,
+      reject_reason TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_candidates_work_chapter
+      ON story_generation_candidates(work_id, chapter_id, id);
+    CREATE INDEX IF NOT EXISTS idx_story_candidates_status
+      ON story_generation_candidates(work_id, status, update_time);
+
+    CREATE TABLE IF NOT EXISTS story_issue_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      issue_key VARCHAR(300) NOT NULL,
+      code VARCHAR(80) NOT NULL,
+      severity VARCHAR(20) NOT NULL,
+      scope VARCHAR(20) NOT NULL,
+      chapter_ids_json TEXT,
+      evidence_json TEXT,
+      invariants_json TEXT,
+      expected_result TEXT,
+      message TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      first_seen_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_seen_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      resolved_time DATETIME,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      UNIQUE(work_id, issue_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_issue_work_status
+      ON story_issue_ledger(work_id, status, severity);
+
+    CREATE TABLE IF NOT EXISTS story_release_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      label VARCHAR(100) NOT NULL,
+      content_hash VARCHAR(80) NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      is_frozen INTEGER NOT NULL DEFAULT 1,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_release_work
+      ON story_release_snapshots(work_id, create_time);
 
     -- ============================================
     -- 伏笔追踪表（V1.5）
@@ -260,6 +325,53 @@ export function initSchema(): void {
 
     CREATE INDEX IF NOT EXISTS idx_emotional_state_work_character
       ON emotional_state_ledger(work_id, character_name, chapter_id);
+
+    -- ============================================
+    -- 通用故事状态账本与章节模式指纹（V4.1）
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS story_state_facts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      entity VARCHAR(120) NOT NULL,
+      state_key VARCHAR(120) NOT NULL,
+      value_type VARCHAR(20) NOT NULL,
+      value_json TEXT NOT NULL,
+      transition VARCHAR(20) NOT NULL,
+      irreversible INTEGER NOT NULL DEFAULT 0,
+      evidence TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_state_facts_work_chapter
+      ON story_state_facts(work_id, chapter_id);
+    CREATE INDEX IF NOT EXISTS idx_story_state_facts_entity_key
+      ON story_state_facts(work_id, entity, state_key);
+
+    CREATE TABLE IF NOT EXISTS chapter_pattern_fingerprints (
+      chapter_id INTEGER PRIMARY KEY,
+      work_id INTEGER NOT NULL,
+      conflict_type TEXT NOT NULL,
+      protagonist_method TEXT NOT NULL,
+      antagonist_tactic TEXT NOT NULL,
+      antagonist_outcome TEXT NOT NULL,
+      opponent_adjustment TEXT NOT NULL,
+      location_type TEXT NOT NULL,
+      hook_type TEXT NOT NULL,
+      cost_type TEXT NOT NULL,
+      relationship_delta TEXT NOT NULL,
+      volume_objective_delta TEXT NOT NULL,
+      payoff_type VARCHAR(20) NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chapter_pattern_work
+      ON chapter_pattern_fingerprints(work_id, chapter_id);
 
     -- ============================================
     -- 资源约束账本（体力/法力/积分/等级/冷却等跨章节可变状态）

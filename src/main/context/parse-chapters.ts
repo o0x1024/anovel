@@ -2,6 +2,8 @@ import { extractJsonText } from './parse-json-extract'
 import { normalizeEmotionContract, type EmotionContract } from '../../shared/emotion-contract'
 
 export interface ParsedChapter {
+  /** 稳定数据库身份；结构修复等定向任务应优先按 id 匹配，title 只作校验。 */
+  id?: number
   title: string
   outline: string
   beat_role?: string | null
@@ -12,6 +14,7 @@ export interface ParsedChapter {
   dramatic_contract?: DramaticContract | null
   tension_plan?: TensionPlan | null
   emotion_contract?: EmotionContract | null
+  continuity_contract?: ContinuityContract | null
 }
 
 export interface ParsedSingleChapterOutline {
@@ -42,6 +45,26 @@ export interface TensionPlan {
   phase: string
   level: number
   payoff_type: 'debt' | 'partial' | 'major' | 'aftertaste'
+}
+
+/**
+ * 短故事跨拍连续性合同。
+ * 不单独落数据库列，随 outline_diagnosis 保存，供节拍门禁与正文生成共同使用。
+ */
+export interface ContinuityContract {
+  time_anchor?: string
+  elapsed_from_previous?: string
+  start_location?: string
+  end_location?: string
+  entry_facts?: string[]
+  exit_facts?: string[]
+  knowledge_changes?: string[]
+  evidence_changes?: string[]
+  opponent_action?: string
+  opponent_reasoning?: string
+  damage_to_protagonist?: string
+  protagonist_adjustment?: string
+  recap_forbidden?: string[]
 }
 
 interface ChapterExecutionBlueprint {
@@ -289,6 +312,9 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   if (!item || typeof item !== 'object') return null
   const row = item as Record<string, unknown>
 
+  const idValue = Number(row.id ?? row.chapter_id ?? row.chapterId)
+  const id = Number.isInteger(idValue) && idValue > 0 ? idValue : undefined
+
   let title = String(row.title ?? row.name ?? row.章节名 ?? '').trim()
   title = title.replace(/^\*+|\*+$/g, '')
   if (!title || isMetaChapterTitle(title)) return null
@@ -304,6 +330,7 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   )
   const tensionPlan = normalizeTensionPlan(row.tension_plan ?? row.tensionPlan)
   const emotionContract = normalizeEmotionContract(row.emotion_contract ?? row.emotionContract)
+  const continuityContract = normalizeContinuityContract(row.continuity_contract ?? row.continuityContract)
   const numericState = extractNumericState(row)
   const blueprint = normalizeExecutionBlueprint(row)
   const outline = buildOutlineFromParts(plotPoints, outlineRaw, nextHook, dramaticContract, numericState, blueprint)
@@ -311,6 +338,7 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
   if (isPlaceholderOutline(outline)) return null
 
   return {
+    id,
     title,
     outline,
     beat_role: row.beat_role != null ? String(row.beat_role) : null,
@@ -320,8 +348,32 @@ function normalizeChapterItem(item: unknown): ParsedChapter | null {
     characters: normalizeCharactersField(row.characters),
     dramatic_contract: dramaticContract,
     tension_plan: tensionPlan,
-    emotion_contract: emotionContract
+    emotion_contract: emotionContract,
+    continuity_contract: continuityContract
   }
+}
+
+function normalizeContinuityContract(value: unknown): ContinuityContract | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  const contract: ContinuityContract = {
+    time_anchor: firstString(row, ['time_anchor', 'timeAnchor']),
+    elapsed_from_previous: firstString(row, ['elapsed_from_previous', 'elapsedFromPrevious']),
+    start_location: firstString(row, ['start_location', 'startLocation']),
+    end_location: firstString(row, ['end_location', 'endLocation']),
+    entry_facts: normalizeStringArray(row.entry_facts ?? row.entryFacts),
+    exit_facts: normalizeStringArray(row.exit_facts ?? row.exitFacts),
+    knowledge_changes: normalizeStringArray(row.knowledge_changes ?? row.knowledgeChanges),
+    evidence_changes: normalizeStringArray(row.evidence_changes ?? row.evidenceChanges),
+    opponent_action: firstString(row, ['opponent_action', 'opponentAction']),
+    opponent_reasoning: firstString(row, ['opponent_reasoning', 'opponentReasoning']),
+    damage_to_protagonist: firstString(row, ['damage_to_protagonist', 'damageToProtagonist']),
+    protagonist_adjustment: firstString(row, ['protagonist_adjustment', 'protagonistAdjustment']),
+    recap_forbidden: normalizeStringArray(row.recap_forbidden ?? row.recapForbidden)
+  }
+  return Object.values(contract).some(value => Array.isArray(value) ? value.length > 0 : Boolean(value))
+    ? contract
+    : null
 }
 
 function extractNumericState(row: Record<string, unknown>): string | null {

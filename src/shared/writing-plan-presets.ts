@@ -2,7 +2,7 @@
 export type PresetNovelLength = 'short' | 'medium' | 'long'
 export type NovelLength = PresetNovelLength | 'custom'
 
-export const DEFAULT_WORDS_PER_CHAPTER = 4000
+export const DEFAULT_WORDS_PER_CHAPTER = 2000
 
 export interface NovelLengthPreset {
   label: string
@@ -12,52 +12,30 @@ export interface NovelLengthPreset {
   wordsPerChapter: number
 }
 
-export const NOVEL_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> = {
-  short: {
-    label: '短篇小说',
-    description: '单线快节奏，适合集中爆发',
-    targetTotalWords: 200_000,
-    suggestedChapters: 50,
-    wordsPerChapter: DEFAULT_WORDS_PER_CHAPTER
-  },
-  medium: {
-    label: '中篇小说',
-    description: '主流网文体量，多卷展开',
-    targetTotalWords: 800_000,
-    suggestedChapters: 200,
-    wordsPerChapter: DEFAULT_WORDS_PER_CHAPTER
-  },
-  long: {
-    label: '长篇小说',
-    description: '超长连载，深度分卷',
-    targetTotalWords: 1_600_000,
-    suggestedChapters: 400,
+function createLengthPreset(
+  label: string,
+  description: string,
+  targetTotalWords: number
+): NovelLengthPreset {
+  return {
+    label,
+    description,
+    targetTotalWords,
+    suggestedChapters: Math.ceil(targetTotalWords / DEFAULT_WORDS_PER_CHAPTER),
     wordsPerChapter: DEFAULT_WORDS_PER_CHAPTER
   }
 }
 
+export const NOVEL_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> = {
+  short: createLengthPreset('短篇小说', '单线快节奏，适合集中爆发', 200_000),
+  medium: createLengthPreset('中篇小说', '主流网文体量，多卷展开', 800_000),
+  long: createLengthPreset('长篇小说', '超长连载，深度分卷', 1_600_000)
+}
+
 export const STORY_LENGTH_PRESETS: Record<PresetNovelLength, NovelLengthPreset> = {
-  short: {
-    label: '短篇故事',
-    description: '快速聚焦单一事件或冲突，篇幅较短',
-    targetTotalWords: 10_000,
-    suggestedChapters: 3,
-    wordsPerChapter: 3000
-  },
-  medium: {
-    label: '中篇故事',
-    description: '情节发展较为完整，有多条冲突线',
-    targetTotalWords: 30_000,
-    suggestedChapters: 10,
-    wordsPerChapter: 3000
-  },
-  long: {
-    label: '长篇故事',
-    description: '人物关系更为复杂，支持多节拍深度展现',
-    targetTotalWords: 60_000,
-    suggestedChapters: 15,
-    wordsPerChapter: 4000
-  }
+  short: createLengthPreset('短篇故事', '快速聚焦单一事件或冲突，篇幅较短', 10_000),
+  medium: createLengthPreset('中篇故事', '情节发展较为完整，有多条冲突线', 30_000),
+  long: createLengthPreset('长篇故事', '人物关系更为复杂，支持多节拍深度展现', 60_000)
 }
 
 export function getPresetsForType(workType?: string): Record<PresetNovelLength, NovelLengthPreset> {
@@ -68,7 +46,8 @@ export const DEFAULT_NOVEL_LENGTH: PresetNovelLength = 'medium'
 
 export const TARGET_WORD_PRESETS = [
   200_000, 300_000, 400_000, 500_000, 600_000, 700_000,
-  800_000, 1_000_000, 1_200_000, 1_500_000, 1_600_000, 2_000_000
+  800_000, 1_000_000, 1_200_000, 1_500_000, 1_600_000, 2_000_000,
+  3_000_000, 4_000_000
 ] as const
 
 /** 每章目标字数选项 — 章节规划与正文生成共用 */

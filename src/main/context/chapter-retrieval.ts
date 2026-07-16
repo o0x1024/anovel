@@ -1,4 +1,5 @@
-import { volumeChapterDAO, foreshadowingDAO, characterSnapshotDAO } from '../db'
+import { volumeChapterDAO, foreshadowingDAO, characterSnapshotDAO, storyStateDAO } from '../db'
+import { extractMemoryKeywords } from './novel-memory-retrieval'
 
 export interface RetrievedChapter {
   chapterId: number
@@ -16,7 +17,7 @@ export function retrieveRelevantChapters(
   workId: number,
   chapterId: number,
   outlineText: string,
-  limit = 2
+  limit = 4
 ): RetrievedChapter[] {
   const all = volumeChapterDAO.listChaptersByWork(workId)
   const idx = all.findIndex(c => c.id === chapterId)
@@ -31,11 +32,40 @@ export function retrieveRelevantChapters(
 
   const keywords = extractKeywords(outlineText)
   const characterNames = characterSnapshotDAO.listCharacterNames(workId)
+  const focusCharacterNames = characterNames.filter(name => name && outlineText.includes(name))
   const pending = foreshadowingDAO.listPending(workId)
+  const memoryKeywords = extractMemoryKeywords(outlineText)
+  const relevantPending = pending.filter(item => {
+    const text = `${item.description ?? ''}\n${item.plant_location ?? ''}`
+    return memoryKeywords.some(keyword => text.includes(keyword))
+      || (item.description?.trim() ? outlineText.includes(item.description.trim().slice(0, 10)) : false)
+  })
+  const relevantFactReasons = new Map<number, string[]>()
+  for (const fact of storyStateDAO.listFactsByWork(workId)) {
+    const text = `${fact.entity}\n${fact.state_key}\n${fact.evidence ?? ''}`
+    const relevant = outlineText.includes(fact.entity)
+      || outlineText.includes(fact.state_key)
+      || memoryKeywords.some(keyword => text.includes(keyword))
+    if (!relevant) continue
+    const reasons = relevantFactReasons.get(fact.chapter_id) ?? []
+    reasons.push(`${fact.entity}.${fact.state_key}`)
+    relevantFactReasons.set(fact.chapter_id, reasons)
+  }
 
+  const relevantForeshadowChapterIds = new Set(
+    relevantPending.map(item => item.plant_chapter_id).filter((id): id is number => id != null)
+  )
+  const recentFloor = Math.max(0, idx - 80)
   const candidates = all
     .slice(0, idx)
-    .filter(c => c.id !== prevId && c.content?.trim())
+    .filter((c, index) => {
+      if (c.id === prevId || !c.content?.trim()) return false
+      if (index >= recentFloor) return true
+      if (relevantFactReasons.has(c.id) || relevantForeshadowChapterIds.has(c.id)) return true
+      const metadata = `${c.title}\n${c.outline ?? ''}\n${c.characters ?? ''}`
+      return keywords.some(keyword => metadata.includes(keyword))
+        || focusCharacterNames.some(name => metadata.includes(name))
+    })
 
   const scored: RetrievedChapter[] = []
 
@@ -44,10 +74,10 @@ export function retrieveRelevantChapters(
     let score = 0
     const reasons: string[] = []
 
-    for (const name of characterNames) {
-      if (name && (outlineText.includes(name) || content.includes(name))) {
-        score += 2
-        if (outlineText.includes(name)) reasons.push(`角色「${name}」`)
+    for (const name of focusCharacterNames) {
+      if (content.includes(name)) {
+        score += 4
+        reasons.push(`角色「${name}」`)
       }
     }
 
@@ -58,7 +88,7 @@ export function retrieveRelevantChapters(
       }
     }
 
-    for (const f of pending) {
+    for (const f of relevantPending) {
       const loc = f.plant_location || ''
       if (loc && (loc.includes(ch.title) || ch.title.includes(loc.slice(0, 6)))) {
         score += 4
@@ -70,12 +100,18 @@ export function retrieveRelevantChapters(
       }
     }
 
+    const factReasons = relevantFactReasons.get(ch.id) ?? []
+    if (factReasons.length > 0) {
+      score += 6 + Math.min(6, factReasons.length * 2)
+      reasons.push(`状态「${factReasons.slice(0, 2).join('、')}」`)
+    }
+
     if (score > 0) {
       scored.push({
         chapterId: ch.id,
         chapterTitle: ch.title,
         volumeName: ch.volume_name,
-        content: buildRelevantExcerpt(content, keywords, pending.map(f => f.description)),
+        content: buildRelevantExcerpt(content, keywords, relevantPending.map(f => f.description)),
         reason: [...new Set(reasons)].slice(0, 3).join('；') || '相关',
         score
       })

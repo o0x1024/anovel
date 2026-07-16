@@ -1,4 +1,4 @@
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, emotionalStateDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, volumeChapterDAO, emotionalStateDAO, storyStateDAO } from '../db'
 
 export interface MemoryCleanupResult {
   snapshotsRemoved: number
@@ -6,6 +6,8 @@ export interface MemoryCleanupResult {
   payoffsReverted: number
   timelineRemoved?: number
   emotionalStatesRemoved?: number
+  stateFactsRemoved?: number
+  patternFingerprintsRemoved?: number
 }
 
 function normalizeDesc(desc: string): string {
@@ -28,7 +30,12 @@ export function clearChapterMemoryBeforeExtract(workId: number, chapterId: numbe
   const foreshadowingRemoved = foreshadowingDAO.deleteByPlantChapter(workId, chapterId)
   const snapshotsRemoved = characterSnapshotDAO.deleteByChapter(chapterId)
   const timelineRemoved = timelineDAO.deleteByChapter(workId, chapterId)
-  return { snapshotsRemoved, foreshadowingRemoved, payoffsReverted, timelineRemoved }
+  const systemic = storyStateDAO.deleteByChapter(workId, chapterId)
+  return {
+    snapshotsRemoved, foreshadowingRemoved, payoffsReverted, timelineRemoved,
+    stateFactsRemoved: systemic.facts,
+    patternFingerprintsRemoved: systemic.fingerprints
+  }
 }
 
 /**

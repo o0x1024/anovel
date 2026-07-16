@@ -77,7 +77,7 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
     return 'polish'
   }
 
-  if (normalized.startsWith('ai_trace_') || normalized === 'memory_extract') {
+  if (normalized.startsWith('ai_trace_')) {
     return 'deai'
   }
 
@@ -90,6 +90,7 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
     normalized === 'emotion_blind_read' ||
     normalized === 'emotion_target_compare' ||
     normalized === 'emotion_state_extract' ||
+    normalized === 'memory_extract' ||
     normalized.startsWith('quality_diagnosis') ||
     normalized === 'settings_overall_check' ||
     normalized === 'settings_character_check' ||

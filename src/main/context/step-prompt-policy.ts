@@ -38,6 +38,7 @@ export function isCoreSettingsFlowStep(step: string | undefined): boolean {
 export function isFocusedAnalysisStep(step: string | undefined): boolean {
   if (!step) return false
   if (step === 'story_title_hook_gen') return true
+  if (step === 'goal_novel_volume_chapter_gate' || step === 'goal_novel_volume_chapter_repair') return true
   if (step.endsWith('_self_check')) return true
   const prefixes = [
     'critique_',

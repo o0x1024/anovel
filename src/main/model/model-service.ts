@@ -126,7 +126,9 @@ export class ModelService {
         topP: request.topP ?? stepDefaults.topP
       }
 
-      if (stepOverrideThinking !== undefined) {
+      if (request.forceThinkingDisabled) {
+        enrichedRequest.thinkingEnabled = false
+      } else if (stepOverrideThinking !== undefined) {
         enrichedRequest.thinkingEnabled = stepOverrideThinking
       }
 
@@ -219,6 +221,7 @@ export class ModelService {
           workId: request.workId,
           durationMs: response.durationMs ?? 0,
           usage: response.usage,
+          finishReason: response.finishReason,
           content: response.content
         })
 

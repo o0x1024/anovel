@@ -1,5 +1,11 @@
-import { foreshadowingDAO, characterSnapshotDAO, timelineDAO } from '../db'
+import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, storyStateDAO } from '../db'
 import type { ForeshadowingDepth } from '../db/dao/foreshadowing-dao'
+import type {
+  ChapterPatternFingerprintInput,
+  StoryStateFactInput,
+  StoryStateTransition,
+  StoryStateValueType
+} from '../../shared/novel-systemic-types'
 
 export interface ExtractedMemory {
   foreshadowing_planted?: {
@@ -26,6 +32,8 @@ export interface ExtractedMemory {
     absolute_time?: string
     relative_time?: string
   }[]
+  state_facts?: StoryStateFactInput[]
+  chapter_pattern?: ChapterPatternFingerprintInput
 }
 
 export interface MemoryExtractResult {
@@ -33,6 +41,8 @@ export interface MemoryExtractResult {
   resolved: number
   snapshots: number
   timelineEvents: number
+  stateFacts: number
+  patternFingerprint: boolean
 }
 
 export interface ForeshadowingResolutionResult {
@@ -40,6 +50,20 @@ export interface ForeshadowingResolutionResult {
   partial: { id: number; evidence: string }[]
   pending: number[]
 }
+
+export const MEMORY_EXTRACT_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['foreshadowing_planted', 'foreshadowing_resolved', 'character_snapshots', 'timeline_events', 'state_facts', 'chapter_pattern'],
+  properties: {
+    foreshadowing_planted: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    foreshadowing_resolved: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    character_snapshots: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    timeline_events: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    state_facts: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    chapter_pattern: { type: 'object', additionalProperties: true }
+  },
+  additionalProperties: false
+} as const
 
 export function parseMemoryExtract(content: string): ExtractedMemory {
   const match = content.match(/```(?:json)?\s*([\s\S]*?)```/i)
@@ -58,10 +82,81 @@ export function parseMemoryExtract(content: string): ExtractedMemory {
     if (result.timeline_events.length === 0) {
       throw new Error('本章至少需要一条关键时间线事件')
     }
+    result.state_facts = normalizeStateFacts(result.state_facts)
+    result.chapter_pattern = normalizeChapterPattern(result.chapter_pattern)
     return result
   } catch (error) {
     throw new Error(`叙事记忆解析失败：${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+function compactEvidenceText(value: string): string {
+  return value.replace(/[\s“”‘’'"《》]/g, '')
+}
+
+/** 承重状态必须能回指正文原句；无证据的模型推断不得写入事实账本。 */
+export function validateStateFactEvidence(extracted: ExtractedMemory, sourceContent: string): string[] {
+  const source = compactEvidenceText(sourceContent)
+  const errors: string[] = []
+  for (const fact of extracted.state_facts ?? []) {
+    const label = `${fact.entity}.${fact.key}`
+    const evidence = fact.evidence?.trim() ?? ''
+    if (!evidence) {
+      errors.push(`${label}缺少正文证据`)
+      continue
+    }
+    if (evidence.replace(/\s/g, '').length > 80) {
+      errors.push(`${label}证据超过80字，无法稳定定位`)
+      continue
+    }
+    if (!source.includes(compactEvidenceText(evidence))) {
+      errors.push(`${label}证据不是正文原文片段`)
+    }
+  }
+  return errors
+}
+
+const STATE_VALUE_TYPES = new Set<StoryStateValueType>(['number', 'enum', 'boolean', 'set', 'text'])
+const STATE_TRANSITIONS = new Set<StoryStateTransition>(['create', 'update', 'increase', 'decrease', 'unlock', 'complete', 'invalidate'])
+
+function normalizeStateFacts(value: unknown): StoryStateFactInput[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    const entity = String(row.entity ?? '').trim()
+    const key = String(row.key ?? '').trim()
+    const valueType = String(row.valueType ?? row.value_type ?? '') as StoryStateValueType
+    const transition = String(row.transition ?? '') as StoryStateTransition
+    if (!entity || !key || !STATE_VALUE_TYPES.has(valueType) || !STATE_TRANSITIONS.has(transition)) return []
+    return [{
+      entity, key, valueType, transition, value: row.value ?? null,
+      irreversible: row.irreversible === true,
+      evidence: String(row.evidence ?? '').trim() || undefined
+    }]
+  })
+}
+
+function normalizeChapterPattern(value: unknown): ChapterPatternFingerprintInput | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  const payoffType = String(row.payoffType ?? row.payoff_type ?? '') as ChapterPatternFingerprintInput['payoffType']
+  if (!['debt', 'partial', 'major', 'aftertaste'].includes(payoffType)) return undefined
+  const field = (camel: string, snake: string) => String(row[camel] ?? row[snake] ?? '').trim()
+  const result: ChapterPatternFingerprintInput = {
+    conflictType: field('conflictType', 'conflict_type'),
+    protagonistMethod: field('protagonistMethod', 'protagonist_method'),
+    antagonistTactic: field('antagonistTactic', 'antagonist_tactic'),
+    antagonistOutcome: field('antagonistOutcome', 'antagonist_outcome'),
+    opponentAdjustment: field('opponentAdjustment', 'opponent_adjustment'),
+    locationType: field('locationType', 'location_type'),
+    hookType: field('hookType', 'hook_type'),
+    costType: field('costType', 'cost_type'),
+    relationshipDelta: field('relationshipDelta', 'relationship_delta'),
+    volumeObjectiveDelta: field('volumeObjectiveDelta', 'volume_objective_delta'),
+    payoffType
+  }
+  return result
 }
 
 export function applyMemoryExtract(
@@ -73,6 +168,8 @@ export function applyMemoryExtract(
   let resolved = 0
   let snapshots = 0
   let timelineEvents = 0
+  let stateFacts = 0
+  let patternFingerprint = false
 
   for (const item of extracted.foreshadowing_planted ?? []) {
     if (!item.description?.trim()) continue
@@ -120,7 +217,15 @@ export function applyMemoryExtract(
     timelineEvents++
   }
 
-  return { planted, resolved, snapshots, timelineEvents }
+  const facts = extracted.state_facts ?? []
+  storyStateDAO.replaceChapterFacts(workId, chapterId, facts)
+  stateFacts = facts.length
+  if (extracted.chapter_pattern) {
+    storyStateDAO.replaceFingerprint(workId, chapterId, extracted.chapter_pattern)
+    patternFingerprint = true
+  }
+
+  return { planted, resolved, snapshots, timelineEvents, stateFacts, patternFingerprint }
 }
 
 export const FORESHADOWING_RESOLVE_SYSTEM_PROMPT = [
@@ -216,10 +321,19 @@ export const MEMORY_EXTRACT_SYSTEM_PROMPT = [
   '示例：[{"name":"体力","value":"50","unit":""},{"name":"信用度","value":"87","unit":"点"},{"name":"境界","value":"练气三层","unit":""}]',
   '若本章无数值类状态变化，numeric_stats 留空数组。',
   'timeline_events 必须记录本章关键事件，以及发生时间或相对上一章的时间推进；没有明确绝对时间时填写 relative_time。',
+  '涉及证据、文件、钥匙、手机、武器、信物等承重道具时，必须在 timeline_events.event_description 中记录其章末持有人、所在位置、公开/隐藏/损毁状态，并在知情角色的 character_snapshots.known_info 中记录谁已经知道该状态。',
+  '已经发生过的关键事件必须按本章实际时序记录，不得把回忆或复述误记为本章再次发生。',
+  '',
+  'state_facts 用于记录跨章承重状态。题材无关地提取：能力/境界/权限、任务状态、伤势、身份、阵营、持有物、地点控制权、对手已知情报等。',
+  '只记录本章明确创建或发生变化的状态；valueType 只允许 number/enum/boolean/set/text；transition 只允许 create/update/increase/decrease/unlock/complete/invalidate。',
+  '同一章的同一 entity+key 只输出一条，value 必须是章末最终状态；不得把变化前后两个值同时当作并存事实。',
+  '完成任务用 complete，解锁能力或权限用 unlock；不可逆事实设置 irreversible=true；evidence 摘录不超过50字的正文证据。',
+  'chapter_pattern 必须用抽象语义概括本章结构，不得照抄专有名词。relationshipDelta 和 volumeObjectiveDelta 无变化时明确写“无变化”。',
+  'payoffType 只允许 debt/partial/major/aftertaste。opponentAdjustment 必须说明对手是否基于既有失败改变策略。',
   '',
   '输出 JSON：',
   '```json',
-  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":"","numeric_stats":[{"name":"","value":"","unit":""}]}],"timeline_events":[{"event_name":"","event_description":"","absolute_time":"","relative_time":""}]}',
+  '{"foreshadowing_planted":[{"description":"","depth":"normal","location":""}],"foreshadowing_resolved":[{"description":"","location":""}],"character_snapshots":[{"character_name":"","location":"","mental_state":"","known_info":"","relationship_changes":"","ability_changes":"","numeric_stats":[{"name":"","value":"","unit":""}]}],"timeline_events":[{"event_name":"","event_description":"","absolute_time":"","relative_time":""}],"state_facts":[{"entity":"","key":"","valueType":"enum","value":"","transition":"update","irreversible":false,"evidence":""}],"chapter_pattern":{"conflictType":"","protagonistMethod":"","antagonistTactic":"","antagonistOutcome":"","opponentAdjustment":"","locationType":"","hookType":"","costType":"","relationshipDelta":"","volumeObjectiveDelta":"","payoffType":"debt"}}',
   '```',
   '若无某项则留空数组。'
 ].join('\n')

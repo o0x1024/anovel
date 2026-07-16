@@ -78,6 +78,49 @@ class EmotionalStateDAO extends BaseDAO {
     })
   }
 
+  /** 情绪盲读结果与跨章账本必须同成同败，禁止出现“评估已通过但账本缺失”。 */
+  replaceChapterOutcome(
+    chapterId: number,
+    rows: EmotionalStateLedgerInput[],
+    assessmentJson: string,
+    emotionIntensity: number
+  ): void {
+    this.transaction(() => {
+      this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapterId])
+      for (const row of rows) {
+        this.insert(
+          `INSERT INTO emotional_state_ledger (
+            work_id, chapter_id, character_name, felt_state, displayed_state,
+            unresolved_emotion, protective_strategy, behavioral_aftereffect,
+            beliefs_json, relationships_json, source_event
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [row.work_id, chapterId, row.character_name, row.felt_state,
+            row.displayed_state, row.unresolved_emotion, row.protective_strategy,
+            row.behavioral_aftereffect, row.beliefs_json ?? null,
+            row.relationships_json ?? null, row.source_event]
+        )
+      }
+      const updated = this.run(
+        `UPDATE chapters SET emotion_assessment_json = ?, emotion_intensity = ?,
+         update_time = datetime('now') WHERE id = ?`,
+        [assessmentJson, emotionIntensity, chapterId]
+      ).changes
+      if (updated !== 1) throw new Error('情绪验收持久化失败：章节不存在')
+    })
+  }
+
+  replaceAssessmentWithoutLedger(chapterId: number, assessmentJson: string, emotionIntensity: number): void {
+    this.transaction(() => {
+      this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapterId])
+      const updated = this.run(
+        `UPDATE chapters SET emotion_assessment_json = ?, emotion_intensity = ?,
+         update_time = datetime('now') WHERE id = ?`,
+        [assessmentJson, emotionIntensity, chapterId]
+      ).changes
+      if (updated !== 1) throw new Error('情绪验收持久化失败：章节不存在')
+    })
+  }
+
   deleteByChapter(chapterId: number): number {
     return this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapterId]).changes
   }

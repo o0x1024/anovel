@@ -61,7 +61,7 @@ const DEFAULT_CONFIG: GoalConfig = {
   humanReviewTitleHook: false,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
-  maxTurns: 60,
+  maxTurns: props.workType === 'novel' ? 60 : 30,
   goalMatchMin: 85,
   overallStoryMin: 80,
   previewHookMin: 75,
@@ -75,7 +75,7 @@ function loadConfig(): GoalConfig {
     const raw = localStorage.getItem(`${CONFIG_STORAGE_KEY}:${props.workId}`)
     if (raw) {
       const saved = JSON.parse(raw) as Partial<GoalConfig>
-      return {
+      const merged = {
         ...DEFAULT_CONFIG,
         ...saved,
         qualityMetricMins: {
@@ -83,6 +83,8 @@ function loadConfig(): GoalConfig {
           ...saved.qualityMetricMins
         }
       }
+      if (props.workType !== 'novel') merged.maxTurns = Math.min(30, Math.max(1, merged.maxTurns))
+      return merged
     }
   } catch { /* ignore */ }
   return { ...DEFAULT_CONFIG }
@@ -146,6 +148,17 @@ interface GoalTurn {
   create_time: string
 }
 
+interface StoryHarnessIssue {
+  id: number
+  code: string
+  severity: string
+  scope: string
+  message: string
+  expected_result: string | null
+  attempts: number
+  status: 'open' | 'resolved' | 'stalled'
+}
+
 interface GoalProgressEvent {
   workId: number
   turn: number
@@ -158,10 +171,12 @@ interface GoalProgressEvent {
 
 const state = ref<GoalState | null>(null)
 const turns = ref<GoalTurn[]>([])
+const harnessIssues = ref<StoryHarnessIssue[]>([])
 const running = ref(false)
 const lastMessage = ref('')
 const lastStatus = ref('')
 const lastCheck = ref<GoalCheckResult | null>(null)
+const terminalReason = ref<string | null>(null)
 
 const statusLabel = computed(() => {
   const s = state.value?.status
@@ -188,6 +203,7 @@ const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_pha
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
   const s = state.value?.status
+  if (terminalReason.value === 'needs_manual_editor') return false
   if (!s || s === 'goal_met' || s === 'timeout') return false
   if (running.value && s === 'running') return false
   return s === 'paused' || s === 'cancelled'
@@ -200,7 +216,7 @@ const resumeLabel = computed(() =>
 
 const canContinueRepair = computed(() => {
   const s = state.value
-  if (!s || running.value || s.goal_met) return false
+  if (!s || running.value || s.goal_met || terminalReason.value === 'needs_manual_editor') return false
   const repairPhases = ['goal_check', 'repair_plan', 'repair_execute']
   return (s.status === 'timeout' || s.status === 'paused')
     && repairPhases.includes(s.current_phase ?? '')
@@ -212,7 +228,8 @@ const phasePickerTouched = ref(false)
 const showResumePhasePicker = computed(() => {
   if (running.value) return false
   const s = state.value
-  if (!s || s.goal_met) return false
+  if (!s) return false
+  if (s.goal_met) return true
   if (s.status === 'paused' || s.status === 'cancelled' || s.status === 'timeout') return true
   return (s.turn_count ?? 0) > 0 && Boolean(s.current_phase)
 })
@@ -256,7 +273,7 @@ const dimStatus = computed(() => {
     quality: c.qualityScore >= 0 && !c.qualityHardFail && c.qualityScore >= cfg.qualityMin,
     emotion: c.emotionScore >= 80,
     gate: c.gateBlockers === 0,
-    antiAi: c.antiAiViolations === 0,
+    antiAi: !c.reasons.some(reason => reason.includes('anti-AI 规则达到阻塞阈值')),
     goal: !cfg.goalDescription.trim() || cfg.goalMatchMin <= 0 || c.goalMatchScore >= cfg.goalMatchMin,
     overall: props.workType !== 'story' || cfg.overallStoryMin <= 0 || c.overallStoryScore >= cfg.overallStoryMin,
     preview: props.workType !== 'story' || cfg.previewHookMin <= 0 || c.previewHookScore >= cfg.previewHookMin,
@@ -273,13 +290,16 @@ async function refreshState() {
   const res = await window.anovel.invoke('goal:getState', props.workId) as {
     state: GoalState | null
     turns: GoalTurn[]
+    harnessIssues: StoryHarnessIssue[]
   }
   state.value = res.state
   turns.value = res.turns
+  harnessIssues.value = res.harnessIssues ?? []
   if (res.state?.state_json) {
     try {
       const runtime = JSON.parse(res.state.state_json) as {
         lastCheck?: GoalCheckResult
+        terminalReason?: string
         liveProgress?: {
           turn: number
           phase: string
@@ -289,6 +309,7 @@ async function refreshState() {
         }
       }
       lastCheck.value = runtime.lastCheck ?? null
+      terminalReason.value = runtime.terminalReason ?? null
       if (runtime.liveProgress?.message) {
         lastMessage.value = runtime.liveProgress.message
         lastStatus.value = runtime.liveProgress.status
@@ -305,9 +326,11 @@ async function refreshState() {
       }
     } catch {
       lastCheck.value = null
+      terminalReason.value = null
     }
   } else {
     lastCheck.value = null
+    terminalReason.value = null
   }
   if (!lastMessage.value && res.turns[0]?.summary) {
     lastMessage.value = res.turns[0].summary
@@ -387,9 +410,17 @@ async function resume() {
 
 async function continueRepair() {
   if (running.value) return
-  resumeFromPhase.value = 'goal_check'
+  // 小说整书终审默认只读；只有用户显式点击继续修复时才进入受限修复计划。
+  resumeFromPhase.value = 'repair_plan'
   phasePickerTouched.value = true
   await resume()
+}
+
+async function recheckExistingNovel() {
+  if (running.value) return
+  resumeFromPhase.value = 'goal_check'
+  phasePickerTouched.value = true
+  await start()
 }
 
 async function copyEvaluationData() {
@@ -582,7 +613,7 @@ watch(config, saveConfig, { deep: true })
         <div class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-3">
           <p class="text-xs font-bold text-base-content/70">去 AI 味</p>
           <label class="flex items-center justify-between gap-3 text-xs cursor-pointer">
-            <span>anti-AI 规则零违规</span>
+            <span>{{ workType === 'story' ? 'anti-AI 规则密度门禁' : 'anti-AI 规则零违规' }}</span>
             <input v-model="config.checkAntiAiRules" type="checkbox" :disabled="running"
               class="checkbox checkbox-xs checkbox-primary" />
           </label>
@@ -592,9 +623,10 @@ watch(config, saveConfig, { deep: true })
           <p class="text-xs font-bold text-base-content/70">运行控制</p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>轮次上限</span>
-            <input v-model.number="config.maxTurns" type="number" min="1" max="100"
+            <input v-model.number="config.maxTurns" type="number" min="1" :max="workType === 'story' ? 30 : 100"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
+          <p v-if="workType === 'story'" class="text-[11px] text-base-content/40 leading-relaxed">短故事最多 30 轮；达到上限后保留正文与候选并暂停，不会自动清零续跑。</p>
           <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节情节、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
@@ -614,12 +646,24 @@ watch(config, saveConfig, { deep: true })
         <p class="text-[11px] text-base-content/40 leading-relaxed">
           “启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”保留原轮次。已有作品内容不会被自动清除。
         </p>
+        <p v-if="workType === 'novel'" class="text-[11px] text-warning/80 leading-relaxed">
+          长篇会按“本卷大纲 → 本卷正文 → 冻结”滚动运行；整书终审只读。终审未过时，只有手动点击“继续修复”才会改写，且自动范围限于尾部 8 章。
+        </p>
       </div>
 
-      <div class="flex gap-2 pt-2 border-t border-base-300/60">
+      <div class="flex flex-wrap gap-2 pt-2 border-t border-base-300/60">
+        <button
+          v-if="workType === 'novel' && !running && state"
+          class="btn btn-secondary btn-sm gap-2"
+          title="保留现有设定、大纲和正文，从目标验收开始补抽取、诊断并按证据修复"
+          @click="recheckExistingNovel"
+        >
+          <font-awesome-icon icon="stethoscope" class="w-3.5 h-3.5" />
+          重新验收已有正文
+        </button>
         <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
-          {{ state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环' }}
+          {{ terminalReason === 'needs_manual_editor' ? '人工编辑后开启新周期' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环') }}
         </button>
         <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" @click="resume">
           <font-awesome-icon icon="forward" class="w-3.5 h-3.5" />
@@ -725,6 +769,14 @@ watch(config, saveConfig, { deep: true })
         </div>
         <div v-if="lastCheck && !lastCheck.met" class="text-xs text-warning">
           未达标：{{ lastCheck.reasons.join('；') }}
+        </div>
+        <div v-if="workType === 'story' && harnessIssues.some(issue => issue.status !== 'resolved')" class="rounded-xl border border-warning/40 bg-warning/5 p-3 space-y-2 text-xs">
+          <p class="font-bold text-warning">Harness 问题账本</p>
+          <div v-for="issue in harnessIssues.filter(item => item.status !== 'resolved').slice(0, 8)" :key="issue.id" class="space-y-0.5">
+            <p><span class="font-mono">{{ issue.code }}</span> · {{ issue.status === 'stalled' ? '需人工编辑' : `已尝试 ${issue.attempts} 次` }}</p>
+            <p class="text-base-content/60">{{ issue.message }}</p>
+            <p v-if="issue.expected_result" class="text-base-content/45">验收结果：{{ issue.expected_result }}</p>
+          </div>
         </div>
         <p v-if="lastMessage" class="text-xs text-base-content/50 pt-1">{{ lastMessage }}</p>
       </div>
