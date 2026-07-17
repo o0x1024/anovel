@@ -19,7 +19,7 @@
  */
 import { BrowserWindow, type WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, workDAO } from '../../db'
+import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, storyStateDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
 import { buildWorkContext } from '../work-context'
@@ -33,6 +33,12 @@ import { buildSettingsQualityInput, getSettingsQualityStatus, recordQualityCheck
 import { STORY_OVERALL_CHECK_SYSTEM_PROMPT } from '../story-settings-quality'
 import { loadWritingPlan } from '../writing-plan'
 import { bodyWordCountBounds } from '../../../shared/body-word-target'
+import {
+  evaluateNovelQualityAcceptance,
+  formatChapterExecutionContract,
+  isBetterNovelBodyCandidate,
+  isRecognizedNovelHardFail
+} from '../../../shared/chapter-execution-contract'
 import { goldenFingerStructuredPromptSection } from '../../../shared/golden-finger-types'
 import { validateGoldenFinger } from '../golden-finger-validation'
 import { extractJsonText } from '../parse-json-extract'
@@ -42,7 +48,13 @@ import {
   type StoryGoalConfig,
   type GoalCheckResult
 } from './story-goal-checker'
-import { generateBeatBody, reviseBeatBody, extractNarrativeMemoryAfterGeneration, type BeatGenResult } from './story-goal-doer'
+import {
+  commitPreparedNarrativeMemory,
+  generateBeatBody,
+  prepareNarrativeMemoryAfterGeneration,
+  reviseBeatBody,
+  type BeatGenResult
+} from './story-goal-doer'
 import { incubateStoryline, runStorylineGate, freezeStoryline } from './story-goal-routine'
 import { diagnoseChapterQualityAi } from '../../ipc-v15'
 import { parseQualityAiScoreReport, type QualityAiMetricKey } from '../../../shared/quality-ai-score'
@@ -60,9 +72,11 @@ import {
 } from './story-goal-model'
 import {
   generateNextNovelOutlineBatch,
+  reconcileNovelWorkflowState,
   prepareNovelVolumePlan,
   NovelPipelineError,
   readNovelGoalState,
+  resetNovelGoalStateFromVolumePlan,
   resolveNovelVolumeWorkflowCheckpoint,
   updateNovelGoalState,
 } from './novel-outline-pipeline'
@@ -73,11 +87,13 @@ import { parseCachedQualityAssessment, serializeQualityAssessment } from './chap
 import { retentionPackagingRules } from './reader-retention'
 import { assessNovelVolume } from './novel-whole-evaluator'
 import { assessNovelSystemics } from './novel-systemic-gate'
+import { compileChapterExecutionContract } from '../chapter-execution-context'
 import {
   MAX_AUTO_NOVEL_REPAIR_CHAPTERS,
   MAX_NOVEL_PHASE_FAILURES,
   MAX_NOVEL_REPAIR_STALLS,
   capNovelAutomaticRepairTargets,
+  isNovelChapterReadyForTransition,
   isTerminalNovelRepairError,
   minimumNovelTurnBudget,
   nextPhaseAfterNovelOutlineCheckpoint,
@@ -467,6 +483,7 @@ interface PendingDraftChapter {
 
 function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): PendingDraftChapter | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const fingerprintChapterIds = new Set(storyStateDAO.listFingerprintsByWork(workId).map(row => row.chapter_id))
   for (const ch of chapters) {
     const content = ch.content?.trim() ?? ''
     if (!content) return { id: ch.id, title: ch.title, needsGeneration: true }
@@ -474,7 +491,12 @@ function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): Pendi
     const cachedQuality = parseCachedQualityAssessment(ch.quality_assessment_json, content)
     const qualityReady = !config.diagnoseBodyAfterGeneration || config.qualityMin <= 0 || !!cachedQuality
     const emotionReady = isEmotionOutcomeComplete(ch.id, content, ch.emotion_assessment_json)
-    if (!qualityReady || !emotionReady) {
+    const memoryReady = fingerprintChapterIds.has(ch.id)
+    if (!isNovelChapterReadyForTransition({
+      qualityReady,
+      emotionReady,
+      patternFingerprintReady: memoryReady
+    })) {
       return { id: ch.id, title: ch.title, needsGeneration: false }
     }
   }
@@ -499,6 +521,19 @@ async function diagnoseAndFixUntilPass(
   let rounds = 0
   let bestScore = -1
   const failedMetrics: string[] = []
+  const contract = compileChapterExecutionContract(workId, chapterId)
+  if (!contract || contract.errors.length > 0) {
+    throw new Error(`章节执行合同无效：${contract?.errors.join('；') || '章节不存在'}`)
+  }
+  let bestCandidate: {
+    content: string
+    wordCount: number
+    scoreTotal: number
+    hardFail: boolean
+    blockingFailures: string[]
+    advisoryFailures: string[]
+    report?: string
+  } | null = null
 
   while (rounds < MAX_CHAPTER_QUALITY_ROUNDS) {
     assertNotAborted(signal)
@@ -515,17 +550,59 @@ async function diagnoseAndFixUntilPass(
     }
 
     const breakdown = res.report ? parseQualityAiScoreReport(res.report) : null
-    const metricFailures = breakdown
-      ? breakdown.items
-          .filter(item => item.score < qualityMetricMins[item.key])
-          .map(item => `${item.label} ${item.score}/${qualityMetricMins[item.key]}`)
-      : []
-    const currentFailures = [...metricFailures]
-    if (res.hardFail) currentFailures.push('存在质量硬失败项')
-    if (res.scoreTotal < qualityMin) currentFailures.push(`质量总分 ${res.scoreTotal}/${qualityMin}`)
-    failedMetrics.splice(0, failedMetrics.length, ...currentFailures)
+    const recognizedHardFail = isRecognizedNovelHardFail(
+      Boolean(res.hardFail),
+      breakdown?.failedRules ?? []
+    )
+    const acceptance = breakdown
+      ? evaluateNovelQualityAcceptance({
+          scoreTotal: res.scoreTotal,
+          hardFail: recognizedHardFail,
+          items: breakdown.items,
+          actualWordCount: countWords(ch.content),
+          qualityMin,
+          qualityMetricMins,
+          contract
+        })
+      : {
+          passed: false,
+          acceptedWithinTolerance: false,
+          blockingFailures: ['诊断报告缺少结构化单项分'],
+          advisoryFailures: [] as string[],
+          acceptanceFloor: Math.max(65, qualityMin - 5)
+        }
+    failedMetrics.splice(0, failedMetrics.length, ...acceptance.blockingFailures)
 
-    if (!res.hardFail && res.scoreTotal >= qualityMin && metricFailures.length === 0) {
+    const candidateRank = {
+      hardFail: recognizedHardFail,
+      blockingFailures: acceptance.blockingFailures.length,
+      scoreTotal: res.scoreTotal,
+      wordCount: countWords(ch.content),
+      targetWords: contract.wordTarget
+    }
+    const bestRank = bestCandidate
+      ? {
+          hardFail: bestCandidate.hardFail,
+          blockingFailures: bestCandidate.blockingFailures.length,
+          scoreTotal: bestCandidate.scoreTotal,
+          wordCount: bestCandidate.wordCount,
+          targetWords: contract.wordTarget
+        }
+      : null
+    if (isBetterNovelBodyCandidate(candidateRank, bestRank)) {
+      bestCandidate = {
+        content: ch.content,
+        wordCount: candidateRank.wordCount,
+        scoreTotal: res.scoreTotal,
+        hardFail: recognizedHardFail,
+        blockingFailures: [...acceptance.blockingFailures],
+        advisoryFailures: [...acceptance.advisoryFailures],
+        report: res.report
+      }
+    }
+    bestScore = Math.max(bestScore, res.scoreTotal)
+
+    if (acceptance.passed) {
       volumeChapterDAO.updateChapter(chapterId, {
         quality_assessment_json: serializeQualityAssessment({
           content: ch.content,
@@ -534,16 +611,37 @@ async function diagnoseAndFixUntilPass(
           report: res.report
         })
       })
+      if (acceptance.acceptedWithinTolerance) {
+        onProgress?.(`「${ch.title}」承重门禁通过，质量 ${res.scoreTotal}/${qualityMin}，按弱模型软容差验收`)
+      }
       return { passed: true, finalScore: res.scoreTotal, rounds, failedMetrics }
     }
 
-    bestScore = Math.max(bestScore, res.scoreTotal)
+    let repairSource = ch.content
+    let repairReport = res.report
+    let repairBlocking = acceptance.blockingFailures
+    let repairAdvisory = acceptance.advisoryFailures
+    if (bestCandidate && bestCandidate.content !== ch.content) {
+      volumeChapterDAO.updateChapterWithVersion(chapterId, {
+        content: bestCandidate.content,
+        word_count: bestCandidate.wordCount,
+        emotion_assessment_json: null,
+        quality_assessment_json: null
+      })
+      repairSource = bestCandidate.content
+      repairReport = bestCandidate.report
+      repairBlocking = bestCandidate.blockingFailures
+      repairAdvisory = bestCandidate.advisoryFailures
+      onProgress?.(`「${ch.title}」本轮评分退化，已回滚到最佳候选 ${bestCandidate.scoreTotal} 分后继续定点修复`)
+    }
 
     onProgress?.(`正在修复「${ch.title}」第 ${rounds} 轮`)
     const fixPrompt = [
-      `【原文】\n${ch.content}`,
-      `【问题】${res.hardFail ? '存在硬失败项' : `质量分 ${res.scoreTotal}，未达标指标：${metricFailures.join('、')}`}`,
-      res.report ? `【完整诊断报告】\n${res.report}` : '',
+      formatChapterExecutionContract(contract),
+      `【原文】\n${repairSource}`,
+      `【本轮只修复这些阻塞项】\n${repairBlocking.join('；')}`,
+      repairAdvisory.length ? `【软质量参考，不得牺牲章节合同强行追分】\n${repairAdvisory.slice(0, 4).join('；')}` : '',
+      repairReport ? `【完整诊断报告】\n${repairReport}` : '',
       QUALITY_APPLY_FIXES_PROMPT
     ].filter(Boolean).join('\n\n')
 
@@ -553,7 +651,14 @@ async function diagnoseAndFixUntilPass(
         step: 'goal_diagnose_fix',
         enrichWorkContext: false,
         enrichNarrativeMemory: false,
-        systemPrompt: `你是资深网文编辑。请针对以下问题直接输出修改后的正文全文，不要解释。${STYLE_REWRITE_INSTRUCTION}`,
+        temperature: 0.3,
+        maxTokens: Math.max(6000, Math.min(12000, contract.wordTarget * 2)),
+        systemPrompt: [
+          '你是资深网文定向编辑。只修复 user 消息中【本轮只修复这些阻塞项】，直接输出修改后的正文全文，不要解释。',
+          '章节执行合同优先；软质量参考不得驱使你增加无效对话、越过结尾、改变事实或删减已通过节点。',
+          '修改后须保持或改善其他已通过指标；无法同时改善时保留原文对应部分。',
+          STYLE_REWRITE_INSTRUCTION
+        ].join('\n'),
         prompt: fixPrompt
       }),
       { stream: false, signal }
@@ -571,6 +676,19 @@ async function diagnoseAndFixUntilPass(
       failedMetrics.push('修复未返回有效正文')
       onProgress?.(`「${ch.title}」第 ${rounds} 轮修复未返回有效正文，正在重新诊断`)
     }
+  }
+  if (bestCandidate) {
+    const latest = volumeChapterDAO.getChapter(chapterId)
+    if (latest?.content !== bestCandidate.content) {
+      volumeChapterDAO.updateChapterWithVersion(chapterId, {
+        content: bestCandidate.content,
+        word_count: bestCandidate.wordCount,
+        emotion_assessment_json: null,
+        quality_assessment_json: null
+      })
+    }
+    failedMetrics.splice(0, failedMetrics.length, ...bestCandidate.blockingFailures)
+    bestScore = bestCandidate.scoreTotal
   }
   onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」连续 ${MAX_CHAPTER_QUALITY_ROUNDS} 轮未通过质量门禁`)
   return { passed: false, finalScore: bestScore, rounds, failedMetrics: [...new Set(failedMetrics)] }
@@ -655,6 +773,7 @@ async function runChapterAcceptanceGate(
     const revised = await reviseBeatBody(workId, chapterId, {
       signal,
       workType: 'novel',
+      deferNarrativeMemory: true,
       instruction: emotionRepairHint(assessment)
     })
     if (!revised.success) {
@@ -668,6 +787,58 @@ async function runChapterAcceptanceGate(
     qualityScore,
     rounds: totalQualityRounds,
     failedMetrics: [...new Set(failures)]
+  }
+}
+
+async function finalizeNovelChapterMemory(
+  workId: number,
+  chapterId: number,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  if (!chapter?.content?.trim()) throw new Error('最终正文不存在，无法提交叙事记忆')
+
+  onProgress?.(`正在从「${chapter.title}」已通过质量与情绪门禁的正文提取候选记忆`)
+  try {
+    const prepared = await prepareNarrativeMemoryAfterGeneration(
+      workId,
+      chapterId,
+      chapter.content,
+      signal,
+      { requirePatternFingerprint: true, dropInvalidStateFactsAfterRetries: true }
+    )
+    const committed = commitPreparedNarrativeMemory(workId, chapterId, prepared, {
+      markChapterCompleted: true,
+      validate: () => {
+        const latest = volumeChapterDAO.getChapter(chapterId)
+        const consistency = runConsistencyGate(workId, chapterId, latest?.content ?? '')
+        const resource = runResourceConstraintGate(workId, chapterId)
+        const fingerprintReady = storyStateDAO.listFingerprintsByWork(workId)
+          .some(row => row.chapter_id === chapterId)
+        const systemic = assessNovelSystemics(workId, {
+          requireFingerprints: false,
+          includeProseScan: false
+        }).issues.filter(issue => issue.severity === 'blocker' && issue.chapterIds.includes(chapterId))
+        return [
+          ...consistency.blockers.map(item => `一致性：${item}`),
+          ...resource.blockers.map(item => `资源约束：${item}`),
+          ...(!fingerprintReady ? ['模式指纹：章节模式指纹缺失'] : []),
+          ...systemic.map(issue => `跨章状态/模式：${issue.message}`)
+        ]
+      }
+    })
+    onProgress?.(`「${chapter.title}」候选记忆及依赖门禁已原子提交`)
+    return committed
+  } catch (error) {
+    // 候选正文仍保留，但任何不完整或过期的派生记忆都不得对后续章节可见。
+    clearChapterNarrativeMemory(workId, chapterId)
+    volumeChapterDAO.updateChapter(chapterId, {
+      status: 'draft',
+      emotion_assessment_json: null,
+      quality_assessment_json: null
+    })
+    throw error
   }
 }
 
@@ -906,12 +1077,19 @@ async function executeNovelRepairPlan(
       assertNotAborted(signal)
       const ch = volumeChapterDAO.getChapter(chapterId)
       onProgress?.(`正在生成缺失章节「${ch?.title ?? chapterId}」`)
-      const gen = await generateBeatBody(workId, chapterId, { signal, goalDescription: goal, workType: 'novel' })
+      clearChapterNarrativeMemory(workId, chapterId)
+      const gen = await generateBeatBody(workId, chapterId, {
+        signal,
+        goalDescription: goal,
+        workType: 'novel',
+        deferNarrativeMemory: true
+      })
       if (!gen.success) throw new Error(gen.error || '生成失败')
       const gate = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
       if (!gate.passed) {
         throw new Error(`「${ch?.title ?? chapterId}」补写后未通过质量与情绪门禁：${gate.failedMetrics.join('、')}`)
       }
+      await finalizeNovelChapterMemory(workId, chapterId, signal, onProgress)
       summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字，质量与情绪门禁通过`)
     }
     return summaries.join('；')
@@ -928,18 +1106,19 @@ async function executeNovelRepairPlan(
     assertNotAborted(signal)
     const ch = volumeChapterDAO.getChapter(chapterId)
     if (!ch) continue
+    clearChapterNarrativeMemory(workId, chapterId)
     let summary = ''
     let bodyChanged = false
 
     if (plan.issueCodes?.includes('MISSING_PATTERN_FINGERPRINT') && ch.content?.trim()) {
-      onProgress?.(`正在补抽取模式指纹「${ch.title}」`)
-      await extractNarrativeMemoryAfterGeneration(workId, chapterId, ch.content, signal)
-      summary = `${ch.title} 已补抽取状态与模式指纹`
+      onProgress?.(`「${ch.title}」将在复验后重新提取状态与模式指纹`)
+      summary = `${ch.title} 等待复验后补抽取状态与模式指纹`
     } else if (plan.action === 'systemic') {
       onProgress?.(`正在修复承重状态「${ch.title}」`)
       const gen = await reviseBeatBody(workId, chapterId, {
         signal,
         workType: 'novel',
+        deferNarrativeMemory: true,
         instruction: `${plan.hint}\n只修改与确定性证据冲突的事实；既有不可逆状态优先，不得用模糊措辞掩盖冲突。`
       })
       if (!gen.success) throw new Error(gen.error || '承重状态修复失败')
@@ -948,7 +1127,9 @@ async function executeNovelRepairPlan(
 
     } else if (plan.action === 'expand' || plan.action === 'compress') {
       onProgress?.(`正在${plan.action === 'expand' ? '扩写' : '压缩'}「${ch.title}」`)
-      const gen = await reviseBeatBody(workId, chapterId, { signal, instruction: plan.hint, workType: 'novel' })
+      const gen = await reviseBeatBody(workId, chapterId, {
+        signal, instruction: plan.hint, workType: 'novel', deferNarrativeMemory: true
+      })
       if (!gen.success) throw new Error(gen.error || '字数修订失败')
       bodyChanged = true
       summary = `${ch.title} ${gen.wordCount}字`
@@ -961,6 +1142,7 @@ async function executeNovelRepairPlan(
       const gen = await reviseBeatBody(workId, chapterId, {
         signal,
         workType: 'novel',
+        deferNarrativeMemory: true,
         instruction: `根据以下质量诊断逐项修复，优先处理硬失败、因果、人设、设定、大纲覆盖和章末钩子：\n${diagnosis.report}`
       })
       if (!gen.success) throw new Error(gen.error || '质量修复失败')
@@ -975,18 +1157,21 @@ async function executeNovelRepairPlan(
           : null
         if (assessment) instruction = emotionRepairHint(assessment)
       } catch { /* 使用通用情绪修复提示 */ }
-      const gen = await reviseBeatBody(workId, chapterId, { signal, instruction, workType: 'novel' })
+      const gen = await reviseBeatBody(workId, chapterId, {
+        signal, instruction, workType: 'novel', deferNarrativeMemory: true
+      })
       if (!gen.success) throw new Error(gen.error || '情绪修复失败')
       bodyChanged = true
       summary = `${ch.title} 已按情绪盲读报告定向精修`
     } else if (plan.action === 'deai') {
       onProgress?.(`正在去AI/修复一致性「${ch.title}」`)
-      const gate = runConsistencyGate(workId, chapterId, ch.content ?? '')
+      const gate = runConsistencyGate(workId, chapterId, ch.content ?? '', { requireTimeline: false })
       const violations = gate.blockers.join('；')
       const gen = await reviseBeatBody(workId, chapterId, {
         signal,
         instruction: `请修复以下问题：${[violations, plan.hint].filter(Boolean).join('；') || '去除AI腔、提升叙事自然度'}`,
-        workType: 'novel'
+        workType: 'novel',
+        deferNarrativeMemory: true
       })
       if (!gen.success) throw new Error(gen.error || '修复失败')
       bodyChanged = true
@@ -995,6 +1180,7 @@ async function executeNovelRepairPlan(
       onProgress?.(`正在优化目标匹配「${ch.title}」`)
       const gen = await reviseBeatBody(workId, chapterId, {
         signal,
+        deferNarrativeMemory: true,
         instruction: `${plan.hint || '强化创作目标匹配度'}\n用户目标：${goal}`,
         workType: 'novel'
       })
@@ -1007,6 +1193,7 @@ async function executeNovelRepairPlan(
     if (!acceptance.passed) {
       throw new Error(`「${ch.title}」修订后未通过质量与情绪门禁：${acceptance.failedMetrics.join('、')}`)
     }
+    await finalizeNovelChapterMemory(workId, chapterId, signal, onProgress)
     if (bodyChanged) {
       const state = readNovelGoalState(workId)
       const volumeName = volumeChapterDAO.listVolumes(workId).find(volume => volume.id === ch.volume_id)?.name
@@ -1160,6 +1347,11 @@ export async function runNovelGoalLoop(
   bindGoalLoopModelOpts(workId, fullConfig)
 
   goalRoutineDAO.ensure(workId)
+  const hasNoNovelStructure = volumeChapterDAO.listVolumes(workId).length === 0
+    && volumeChapterDAO.listChaptersByWork(workId).length === 0
+  if (!resume && explicitPhase === 'generate_volumes' && hasNoNovelStructure) {
+    resetNovelGoalStateFromVolumePlan(workId)
+  }
   updateNovelGoalState(workId, {
     ...(!resume && !explicitPhase
       ? {
@@ -1367,6 +1559,13 @@ export async function runNovelGoalLoop(
           emit(`分卷大纲完成：${result.volumes} 卷，进入章节情节`, 'running')
           phase = 'generate_beats'
         } else if (phase === 'generate_beats') {
+          const reconciled = reconcileNovelWorkflowState(workId)
+          if (reconciled.changed) {
+            emit(
+              `检测到分卷事实数据与冻结检查点不一致，已自动失效章节门禁 ${reconciled.invalidatedChapterVolumes.length} 卷、正文门禁 ${reconciled.invalidatedBodyVolumes.length} 卷`,
+              'running'
+            )
+          }
           const outlinedChapters = volumeChapterDAO.listChaptersByWork(workId)
           const outlineState = readNovelGoalState(workId)
           const workflow = outlineState.novelOutline
@@ -1435,6 +1634,13 @@ export async function runNovelGoalLoop(
             allOutlinesComplete: res.complete
           })
         } else if (phase === 'draft_body') {
+          const reconciled = reconcileNovelWorkflowState(workId)
+          if (reconciled.changed) {
+            emit(
+              `检测到正文事实数据与冻结检查点不一致，已自动回退到最早未完成分卷`,
+              'running'
+            )
+          }
           const draftState = readNovelGoalState(workId)
           const draftChapters = volumeChapterDAO.listChaptersByWork(workId)
           const workflow = draftState.novelOutline
@@ -1476,21 +1682,23 @@ export async function runNovelGoalLoop(
                 `正文目标章节不属于当前已冻结分卷「${workflow?.kind === 'draft_body' ? workflow.volume.name : '未知'}」`
               )
             }
-            let finalMemory: BeatGenResult['memoryExtracted']
-            let shouldSyncFinalMemory = true
+            // 未完成验收的正文只能作为候选；先移除旧派生记忆，避免同章修订读到未来章末状态。
+            clearChapterNarrativeMemory(workId, chapter.id)
             if (chapter.needsGeneration) {
               emit(`正在生成正文「${chapter.title}」`, 'running')
-              const gen = await generateBeatBody(workId, chapter.id, { signal: controller.signal, goalDescription: fullConfig.goalDescription, workType: 'novel' })
+              const gen = await generateBeatBody(workId, chapter.id, {
+                signal: controller.signal,
+                goalDescription: fullConfig.goalDescription,
+                workType: 'novel',
+                deferNarrativeMemory: true
+              })
               if (!gen.success) throw new Error(gen.error || '正文生成失败')
-              finalMemory = gen.memoryExtracted
-              shouldSyncFinalMemory = !finalMemory
-              const memMsg = finalMemory ? ` · 记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收` : ''
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'draft',
                 target_chapter_id: chapter.id,
-                summary: `生成「${chapter.title}」${gen.wordCount}字${memMsg}`
+                summary: `生成候选正文「${chapter.title}」${gen.wordCount}字，叙事记忆尚未提交`
               })
-              emit(`生成「${chapter.title}」${gen.wordCount}字${memMsg}`, 'running')
+              emit(`生成候选正文「${chapter.title}」${gen.wordCount}字，开始执行质量与情绪门禁`, 'running')
             } else {
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'diagnose_resume',
@@ -1507,7 +1715,6 @@ export async function runNovelGoalLoop(
               controller.signal,
               msg => emit(msg, 'running')
             )
-            shouldSyncFinalMemory = true
             goalRoutineDAO.appendTurn({
               work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
               target_chapter_id: chapter.id,
@@ -1518,48 +1725,26 @@ export async function runNovelGoalLoop(
             })
             if (!acceptance.passed) {
               clearChapterNarrativeMemory(workId, chapter.id)
-              volumeChapterDAO.updateChapterWithVersion(chapter.id, {
-                content: '', word_count: 0, status: 'draft', emotion_assessment_json: null
+              volumeChapterDAO.updateChapter(chapter.id, {
+                status: 'draft', emotion_assessment_json: null, quality_assessment_json: null
               })
               throw new Error(
-                `「${chapter.title}」连续 ${MAX_CHAPTER_CONVERGENCE_ROUNDS} 轮未通过质量与情绪联合门禁，禁止进入下一章`
+                `「${chapter.title}」累计诊断 ${acceptance.rounds} 轮仍未通过质量与情绪联合门禁，已保留最佳正文并禁止进入下一章`
                 + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
               )
             }
 
-            if (shouldSyncFinalMemory) {
-              const latest = volumeChapterDAO.getChapter(chapter.id)
-              if (latest?.content?.trim()) {
-                emit(`正在同步「${chapter.title}」最终正文的伏笔与角色快照`, 'running')
-                finalMemory = await extractNarrativeMemoryAfterGeneration(workId, chapter.id, latest.content, controller.signal)
-                goalRoutineDAO.appendTurn({
-                  work_id: workId, turn_no: turn, phase, action: 'memory_sync',
-                  target_chapter_id: chapter.id,
-                  summary: `同步「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`
-                })
-                emit(`已同步「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`, 'running')
-              }
-            }
-
-            const latestAfterRepair = volumeChapterDAO.getChapter(chapter.id)
-            const finalConsistency = runConsistencyGate(workId, chapter.id, latestAfterRepair?.content ?? '')
-            const finalResource = runResourceConstraintGate(workId, chapter.id)
-            const finalBlockers = [...finalConsistency.blockers, ...finalResource.blockers]
-            if (finalBlockers.length > 0) {
-              clearChapterNarrativeMemory(workId, chapter.id)
-              volumeChapterDAO.updateChapterWithVersion(chapter.id, { content: '', word_count: 0, status: 'draft' })
-              throw new Error(`章节最终门禁未通过：${finalBlockers.join('；')}`)
-            }
-
-            const systemicBlockers = assessNovelSystemics(workId, {
-              requireFingerprints: false,
-              includeProseScan: false
-            }).issues.filter(issue => issue.severity === 'blocker' && issue.chapterIds.includes(chapter.id))
-            if (systemicBlockers.length > 0) {
-              clearChapterNarrativeMemory(workId, chapter.id)
-              volumeChapterDAO.updateChapterWithVersion(chapter.id, { content: '', word_count: 0, status: 'draft' })
-              throw new Error(`章节跨章状态/模式门禁未通过：${systemicBlockers.map(issue => issue.message).join('；')}`)
-            }
+            const finalMemory = await finalizeNovelChapterMemory(
+              workId,
+              chapter.id,
+              controller.signal,
+              msg => emit(msg, 'running')
+            )
+            goalRoutineDAO.appendTurn({
+              work_id: workId, turn_no: turn, phase, action: 'memory_sync',
+              target_chapter_id: chapter.id,
+              summary: `章级门禁完成后原子提交「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`
+            })
 
             const volumeCheckpoint = await runVolumeBodyCheckpoint(
               workId,

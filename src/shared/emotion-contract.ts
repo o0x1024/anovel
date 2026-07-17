@@ -226,6 +226,15 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+function certaintyText(value: unknown): string {
+  const normalized = text(value)
+  if (normalized) return normalized
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return ''
+  const level = numeric >= 0 && numeric <= 1 ? Math.round(numeric * 4) : Math.round(numeric)
+  return `人物判断确定性等级 ${Math.max(0, Math.min(4, level))}/4`
+}
+
 function bounded(value: unknown, min: number, max: number): number {
   const n = Number(value)
   if (!Number.isFinite(n)) return min
@@ -268,7 +277,7 @@ export function normalizeEmotionContract(value: unknown): EmotionContract | null
       perceived_meaning: text(appraisal.perceived_meaning),
       blame_or_cause: text(appraisal.blame_or_cause),
       controllability: text(appraisal.controllability),
-      certainty: text(appraisal.certainty),
+      certainty: certaintyText(appraisal.certainty),
       value_or_norm_violated: text(appraisal.value_or_norm_violated)
     },
     character_layers: {
@@ -293,23 +302,30 @@ export function normalizeEmotionContract(value: unknown): EmotionContract | null
     emotional_debt_paid: text(row.emotional_debt_paid),
     residue_into_next: text(row.residue_into_next)
   }
-  return validateEmotionContract(contract).length === 0 ? contract : null
+  // 解析只负责结构与类型归一化，字段完整性由知道章节位置的调用方校验。
+  // 否则一个空字段会让整份合同变成 null，门禁只能误报“缺少 emotion_contract”。
+  return contract
 }
 
-export function validateEmotionContract(contract: EmotionContract): string[] {
+export function validateEmotionContract(
+  contract: EmotionContract,
+  options: { isFinalBeat?: boolean } = {}
+): string[] {
   const required: Array<[string, string]> = [
     ['pov_character', contract.pov_character],
     ['attachment_anchor', contract.attachment_anchor],
     ['value_at_stake', contract.value_at_stake],
     ['trigger_event', contract.trigger_event],
     ['perceived_meaning', contract.character_appraisal.perceived_meaning],
+    ['certainty', contract.character_appraisal.certainty],
     ['felt', contract.character_layers.felt],
     ['displayed', contract.character_layers.displayed],
+    ['action_impulse', contract.character_layers.action_impulse],
     ['choice_and_cost', contract.choice_and_cost],
     ['private_detail_anchor', contract.private_detail_anchor],
-    ['subtext_or_omission', contract.subtext_or_omission],
-    ['residue_into_next', contract.residue_into_next]
+    ['subtext_or_omission', contract.subtext_or_omission]
   ]
+  if (!options.isFinalBeat) required.push(['residue_into_next', contract.residue_into_next])
   return required.filter(([, value]) => !value.trim()).map(([key]) => `缺少 ${key}`)
 }
 

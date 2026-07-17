@@ -41,7 +41,10 @@ export function derivedMemoryFailureDisposition(
   aborted: boolean
 ): 'cancel' | 'block' | 'defer' {
   if (aborted) return 'cancel'
-  return workType === 'story' ? 'defer' : 'block'
+  // 正文是主产物，叙事记忆和模式指纹都可由同一份正文重算。
+  // 长篇仍会在进入下一章前强制补齐指纹，但不得因此丢弃并重新生成正文。
+  void workType
+  return 'defer'
 }
 
 /** 修复模型流式拼接常见的孤立引号/单个未闭合中文引号，不改写任何叙事词句。 */

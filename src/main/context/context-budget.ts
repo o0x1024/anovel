@@ -50,6 +50,8 @@ import { resolveChapterCharacterNames, buildFocusCharacterHint } from './charact
 import { formatAdoptedNamesForBodyContext } from './name-registry'
 import { filterAnchorsForChapter, filterAnchorsForVolume } from './anchor-scope'
 import { formatEmotionContractForPrompt, normalizeEmotionContract } from '../../shared/emotion-contract'
+import { adaptBodyStyleTextForContract, type ChapterExecutionContract } from '../../shared/chapter-execution-contract'
+import { compileChapterExecutionContract } from './chapter-execution-context'
 
 export type ContextPressure = 'safe' | 'warning' | 'critical' | 'blocking'
 
@@ -229,10 +231,12 @@ export function collectPromptSections(
   )
 
   let chapterCharacterNames: string[] | undefined
+  let chapterExecutionContract: ChapterExecutionContract | null = null
   if (isBodyStep && workId && request.chapterId) {
     const ch = volumeChapterDAO.getChapter(request.chapterId)
     if (ch) {
       chapterCharacterNames = resolveChapterCharacterNames(workId, ch)
+      chapterExecutionContract = compileChapterExecutionContract(workId, request.chapterId)
     }
   }
 
@@ -292,6 +296,10 @@ export function collectPromptSections(
     let { languageText, stepRulesText } = resolveStyleTexts(request)
     if (languageText && request.step?.startsWith('body_')) {
       languageText = stripEmbeddedAntiAiSection(languageText)
+    }
+    if (chapterExecutionContract && request.step?.startsWith('body_')) {
+      languageText = adaptBodyStyleTextForContract(languageText, chapterExecutionContract)
+      stepRulesText = adaptBodyStyleTextForContract(stepRulesText, chapterExecutionContract)
     }
     if (languageText) {
       sections.push(systemRuleSection({
@@ -494,7 +502,7 @@ export function collectPromptSections(
     if (hasWorldviewSection) {
       workCtxOptions = {
         ...workCtxOptions,
-        excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'worldview']
+        excludeCoreTypes: [...(workCtxOptions.excludeCoreTypes ?? []), 'world_pressure']
       }
     }
     const ctx = buildWorkContext(workId, workCtxOptions)

@@ -180,7 +180,19 @@ export function resolveChapterCharacterNames(
   chapter: { characters?: string | null; outline?: string | null }
 ): string[] {
   if (chapter.characters?.trim()) {
-    return chapter.characters.split(',').map(s => s.trim()).filter(Boolean)
+    const raw = chapter.characters.trim()
+    if (raw.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(raw) as unknown
+        if (Array.isArray(parsed)) {
+          const names = parsed.filter((item): item is string => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(Boolean)
+          if (names.length > 0) return [...new Set(names)]
+        }
+      } catch { /* 兼容旧版逗号字符串 */ }
+    }
+    return [...new Set(raw.split(',').map(s => s.trim().replace(/^[\["']+|[\]"']+$/g, '')).filter(Boolean))]
   }
   const cards = loadCharacterCards(workId)
   if (cards.length === 0) return []
@@ -190,9 +202,15 @@ export function resolveChapterCharacterNames(
   return cards.filter(c => c.role === 'protagonist').slice(0, 2).map(c => c.name)
 }
 
-/** 格式化所有角色卡片摘要（全量注入，不按出场角色过滤） */
-export function formatCharacterCardsForChapter(workId: number): string {
-  const cards = loadCharacterCards(workId)
+/**
+ * 格式化章节角色卡片摘要。
+ * 正文链路必须传入本章出场角色，避免把终局反派和后期配角注入当前章节。
+ * 未传过滤名单时保留全量行为，供非正文兼容调用使用。
+ */
+export function formatCharacterCardsForChapter(workId: number, characterNames?: string[]): string {
+  const allCards = loadCharacterCards(workId)
+  const allowed = characterNames?.length ? new Set(characterNames) : null
+  const cards = allowed ? allCards.filter(card => allowed.has(card.name)) : allCards
   if (cards.length === 0) return ''
 
   const lines = cards.map(c => {

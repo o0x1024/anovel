@@ -9,7 +9,8 @@ export function registerV27IpcHandlers(): void {
     estimateContextBudget(request))
 
   ipcMain.handle('consistency:gate', (_e, workId: number, chapterId: number, content: string) =>
-    runConsistencyGate(workId, chapterId, content))
+    // 编辑器保存的是尚未提取派生记忆的候选正文；完整时间线门禁由记忆提交阶段执行。
+    runConsistencyGate(workId, chapterId, content, { requireTimeline: false }))
 
   ipcMain.handle('narrative:crossChapterScan', (_e, workId: number) =>
     scanCrossChapterConsistency(workId))

@@ -68,5 +68,14 @@ export function routineFailureSignature(phase: string, error: unknown): string {
   if (/叙事记忆提取/.test(message)) return `${phase}:MEMORY_EXTRACTION`
   if (/候选.*(?:达到|生成).*个|停止继续抽卡/.test(message)) return `${phase}:CANDIDATE_BUDGET`
   if (/跨拍连续性|连续性修复/.test(message)) return `${phase}:CONTINUITY`
-  return `${phase}:${name}:${message.replace(/\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim().slice(0, 180)}`
+  // 供应商在同一故障的每次响应里都会生成新的 request/trace id；它们不是新故障，
+  // 否则熔断器会把无限重试误判成无限个不同异常。
+  const normalized = message
+    .replace(/\b(?:request|trace)[ _-]?id\s*[:=]\s*[a-z0-9_-]+/gi, 'provider_request_id:<dynamic>')
+    .replace(/\b(?:req|rid)\s*[:=]\s*[a-z0-9_-]+/gi, 'provider_request_id:<dynamic>')
+    .replace(/\d+(?:\.\d+)?/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180)
+  return `${phase}:${name}:${normalized}`
 }

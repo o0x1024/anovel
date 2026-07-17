@@ -58,9 +58,44 @@ export const MEMORY_EXTRACT_RESPONSE_SCHEMA = {
     foreshadowing_planted: { type: 'array', items: { type: 'object', additionalProperties: true } },
     foreshadowing_resolved: { type: 'array', items: { type: 'object', additionalProperties: true } },
     character_snapshots: { type: 'array', items: { type: 'object', additionalProperties: true } },
-    timeline_events: { type: 'array', items: { type: 'object', additionalProperties: true } },
+    timeline_events: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: true,
+        required: ['event_name'],
+        properties: {
+          event_name: { type: 'string', minLength: 1 },
+          event_description: { type: 'string' },
+          absolute_time: { type: 'string' },
+          relative_time: { type: 'string' }
+        }
+      }
+    },
     state_facts: { type: 'array', items: { type: 'object', additionalProperties: true } },
-    chapter_pattern: { type: 'object', additionalProperties: true }
+    chapter_pattern: {
+      type: 'object',
+      additionalProperties: false,
+      required: [
+        'conflictType', 'protagonistMethod', 'antagonistTactic', 'antagonistOutcome',
+        'opponentAdjustment', 'locationType', 'hookType', 'costType',
+        'relationshipDelta', 'volumeObjectiveDelta', 'payoffType'
+      ],
+      properties: {
+        conflictType: { type: 'string' },
+        protagonistMethod: { type: 'string' },
+        antagonistTactic: { type: 'string' },
+        antagonistOutcome: { type: 'string' },
+        opponentAdjustment: { type: 'string' },
+        locationType: { type: 'string' },
+        hookType: { type: 'string' },
+        costType: { type: 'string' },
+        relationshipDelta: { type: 'string' },
+        volumeObjectiveDelta: { type: 'string' },
+        payoffType: { type: 'string', enum: ['debt', 'partial', 'major', 'aftertaste'] }
+      }
+    }
   },
   additionalProperties: false
 } as const
@@ -79,9 +114,8 @@ export function parseMemoryExtract(content: string): ExtractedMemory {
       || !Array.isArray(result.timeline_events)) {
       throw new Error('缺少完整的叙事记忆数组字段')
     }
-    if (result.timeline_events.length === 0) {
-      throw new Error('本章至少需要一条关键时间线事件')
-    }
+    result.timeline_events = normalizeTimelineEvents(result.timeline_events)
+    if (result.timeline_events.length === 0) throw new Error('本章至少需要一条有效的关键时间线事件')
     result.state_facts = normalizeStateFacts(result.state_facts)
     result.chapter_pattern = normalizeChapterPattern(result.chapter_pattern)
     return result
@@ -90,13 +124,42 @@ export function parseMemoryExtract(content: string): ExtractedMemory {
   }
 }
 
+function normalizeTimelineEvents(value: unknown): NonNullable<ExtractedMemory['timeline_events']> {
+  if (!Array.isArray(value)) return []
+  const placeholderTimes = new Set(['relative_time', 'absolute_time', 'null', 'none', '未知', '无', '无明确时间'])
+  const normalizeTime = (item: unknown): string => {
+    const text = typeof item === 'string' ? item.trim() : ''
+    return placeholderTimes.has(text.toLowerCase()) ? '' : text
+  }
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    const eventName = typeof row.event_name === 'string' ? row.event_name.trim() : ''
+    const absoluteTime = normalizeTime(row.absolute_time)
+    const relativeTime = normalizeTime(row.relative_time)
+    if (!eventName) return []
+    return [{
+      event_name: eventName,
+      event_description: typeof row.event_description === 'string'
+        ? row.event_description.trim() || undefined
+        : undefined,
+      absolute_time: absoluteTime || undefined,
+      // 时间是派生索引，不应因弱模型漏字段而否决已经有效的事件；用保守相对锚点降级。
+      relative_time: relativeTime || (absoluteTime ? undefined : '本章内')
+    }]
+  })
+}
+
 function compactEvidenceText(value: string): string {
   return value.replace(/[\s“”‘’'"《》]/g, '')
 }
 
-/** 承重状态必须能回指正文原句；无证据的模型推断不得写入事实账本。 */
-export function validateStateFactEvidence(extracted: ExtractedMemory, sourceContent: string): string[] {
+export function partitionStateFactsByEvidence(
+  extracted: ExtractedMemory,
+  sourceContent: string
+): { valid: StoryStateFactInput[]; errors: string[] } {
   const source = compactEvidenceText(sourceContent)
+  const valid: StoryStateFactInput[] = []
   const errors: string[] = []
   for (const fact of extracted.state_facts ?? []) {
     const label = `${fact.entity}.${fact.key}`
@@ -111,9 +174,16 @@ export function validateStateFactEvidence(extracted: ExtractedMemory, sourceCont
     }
     if (!source.includes(compactEvidenceText(evidence))) {
       errors.push(`${label}证据不是正文原文片段`)
+      continue
     }
+    valid.push(fact)
   }
-  return errors
+  return { valid, errors }
+}
+
+/** 承重状态必须能回指正文原句；无证据的模型推断不得写入事实账本。 */
+export function validateStateFactEvidence(extracted: ExtractedMemory, sourceContent: string): string[] {
+  return partitionStateFactsByEvidence(extracted, sourceContent).errors
 }
 
 const STATE_VALUE_TYPES = new Set<StoryStateValueType>(['number', 'enum', 'boolean', 'set', 'text'])
@@ -156,7 +226,46 @@ function normalizeChapterPattern(value: unknown): ChapterPatternFingerprintInput
     volumeObjectiveDelta: field('volumeObjectiveDelta', 'volume_objective_delta'),
     payoffType
   }
-  return result
+  return Object.entries(result).some(([key, item]) => key !== 'payoffType' && !String(item).trim())
+    ? undefined
+    : result
+}
+
+export function deriveChapterPatternFromOutlineDiagnosis(
+  outlineDiagnosis: string | null | undefined
+): ChapterPatternFingerprintInput | undefined {
+  if (!outlineDiagnosis?.trim()) return undefined
+  try {
+    const diagnosis = JSON.parse(outlineDiagnosis) as {
+      pattern_contract?: Record<string, unknown>
+      dramatic_contract?: Record<string, unknown>
+      tension_plan?: { payoff_type?: unknown }
+    }
+    const pattern = diagnosis.pattern_contract
+    if (!pattern) return undefined
+    const text = (key: string) => String(pattern[key] ?? '').trim()
+    const dramatic = diagnosis.dramatic_contract ?? {}
+    const payoffType = String(diagnosis.tension_plan?.payoff_type ?? 'debt') as ChapterPatternFingerprintInput['payoffType']
+    if (!['debt', 'partial', 'major', 'aftertaste'].includes(payoffType)) return undefined
+    const result: ChapterPatternFingerprintInput = {
+      conflictType: text('conflict_type'),
+      protagonistMethod: text('protagonist_method'),
+      antagonistTactic: text('antagonist_tactic'),
+      antagonistOutcome: String(dramatic.irreversible_change ?? dramatic.payoff_or_debt ?? '').trim(),
+      opponentAdjustment: text('anticipated_opponent_adjustment'),
+      locationType: text('location_type'),
+      hookType: text('hook_type'),
+      costType: text('cost_type'),
+      relationshipDelta: text('relationship_delta'),
+      volumeObjectiveDelta: text('volume_objective_delta'),
+      payoffType
+    }
+    return Object.entries(result).some(([key, item]) => key !== 'payoffType' && !String(item).trim())
+      ? undefined
+      : result
+  } catch {
+    return undefined
+  }
 }
 
 export function applyMemoryExtract(
@@ -327,7 +436,7 @@ export const MEMORY_EXTRACT_SYSTEM_PROMPT = [
   'state_facts 用于记录跨章承重状态。题材无关地提取：能力/境界/权限、任务状态、伤势、身份、阵营、持有物、地点控制权、对手已知情报等。',
   '只记录本章明确创建或发生变化的状态；valueType 只允许 number/enum/boolean/set/text；transition 只允许 create/update/increase/decrease/unlock/complete/invalidate。',
   '同一章的同一 entity+key 只输出一条，value 必须是章末最终状态；不得把变化前后两个值同时当作并存事实。',
-  '完成任务用 complete，解锁能力或权限用 unlock；不可逆事实设置 irreversible=true；evidence 摘录不超过50字的正文证据。',
+  '完成任务用 complete，解锁能力或权限用 unlock；不可逆事实设置 irreversible=true；evidence 必须逐字复制正文中连续的原文片段，不得改写、概括或补充正文没有的字段名，且不超过50字。',
   'chapter_pattern 必须用抽象语义概括本章结构，不得照抄专有名词。relationshipDelta 和 volumeObjectiveDelta 无变化时明确写“无变化”。',
   'payoffType 只允许 debt/partial/major/aftertaste。opponentAdjustment 必须说明对手是否基于既有失败改变策略。',
   '',

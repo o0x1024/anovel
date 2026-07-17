@@ -106,7 +106,13 @@ import {
   ensureChapterEmotionOutcome,
   EMOTION_GATE_MIN_SCORE
 } from './emotion-gate'
-import { formatGenrePolicy, resolveStoryGenrePolicy, tensionCurveForBeat, validateTensionPlans } from './story-genre-policy'
+import {
+  formatGenrePolicy,
+  normalizeTensionPlanForBeat,
+  resolveStoryGenrePolicy,
+  tensionCurveForBeat,
+  validateTensionPlans
+} from './story-genre-policy'
 import { resetFailedStoryStructure } from './story-structure-reset'
 import { routeStoryForensicRepair } from './story-forensic-repair'
 import type { StoryForensicIssue } from './story-whole-evaluator'
@@ -114,12 +120,19 @@ import {
   BEAT_CONTRACT_MAX_TOKENS,
   BEAT_SKELETON_MAX_TOKENS,
   BEAT_STAGE_MAX_ATTEMPTS,
-  beatGateRecoveryForFailureCount,
+  beatGateContractRepairIndexes,
+  beatGateIssueSignature,
+  beatGateIssuesForIndex,
+  beatGateIssuesForLayer,
+  beatGateNeedsSkeletonModelRepair,
+  beatGateRepairIndexes,
+  beatGateResolvedTargetCount,
   type BeatGateRecovery,
   compactBeatSkeletons,
   exactStageCountError,
   mergeStagedBeat,
   mergeStoryBlueprintDiagnosis,
+  sanitizeBeatSkeleton,
   storyBeatStageKey
 } from './story-beat-staging'
 import { retentionEvaluationRules, retentionPackagingRules, retentionPlanningRules } from './reader-retention'
@@ -223,6 +236,8 @@ interface RoutineRuntimeState {
     gateFeedback: string
     skeletons: ParsedChapter[]
     enriched: ParsedChapter[]
+    repairIndexes?: number[]
+    gateIssues?: string[]
     updatedAt: string
   }
   evaluationHistory?: Array<{
@@ -1211,8 +1226,13 @@ function extractFirstJsonObject(content: string): string | null {
 }
 
 function buildBeatGatePrompt(goalDescription: string, chapters: ParsedChapter[]): string {
+  const authorityCurve = chapters.map((_, index) => {
+    const expected = tensionCurveForBeat(index + 1, chapters.length)
+    return `第${index + 1}拍：${expected.phase}，允许 ${expected.min}-${expected.max}`
+  }).join('\n')
   return [
     goalDescription.trim() ? `【用户创作目标】\n${goalDescription.trim()}` : '',
+    `【权威张力曲线 - 允许蓄力回落，禁止要求逐拍单调递增】\n${authorityCurve}`,
     '【待门禁节拍】',
     JSON.stringify(chapters.map((chapter, index) => ({
       index: index + 1,
@@ -1239,7 +1259,7 @@ async function runBeatGate(
   const tensionIssues = validateTensionPlans(chapters)
   const continuityIssues = validateStoryContinuityContracts(chapters)
   const emotionIssues = chapters.flatMap((chapter, index) => chapter.emotion_contract
-    ? validateEmotionContract(chapter.emotion_contract).map(issue => `第${index + 1}拍${issue}`)
+    ? validateEmotionContract(chapter.emotion_contract, { isFinalBeat: index === chapters.length - 1 }).map(issue => `第${index + 1}拍${issue}`)
     : [`第${index + 1}拍缺少 emotion_contract`])
   if (tensionIssues.length > 0 || emotionIssues.length > 0 || continuityIssues.length > 0) {
     return {
@@ -1260,9 +1280,9 @@ async function runBeatGate(
         '1. 每拍都必须有完整 dramatic_contract，尤其是 protagonist_want、obstacle、stakes、pressure_escalation、turn、irreversible_change；仅最终拍允许 next_question 为空。',
         '2. 每拍必须是一场有目标、阻力、选择和后果的戏，不能只是事件顺序、设定解释、地点移动或背景补充。',
         '3. 每拍结尾必须让局面发生不可逆变化；非最终拍的 next_question/next_hook 必须驱动追读，最终拍必须闭环且不得强行续钩子。',
-        '4. 全篇节拍之间必须形成压力递增和因果推进，不能每拍相互独立。',
+        '4. 张力必须严格遵守用户提示中的权威曲线；曲线允许蓄力拍回落，不得擅自要求逐拍单调递增。因果压力仍须持续推进。',
         '5. 第一拍必须直接切入极端冲突，不能慢热铺垫。',
-        '6. 每拍必须有 tension_plan；全篇必须存在蓄力、部分兑现、高潮兑现和余味，禁止所有拍都标成高潮。',
+        '6. 每拍必须有 tension_plan；level 建议不得越过权威曲线范围。全篇必须存在蓄力、部分兑现、高潮兑现和余味。',
         '7. 每拍必须有完整 emotion_contract；读者依恋、事件意义、人物表里冲突、有代价选择和下一拍余波缺一不可。',
         '8. 每拍必须有完整 continuity_contract；逐拍核对时间、地点、已完成事件、人物知识和证据状态，相邻拍存在矛盾即 blocking issue。',
         '9. 中段必须有基于对手已知信息的有效反制，并实际破坏主角计划；只有挑衅、自曝、下跪或等待主角公布证据不算反制。',
@@ -1301,8 +1321,78 @@ function formatBeatGateFeedback(gate: BeatGateResult): string {
     `上一轮节拍门禁未通过，得分 ${gate.score}。`,
     gate.blockingIssues.length > 0 ? `阻塞问题：\n${gate.blockingIssues.map(x => `- ${x}`).join('\n')}` : '',
     gate.suggestions.length > 0 ? `重生要求：\n${gate.suggestions.map(x => `- ${x}`).join('\n')}` : '',
-    '请整组重生 chapters，不要只小修文字；必须让每拍具备目标、阻力、代价、转折和不可逆变化。'
+    '只修复阻塞问题明确指出的字段；未被点名且已通过的合同字段必须保持不变。'
   ].filter(Boolean).join('\n')
+}
+
+function cloneBeatChapters(chapters: ParsedChapter[]): ParsedChapter[] {
+  return JSON.parse(JSON.stringify(chapters)) as ParsedChapter[]
+}
+
+function beatRepairNeighborhood(chapters: ParsedChapter[], index: number): Array<Record<string, unknown>> {
+  return chapters
+    .slice(Math.max(0, index - 1), Math.min(chapters.length, index + 2))
+    .map((chapter, offset) => ({
+      index: Math.max(0, index - 1) + offset + 1,
+      title: chapter.title,
+      plot_outline: chapter.outline,
+      next_hook: chapter.next_hook,
+      dramatic_contract: chapter.dramatic_contract,
+      continuity_contract: chapter.continuity_contract,
+      emotion_information_position: chapter.emotion_contract?.information_position ?? null
+    }))
+}
+
+async function repairBeatSkeletons(
+  workId: number,
+  volumeId: number,
+  skeletons: ParsedChapter[],
+  current: ParsedChapter[],
+  issues: string[],
+  context: string,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<Set<number>> {
+  const modelIssues = issues.filter(beatGateNeedsSkeletonModelRepair)
+  const indexes = beatGateRepairIndexes(modelIssues, skeletons.length)
+  const repaired = new Set<number>()
+  for (const index of indexes) {
+    const scopedIssues = beatGateIssuesForIndex(modelIssues, index, skeletons.length)
+    if (scopedIssues.length === 0) continue
+    onProgress?.(`正在重写第 ${index + 1} 拍事件骨架（保留其余节拍）`)
+    const candidates = await generateBeatStage(workId, volumeId, {
+      systemPrompt: [
+        '你是短故事事件骨架修复编辑。本次只重写指定的一拍，只输出包含一个元素的 chapters 数组。',
+        'title 必须原样保留；只允许输出 title、plot_points、beat_role、foreshadow_target、next_hook、characters。',
+        '修复触发机制、因果铺垫、事件可信度或最终闭环问题；不得改写其他节拍已经确定的事实。',
+        index === skeletons.length - 1
+          ? '这是最终拍：必须完成核心冲突，next_hook 必须为空，plot_points 不得包含章末钩子、续集问题或未来任务。'
+          : '非最终拍的 next_hook 必须由本拍结果自然产生。',
+        '只输出合法 JSON，不要 Markdown、说明或思考过程。'
+      ].join('\n'),
+      prompt: [
+        context,
+        `【全篇事件骨架 - 只读】\n${JSON.stringify(compactBeatSkeletons(skeletons), null, 2)}`,
+        `【相邻拍当前事实状态 - 必须保持一致】\n${JSON.stringify(beatRepairNeighborhood(current, index), null, 2)}`,
+        `【只修复第 ${index + 1} 拍】\n${JSON.stringify(compactBeatSkeletons([skeletons[index]])[0], null, 2)}`,
+        `【必须解决的问题】\n${scopedIssues.map(issue => `- ${issue}`).join('\n')}`
+      ].join('\n\n'),
+      maxTokens: BEAT_CONTRACT_MAX_TOKENS
+    }, `第 ${index + 1} 拍骨架修复`, signal,
+    chapters => exactStageCountError(chapters.length, 1, '单拍骨架修复返回'))
+    const candidate = candidates[0]
+    skeletons[index] = sanitizeBeatSkeleton({
+      ...skeletons[index],
+      title: skeletons[index].title,
+      outline: candidate.outline,
+      beat_role: candidate.beat_role ?? skeletons[index].beat_role,
+      foreshadow_target: candidate.foreshadow_target ?? skeletons[index].foreshadow_target,
+      next_hook: candidate.next_hook ?? skeletons[index].next_hook,
+      characters: candidate.characters ?? skeletons[index].characters
+    }, index === skeletons.length - 1)
+    repaired.add(index)
+  }
+  return repaired
 }
 
 async function generateBeatCandidatesWithGate(
@@ -1317,45 +1407,107 @@ async function generateBeatCandidatesWithGate(
   onProgress?: (message: string) => void
 ): Promise<{ chapters: ParsedChapter[]; gate: BeatGateResult; rounds: number; degraded: boolean }> {
   const stageKey = storyBeatStageKey(basePrompt, beatCount)
-  const storedStage = readRuntimeState(workId).beatGenerationStage
+  const storedRuntime = readRuntimeState(workId)
+  const storedStage = storedRuntime.beatGenerationStage
   const resumableStage = storedStage?.key === stageKey && storedStage.skeletons.length === beatCount
     ? storedStage
     : undefined
   let gateFeedback = resumableStage?.gateFeedback ?? ''
-  let best: { chapters: ParsedChapter[]; gate: BeatGateResult; round: number } | null = null
+  let skeletons = resumableStage?.skeletons
+  const storedDraft = storedRuntime.beatGenerationDraft
+  let best: { chapters: ParsedChapter[]; skeletons: ParsedChapter[]; gate: BeatGateResult; round: number } | null =
+    storedDraft?.chapters.length === beatCount
+      ? {
+          chapters: cloneBeatChapters(storedDraft.chapters),
+          skeletons: cloneBeatChapters(skeletons ?? storedDraft.chapters),
+          gate: { passed: false, score: storedDraft.score, blockingIssues: storedDraft.issues, suggestions: [] },
+          round: storedDraft.round
+        }
+      : null
+  let parsed = resumableStage ? [...resumableStage.enriched] : []
+  let repairIndexes = resumableStage?.repairIndexes
+  let repairIssues = resumableStage?.gateIssues ?? []
+  let previousIssueSignature = ''
+  let stagnantIssueRounds = 0
 
   for (let round = resumableStage?.round ?? 1; round <= MAX_BEAT_GENERATION_ROUNDS; round++) {
     assertNotAborted(signal)
-    const isResume = resumableStage?.round === round
+    const isResume = Boolean(skeletons)
     onProgress?.(isResume
-      ? `正在恢复节拍契约补全（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`
+      ? `正在定向补全 ${repairIndexes?.length ?? Math.max(0, beatCount - parsed.length)} 个问题节拍（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`
       : `正在生成节拍骨架（第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮）`)
     const prompt = [
       basePrompt,
       gateFeedback ? `【上一轮门禁反馈 - 必须全部修复】\n${gateFeedback}` : ''
     ].filter(Boolean).join('\n\n')
 
-    const skeletons = isResume
-      ? resumableStage.skeletons
-      : await generateBeatStage(workId, volumeId, {
+    if (!skeletons) {
+      skeletons = await generateBeatStage(workId, volumeId, {
           prompt,
           systemPrompt: skeletonSystemPrompt,
           maxTokens: BEAT_SKELETON_MAX_TOKENS
         }, '节拍骨架', signal, chapters => exactStageCountError(chapters.length, beatCount, '节拍骨架'))
+      parsed = []
+      repairIndexes = Array.from({ length: skeletons.length }, (_, index) => index)
+    }
 
-    const parsed: ParsedChapter[] = isResume ? [...resumableStage.enriched] : []
+    // 最终拍闭环属于可确定执行的格式约束，先清除骨架文本中的章末钩子，
+    // 避免后续契约修复永远无法触及被锁定的 plot_outline。
+    skeletons = skeletons.map((chapter, index) => sanitizeBeatSkeleton(chapter, index === skeletons!.length - 1))
+    parsed = parsed.map((chapter, index) => sanitizeBeatSkeleton(chapter, index === skeletons!.length - 1))
+    // 定向补拍必须携带上一轮门禁反馈，否则会原样再生成同一个缺字段合同。
+    const contractContext = prompt.replace(/\n请输出完整 chapters 数组。?\s*$/, '')
+    const structuralRepaired = repairIssues.length > 0
+      ? await repairBeatSkeletons(
+          workId,
+          volumeId,
+          skeletons,
+          parsed,
+          beatGateIssuesForLayer(repairIssues, 'skeleton'),
+          contractContext,
+          signal,
+          onProgress
+        )
+      : new Set<number>()
     const compactSkeletons = compactBeatSkeletons(skeletons)
-    const contractContext = basePrompt.replace(/\n请输出完整 chapters 数组。?\s*$/, '')
-    if (!isResume) {
+    if (!isResume || parsed.length < skeletons.length) {
       patchRuntimeState(workId, {
         beatGenerationStage: {
-          key: stageKey, round, gateFeedback, skeletons, enriched: [], updatedAt: new Date().toISOString()
+          key: stageKey, round, gateFeedback, skeletons, enriched: parsed, repairIndexes, gateIssues: repairIssues, updatedAt: new Date().toISOString()
         }
       })
     }
-    for (let index = parsed.length; index < skeletons.length; index++) {
+    const contractIssues = beatGateIssuesForLayer(repairIssues, 'contract')
+    const structuralContractIndexes = new Set<number>()
+    for (const index of structuralRepaired) {
+      if (index > 0) structuralContractIndexes.add(index - 1)
+      structuralContractIndexes.add(index)
+      if (index + 1 < skeletons.length) structuralContractIndexes.add(index + 1)
+    }
+    const routedRepairIndexes = repairIssues.length > 0
+      ? [...new Set([
+          ...beatGateContractRepairIndexes(contractIssues, skeletons.length),
+          ...structuralContractIndexes
+        ])].sort((left, right) => left - right)
+      : []
+    const indexesToRepair = routedRepairIndexes.length > 0
+      ? routedRepairIndexes
+      : repairIssues.length > 0
+        ? []
+        : repairIndexes?.length
+          ? repairIndexes
+          : Array.from({ length: skeletons.length - parsed.length }, (_, offset) => parsed.length + offset)
+    for (const index of indexesToRepair) {
       assertNotAborted(signal)
       const skeleton = skeletons[index]
+      let issueScope = beatGateIssuesForIndex(contractIssues, index, skeletons.length)
+      if (structuralRepaired.has(index)) {
+        issueScope = ['事件骨架已经定向改写：按新骨架重新生成全部合同，并与相邻拍事实状态保持一致']
+      } else if (structuralContractIndexes.has(index)) {
+        issueScope = ['相邻拍事件骨架已经改变：联动校准 continuity_contract 的事实、知识、时间、地点和证据状态']
+      } else if (issueScope.length === 0 && contractIssues.some(issue => /continuity_contract|连续性|时间线|时间锚点|地点|人物认知|知识状态|entry_facts|knowledge_changes|info_gap|证据/.test(issue))) {
+        issueScope = ['相邻拍 continuity_contract 联动校准：只修正与相邻拍冲突的事实、知识、时间、地点和证据状态']
+      }
       onProgress?.(`正在补全节拍契约 ${index + 1}/${skeletons.length}（第 ${round} 轮）`)
       const candidates = await generateBeatStage(workId, volumeId, {
         systemPrompt: [
@@ -1366,32 +1518,56 @@ async function generateBeatCandidatesWithGate(
         prompt: [
           contractContext,
           `【全篇节拍骨架 - 只读】\n${JSON.stringify(compactSkeletons, null, 2)}`,
-          `【当前只补全第 ${index + 1} 拍】\n${JSON.stringify(compactSkeletons[index], null, 2)}`
-        ].join('\n\n'),
+          parsed[index]
+            ? `【当前合同与相邻拍事实状态 - 在此基础上定向修复】\n${JSON.stringify(beatRepairNeighborhood(parsed, index), null, 2)}`
+            : '',
+          `【当前只补全第 ${index + 1} 拍】\n${JSON.stringify(compactSkeletons[index], null, 2)}`,
+          issueScope.length > 0 ? `【当前拍必须解决的问题】\n${issueScope.map(issue => `- ${issue}`).join('\n')}` : ''
+        ].filter(Boolean).join('\n\n'),
         maxTokens: BEAT_CONTRACT_MAX_TOKENS
       }, `第 ${index + 1} 拍契约补全`, signal,
       chapters => exactStageCountError(chapters.length, 1, '单拍契约返回'))
-      parsed.push(mergeStagedBeat(skeleton, candidates[0]))
+      parsed[index] = normalizeTensionPlanForBeat(
+        mergeStagedBeat(skeleton, candidates[0], {
+          current: structuralRepaired.has(index) ? undefined : parsed[index],
+          issues: issueScope,
+          isFinalBeat: index === skeletons.length - 1
+        }),
+        index,
+        skeletons.length
+      )
       patchRuntimeState(workId, {
         beatGenerationStage: {
-          key: stageKey, round, gateFeedback, skeletons, enriched: parsed, updatedAt: new Date().toISOString()
+          key: stageKey, round, gateFeedback, skeletons, enriched: parsed, repairIndexes, gateIssues: repairIssues, updatedAt: new Date().toISOString()
         }
       })
     }
 
     onProgress?.(`正在运行节拍 AI 门禁（第 ${round} 轮，达标前持续重生）`)
     const gate = await runBeatGate(workId, goalDescription, parsed, signal)
-    const shouldKeep = !best
+    const resolvedTargetCount = beatGateResolvedTargetCount(repairIssues, gate.blockingIssues, skeletons.length)
+    const madeTargetedProgress = resolvedTargetCount > 0
+      && (!best || gate.score >= best.gate.score - 5)
+      && (!best || gate.blockingIssues.length <= best.gate.blockingIssues.length)
+    // 通过硬门禁的候选永远优先于历史高分但仍有阻塞项的草稿。
+    const shouldKeep = gate.passed
+      || !best
       || gate.score > best.gate.score
       || (gate.score === best.gate.score && gate.blockingIssues.length < best.gate.blockingIssues.length)
-    if (shouldKeep) best = { chapters: parsed, gate, round }
+      || madeTargetedProgress
+    if (shouldKeep) best = { chapters: cloneBeatChapters(parsed), skeletons: cloneBeatChapters(skeletons), gate, round }
+    else if (best) {
+      parsed = cloneBeatChapters(best.chapters)
+      skeletons = cloneBeatChapters(best.skeletons)
+      onProgress?.(`本轮引入了更多问题，已回滚到 ${best.gate.score} 分最佳候选`)
+    }
     if (best) {
       patchRuntimeState(workId, {
         beatGenerationDraft: {
           round: best.round,
           score: best.gate.score,
           issues: best.gate.blockingIssues,
-          chapters: best.chapters,
+          chapters: cloneBeatChapters(best.chapters),
           updatedAt: new Date().toISOString()
         }
       })
@@ -1402,17 +1578,55 @@ async function generateBeatCandidatesWithGate(
       return { chapters: parsed, gate, rounds: round, degraded: false }
     }
 
+    const repairGate = shouldKeep || !best ? gate : best.gate
     const issueSummary = gate.blockingIssues.slice(0, 2).join('；') || '未达到门禁标准'
     onProgress?.(`节拍门禁第 ${round}/${MAX_BEAT_GENERATION_ROUNDS} 轮未通过（${gate.score}分）：${issueSummary}`)
-    patchRuntimeState(workId, { beatGenerationStage: undefined })
-    if (round === MAX_BEAT_GENERATION_ROUNDS) {
-      const fallback = best ?? { chapters: parsed, gate, round }
-      patchRuntimeState(workId, { beatGenerationDraft: undefined })
+    const issueSignature = beatGateIssueSignature(gate.blockingIssues, skeletons.length)
+    if (issueSignature && issueSignature === previousIssueSignature && !shouldKeep) stagnantIssueRounds++
+    else stagnantIssueRounds = 0
+    previousIssueSignature = issueSignature
+    const noConvergence = stagnantIssueRounds >= 1
+    if (round === MAX_BEAT_GENERATION_ROUNDS || noConvergence) {
+      const fallback = best ?? { chapters: parsed, skeletons, gate, round }
+      const fallbackIssues = fallback.gate.blockingIssues
+      const fallbackIndexes = beatGateRepairIndexes(fallbackIssues, skeletons.length)
+      patchRuntimeState(workId, {
+        beatGenerationStage: {
+          key: stageKey,
+          round: 1,
+          gateFeedback: formatBeatGateFeedback(fallback.gate),
+          skeletons: cloneBeatChapters(fallback.skeletons),
+          enriched: cloneBeatChapters(fallback.chapters),
+          repairIndexes: fallbackIndexes.length > 0 ? fallbackIndexes : Array.from({ length: skeletons.length }, (_, index) => index),
+          gateIssues: fallbackIssues,
+          updatedAt: new Date().toISOString()
+        }
+      })
       throw new Error(
-        `节拍门禁连续 ${MAX_BEAT_GENERATION_ROUNDS} 轮未通过，禁止降级进入正文；最佳候选 ${fallback.gate.score} 分：${fallback.gate.blockingIssues.join('；')}`
+        noConvergence
+          ? `节拍门禁连续 2 轮同类问题未收敛，禁止继续消耗调用；最佳候选 ${fallback.gate.score} 分：${fallbackIssues.join('；')}`
+          : `节拍门禁连续 ${MAX_BEAT_GENERATION_ROUNDS} 轮未通过，禁止降级进入正文；最佳候选 ${fallback.gate.score} 分：${fallbackIssues.join('；')}`
       )
     }
-    gateFeedback = formatBeatGateFeedback(gate)
+    // parsed 已回滚到最佳草稿时，下一轮必须按该草稿自己的问题定向修复，
+    // 不能拿被丢弃候选的问题去覆盖最佳草稿的字段。
+    gateFeedback = formatBeatGateFeedback(repairGate)
+    repairIssues = repairGate.blockingIssues
+    // “第15拍缺 emotion_contract”这类局部错误只需要补第15拍，不能再付出整组 15 次调用。
+    repairIndexes = beatGateRepairIndexes(repairGate.blockingIssues, skeletons.length)
+    if (repairIndexes.length === 0) repairIndexes = Array.from({ length: skeletons.length }, (_, index) => index)
+    patchRuntimeState(workId, {
+      beatGenerationStage: {
+        key: stageKey,
+        round: round + 1,
+        gateFeedback,
+        skeletons,
+        enriched: parsed,
+        repairIndexes,
+        gateIssues: repairIssues,
+        updatedAt: new Date().toISOString()
+      }
+    })
   }
 
   throw new Error('节拍大纲生成未能在有限轮次内完成')
@@ -1424,7 +1638,7 @@ async function ensureBeats(
   goalDescription: string,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ created: number; error?: string; warning?: string; recovery?: BeatGateRecovery }> {
+): Promise<{ created: number; error?: string; warning?: string; recovery?: BeatGateRecovery; terminal?: boolean }> {
   const existing = volumeChapterDAO.listChaptersByWork(workId)
   const runtime = readRuntimeState(workId)
   const forceBeatRebuild = runtime.forceBeatRebuild === true
@@ -1445,7 +1659,14 @@ async function ensureBeats(
   const configuredCount = plan.targetChapters > 0
     ? Math.max(1, Math.round(plan.targetChapters))
     : 5
-  const suggestedCount = forceBeatRebuild && existing.length > 0 ? existing.length : configuredCount
+  // 断点续跑时，未完成的节拍骨架是已投入模型调用成本的唯一事实来源。
+  // 不能因写作计划在此期间回落到默认值而把 15 拍的断点悄悄改成 5 拍并从头再来。
+  const stagedBeatCount = !forceBeatRebuild ? runtime.beatGenerationStage?.skeletons?.length : undefined
+  const suggestedCount = forceBeatRebuild && existing.length > 0
+    ? existing.length
+    : stagedBeatCount && stagedBeatCount > 0
+      ? stagedBeatCount
+      : configuredCount
 
   const vol = volumes[0]
   const work = workDAO.getById(workId)
@@ -1484,17 +1705,8 @@ async function ensureBeats(
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e)
     if (/节拍门禁连续/.test(error)) {
-      const failureCount = (readRuntimeState(workId).beatGateFailureCount ?? 0) + 1
-      const recovery = beatGateRecoveryForFailureCount(failureCount)
-      const feedback = recovery === 'simplify'
-        ? [
-            error,
-            '【Harness 自动降复杂度】只保留一个核心冲突、一个倒计时、一个承重证据载体和最少必要人物。',
-            '每拍最多一次地点迁移和一次证据持有状态变化；最终拍只兑现核心冲突，不得新增人物、任务或续集钩子。'
-          ].join('\n')
-        : error
-      patchRuntimeState(workId, { beatGateFailureCount: failureCount, structuralFeedback: feedback })
-      return { created: 0, warning: error, recovery }
+      // 一次生成周期已经最多经历四轮门禁；到这里继续从头重建只会把同一问题放大为数小时等待。
+      return { created: 0, error, terminal: true }
     }
     return { created: 0, error }
   }
@@ -2577,6 +2789,15 @@ export async function runStoryGoalLoop(
       turn++
       goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
       const attemptedPhase = phase
+      // 每轮在发起模型调用前就落库。过去节拍门禁通过 continue 回到本阶段时，
+      // 轮次 4/5/6 没有成功或 error 记录，界面因而只能看到 1/2/3 和实时轮次。
+      goalRoutineDAO.appendTurn({
+        work_id: workId,
+        turn_no: turn,
+        phase: attemptedPhase,
+        action: 'phase_start',
+        summary: `开始执行「${attemptedPhase}」阶段`
+      })
 
       try {
         if (phase === 'incubate_outline') {
@@ -2666,7 +2887,7 @@ export async function runStoryGoalLoop(
           phase = 'generate_beats'
         } else if (phase === 'generate_beats') {
           const res = await ensureBeats(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
-          if (res.error) throw new Error(res.error)
+          if (res.error) throw (res.terminal ? new GoalPhaseExhaustedError(res.error) : new Error(res.error))
           if (res.recovery === 'retry_beats') {
             emit('节拍门禁未通过，保留故事发动机并在节拍层定向重建', 'running')
             phase = 'generate_beats'

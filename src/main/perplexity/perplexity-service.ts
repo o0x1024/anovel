@@ -8,6 +8,14 @@ import { getActiveModelId } from './model-manager'
 import { computeViaApi, computeWholeViaApi, isDegenerateApiLogprobs, type TokenMetric } from './api-perplexity'
 import { runHeuristicDetect } from './heuristic-detect'
 import { appPreferenceDAO } from '../db'
+import {
+  classifyZhuqueSegments,
+  computeZhuqueDistribution,
+  computeZhuqueTokenRisk,
+  scoreZhuqueSegment,
+  segmentTextForZhuque,
+  toAigcSegments
+} from './zhuque-alignment'
 
 export interface LabModelOverride {
   modelType?: string
@@ -143,47 +151,7 @@ async function terminateWorker(): Promise<void> {
 }
 
 function segmentText(text: string): Array<{ id: number; text: string }> {
-  const paragraphs = text.split(/\n/).map((p, idx, arr) => {
-    return idx < arr.length - 1 ? p + '\n' : p
-  })
-  const segments: Array<{ id: number; text: string }> = []
-  let id = 0
-
-  for (const para of paragraphs) {
-    const trimmed = para.replace(/\n$/, '')
-    if (!trimmed.trim()) {
-      if (segments.length > 0) {
-        segments[segments.length - 1].text += '\n'
-      }
-      continue
-    }
-
-    const sentences = trimmed.split(/(?<=[。！？；…」』）])/g).filter(s => s.trim().length > 3)
-    if (sentences.length <= 2) {
-      segments.push({ id: id++, text: para })
-    } else {
-      let buffer = ''
-      for (const s of sentences) {
-        buffer += s
-        if (buffer.length >= 40) {
-          segments.push({ id: id++, text: buffer })
-          buffer = ''
-        }
-      }
-      if (buffer.trim()) {
-        if (segments.length > 0 && segments[segments.length - 1].text.length < 30) {
-          segments[segments.length - 1].text += buffer
-        } else {
-          segments.push({ id: id++, text: buffer })
-        }
-      }
-      if (para.endsWith('\n') && segments.length > 0) {
-        segments[segments.length - 1].text += '\n'
-      }
-    }
-  }
-
-  return segments
+  return segmentTextForZhuque(text)
 }
 
 /**
@@ -199,38 +167,7 @@ function segmentText(text: string): Array<{ id: number; text: string }> {
  * - 人类文本: 三指标方向不一致，自然散落在基线附近
  */
 function computeSegmentAiScore(ppl: number, top5Rate: number, avgProb: number, modelId?: string): number {
-  const thresholds = getDetectThresholds(modelId)
-  const B = thresholds.baseline
-
-  // 1. 计算各维度的有符号偏差（正=偏高/偏创意方向）
-  const pplDev = (ppl - B.ppl) / B.ppl
-  const top5Dev = (B.top5 - top5Rate) / B.top5   // 方向反转：Top5低=创意方向
-  const probDev = (B.avgProb - avgProb) / B.avgProb // 方向反转：Prob低=创意方向
-
-  // 2. 判断方向一致性
-  const signs = [Math.sign(pplDev), Math.sign(top5Dev), Math.sign(probDev)]
-  const positives = signs.filter(s => s > 0).length
-  const negatives = signs.filter(s => s < 0).length
-  const coherence = Math.max(positives, negatives) / 3 // 1.0=完全一致
-
-  // 3. 各维度绝对偏离映射到 0-95 分
-  const mapDev = (d: number) => Math.min(95,
-    d <= 0.3 ? d / 0.3 * 30 :
-    d <= 0.7 ? 30 + (d - 0.3) / 0.4 * 30 :
-    60 + (d - 0.7) / 0.5 * 25)
-
-  const pplScore = mapDev(Math.abs(pplDev))
-  const top5Score = mapDev(Math.abs(top5Dev))
-  const probScore = mapDev(Math.abs(probDev))
-
-  // 4. 加权综合
-  const w = thresholds.weights
-  const baseScore = pplScore * w.ppl + top5Score * w.top5 + probScore * w.avgProb
-
-  // 5. 方向一致性放大：一致方向强化 AI 嫌疑
-  const coherenceMultiplier = 0.7 + coherence * 0.6 // [0.9, 1.3]
-
-  return Math.min(100, baseScore * coherenceMultiplier)
+  return computeZhuqueTokenRisk({ ppl, top5Rate, avgProb, tokenCount: 2 }, modelId)
 }
 
 /**
@@ -477,82 +414,35 @@ export async function runPerplexityDetect(
   ).join(', ')
   appLogger.info('perplexity', `段落明细(前10): ${sampleDetails}`)
 
-  // 计算启发式特征
-  const heuristic = computeHeuristicFeatures(text)
-  appLogger.info('perplexity', `启发式: 句长标准差=${heuristic.sentLenStd.toFixed(1)}, 连接词密度=${heuristic.connectorDensity.toFixed(3)}, AI加分=${heuristic.heuristicAiBoost}, 特征=[${heuristic.details}]`)
-
-  // 对每个段落计算 AI 评分
-  const segmentScores: number[] = segments.map((_, i) => {
-    const pplResult = pplResults[i]
-    if (!pplResult || pplResult.ppl === 0 || pplResult.ppl >= 400) return 50
-    // 即使 tokenCount 少也不再硬编码为"疑似"，因为整文上下文已提供可靠评分
-    return computeSegmentAiScore(pplResult.ppl, pplResult.top5Rate, pplResult.avgProb, detectModelId)
+  const scoredDrafts = segments.map((seg, i) => {
+    const metric = pplResults[i] ?? { id: seg.id, ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 }
+    return scoreZhuqueSegment(seg.text, metric, detectModelId)
   })
-
-  // 有效段落评分
-  const validScores = segmentScores.filter((_, i) =>
-    pplResults[i]?.ppl > 0 && pplResults[i]?.ppl < 400)
-
-  // 计算文档级 AI 评分
+  const classified = classifyZhuqueSegments(scoredDrafts, detectModelId)
+  const distribution = computeZhuqueDistribution(classified)
+  const resultSegments = toAigcSegments(classified)
+  const validScores = classified
+    .filter((_, i) => (pplResults[i]?.tokenCount ?? 0) >= 2)
+    .map(segment => segment.score)
   const rawDocScore = validScores.length > 0
-    ? validScores.reduce((a, b) => a + b, 0) / validScores.length : 50
+    ? validScores.reduce((a, b) => a + b, 0) / validScores.length
+    : 50
+  const fingerprintHits = classified.reduce(
+    (sum, segment) => sum + segment.evidence.filmShot + segment.evidence.connector +
+      segment.evidence.emotionTemplate + segment.evidence.summaryClosure,
+    0
+  )
 
-  const suspiciousCount = validScores.filter(s => s >= 30).length
-  const suspiciousRatio = validScores.length > 0 ? suspiciousCount / validScores.length : 0
-  const consistencyBoost = suspiciousRatio > 0.55 ? (suspiciousRatio - 0.55) * 30 : 0
-
-  const docScore = rawDocScore + heuristic.heuristicAiBoost + consistencyBoost
-  const explainerMode = detectModelId === 'qwen3.5-4b-q4'
-    && heuristic.explainerHits >= 6
-    && segments.length >= 12
-  const explainerAiFloor = explainerMode
-    ? MODEL_THRESHOLD_OVERRIDES['qwen3.5-4b-q4']?.explainerAiFloor ?? 54
-    : undefined
-
-  appLogger.info('perplexity', `文档级AI评分(V6整文): ${rawDocScore.toFixed(1)} + 启发式${heuristic.heuristicAiBoost} + 一致性${consistencyBoost.toFixed(1)} = ${docScore.toFixed(1)} (${docScore >= 38 ? '偏AI' : docScore <= 30 ? '偏人工' : '中性'})${explainerMode ? ', 科普体模式' : ''}`)
-
-  // 二次分类：根据文档上下文偏置段落得分
-  const resultSegments: AigcSegment[] = segments.map((seg, i) => {
-    const pplResult = pplResults[i]
-    if (!pplResult || pplResult.ppl === 0) {
-      // 整文模式下没有 token 覆盖的段落（极端短如空行），根据文档整体趋势判定
-      const fallbackCategory: AigcCategory = docScore >= 50 ? 'suspected_ai' : docScore <= 25 ? 'human' : 'suspected_ai'
-      return { text: seg.text, category: fallbackCategory, reason: '基于全文上下文推断' }
-    }
-
-    let adjustedScore = segmentScores[i]
-
-    // 文档级上下文偏置
-    const thresholds = getDetectThresholds(detectModelId)
-    const bias = thresholds.docBias
-    if (docScore >= bias.boostThreshold) {
-      const boost = Math.min(bias.boostMax, (docScore - bias.boostThreshold) * bias.boostFactor)
-      adjustedScore = Math.min(100, adjustedScore + boost)
-    } else if (docScore <= bias.reduceThreshold) {
-      const reduction = Math.min(bias.reduceMax, (bias.reduceThreshold - docScore) * bias.reduceFactor)
-      adjustedScore = Math.max(0, adjustedScore - reduction)
-    }
-
-    if (explainerMode) {
-      const segHits = (seg.text.match(EXPLAINER_PATTERNS) || []).length
-      if (segHits >= 2) adjustedScore = Math.min(100, adjustedScore + 20)
-      else if (segHits >= 1) adjustedScore = Math.min(100, adjustedScore + 14)
-      else adjustedScore = Math.min(100, adjustedScore + 10)
-    }
-
-    const category = classifyByScore(adjustedScore, detectModelId, { aiFloor: explainerAiFloor })
-    return {
-      text: seg.text,
-      category,
-      reason: generateReason(pplResult.ppl, pplResult.top5Rate, category)
-    }
+  appLogger.info('perplexity', '朱雀对齐检测', {
+    modelId: detectModelId,
+    segmentCount: segments.length,
+    avgScore: Math.round(rawDocScore * 10) / 10,
+    fingerprintHits,
+    distribution
   })
 
-  const distribution = computeDistribution(resultSegments)
-  const overallScore = computeSegmentAiScore(avgPPL, avgTop5, validResults.length > 0
-    ? validResults.reduce((a, r) => a + r.avgProb, 0) / validResults.length : 0.15, detectModelId)
-  const overallCategory = classifyByScore(overallScore, detectModelId)
-  const summary = buildSummary(avgPPL, avgTop5, overallCategory, distribution)
+  const summary = `朱雀实验对齐估计：人工 ${distribution.human}%，疑似AI ${distribution.suspected_ai}%，AI特征 ${distribution.ai}%` +
+    (fingerprintHits > 0 ? `；命中特征短语 ${fingerprintHits} 处` : '')
 
   return { segments: resultSegments, distribution, summary }
 }
@@ -752,16 +642,21 @@ export async function getSegmentMetrics(
     return { segments: details, docScore }
   }
 
-  const details: SegmentDetectDetail[] = segments.map((seg, i) => {
+  const scored = classifyZhuqueSegments(segments.map((seg, i) => {
+    const r = pplResults[i] ?? { id: seg.id, ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 }
+    return scoreZhuqueSegment(seg.text, r, detectModelId)
+  }), detectModelId)
+
+  const details: SegmentDetectDetail[] = scored.map((segment, i) => {
     const r = pplResults[i]
-    if (!r || r.ppl === 0 || r.ppl >= 400) {
-      return { text: seg.text, aiScore: 50, ppl: r?.ppl ?? 0, top5Rate: r?.top5Rate ?? 0, avgProb: r?.avgProb ?? 0, category: 'suspected_ai' as AigcCategory }
+    return {
+      text: segment.text,
+      aiScore: segment.score,
+      ppl: r?.ppl ?? 0,
+      top5Rate: r?.top5Rate ?? 0,
+      avgProb: r?.avgProb ?? 0,
+      category: segment.category
     }
-    const score = computeSegmentAiScore(r.ppl, r.top5Rate, r.avgProb, detectModelId)
-    const thresholds = getDetectThresholds(detectModelId)
-    const category: AigcCategory = score >= thresholds.classify.aiFloor ? 'ai'
-      : score <= thresholds.classify.humanCeiling ? 'human' : 'suspected_ai'
-    return { text: seg.text, aiScore: score, ppl: r.ppl, top5Rate: r.top5Rate, avgProb: r.avgProb, category }
   })
 
   const validScores = details.filter(d => d.ppl > 0 && d.ppl < 400).map(d => d.aiScore)

@@ -246,10 +246,13 @@ function syncResumePhaseFromState(): void {
   resumeFromPhase.value = normalizePhase(state.value?.current_phase)
 }
 const visibleTurns = computed(() => {
+  // 一轮可产生“开始 / 完成 / error”等多个审计事件；历史卡按轮次展示最新结果，
+  // 既保留失败轮次，也避免同一编号刷屏。
+  const history = turns.value.filter((turn, index, all) =>
+    all.findIndex(candidate => candidate.turn_no === turn.turn_no) === index
+  )
   const ev = liveTurn.value
-  if (!ev || ev.status !== 'running') return turns.value
-  const latest = turns.value[0]
-  if (latest?.turn_no === ev.turn && latest?.summary === ev.message) return turns.value
+  if (!ev || ev.status !== 'running') return history
   return [{
     id: -1,
     turn_no: ev.turn,
@@ -259,7 +262,7 @@ const visibleTurns = computed(() => {
     score: null,
     summary: ev.message,
     create_time: new Date().toISOString()
-  }, ...turns.value]
+  }, ...history.filter(turn => turn.turn_no !== ev.turn)]
 })
 
 /** 各维度达标状态（✓/✗） */

@@ -57,5 +57,9 @@ assert.equal(
   routineFailureSignature('draft_body', new Error('叙事记忆提取连续3轮未通过：证据错误')),
   'draft_body:MEMORY_EXTRACTION'
 )
+assert.equal(
+  routineFailureSignature('generate_beats', new Error('Your account 2106272765 has not activated the model. Request id: 0217abcde1')),
+  routineFailureSignature('generate_beats', new Error('Your account 2106272765 has not activated the model. Request id: 0217fedcb9'))
+)
 
 console.log('story structural repair policy tests passed')

@@ -23,6 +23,7 @@ import {
 import {
   MAX_AUTO_NOVEL_REPAIR_CHAPTERS,
   capNovelAutomaticRepairTargets,
+  isNovelChapterReadyForTransition,
   isTerminalNovelRepairError,
   minimumNovelTurnBudget,
   nextPhaseAfterNovelOutlineCheckpoint,
@@ -143,6 +144,22 @@ assert.notEqual(
   paraphraseFailureA,
   novelPhaseFailureSignature('generate_beats', 'CONTRACT_INVALID', '分卷「第一卷」第 30-36 章窗口门禁问题')
 )
+assert.notEqual(
+  novelPhaseFailureSignature('draft_body', 'Error', '连续3轮未通过质量与情绪联合门禁，质量总分72'),
+  novelPhaseFailureSignature('draft_body', 'Error', '叙事记忆提取连续3轮未通过结构与证据门禁')
+)
+assert.notEqual(
+  novelPhaseFailureSignature('draft_body', 'CONTRACT_INVALID', '章节执行合同冲突：禁止越界与必须覆盖相互矛盾'),
+  novelPhaseFailureSignature('draft_body', 'Error', '连续3轮未通过质量与情绪联合门禁，质量总分72')
+)
+assert.notEqual(
+  novelPhaseFailureSignature('draft_body', 'Error', '叙事记忆提取连续3轮未通过结构与证据门禁'),
+  novelPhaseFailureSignature('draft_body', 'Error', '章节模式指纹提取失败，禁止进入下一章')
+)
+assert.equal(
+  novelPhaseFailureSignature('draft_body', 'Error', '叙事记忆提取连续3轮失败：chapter_pattern 缺失'),
+  novelPhaseFailureSignature('draft_body', 'Error', '章节模式指纹提取失败，禁止进入下一章')
+)
 assert.equal(shouldInjectWritingStyle('goal_novel_volume_chapter_gate'), false)
 assert.equal(shouldInjectTasteAndConditionRules('goal_novel_volume_chapter_gate'), false)
 assert.equal(shouldInjectWritingStyle('goal_novel_volume_chapter_repair'), false)
@@ -225,6 +242,16 @@ assert.equal(MAX_AUTO_NOVEL_REPAIR_CHAPTERS, 8)
 assert.equal(isTerminalNovelRepairError('REPAIR_STALL'), true)
 assert.equal(isTerminalNovelRepairError('REPAIR_BOUNDARY'), true)
 assert.equal(isTerminalNovelRepairError('OUTPUT_INVALID'), false)
+assert.equal(isNovelChapterReadyForTransition({
+  qualityReady: true,
+  emotionReady: true,
+  patternFingerprintReady: false
+}), false)
+assert.equal(isNovelChapterReadyForTransition({
+  qualityReady: true,
+  emotionReady: true,
+  patternFingerprintReady: true
+}), true)
 assert.deepEqual(capNovelAutomaticRepairTargets([2, 3], policyChapters), [])
 assert.equal(shouldPauseForReadOnlyNovelAudit({ planComplete: true, contentComplete: true, met: false }), true)
 assert.equal(shouldPauseForReadOnlyNovelAudit({ planComplete: false, contentComplete: true, met: false }), false)

@@ -30,7 +30,13 @@ export function novelPhaseFailureSignature(phase: string, errorCode: string, mes
   } else if (phase === 'generate_volumes') {
     stage = 'volume_contract_generation'
   } else if (phase === 'draft_body') {
-    stage = 'body_generation_or_gate'
+    if (/章节执行合同|CONTRACT_INVALID|合同冲突/.test(message)) stage = 'chapter_contract'
+    else if (/模式指纹|chapter_pattern|MISSING_PATTERN_FINGERPRINT/.test(message)) stage = 'pattern_fingerprint'
+    else if (/叙事记忆|state_facts|正文证据/.test(message)) stage = 'memory_extraction'
+    else if (/质量与情绪|质量总分|AI句式|对话密度|句长波动|字数达标/.test(message)) stage = 'body_acceptance'
+    else if (/资源数值门禁|资源约束/.test(message)) stage = 'resource_gate'
+    else if (/一致性门禁|跨章状态|状态\/模式门禁/.test(message)) stage = 'systemic_gate'
+    else stage = 'body_generation'
   }
   return `${phase}:${stage}:${errorCode}:${normalizedNovelFailureKind(message)}`
 }
@@ -40,6 +46,14 @@ export function minimumNovelTurnBudget(targetChapters: number, targetChaptersPer
   const volumes = Math.max(1, Math.ceil(chapters / targetChaptersPerVolume))
   // 每章至少预留一次大纲轮次和一次正文轮次，并覆盖卷级门禁与基础阶段。
   return chapters * 2 + volumes * 8 + 50
+}
+
+export function isNovelChapterReadyForTransition(input: {
+  qualityReady: boolean
+  emotionReady: boolean
+  patternFingerprintReady: boolean
+}): boolean {
+  return input.qualityReady && input.emotionReady && input.patternFingerprintReady
 }
 
 export interface NovelPolicyChapter {

@@ -102,12 +102,9 @@ export function getModelFilePath(userDataPath: string, modelId?: string): string
 }
 
 /**
- * 检测参数 V5 — 默认阈值（基于 Qwen3.5-0.8B 校准，MAE=8.5%）
- * 
- * 核心思想：人类文本围绕基线波动，AI 文本偏离基线且三指标方向一致
- * - 模仿型AI → PPL低、Top5高、AvgProb高 (全部偏"可预测")
- * - 创意型AI → PPL高、Top5低、AvgProb低 (全部偏"不可预测")
- * - 人类文本 → 三指标方向不一致，散落在基线附近
+ * 朱雀实验对齐阈值。
+ * 只把低 PPL / 高 Top5 / 高 AvgProb 的“高可预测”方向计为 AI 风险；
+ * 高 PPL、低命中率的 n-gram 扰动按朱雀实测应降低风险，不能再反向加分。
  */
 export const DETECT_THRESHOLDS = {
   baseline: {
@@ -117,8 +114,8 @@ export const DETECT_THRESHOLDS = {
   },
 
   classify: {
-    aiFloor: 58,
-    humanCeiling: 22,
+    aiFloor: 65,
+    humanCeiling: 38,
   },
 
   docBias: {
@@ -159,7 +156,7 @@ export const MODEL_THRESHOLD_OVERRIDES: Record<string, ModelThresholdOverride> =
    */
   'deepseek-v4-flash': {
     heuristicBaseScore: 52,
-    classify: { aiFloor: 72, humanCeiling: 50 },
+    classify: { aiFloor: 68, humanCeiling: 40 },
     docBias: {
       boostThreshold: 68,
       boostFactor: 0.8,
@@ -171,7 +168,7 @@ export const MODEL_THRESHOLD_OVERRIDES: Record<string, ModelThresholdOverride> =
   },
   'qwen3.5-4b-q4': {
     baseline: { ppl: 22.52, top5: 0.600, avgProb: 0.320 },
-    classify: { aiFloor: 68, humanCeiling: 25 },
+    classify: { aiFloor: 68, humanCeiling: 40 },
     docBias: {
       boostThreshold: 42,
       boostFactor: 2,
@@ -185,7 +182,7 @@ export const MODEL_THRESHOLD_OVERRIDES: Record<string, ModelThresholdOverride> =
   },
   'qwen3.5-9b-q4': {
     baseline: { ppl: 18, top5: 0.68, avgProb: 0.35 },
-    classify: { aiFloor: 72, humanCeiling: 26 },
+    classify: { aiFloor: 70, humanCeiling: 40 },
     docBias: {
       boostThreshold: 45,
       boostFactor: 1.8,

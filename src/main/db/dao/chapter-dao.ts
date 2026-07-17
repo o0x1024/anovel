@@ -56,6 +56,10 @@ export class VolumeChapterDAO extends BaseDAO {
     return this.all<VolumeRow>('SELECT * FROM volumes WHERE work_id = ? ORDER BY sort', [workId])
   }
 
+  getVolume(id: number): VolumeRow | undefined {
+    return this.get<VolumeRow>('SELECT * FROM volumes WHERE id = ?', [id])
+  }
+
   createVolume(
     workId: number,
     name: string,

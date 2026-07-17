@@ -313,6 +313,14 @@ const HUMAN_WRITING_META = [
   '目标：写出来的东西像一个赶稿的人类作者写的有精彩有糙段，有灵光一闪也有平铺直叙。'
 ].join('\n')
 
+const BODY_GENERATION_ANTI_AI_LIGHT = [
+  '【正文去模板轻约束】',
+  '- 禁止“不是A，而是B/不是A，是B”、书面连接词堆砌、模板情感总结和逐帧电影镜头链。',
+  '- 对话标注、动作、心理和环境必须服务于当前事件；不要用僵住、瞳孔骤缩、呼吸一滞等模板反应代替人物选择。',
+  '- 句长和段落随节奏自然变化，不设固定句号数量，不为制造“人味”故意写碎句、长逗号链或生僻词。',
+  '- 章末停在合同指定的动作、信息或选择上，不追加总结感悟。'
+].join('\n')
+
 /**
  * 将规则列表格式化为去 AI 味 system 文本（含示范对与底层模式）。
  */
@@ -398,7 +406,7 @@ export function formatAntiAiRulesForPrompt(workId: number, step?: string): strin
   if (formatted) return formatted
 
   if (step === 'body_generation') {
-    return HUMAN_WRITING_META
+    return BODY_GENERATION_ANTI_AI_LIGHT
   }
   return ''
 }

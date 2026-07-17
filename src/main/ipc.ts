@@ -87,6 +87,10 @@ import {
 import { getWorkBodyText } from './context/assistant/work-reference'
 import { ensureChapterEmotionContract } from './context/goal-routine/emotion-engine'
 import { assessChapterEmotion } from './context/goal-routine/emotion-gate'
+import {
+  invalidateNovelGoalStateAfterVolumeDeletion,
+  resetNovelGoalStateFromVolumePlan
+} from './context/goal-routine/novel-outline-pipeline'
 
 /**
  * 注册所有 IPC 处理器，桥接渲染进程与数据库层
@@ -157,9 +161,22 @@ export function registerIpcHandlers(): void {
     volumeChapterDAO.createVolume(workId, name, desc))
   ipcMain.handle('volume:update', (_e, id: number, fields: Record<string, unknown>) =>
     volumeChapterDAO.updateVolume(id, fields))
-  ipcMain.handle('volume:delete', (_e, id: number) => volumeChapterDAO.deleteVolume(id))
-  ipcMain.handle('volume:batchUpsert', (_e, workId: number, items: { name: string; description?: string }[], mode?: 'append' | 'replace') =>
-    volumeChapterDAO.batchUpsertVolumes(workId, items, mode ?? 'append'))
+  ipcMain.handle('volume:delete', (_e, id: number) => {
+    const volume = volumeChapterDAO.getVolume(id)
+    const deleted = volumeChapterDAO.deleteVolume(id)
+    if (deleted && volume && workDAO.getById(volume.work_id)?.work_type !== 'story') {
+      invalidateNovelGoalStateAfterVolumeDeletion(volume.work_id, volume.name)
+    }
+    return deleted
+  })
+  ipcMain.handle('volume:batchUpsert', (_e, workId: number, items: { name: string; description?: string }[], mode?: 'append' | 'replace') => {
+    const resolvedMode = mode ?? 'append'
+    const ids = volumeChapterDAO.batchUpsertVolumes(workId, items, resolvedMode)
+    if (resolvedMode === 'replace' && workDAO.getById(workId)?.work_type !== 'story') {
+      resetNovelGoalStateFromVolumePlan(workId)
+    }
+    return ids
+  })
   ipcMain.handle('volume:parseSuggestions', (_e, content: string) => parseVolumeSuggestions(content))
 
   ipcMain.handle('chapter:list', (_e, volumeId: number) => volumeChapterDAO.listChapters(volumeId))

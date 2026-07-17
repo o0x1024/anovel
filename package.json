@@ -16,6 +16,8 @@
     "test:continuity-escalation": "jiti scripts/test-story-continuity-escalation.ts",
     "test:novel-volume-staging": "jiti scripts/test-novel-volume-staging.ts",
     "test:novel-harness": "jiti scripts/test-novel-harness.ts",
+    "test:novel-memory-commit": "node scripts/run-electron-test.mjs scripts/test-novel-memory-commit-db.ts",
+    "test:novel-volume-state": "node scripts/run-electron-test.mjs scripts/test-novel-volume-state-db.ts",
     "test:structural-repair": "jiti scripts/test-story-structural-repair-policy.ts",
     "test:story-harness": "jiti scripts/test-story-harness.ts && jiti scripts/test-model-json-repair.ts && jiti scripts/test-structured-model-output.ts && node scripts/run-electron-test.mjs scripts/test-story-harness-db.ts",
     "postinstall": "node scripts/rebuild-native.mjs",

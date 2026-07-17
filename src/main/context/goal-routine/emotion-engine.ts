@@ -5,7 +5,8 @@ import {
   type EmotionEngine,
   EMOTION_CONTRACT_ENUM_RULE,
   formatEmotionContractForPrompt,
-  normalizeEmotionContract
+  normalizeEmotionContract,
+  validateEmotionContract
 } from '../../../shared/emotion-contract'
 import { extractJsonText } from '../parse-json-extract'
 import { withGoalLoopModelOptions } from './story-goal-model'
@@ -196,6 +197,9 @@ export async function ensureEmotionEngine(
 
 export function loadChapterEmotionContract(chapterId: number): EmotionContract | null {
   const chapter = volumeChapterDAO.getChapter(chapterId)
+  const workId = volumeChapterDAO.getWorkIdForChapter(chapterId)
+  const chapters = workId != null ? volumeChapterDAO.listChaptersByWork(workId) : []
+  const isFinalBeat = chapters.length > 0 && chapters[chapters.length - 1]?.id === chapterId
   const sources: unknown[] = []
   if (chapter?.emotion_contract_json) sources.push(chapter.emotion_contract_json)
   if (chapter?.outline_diagnosis) {
@@ -205,7 +209,7 @@ export function loadChapterEmotionContract(chapterId: number): EmotionContract |
     try {
       const parsed = typeof source === 'string' ? JSON.parse(source) as unknown : source
       const contract = normalizeEmotionContract(parsed)
-      if (contract) return contract
+      if (contract && validateEmotionContract(contract, { isFinalBeat }).length === 0) return contract
     } catch { /* 尝试下一来源 */ }
   }
   return null
@@ -239,6 +243,7 @@ export async function ensureChapterEmotionContract(
   const index = chapters.findIndex(chapter => chapter.id === chapterId)
   const chapter = chapters[index]
   if (!chapter) throw new Error('章节不存在')
+  const isFinalBeat = index === chapters.length - 1
   const neighborhood = chapters.slice(Math.max(0, index - 2), Math.min(chapters.length, index + 3))
     .map(item => ({ title: item.title, outline: item.outline, emotion_contract: item.emotion_contract_json }))
   let feedback = ''
@@ -274,7 +279,7 @@ export async function ensureChapterEmotionContract(
     }
     let contract: EmotionContract | null = null
     try { contract = normalizeEmotionContract(parseObject(response.content, '情绪契约')) } catch { contract = null }
-    if (contract) {
+    if (contract && validateEmotionContract(contract, { isFinalBeat }).length === 0) {
       volumeChapterDAO.updateChapter(chapterId, { emotion_contract_json: JSON.stringify(contract), emotion_assessment_json: null })
       return contract
     }

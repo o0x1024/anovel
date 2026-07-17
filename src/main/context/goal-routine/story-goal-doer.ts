@@ -20,7 +20,7 @@ import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
 import { formatBodyPromptLines } from '../../../shared/work-terminology'
 import {
-  BODY_GENERATION_SYSTEM,
+  NOVEL_GOAL_BODY_GENERATION_SYSTEM,
   STORY_BODY_GENERATION_SYSTEM,
   extractEmotionIntensity
 } from '../../../shared/body-generation-prompt'
@@ -35,12 +35,15 @@ import {
   FORESHADOWING_RESOLVE_SYSTEM_PROMPT,
   MEMORY_EXTRACT_RESPONSE_SCHEMA,
   parseMemoryExtract,
-  validateStateFactEvidence,
+  partitionStateFactsByEvidence,
+  deriveChapterPatternFromOutlineDiagnosis,
   applyMemoryExtract,
   parseForeshadowingResolutions,
   applyForeshadowingResolutions
 } from '../memory-extract'
+import type { ExtractedMemory, ForeshadowingResolutionResult } from '../memory-extract'
 import { clearChapterMemoryBeforeExtract, clearChapterNarrativeMemory } from '../memory-cleanup'
+import { getDatabase } from '../../db/connection'
 import { appLogger } from '../../logger/app-logger'
 import { getGoalLoopModelOpts, withGoalLoopModelOptions } from './story-goal-model'
 import { formatChapterResourceBudgetsForPrompt, runResourceConstraintGate } from '../resource-ledger'
@@ -70,6 +73,14 @@ import {
   shouldBlockStoryAntiAi,
   STORY_HARNESS_MAX_CANDIDATES_PER_BEAT
 } from '../../../shared/story-harness'
+import {
+  formatChapterExecutionContract,
+  type ChapterExecutionContract
+} from '../../../shared/chapter-execution-contract'
+import {
+  buildChapterExecutionContext,
+  compileChapterExecutionContract
+} from '../chapter-execution-context'
 
 function storyCandidateContextSource(
   workId: number,
@@ -101,9 +112,9 @@ export interface BeatGenResult {
   continuityRepairRounds?: number
   continuityBlockers?: string[]
   requiresEscalation?: boolean
-  failureKind?: 'body_integrity' | 'continuity' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
+  failureKind?: 'contract' | 'body_integrity' | 'continuity' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
   memoryPending?: boolean
-  memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; stateFacts?: number; patternFingerprint?: boolean; foreshadowingResolved: number; foreshadowingPartial: number }
+  memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; stateFacts?: number; patternFingerprint?: boolean; warnings?: string[]; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
 
@@ -115,6 +126,8 @@ export interface GenerateBeatBodyOptions {
   workType?: 'novel' | 'story'
   wordTargetOverride?: number
   onContinuityEvent?: (event: StoryContinuityRepairEvent) => void
+  /** 小说目标循环先稳定正文，再由外层统一提交叙事记忆。 */
+  deferNarrativeMemory?: boolean
 }
 
 export interface ReviseBeatBodyOptions {
@@ -122,6 +135,21 @@ export interface ReviseBeatBodyOptions {
   instruction: string
   workType?: 'novel' | 'story'
   wordTargetOverride?: number
+  /** 修订候选不得提前覆盖已经验收的叙事记忆。 */
+  deferNarrativeMemory?: boolean
+}
+
+export interface PreparedNarrativeMemory {
+  sourceContent: string
+  extracted: ExtractedMemory
+  resolutions: ForeshadowingResolutionResult
+  warnings: string[]
+}
+
+export interface CommitPreparedNarrativeMemoryOptions {
+  /** 在同一事务内、临时记忆已经可见时执行依赖记忆的同步门禁。 */
+  validate?: () => string[]
+  markChapterCompleted?: boolean
 }
 
 function countWords(s: string): number {
@@ -309,7 +337,9 @@ function buildBodyPrompt(
   wordTarget: number,
   goalDescription?: string,
   extraHint?: string,
-  workType: 'novel' | 'story' = 'story'
+  workType: 'novel' | 'story' = 'story',
+  executionContract?: ChapterExecutionContract,
+  executionContext = ''
 ): string | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const ch = chapters.find(c => c.id === chapterId)
@@ -329,9 +359,9 @@ function buildBodyPrompt(
   )
   const resourceBudget = formatChapterResourceBudgetsForPrompt(workId, chapterId)
   const emotionCard = emotionExecutionCard(chapterId)
-  return formatBodyPromptLines(workType, {
+  const taskPrompt = formatBodyPromptLines(workType, {
     volName: vol?.name,
-    volDescription: vol?.description,
+    volDescription: workType === 'novel' && executionContract ? undefined : vol?.description,
     chapterTitle: ch.title,
     outline: ch.outline,
     wordTargetLine: formatBodyWordTargetLine(wordTarget)
@@ -350,6 +380,12 @@ function buildBodyPrompt(
       goldenOpeningUserSection({ workType, ordinal, hook: hookText, openingDesign: openingSlot })
     ].filter(Boolean)
   ).join('\n\n')
+  if (workType !== 'novel' || !executionContract) return taskPrompt
+  return [
+    formatChapterExecutionContract(executionContract),
+    executionContext,
+    taskPrompt
+  ].filter(Boolean).join('\n\n')
 }
 
 /**
@@ -361,7 +397,10 @@ export async function generateBeatBody(
   chapterId: number,
   options: GenerateBeatBodyOptions = {}
 ): Promise<BeatGenResult> {
-  const { signal, onProgress, goalDescription, extraHint, workType = 'story', wordTargetOverride } = options
+  const {
+    signal, onProgress, goalDescription, extraHint, workType = 'story', wordTargetOverride,
+    deferNarrativeMemory = false
+  } = options
   const existingChapter = volumeChapterDAO.getChapter(chapterId)
   const generationContext = storyCandidateContextSource(workId, existingChapter)
   if (workType === 'story') {
@@ -390,15 +429,58 @@ export async function generateBeatBody(
   await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
   const plan = loadWritingPlan(workId)
   const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
-  const prompt = buildBodyPrompt(workId, chapterId, wordTarget, goalDescription, extraHint, workType)
+  const executionContract = workType === 'novel'
+    ? compileChapterExecutionContract(workId, chapterId, wordTarget)
+    : null
+  if (workType === 'novel' && !executionContract) {
+    return { success: false, content: '', wordCount: 0, failureKind: 'contract', error: '章节不存在，无法编译正文执行合同' }
+  }
+  if (executionContract?.errors.length) {
+    return {
+      success: false,
+      content: '',
+      wordCount: 0,
+      failureKind: 'contract',
+      error: `章节执行合同冲突：${executionContract.errors.join('；')}`
+    }
+  }
+  const compactContext = executionContract
+    ? buildChapterExecutionContext(workId, chapterId, executionContract)
+    : { text: '', sectionChars: {} }
+  const prompt = buildBodyPrompt(
+    workId,
+    chapterId,
+    wordTarget,
+    goalDescription,
+    extraHint,
+    workType,
+    executionContract ?? undefined,
+    compactContext.text
+  )
   if (!prompt) return { success: false, content: '', wordCount: 0, error: `${workType === 'story' ? '节拍' : '章节'}不存在` }
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
   const ordinal = unitOrdinal(workId, chapterId)
-  const baseSystemPrompt = workType === 'story' ? STORY_BODY_GENERATION_SYSTEM : BODY_GENERATION_SYSTEM
+  const baseSystemPrompt = workType === 'story'
+    ? STORY_BODY_GENERATION_SYSTEM
+    : NOVEL_GOAL_BODY_GENERATION_SYSTEM
   const openingExtra = goldenOpeningSystemExtra(workType, ordinal)
   const systemPrompt = [baseSystemPrompt, openingExtra, BODY_REACTION_CLICHE_DIRECTIVE].filter(Boolean).join('\n\n')
+
+  if (executionContract) {
+    appLogger.info('goal_routine', '正文章节执行合同已编译', {
+      workId,
+      chapterId,
+      chapterOrdinal: executionContract.chapterOrdinal,
+      dialogueMode: executionContract.dialogueMode,
+      wordRange: [executionContract.wordMin, executionContract.wordMax],
+      contractChars: formatChapterExecutionContract(executionContract).length,
+      relevantContextChars: compactContext.text.length,
+      contextSectionChars: compactContext.sectionChars,
+      warnings: executionContract.warnings
+    })
+  }
 
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -406,12 +488,9 @@ export async function generateBeatBody(
       systemPrompt,
       step: 'body_generation',
       workId,
-      maxTokens: Math.max(2048, wordTarget * 2),
-      workContextOptions: {
-        includeVolumes: true,
-        includeIncubator: false,
-        excludeCoreTypes: ['worldview']
-      },
+      maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
+      temperature: workType === 'novel' ? 0.75 : undefined,
+      enrichWorkContext: workType !== 'novel',
       chapterId,
       volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
       enrichNarrativeMemory: true
@@ -430,7 +509,8 @@ export async function generateBeatBody(
     workType,
     signal,
     onProgress,
-    options.onContinuityEvent
+    options.onContinuityEvent,
+    deferNarrativeMemory
   )
 }
 
@@ -489,7 +569,8 @@ async function persistGeneratedBody(
   workType: 'novel' | 'story',
   signal?: AbortSignal,
   onProgress?: (message: string) => void,
-  onContinuityEvent?: (event: StoryContinuityRepairEvent) => void
+  onContinuityEvent?: (event: StoryContinuityRepairEvent) => void,
+  deferNarrativeMemory = false
 ): Promise<BeatGenResult> {
   let content = normalizeModelBodyOutput(rawContent.trim(), 'body_generation')
   const currentChapter = volumeChapterDAO.getChapter(chapterId)
@@ -689,16 +770,22 @@ async function persistGeneratedBody(
     }
   }
 
-  // 提取叙事记忆体（伏笔种植 + 角色快照）+ AI 伏笔回收检测
+  // 小说目标循环的候选正文尚可能被质量/情绪门禁重写，禁止在此提前发布派生记忆。
+  const memoryDeferred = workType === 'novel' && deferNarrativeMemory
   let memoryExtracted: BeatGenResult['memoryExtracted']
   let memoryError = ''
-  try {
-    memoryExtracted = await extractNarrativeMemoryAfterGeneration(workId, chapterId, content, signal)
-  } catch (e) {
-    memoryError = e instanceof Error ? e.message : String(e)
-    appLogger.warn('goal_routine', '叙事记忆提取失败（不阻断生成）', {
-      workId, chapterId, error: memoryError
-    })
+  if (!memoryDeferred) {
+    try {
+      memoryExtracted = await extractNarrativeMemoryAfterGeneration(workId, chapterId, content, signal, {
+        requirePatternFingerprint: workType === 'novel',
+        dropInvalidStateFactsAfterRetries: workType === 'novel'
+      })
+    } catch (e) {
+      memoryError = e instanceof Error ? e.message : String(e)
+      appLogger.warn('goal_routine', '叙事记忆提取失败（不阻断生成）', {
+        workId, chapterId, error: memoryError
+      })
+    }
   }
 
   if (memoryError) {
@@ -711,14 +798,14 @@ async function persistGeneratedBody(
     if (memoryDisposition === 'block') {
       return { success: false, content, wordCount, error: memoryError, failureKind: 'memory_extract' }
     }
-    // 短故事正文是主产物，叙事记忆是可由正文重算的派生索引。
+    // 正文是主产物，叙事记忆是可由同一正文重算的派生索引。
     // 派生索引失败不得否决已经通过正文完整性与连续性门禁的候选。
-    appLogger.warn('goal_routine', '短故事正文门禁已通过，叙事记忆标记为待补偿', {
+    appLogger.warn('goal_routine', '正文候选保留，叙事记忆标记为待补偿', {
       workId, chapterId, error: memoryError
     })
   }
 
-  if (workType === 'novel') {
+  if (workType === 'novel' && !memoryDeferred && !memoryError) {
     const fingerprint = storyStateDAO.listFingerprintsByWork(workId).find(row => row.chapter_id === chapterId)
     const systemic = assessNovelSystemics(workId, { requireFingerprints: false, includeProseScan: false })
     const blockers = systemic.issues.filter(issue =>
@@ -737,7 +824,9 @@ async function persistGeneratedBody(
     }
   }
 
-  const resourceGate = workType === 'story' && memoryError
+  const resourceGate = memoryDeferred
+    ? { passed: true, blockers: [], warnings: ['候选记忆尚未提交，资源门禁推迟到最终原子提交'] }
+    : memoryError
     ? { passed: true, blockers: [], warnings: ['叙事记忆待补偿，本轮不以派生快照缺失否决正文'] }
     : runResourceConstraintGate(workId, chapterId)
   if (!resourceGate.passed) {
@@ -753,13 +842,17 @@ async function persistGeneratedBody(
       failureKind: 'resource'
     }
   }
-  if (resourceGate.warnings.length > 0) {
+  if (!memoryDeferred && resourceGate.warnings.length > 0) {
     appLogger.warn('goal_routine', '资源数值门禁存在警告', {
       workId, chapterId, warnings: resourceGate.warnings
     })
   }
 
-  const consistencyGate = runConsistencyGate(workId, chapterId, content)
+  const consistencyGate = runConsistencyGate(workId, chapterId, content, {
+    // 小说候选记忆要等质量/情绪门禁通过后才原子提交；短故事记忆提取失败时也只标记待补偿。
+    // 这两个阶段都不能用尚未发布的派生时间线反向否决正文候选。
+    requireTimeline: !memoryDeferred && !memoryError
+  })
   if (!consistencyGate.passed) {
     clearChapterNarrativeMemory(workId, chapterId)
     const error = `章节一致性门禁未通过：${consistencyGate.blockers.join('；')}`
@@ -786,7 +879,7 @@ async function persistGeneratedBody(
     const persistFields = {
       content,
       word_count: wordCount,
-      status: 'completed',
+      status: memoryDeferred ? 'draft' : 'completed',
       emotion_assessment_json: null
     }
     if (currentChapter?.content?.trim()) {
@@ -801,7 +894,7 @@ async function persistGeneratedBody(
     content,
     wordCount,
     memoryExtracted,
-    memoryPending: Boolean(memoryError),
+    memoryPending: memoryDeferred || Boolean(memoryError),
     antiAiRepairs,
     antiAiRepairRounds,
     continuityRepairRounds
@@ -852,16 +945,29 @@ export async function reviseBeatBody(
   if (!response.success || !response.content?.trim()) {
     return { success: false, content: '', wordCount: 0, error: response.error || '修订失败' }
   }
-  return persistGeneratedBody(workId, chapterId, response.content, workType, options.signal)
+  return persistGeneratedBody(
+    workId,
+    chapterId,
+    response.content,
+    workType,
+    options.signal,
+    undefined,
+    undefined,
+    options.deferNarrativeMemory ?? false
+  )
 }
 
-export async function extractNarrativeMemoryAfterGeneration(
+export async function prepareNarrativeMemoryAfterGeneration(
   workId: number,
   chapterId: number,
   content: string,
-  signal?: AbortSignal
-): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
-  if (signal?.aborted) return { planted: 0, resolved: 0, snapshots: 0, timelineEvents: 0, foreshadowingResolved: 0, foreshadowingPartial: 0 }
+  signal?: AbortSignal,
+  options: {
+    requirePatternFingerprint?: boolean
+    dropInvalidStateFactsAfterRetries?: boolean
+  } = {}
+): Promise<PreparedNarrativeMemory> {
+  if (signal?.aborted) throw new Error('已取消')
 
   const resourceBudgetPrompt = formatChapterResourceBudgetsForPrompt(workId, chapterId)
   const memorySystemPrompt = resourceBudgetPrompt
@@ -876,12 +982,10 @@ export async function extractNarrativeMemoryAfterGeneration(
       ].join('\n\n')
     : MEMORY_EXTRACT_SYSTEM_PROMPT
 
-  let planted = 0
-  let snapshots = 0
-  let timelineEvents = 0
-  // 1. 提取伏笔种植 + 角色快照。结构或证据不合格时只重试提取器，不重写正文。
+  // 只生成候选记忆，不修改任何正式账本。结构或证据不合格时只重试提取器。
   let extracted: ReturnType<typeof parseMemoryExtract> | undefined
   let extractError = ''
+  const warnings: string[] = []
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (signal?.aborted) throw new Error('canceled')
     const memRes = await modelService.chat(
@@ -910,8 +1014,26 @@ export async function extractNarrativeMemoryAfterGeneration(
     }
     try {
       const candidate = parseMemoryExtract(memRes.content)
-      const evidenceErrors = validateStateFactEvidence(candidate, content)
-      if (evidenceErrors.length > 0) throw new Error(evidenceErrors.join('；'))
+      const evidence = partitionStateFactsByEvidence(candidate, content)
+      const attemptErrors = [...evidence.errors]
+      if (options.requirePatternFingerprint && !candidate.chapter_pattern) {
+        attemptErrors.push('chapter_pattern 缺失、字段为空或 payoffType 非法')
+      }
+      if (attemptErrors.length > 0 && attempt < 3) {
+        throw new Error(attemptErrors.join('；'))
+      }
+      if (evidence.errors.length > 0) {
+        if (!options.dropInvalidStateFactsAfterRetries) throw new Error(evidence.errors.join('；'))
+        candidate.state_facts = evidence.valid
+        warnings.push(`已丢弃 ${evidence.errors.length} 条无原文证据的状态事实：${evidence.errors.join('；')}`)
+      }
+      if (options.requirePatternFingerprint && !candidate.chapter_pattern) {
+        const chapter = volumeChapterDAO.getChapter(chapterId)
+        const fallback = deriveChapterPatternFromOutlineDiagnosis(chapter?.outline_diagnosis)
+        if (!fallback) throw new Error('chapter_pattern 连续3轮无效，且章节合同无法生成确定性回退指纹')
+        candidate.chapter_pattern = fallback
+        warnings.push('模型未返回有效 chapter_pattern，已使用冻结章节合同生成确定性回退指纹')
+      }
       extracted = candidate
       break
     } catch (error) {
@@ -921,18 +1043,15 @@ export async function extractNarrativeMemoryAfterGeneration(
   if (!extracted) {
     throw new Error(`叙事记忆提取连续3轮未通过结构与证据门禁：${extractError}`)
   }
-  clearChapterMemoryBeforeExtract(workId, chapterId)
-  const result = applyMemoryExtract(workId, chapterId, extracted)
-  planted = result.planted
-  snapshots = result.snapshots
-  timelineEvents = result.timelineEvents
-
-  // 2. AI 伏笔回收检测
-  let foreshadowingResolved = 0
-  let foreshadowingPartial = 0
+  if (warnings.length > 0) {
+    appLogger.warn('goal_routine', '叙事记忆提取已执行弱模型确定性降级', {
+      workId, chapterId, warnings
+    })
+  }
+  let resolutions: ForeshadowingResolutionResult = { resolved: [], partial: [], pending: [] }
   const pending = foreshadowingDAO.listPending(workId)
   if (pending.length > 0) {
-    if (signal?.aborted) return { planted, resolved: 0, snapshots, timelineEvents, foreshadowingResolved, foreshadowingPartial }
+    if (signal?.aborted) throw new Error('已取消')
     const pendingList = pending.map(p =>
       `- [id:${p.id}] depth:${p.depth ?? 'normal'} 描述：${p.description}`
     ).join('\n')
@@ -955,25 +1074,80 @@ export async function extractNarrativeMemoryAfterGeneration(
       { stream: false, signal }
     )
     if (resolveRes.success && resolveRes.content?.trim()) {
-      const parsed = parseForeshadowingResolutions(resolveRes.content)
-      const applied = applyForeshadowingResolutions(workId, chapterId, parsed)
-      foreshadowingResolved = applied.resolved
-      foreshadowingPartial = applied.partial
+      resolutions = parseForeshadowingResolutions(resolveRes.content)
     }
   }
 
-  appLogger.info('goal_routine', '叙事记忆已更新', {
-    workId, chapterId, planted, snapshots, foreshadowingResolved, foreshadowingPartial
-  })
+  return { sourceContent: content, extracted, resolutions, warnings }
+}
 
-  return {
-    planted,
-    resolved: 0,
-    snapshots,
-    timelineEvents,
-    stateFacts: result.stateFacts,
-    patternFingerprint: result.patternFingerprint,
-    foreshadowingResolved,
-    foreshadowingPartial
+/**
+ * 把候选记忆、依赖记忆的同步门禁和章节完成状态放进同一事务。
+ * validate 抛错或返回阻塞项时，清理/写入/状态变更会整体回滚。
+ */
+export function commitPreparedNarrativeMemory(
+  workId: number,
+  chapterId: number,
+  prepared: PreparedNarrativeMemory,
+  options: CommitPreparedNarrativeMemoryOptions = {}
+): NonNullable<BeatGenResult['memoryExtracted']> {
+  const transaction = getDatabase().transaction(() => {
+    const latest = volumeChapterDAO.getChapter(chapterId)
+    if (!latest?.content?.trim() || latest.content !== prepared.sourceContent) {
+      throw new Error('候选正文已变化，拒绝提交过期叙事记忆')
+    }
+
+    clearChapterMemoryBeforeExtract(workId, chapterId)
+    const result = applyMemoryExtract(workId, chapterId, prepared.extracted)
+    if (result.timelineEvents === 0) {
+      throw new Error('候选叙事记忆缺少可提交的时间线事件')
+    }
+    const appliedResolutions = applyForeshadowingResolutions(workId, chapterId, prepared.resolutions)
+    const blockers = options.validate?.().filter(Boolean) ?? []
+    if (blockers.length > 0) {
+      throw new Error(`候选叙事记忆门禁未通过：${blockers.join('；')}`)
+    }
+    if (options.markChapterCompleted) {
+      volumeChapterDAO.updateChapter(chapterId, { status: 'completed' })
+    }
+    return {
+      planted: result.planted,
+      resolved: result.resolved,
+      snapshots: result.snapshots,
+      timelineEvents: result.timelineEvents,
+      stateFacts: result.stateFacts,
+      patternFingerprint: result.patternFingerprint,
+      warnings: prepared.warnings,
+      foreshadowingResolved: appliedResolutions.resolved,
+      foreshadowingPartial: appliedResolutions.partial
+    }
+  })
+  const committed = transaction()
+
+  if (process.env.ELECTRON_RUN_AS_NODE !== '1') {
+    appLogger.info('goal_routine', '叙事记忆已更新', {
+      workId,
+      chapterId,
+      planted: committed.planted,
+      snapshots: committed.snapshots,
+      foreshadowingResolved: committed.foreshadowingResolved,
+      foreshadowingPartial: committed.foreshadowingPartial,
+      atomicCommit: true
+    })
   }
+  return committed
+}
+
+export async function extractNarrativeMemoryAfterGeneration(
+  workId: number,
+  chapterId: number,
+  content: string,
+  signal?: AbortSignal,
+  options: {
+    requirePatternFingerprint?: boolean
+    dropInvalidStateFactsAfterRetries?: boolean
+  } = {}
+): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
+  const prepared = await prepareNarrativeMemoryAfterGeneration(workId, chapterId, content, signal, options)
+  return commitPreparedNarrativeMemory(workId, chapterId, prepared)
 }

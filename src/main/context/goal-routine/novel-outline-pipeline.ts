@@ -446,6 +446,122 @@ export function updateNovelGoalState(workId: number, patch: Partial<NovelGoalPer
   goalRoutineDAO.update(workId, { state_json: JSON.stringify({ ...current, ...patch }) })
 }
 
+/** 从分卷规划重新开始时，所有由分卷、章节和正文派生的运行检查点都必须失效。 */
+export function resetNovelGoalStateFromVolumePlan(workId: number): void {
+  goalRoutineDAO.ensure(workId)
+  updateNovelGoalState(workId, {
+    lastCheck: undefined,
+    novelOutline: undefined,
+    volumePlanChecked: undefined,
+    volumeQualityReport: undefined,
+    checkedChapterVolumes: undefined,
+    pendingChapterVolumeGate: undefined,
+    chapterVolumeGateCheckpoint: undefined,
+    checkedBodyVolumes: undefined,
+    pleasureVolumeFingerprint: undefined,
+    repairPlan: undefined,
+    overallRepairRounds: 0,
+    repairStall: undefined,
+    titleHookCandidates: undefined,
+    titleHookPreferredIndex: undefined,
+    titleHookApplied: undefined,
+    finalAudit: undefined,
+    failure: undefined
+  })
+}
+
+/** 删除分卷后同步失效运行态；删除到空结构时，下次必须重新生成整套分卷合同。 */
+export function invalidateNovelGoalStateAfterVolumeDeletion(
+  workId: number,
+  deletedVolumeName: string
+): void {
+  goalRoutineDAO.ensure(workId)
+  const remainingVolumes = volumeChapterDAO.listVolumes(workId)
+  const remainingChapters = volumeChapterDAO.listChaptersByWork(workId)
+  if (remainingVolumes.length === 0 && remainingChapters.length === 0) {
+    resetNovelGoalStateFromVolumePlan(workId)
+    return
+  }
+
+  const state = readNovelGoalState(workId)
+  updateNovelGoalState(workId, {
+    lastCheck: undefined,
+    checkedChapterVolumes: (state.checkedChapterVolumes ?? []).filter(name => name !== deletedVolumeName),
+    checkedBodyVolumes: (state.checkedBodyVolumes ?? []).filter(name => name !== deletedVolumeName),
+    pendingChapterVolumeGate: state.pendingChapterVolumeGate === deletedVolumeName
+      ? undefined
+      : state.pendingChapterVolumeGate,
+    chapterVolumeGateCheckpoint: state.chapterVolumeGateCheckpoint?.volume === deletedVolumeName
+      ? undefined
+      : state.chapterVolumeGateCheckpoint,
+    repairPlan: undefined,
+    repairStall: undefined,
+    finalAudit: undefined,
+    failure: undefined
+  })
+}
+
+/**
+ * 章节/正文是事实源，冻结数组只是缓存。缓存声称已冻结但事实源不完整时自动降级，
+ * 防止旧版本、手工删除或异常退出把目标循环锁死在不可能状态。
+ */
+export function reconcileNovelWorkflowState(workId: number): {
+  changed: boolean
+  invalidatedChapterVolumes: string[]
+  invalidatedBodyVolumes: string[]
+} {
+  const state = readNovelGoalState(workId)
+  const plan = state.novelOutline?.volumePlan ?? []
+  if (plan.length === 0) {
+    return { changed: false, invalidatedChapterVolumes: [], invalidatedBodyVolumes: [] }
+  }
+
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const completeOutlineNames = new Set<string>()
+  const completeBodyNames = new Set<string>()
+  for (const volume of plan) {
+    const expected = volume.endChapter - volume.startChapter + 1
+    const rows = chapters.filter(chapter => chapter.volume_name === volume.name)
+    if (rows.length === expected) completeOutlineNames.add(volume.name)
+    if (rows.length === expected && rows.every(chapter => Boolean(chapter.content?.trim()))) {
+      completeBodyNames.add(volume.name)
+    }
+  }
+
+  const previousChapterVolumes = state.checkedChapterVolumes ?? []
+  const previousBodyVolumes = state.checkedBodyVolumes ?? []
+  const nextChapterVolumes = previousChapterVolumes.filter(name => completeOutlineNames.has(name))
+  const nextBodyVolumes = previousBodyVolumes.filter(name => completeBodyNames.has(name))
+  const invalidatedChapterVolumes = previousChapterVolumes.filter(name => !completeOutlineNames.has(name))
+  const invalidatedBodyVolumes = previousBodyVolumes.filter(name => !completeBodyNames.has(name))
+  const checkpointInvalid = Boolean(
+    state.chapterVolumeGateCheckpoint
+    && !completeOutlineNames.has(state.chapterVolumeGateCheckpoint.volume)
+  )
+  const pendingInvalid = Boolean(
+    state.pendingChapterVolumeGate
+    && !completeOutlineNames.has(state.pendingChapterVolumeGate)
+  )
+  const changed = invalidatedChapterVolumes.length > 0
+    || invalidatedBodyVolumes.length > 0
+    || checkpointInvalid
+    || pendingInvalid
+  if (changed) {
+    updateNovelGoalState(workId, {
+      lastCheck: undefined,
+      checkedChapterVolumes: nextChapterVolumes,
+      checkedBodyVolumes: nextBodyVolumes,
+      pendingChapterVolumeGate: pendingInvalid ? undefined : state.pendingChapterVolumeGate,
+      chapterVolumeGateCheckpoint: checkpointInvalid ? undefined : state.chapterVolumeGateCheckpoint,
+      repairPlan: undefined,
+      repairStall: undefined,
+      finalAudit: undefined,
+      failure: undefined
+    })
+  }
+  return { changed, invalidatedChapterVolumes, invalidatedBodyVolumes }
+}
+
 function parseObject(content: string, label: string): Record<string, unknown> {
   const json = extractJsonText(content.trim()) ?? content.trim()
   try {

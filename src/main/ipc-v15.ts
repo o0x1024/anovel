@@ -88,6 +88,11 @@ import { parseStoryQualityAiScoreBreakdown } from '../shared/story-quality-score
 import { STORY_QUALITY_AI_SYSTEM_PROMPT } from './context/story-chapter-quality'
 import { workDAO } from './db'
 import type { MilestoneAuditResult, PassiveMonitorResult } from '../shared/milestone-audit'
+import { formatChapterQualityOverride } from '../shared/chapter-execution-contract'
+import {
+  buildChapterExecutionContext,
+  compileChapterExecutionContract
+} from './context/chapter-execution-context'
 import { incubatorVersionDAO } from './db/dao/incubator'
 import { buildFrozenStorylineContext } from './context/incubator/build-storyline-context'
 
@@ -204,6 +209,9 @@ const PREV_CHAPTER_SUMMARY_CHARS = 800
 
 function buildContentLogicContext(workId: number, chapterId: number): string | null {
   const sections: string[] = []
+  const workInfo = workDAO.getById(workId)
+  const isStory = workInfo?.work_type === 'story'
+  const executionContract = !isStory ? compileChapterExecutionContract(workId, chapterId) : null
 
   const chapter = volumeChapterDAO.getChapter(chapterId)
   if (chapter?.outline?.trim()) {
@@ -230,10 +238,11 @@ function buildContentLogicContext(workId: number, chapterId: number): string | n
     }
   }
 
-  const workInfo = workDAO.getById(workId)
-  const isStory = workInfo?.work_type === 'story'
-
+  const relevantNames = executionContract?.characterNames.length
+    ? new Set(executionContract.characterNames)
+    : null
   const snapshotNames = characterSnapshotDAO.listCharacterNames(workId)
+    .filter(name => !relevantNames || relevantNames.has(name))
   const snapshots = snapshotNames
     .map(name => characterSnapshotDAO.getLatest(workId, name))
     .filter((s): s is NonNullable<typeof s> => !!s)
@@ -261,23 +270,28 @@ function buildContentLogicContext(workId: number, chapterId: number): string | n
     sections.push(`【角色状态快照 — 正文须与此一致，不得矛盾】\n${snapshotLines.join('\n')}`)
   }
 
-  const coreSettings = coreSettingDAO.listByWork(workId)
-  const byType = new Map(coreSettings.map(s => [s.type, s.content]))
-  const coreLines: string[] = []
-  for (const type of CORE_SETTING_TYPES) {
-    const content = byType.get(type)?.trim()
-    if (!content) continue
-    if (type === 'golden_finger') {
-      const structured = loadGoldenFingerStructured(workId)
-      const constraints = formatGoldenFingerConstraints(structured)
-      coreLines.push(constraints)
-      continue
+  if (executionContract) {
+    const compact = buildChapterExecutionContext(workId, chapterId, executionContract)
+    if (compact.text) sections.push(compact.text)
+  } else {
+    const coreSettings = coreSettingDAO.listByWork(workId)
+    const byType = new Map(coreSettings.map(s => [s.type, s.content]))
+    const coreLines: string[] = []
+    for (const type of CORE_SETTING_TYPES) {
+      const content = byType.get(type)?.trim()
+      if (!content) continue
+      if (type === 'golden_finger') {
+        const structured = loadGoldenFingerStructured(workId)
+        const constraints = formatGoldenFingerConstraints(structured)
+        coreLines.push(constraints)
+        continue
+      }
+      const label = getCoreSettingLabel(type, isStory)
+      coreLines.push(`【${label}】\n${content}`)
     }
-    const label = getCoreSettingLabel(type, isStory)
-    coreLines.push(`【${label}】\n${content}`)
-  }
-  if (coreLines.length) {
-    sections.push(`【核心设定 — 供设定一致性诊断参考】\n${coreLines.join('\n\n')}`)
+    if (coreLines.length) {
+      sections.push(`【核心设定 — 供设定一致性诊断参考】\n${coreLines.join('\n\n')}`)
+    }
   }
 
   if (sections.length === 0) return null
@@ -312,6 +326,9 @@ export async function diagnoseChapterQualityAi(
     : basePrompt
 
   const resolvedWordTarget = modelOpts?.wordTarget ?? loadWritingPlan(workId).wordsPerChapter
+  const executionContract = !isStory
+    ? compileChapterExecutionContract(workId, chapterId, resolvedWordTarget)
+    : null
   const anchorSection = buildAnchorDiagnosisSection(workId, chapterId)
   const sections = [diagnosisContent]
   if (resolvedWordTarget > 0) {
@@ -329,6 +346,7 @@ export async function diagnoseChapterQualityAi(
   if (anchorSection) sections.push('', anchorSection)
   const logicCtx = buildContentLogicContext(workId, chapterId)
   if (logicCtx) sections.push('', logicCtx)
+  if (executionContract) sections.push('', formatChapterQualityOverride(executionContract))
   if (openingLabel) {
     sections.push('', `【${openingLabel} - 专项门禁】`, goldenOpeningSystemExtra(isStory ? 'story' : 'novel', chapterOrdinal))
     if (!isStory) {

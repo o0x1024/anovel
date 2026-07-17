@@ -78,7 +78,7 @@ export function buildNarrativeMemorySections(
         .join('\n')
       focusCharacterNames = resolveChapterCharacterNames(workId, ch)
       currentChapterIndex = allChaptersForWork.findIndex(row => row.id === chapterId)
-      characterCardsText = formatCharacterCardsForChapter(workId)
+      characterCardsText = formatCharacterCardsForChapter(workId, focusCharacterNames)
       const metaParts: string[] = []
       if (characterCardsText) metaParts.push(characterCardsText)
 

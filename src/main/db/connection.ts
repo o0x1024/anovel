@@ -6,6 +6,16 @@ import { ensureIncrementalMigrations } from './migrations'
 let db: Database.Database | null = null
 let migrationsApplied = false
 
+/** 仅供 ELECTRON_RUN_AS_NODE 故障注入测试使用，生产进程禁止替换数据库单例。 */
+export function injectDatabaseForTest(database: Database.Database): void {
+  if (process.env.ELECTRON_RUN_AS_NODE !== '1') {
+    throw new Error('injectDatabaseForTest 只能在 ELECTRON_RUN_AS_NODE 测试进程中使用')
+  }
+  if (db && db !== database) db.close()
+  db = database
+  migrationsApplied = false
+}
+
 /**
  * 获取数据库实例（单例）
  * 数据库文件存储在用户数据目录

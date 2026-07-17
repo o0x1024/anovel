@@ -9,11 +9,17 @@ export interface ConsistencyGateResult {
   warnings: string[]
 }
 
-/** 保存正文前的 consistency 门禁 */
+export interface ConsistencyGateOptions {
+  /** 候选正文尚未提交派生记忆时，不得用数据库时间线缺失否决正文。 */
+  requireTimeline?: boolean
+}
+
+/** consistency 门禁；默认用于记忆已提交后的完整验收，候选阶段可显式延迟时间线检查。 */
 export function runConsistencyGate(
   workId: number,
   chapterId: number,
-  content: string
+  content: string,
+  options: ConsistencyGateOptions = {}
 ): ConsistencyGateResult {
   const blockers: string[] = []
   const warnings: string[] = []
@@ -36,8 +42,10 @@ export function runConsistencyGate(
   warnings.push(...qualityHints.warnings)
   blockers.push(...qualityHints.blockers)
 
-  const timelineEvents = timelineDAO.listByWork(workId).filter(event => event.chapter_id === chapterId)
-  if (timelineEvents.length === 0) blockers.push(`时间线：本${isNovel ? '章' : '拍'}缺少关键事件与时间推进记录`)
+  if (options.requireTimeline ?? true) {
+    const timelineEvents = timelineDAO.listByWork(workId).filter(event => event.chapter_id === chapterId)
+    if (timelineEvents.length === 0) blockers.push(`时间线：本${isNovel ? '章' : '拍'}缺少关键事件与时间推进记录`)
+  }
 
   return {
     passed: blockers.length === 0,

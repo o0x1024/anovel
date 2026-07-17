@@ -130,3 +130,22 @@ export function validateTensionPlans(
   })
   return issues
 }
+
+/** 生成与门禁共享同一条张力曲线；模型越界时做确定性归一化，避免 AI 反馈与程序规则互相打架。 */
+export function normalizeTensionPlanForBeat<T extends { tension_plan?: { phase?: string; level: number; payoff_type: string } | null }>(
+  chapter: T,
+  index: number,
+  total: number
+): T {
+  const plan = chapter.tension_plan
+  if (!plan) return chapter
+  const expected = tensionCurveForBeat(index + 1, total)
+  return {
+    ...chapter,
+    tension_plan: {
+      ...plan,
+      phase: expected.phase,
+      level: Math.max(expected.min, Math.min(expected.max, Math.round(Number(plan.level) || expected.min)))
+    }
+  }
+}
