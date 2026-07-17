@@ -10,10 +10,24 @@ import {
   scoreZhuqueSegment,
   segmentTextForZhuque
 } from '../src/main/perplexity/zhuque-alignment'
+import {
+  validateZhuqueCalibrationCorpus,
+  ZHUQUE_CALIBRATION_SAMPLES
+} from './zhuque-calibration-corpus'
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const readExperiment = (name: string): string =>
   fs.readFileSync(path.join(projectRoot, 'docs/experiments', name), 'utf8')
+
+assert.deepEqual(validateZhuqueCalibrationCorpus(), [], '朱雀校准语料的完整/部分标注契约必须有效')
+assert.equal(ZHUQUE_CALIBRATION_SAMPLES.filter(sample => sample.expected.coverage === 'complete').length, 10)
+assert.deepEqual(
+  ZHUQUE_CALIBRATION_SAMPLES
+    .filter(sample => sample.expected.coverage === 'partial')
+    .map(sample => sample.file),
+  ['F6-inject-filmshot.txt', 'F4-inject-connector.txt'],
+  '只有缺失原始三分类记录的 F4/F6 可以使用部分标注'
+)
 
 const humanText = readExperiment('A1-human.txt')
 const segmented = segmentTextForZhuque(humanText)
@@ -46,6 +60,25 @@ assert.equal(interleaved[1].category, 'suspected_ai', '被人工段打断的孤�
 
 const contiguous = classifyZhuqueSegments([aiDraft, aiDraft, aiDraft])
 assert.ok(contiguous.every(segment => segment.category === 'ai'), '连续高风险段应保留 AI 特征分类')
+
+const lowPredictabilityStyle = scoreZhuqueSegment(
+  '酒旗斜矗，跑堂的麻溜让路，黑黢黢的巷口有人踅摸。'.repeat(8),
+  highMetric
+)
+const styleDocument = classifyZhuqueSegments([humanDraft, lowPredictabilityStyle, aiDraft, aiDraft])
+assert.ok(
+  styleDocument.every(segment => segment.category === 'suspected_ai'),
+  '整篇低可预测风格不得被双簇规则误识别成人工与 AI 混合'
+)
+
+const filmDraft = scoreZhuqueSegment(
+  '他目光落在门上，嘴角微微上扬，脚步顿了顿，缓缓回过头。'.repeat(8),
+  neutralMetric
+)
+const filmDocument = classifyZhuqueSegments([humanDraft, filmDraft, humanDraft])
+assert.equal(filmDocument[0].category, 'human', '电影镜头链不得反向污染此前的人工窗口')
+assert.equal(filmDocument[1].category, 'ai', '同段多处电影镜头链应保留高风险分类')
+assert.equal(filmDocument[2].category, 'suspected_ai', '电影镜头链应影响紧随其后的滑动窗口')
 
 const frontHuman = computeZhuqueDistribution([
   { ...humanDraft, category: 'human' },

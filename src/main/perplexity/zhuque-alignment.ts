@@ -54,6 +54,14 @@ function clamp(value: number, min = 0, max = 100): number {
   return Math.max(min, Math.min(max, value))
 }
 
+function median(values: number[]): number {
+  const ordered = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(ordered.length / 2)
+  return ordered.length % 2 === 0
+    ? (ordered[middle - 1] + ordered[middle]) / 2
+    : ordered[middle]
+}
+
 function countMatches(text: string, patterns: RegExp[]): number {
   return patterns.reduce((total, pattern) => total + (text.match(pattern)?.length ?? 0), 0)
 }
@@ -196,10 +204,18 @@ export function classifyZhuqueSegments(
   if (scored.length === 0) return []
 
   const orderedScores = scored.map(item => item.score).sort((a, b) => a - b)
-  const middle = Math.floor(orderedScores.length / 2)
-  const median = orderedScores.length % 2 === 0
-    ? (orderedScores[middle - 1] + orderedScores[middle]) / 2
-    : orderedScores[middle]
+  const documentMedian = median(orderedScores)
+  // 短语权重只能改变局部窗口，不能反过来定义整篇文本的 token 来源。
+  // F4/F6 注入实验正是“人工底稿 + 局部指纹”，文档基线应先剥离这些局部修正。
+  const tokenMedian = median(scored.map(item => clamp(
+    item.score - item.evidence.penalty + item.evidence.styleReduction
+  )))
+  const documentDomainTerms = scored.reduce((sum, item) => sum + item.evidence.domainTerms, 0)
+  const documentDeepseekStyleTerms = scored.reduce(
+    (sum, item) => sum + item.evidence.deepseekStyleTerms,
+    0
+  )
+  const hasLowPredictabilityDocumentStyle = documentDomainTerms >= 5 || documentDeepseekStyleTerms >= 4
 
   let largestGap = 0
   let splitIndex = -1
@@ -222,7 +238,7 @@ export function classifyZhuqueSegments(
   const upperSpread = upperWithoutMinimum.length > 1
     ? upperWithoutMinimum[upperWithoutMinimum.length - 1] - upperWithoutMinimum[0]
     : 0
-  const hasHumanAnchorInSuspectDoc = median > 52 && median < 68 &&
+  const hasHumanAnchorInSuspectDoc = documentMedian > 52 && documentMedian < 68 &&
     orderedScores[0] <= 38 && upperSpread >= 8
 
   return scored.map((item, index) => {
@@ -233,18 +249,26 @@ export function classifyZhuqueSegments(
     )
 
     let category: AigcCategory
-    if (hasMixedClusters) {
+    const followsFilmShotWindow = (scored[index - 1]?.evidence.filmShot ?? 0) >= 2
+
+    if (hasLowPredictabilityDocumentStyle) {
+      // H1/M4/G1 实测都是整篇低可预测风格：即使内部存在高低双簇，也应统一落入疑似区，
+      // 不能误解释为 Q6/K4 那种人工与 AI 来源混合。
+      category = 'suspected_ai'
+    } else if (hasMixedClusters) {
       if (item.score <= mixedThreshold) {
         category = 'human'
       } else {
         // Q6 的连续 AI 后半段保留 AI；K4/K5 的交替高风险段降为疑似。
         category = hasUpperClusterNeighbour ? 'ai' : 'suspected_ai'
       }
-    } else if (median <= 52) {
-      const hasVerifiedFingerprint = item.evidence.penalty >= 4 && item.score > 50
+    } else if (tokenMedian <= 52) {
+      const hasVerifiedFingerprint = item.evidence.penalty >= 4 && item.score > 60
       category = hasVerifiedFingerprint ? 'suspected_ai' : 'human'
       if (item.evidence.filmShot >= 2 && item.score >= 68) category = 'ai'
-    } else if (median < 68) {
+      // 电影镜头链的滑动窗口会污染紧随其后的上下文段，但普通连接词不扩散。
+      if (followsFilmShotWindow && category === 'human') category = 'suspected_ai'
+    } else if (documentMedian < 68) {
       category = hasHumanAnchorInSuspectDoc && item.score <= 38 ? 'human' : 'suspected_ai'
     } else {
       category = 'ai'

@@ -8,6 +8,10 @@ import {
   scoreZhuqueSegment,
   segmentTextForZhuque
 } from '../src/main/perplexity/zhuque-alignment'
+import {
+  validateZhuqueCalibrationCorpus,
+  ZHUQUE_CALIBRATION_SAMPLES
+} from './zhuque-calibration-corpus'
 
 const projectRoot = process.cwd()
 const defaultModel = path.join(
@@ -16,22 +20,6 @@ const defaultModel = path.join(
 )
 const modelPath = process.argv[2] || defaultModel
 const cachePath = '/tmp/anovel-zhuque-calibration-cache.json'
-
-const samples = [
-  { name: 'A1人工', file: 'A1-human.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } },
-  { name: 'A2纯AI', file: 'A2-ai.txt', expected: { human: 0, suspected_ai: 0, ai: 100 } },
-  { name: 'H1低频词', file: 'H1-ai-lowfreq-vocab-only.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
-  // 注入实验表只记录人工占比；不可臆造剩余疑似/AI的拆分。
-  { name: 'F6镜头链', file: 'F6-inject-filmshot.txt', expected: { human: 19 } },
-  { name: 'F4连接词', file: 'F4-inject-connector.txt', expected: { human: 61 } },
-  { name: 'F8均匀句长', file: 'F8-inject-uniform-sentlen.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } },
-  { name: 'G1修仙', file: 'G1-genre-xianxia.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
-  { name: 'G3推理', file: 'G3-genre-mystery.txt', expected: { human: 0, suspected_ai: 0, ai: 100 } },
-  { name: 'M4DeepSeek', file: 'M4-deepseek.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
-  { name: 'Q6前置混合', file: 'Q6-50human-50ai.txt', expected: { human: 57.37, suspected_ai: 0, ai: 42.63 } },
-  { name: 'K4交替混合', file: 'K4-50mix-interleave.txt', expected: { human: 28.09, suspected_ai: 71.91, ai: 0 } },
-  { name: 'WS4词对交换', file: 'WS4-swap-A2-ai.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } }
-]
 
 type TokenMetric = { charOffset: number; logProb: number; prob: number; inTop5: boolean }
 
@@ -104,20 +92,27 @@ function aggregate(text: string, tokenMetrics: TokenMetric[]) {
 }
 
 async function main() {
-  if (!fs.existsSync(modelPath)) throw new Error(`模型不存在: ${modelPath}`)
-  const llama = await getLlama()
-  const model = await llama.loadModel({ modelPath })
-  const context = await model.createContext({ contextSize: 4096 })
-  const sequence = context.getSequence()
+  const corpusErrors = validateZhuqueCalibrationCorpus()
+  if (corpusErrors.length > 0) throw new Error(`朱雀校准语料无效：${corpusErrors.join('；')}`)
+
   let totalError = 0
   const cache: Record<string, ReturnType<typeof aggregate>> = fs.existsSync(cachePath)
     ? JSON.parse(fs.readFileSync(cachePath, 'utf8'))
     : {}
+  const missingSamples = ZHUQUE_CALIBRATION_SAMPLES.filter(sample => !cache[sample.file])
+  if (missingSamples.length > 0 && !fs.existsSync(modelPath)) {
+    throw new Error(`模型不存在: ${modelPath}`)
+  }
+  const llama = missingSamples.length > 0 ? await getLlama() : undefined
+  const model = llama ? await llama.loadModel({ modelPath }) : undefined
+  const context = model ? await model.createContext({ contextSize: 4096 }) : undefined
+  const sequence = context?.getSequence()
 
-  for (const sample of samples) {
+  for (const sample of ZHUQUE_CALIBRATION_SAMPLES) {
     const text = fs.readFileSync(path.join(projectRoot, 'docs/experiments', sample.file), 'utf8')
     let aggregated = cache[sample.file]
     if (!aggregated) {
+      if (!sequence) throw new Error(`样本 ${sample.file} 缺少缓存且模型未初始化`)
       const tokenMetrics = await computeWholeMetrics(sequence, model, text)
       aggregated = aggregate(text, tokenMetrics)
       cache[sample.file] = aggregated
@@ -126,7 +121,7 @@ async function main() {
     const scored = aggregated.map(({ segment, metric }) => scoreZhuqueSegment(segment.text, metric))
     const classified = classifyZhuqueSegments(scored)
     const distribution = computeZhuqueDistribution(classified)
-    const expectedEntries = Object.entries(sample.expected) as Array<[
+    const expectedEntries = Object.entries(sample.expected.distribution) as Array<[
       keyof typeof distribution,
       number
     ]>
@@ -138,14 +133,15 @@ async function main() {
     const scores = classified.map(segment =>
       `${Math.round(segment.score)}${segment.evidence.styleReduction ? `(-${segment.evidence.styleReduction})` : ''}`
     ).join(',')
-    console.log(`${sample.name.padEnd(10)} 朱雀=${JSON.stringify(sample.expected)} 检测=${JSON.stringify(distribution)} 误差=${error.toFixed(1)} 分=${scores}`)
+    const coverage = sample.expected.coverage === 'partial' ? ' 部分标注' : ''
+    console.log(`${sample.name.padEnd(10)} 朱雀=${JSON.stringify(sample.expected.distribution)}${coverage} 检测=${JSON.stringify(distribution)} 误差=${error.toFixed(1)} 分=${scores}`)
   }
 
-  console.log(`平均三分类 MAE=${(totalError / samples.length).toFixed(1)}%`)
-  await sequence.dispose()
-  await context.dispose()
-  await model.dispose()
-  await llama.dispose()
+  console.log(`已知标注字段平均 MAE=${(totalError / ZHUQUE_CALIBRATION_SAMPLES.length).toFixed(1)}%`)
+  await sequence?.dispose()
+  await context?.dispose()
+  await model?.dispose()
+  await llama?.dispose()
 }
 
 main().catch(error => {

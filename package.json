@@ -14,6 +14,7 @@
     "test:story-beat-staging": "jiti scripts/test-story-beat-staging.ts",
     "test:continuity-repair": "jiti scripts/test-story-continuity-repair-policy.ts",
     "test:continuity-escalation": "jiti scripts/test-story-continuity-escalation.ts",
+    "test:zhuque-alignment": "jiti scripts/test-zhuque-alignment.ts",
     "test:novel-volume-staging": "jiti scripts/test-novel-volume-staging.ts",
     "test:novel-harness": "jiti scripts/test-novel-harness.ts",
     "test:novel-memory-commit": "node scripts/run-electron-test.mjs scripts/test-novel-memory-commit-db.ts",

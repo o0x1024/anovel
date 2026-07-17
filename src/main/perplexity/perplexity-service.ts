@@ -1,17 +1,15 @@
 import { Worker } from 'worker_threads'
 import path from 'path'
-import type { AigcDetectResult, AigcSegment, AigcDistribution, AigcCategory, PerplexityApiConfig } from '../../shared/aigc-detect-types'
+import type { AigcDetectResult, AigcCategory, PerplexityApiConfig } from '../../shared/aigc-detect-types'
 import { ensureModelReady, isModelReady, type DownloadProgressCallback } from './model-manager'
-import { DETECT_THRESHOLDS, getDetectThresholds, MODEL_THRESHOLD_OVERRIDES, resolveDetectModelId } from './constants'
+import { resolveDetectModelId } from './constants'
 import { appLogger } from '../logger/app-logger'
 import { getActiveModelId } from './model-manager'
 import { computeViaApi, computeWholeViaApi, isDegenerateApiLogprobs, type TokenMetric } from './api-perplexity'
-import { runHeuristicDetect } from './heuristic-detect'
 import { appPreferenceDAO } from '../db'
 import {
   classifyZhuqueSegments,
   computeZhuqueDistribution,
-  computeZhuqueTokenRisk,
   scoreZhuqueSegment,
   segmentTextForZhuque,
   toAigcSegments
@@ -154,175 +152,6 @@ function segmentText(text: string): Array<{ id: number; text: string }> {
   return segmentTextForZhuque(text)
 }
 
-/**
- * 计算单个段落的 AI 评分（0-100，越高越像 AI）
- * 综合 PPL（反转方向）和 Top-5 命中率
- */
-/**
- * V3 评分：双向偏离 + 方向一致性
- * 
- * 原理：AI 文本的 PPL/Top5/AvgProb 三指标同时偏向同一方向
- * - 模仿型AI: 三指标全部偏"可预测"方向（PPL低、Top5高、Prob高）
- * - 创意型AI: 三指标全部偏"不可预测"方向（PPL高、Top5低、Prob低）
- * - 人类文本: 三指标方向不一致，自然散落在基线附近
- */
-function computeSegmentAiScore(ppl: number, top5Rate: number, avgProb: number, modelId?: string): number {
-  return computeZhuqueTokenRisk({ ppl, top5Rate, avgProb, tokenCount: 2 }, modelId)
-}
-
-/**
- * 基于 AI 评分分类段落
- * 阈值从 constants.ts 读取，默认 aiFloor=58 / humanCeiling=22
- */
-/** 科普/资讯自媒体体特征词（朱雀对 A3 类敏感，4B 困惑度易低估） */
-const EXPLAINER_PATTERNS = /(你以为|说真的|很多人|换个角度|认知还停留在|千万别|记住|赶紧|提醒|黑产|精准诈骗|导出上千条|你想想看|渗透测试|防不胜防|半分钟|划重点)/g
-
-function classifyByScore(
-  score: number,
-  modelId?: string,
-  opts?: { aiFloor?: number }
-): AigcCategory {
-  const T = getDetectThresholds(modelId).classify
-  const aiFloor = opts?.aiFloor ?? T.aiFloor
-  if (score >= aiFloor) return 'ai'
-  if (score <= T.humanCeiling) return 'human'
-  return 'suspected_ai'
-}
-
-function generateReason(ppl: number, top5Rate: number, category: AigcCategory): string {
-  if (category === 'ai') {
-    if (ppl > 300) return '困惑度极高，表达模式异常，AI特征明显'
-    if (top5Rate < 0.25) return 'Token预测命中率极低，非典型人类用词'
-    return '困惑度偏高且命中率低，疑似AI生成'
-  }
-  if (category === 'human') {
-    if (top5Rate > 0.55) return '表达自然，符合常见写作模式'
-    return '困惑度低，用词符合人类写作习惯'
-  }
-  if (ppl > 150) return '困惑度较高，有AI生成嫌疑'
-  if (top5Rate < 0.40) return '命中率偏低，用词模式有AI倾向'
-  return '困惑度中等，疑似AI辅助'
-}
-
-/**
- * 计算文本启发式特征（补充 PPL 检测）
- * 返回 heuristicAiBoost: 0-15 的 AI 倾向加分
- */
-function computeHeuristicFeatures(text: string): {
-  sentLenStd: number
-  connectorDensity: number
-  heuristicAiBoost: number
-  explainerHits: number
-  details: string
-} {
-  const sentences = text.split(/[。！？；…]+/).filter(s => s.trim().length > 2)
-  if (sentences.length < 3) {
-    return { sentLenStd: 0, connectorDensity: 0, heuristicAiBoost: 0, explainerHits: 0, details: '句子过少' }
-  }
-
-  const lengths = sentences.map(s => s.trim().length)
-  const avgLen = lengths.reduce((a, b) => a + b, 0) / lengths.length
-  const sentLenStd = Math.sqrt(lengths.reduce((s, l) => s + Math.pow(l - avgLen, 2), 0) / lengths.length)
-
-  const connectors = ['然而', '此时', '紧接着', '随即', '与此同时', '不过', '只见', '顿时', '但是', '因此', '于是', '而后']
-  let connectorCount = 0
-  for (const c of connectors) {
-    const matches = text.match(new RegExp(c, 'g'))
-    if (matches) connectorCount += matches.length
-  }
-  const connectorDensity = connectorCount / sentences.length
-
-  let boost = 0
-  const markers: string[] = []
-
-  // 1. 词汇多样性（TTR）: 极低 TTR 可能是模板化 AI
-  const chars = text.replace(/[，。！？、；：""''（）\s\n]/g, '')
-  const uniqueChars = new Set(chars).size
-  const ttr = uniqueChars / Math.min(chars.length, 500)
-  if (ttr < 0.40 && chars.length > 200) {
-    boost += 4
-    markers.push(`TTR极低=${ttr.toFixed(3)}`)
-  }
-
-  // 2. 句首重复率: AI 倾向用相似的句式开头
-  const openings = sentences.map(s => s.trim().slice(0, 2))
-  const uniqueOpenings = new Set(openings).size
-  const openingDiversity = uniqueOpenings / openings.length
-  if (openingDiversity < 0.55 && sentences.length >= 8) {
-    boost += 5
-    markers.push(`句首重复=${(1 - openingDiversity).toFixed(2)}`)
-  }
-
-  // 3. 短长句刻意交替: AI 模仿人类时常刻意插入短句制造"节奏感"
-  if (sentences.length >= 6) {
-    let alternationCount = 0
-    for (let i = 1; i < lengths.length; i++) {
-      const prev = lengths[i - 1]
-      const curr = lengths[i]
-      if ((prev < 8 && curr > 30) || (prev > 30 && curr < 8)) {
-        alternationCount++
-      }
-    }
-    const alternationRate = alternationCount / (lengths.length - 1)
-    if (alternationRate > 0.12) {
-      boost += 8
-      markers.push(`短长交替=${alternationRate.toFixed(2)}`)
-    }
-  }
-
-  // 4. 句长两极化: 大量极短句(< 8字) + 大量长句(> 40字) 同时存在
-  const shortSents = lengths.filter(l => l < 8).length
-  const longSents = lengths.filter(l => l > 40).length
-  const shortRatio = shortSents / sentences.length
-  const longRatio = longSents / sentences.length
-  if (shortRatio > 0.18 && longRatio > 0.12 && sentences.length >= 8) {
-    boost += 6
-    markers.push(`句长两极化: 短${(shortRatio * 100).toFixed(0)}%+长${(longRatio * 100).toFixed(0)}%`)
-  }
-
-  // 5. 对话密度过高: AI小说倾向使用大量短对话推动情节
-  const dialogueLines = text.split('\n').filter(l => /^["「『"]/.test(l.trim()) || /^["""]/.test(l.trim()))
-  const allLines = text.split('\n').filter(l => l.trim().length > 0)
-  if (allLines.length >= 10) {
-    const dialogueRatio = dialogueLines.length / allLines.length
-    if (dialogueRatio > 0.35) {
-      boost += 6
-      markers.push(`对话密度=${(dialogueRatio * 100).toFixed(0)}%`)
-    }
-  }
-
-  // 6. 短对话回复模式: 大量极短台词（"嗯"、"什么？"等）
-  const veryShortSents = sentences.filter(s => s.trim().length <= 4)
-  if (veryShortSents.length >= 5 && veryShortSents.length / sentences.length > 0.10) {
-    boost += 5
-    markers.push(`极短句=${veryShortSents.length}`)
-  }
-
-  // 7. 情感/动作描写模板密度
-  const templatePatterns = /[她他](?:愣|笑|叹|呆|抖|站|蹲|转身|低头|抬头|皱眉|摇头|点头|放下|拿起|走到)|声音很[轻小低哑]|猛地|突然|像是|忽然|半天没/g
-  const templateCount = (text.match(templatePatterns) || []).length
-  if (templateCount >= 8 && sentences.length >= 15) {
-    boost += 6
-    markers.push(`模板化描写=${templateCount}`)
-  }
-
-  // 8. 科普/资讯自媒体体（朱雀对 A3 类敏感，4B 困惑度易低估）
-  const explainerHits = (text.match(EXPLAINER_PATTERNS) || []).length
-  if (explainerHits >= 3 && sentences.length >= 10) {
-    boost += 12 + Math.min(6, explainerHits - 3)
-    markers.push(`科普资讯体=${explainerHits}`)
-  }
-
-  const details = markers.length > 0 ? markers.join(', ') : '无明显AI特征'
-  return {
-    sentLenStd,
-    connectorDensity,
-    heuristicAiBoost: Math.min(30, boost),
-    explainerHits,
-    details,
-  }
-}
-
 export async function runPerplexityDetect(
   text: string,
   onProgress?: (msg: string) => void,
@@ -380,12 +209,9 @@ export async function runPerplexityDetect(
   }
 
   if (useApi && isDegenerateApiLogprobs(pplResults)) {
-    appLogger.warn(
-      'perplexity',
-      `API logprobs 退化，切换启发式检测: ${apiConfig.modelName || detectModelId || 'unknown'}`
+    throw new Error(
+      `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法执行朱雀对齐检测`
     )
-    onProgress?.('云端 logprobs 无效，使用启发式检测（已针对朱雀校准）…')
-    return runHeuristicDetect(text, segments, detectModelId)
   }
 
   // 过滤有效结果
@@ -539,35 +365,6 @@ function computeInWorker(segments: Array<{ id: number; text: string }>): Promise
   }))
 }
 
-function computeDistribution(segments: AigcSegment[]): AigcDistribution {
-  const total = segments.reduce((sum, s) => sum + s.text.length, 0)
-  if (total === 0) return { human: 0, suspected_ai: 0, ai: 0 }
-
-  let humanLen = 0, suspectedLen = 0, aiLen = 0
-  for (const seg of segments) {
-    if (seg.category === 'human') humanLen += seg.text.length
-    else if (seg.category === 'suspected_ai') suspectedLen += seg.text.length
-    else aiLen += seg.text.length
-  }
-
-  return {
-    human: Math.round((humanLen / total) * 10000) / 100,
-    suspected_ai: Math.round((suspectedLen / total) * 10000) / 100,
-    ai: Math.round((aiLen / total) * 10000) / 100
-  }
-}
-
-function buildSummary(avgPPL: number, avgTop5: number, category: AigcCategory, dist: AigcDistribution): string {
-  const B = DETECT_THRESHOLDS.baseline
-  const pplDev = Math.abs(avgPPL - B.ppl) / B.ppl
-  const pplDesc = pplDev < 0.3 ? '正常' : pplDev < 0.7 ? '偏离' : '异常'
-  const top5Dev = Math.abs(avgTop5 - B.top5) / B.top5
-  const top5Desc = top5Dev < 0.15 ? '正常' : top5Dev < 0.3 ? '偏离' : '异常'
-  if (category === 'ai') return `困惑度${pplDesc}(${avgPPL.toFixed(0)})，Token命中率${top5Desc}(${(avgTop5 * 100).toFixed(0)}%)，AI生成特征明显`
-  if (category === 'human') return `困惑度${pplDesc}(${avgPPL.toFixed(0)})，Token命中率${top5Desc}(${(avgTop5 * 100).toFixed(0)}%)，人工写作特征明显`
-  return `困惑度${pplDesc}(${avgPPL.toFixed(0)})，Token命中率${top5Desc}(${(avgTop5 * 100).toFixed(0)}%)，疑似AI生成`
-}
-
 export function isPerplexityModelReady(): boolean {
   return isModelReady()
 }
@@ -626,20 +423,9 @@ export async function getSegmentMetrics(
   }
 
   if (useApi && isDegenerateApiLogprobs(pplResults)) {
-    const heuristicResult = runHeuristicDetect(text, segments, detectModelId)
-    const details: SegmentDetectDetail[] = heuristicResult.segments.map(seg => ({
-      text: seg.text,
-      aiScore: seg.category === 'ai' ? 85 : seg.category === 'human' ? 20 : 55,
-      ppl: 0,
-      top5Rate: 0,
-      avgProb: 0,
-      category: seg.category
-    }))
-    const validScores = details.map(d => d.aiScore)
-    const docScore = validScores.length > 0
-      ? validScores.reduce((a, b) => a + b, 0) / validScores.length
-      : 50
-    return { segments: details, docScore }
+    throw new Error(
+      `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法计算朱雀对齐段落指标`
+    )
   }
 
   const scored = classifyZhuqueSegments(segments.map((seg, i) => {
