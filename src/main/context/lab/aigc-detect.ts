@@ -16,6 +16,7 @@ import { applyWordTable } from './aigc-wordtable-engine'
 import { BUILTIN_ANTI_AI_VOCAB } from './builtin-anti-ai-vocab'
 import { evaluateRewriteCandidates, type RewriteCandidateInput } from './aigc-rewrite-quality'
 import type { WorkModelOptions } from '../../../shared/work-model-options'
+import { ZHUQUE_MIN_TEXT_LENGTH } from '../../perplexity/zhuque-alignment'
 
 const activeRuns = new Map<string, AiSessionHandle>()
 const activeRewriteRuns = new Map<string, AiSessionHandle>()
@@ -1125,6 +1126,10 @@ export async function runAigcDetect(
   modelOpts?: WorkModelOptions
 ): Promise<AigcDetectResult> {
   if (!text.trim()) throw new Error('待检测内容不能为空')
+  const effectiveLength = text.replace(/\s/g, '').length
+  if (effectiveLength < ZHUQUE_MIN_TEXT_LENGTH) {
+    throw new Error(`为对齐朱雀检测口径，文本至少需要 ${ZHUQUE_MIN_TEXT_LENGTH} 个非空白字符（当前 ${effectiveLength}）`)
+  }
   if (text.length > 50000) throw new Error('文本超出 50000 字符限制')
 
   const prev = activeRuns.get(runId)
@@ -1147,7 +1152,7 @@ export async function runAigcDetect(
   }
 
   try {
-    reportProgress('正在准备困惑度检测…', false)
+    reportProgress('正在准备朱雀对齐检测模型…', false)
 
     const labModel: LabModelOverride | undefined = modelOpts?.modelType
       ? { modelType: modelOpts.modelType, modelName: modelOpts.modelName }

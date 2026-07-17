@@ -17,7 +17,10 @@ export interface ZhuqueFingerprintEvidence {
   connector: number
   emotionTemplate: number
   summaryClosure: number
+  domainTerms: number
+  deepseekStyleTerms: number
   penalty: number
+  styleReduction: number
   primaryReason?: string
 }
 
@@ -44,6 +47,8 @@ const FILM_SHOT_PATTERNS = [
 const CONNECTOR_PATTERN = /(然而|因此|此外|与此同时|值得注意的是|不难发现|由此可见|换言之|总而言之|不仅如此|尽管如此)/g
 const EMOTION_TEMPLATE_PATTERN = /(心中|心里|心头)(?:涌起|泛起|升起)一股|眼中闪过一丝|一股.{0,12}(?:涌上|涌入)心头/g
 const SUMMARY_CLOSURE_PATTERN = /(这一刻[，,]?(?:他|她|它)?(?:忽然|终于)?明白了|或许这便是|对于.{0,18}而言|直到此刻[，,]?(?:他|她)?才明白)/g
+const LOW_PREDICTABILITY_DOMAIN_PATTERN = /(灵力|丹田|筑基|炼气|灵石|灵根|宗门|洞府|符箓|法器|修士|仙门|魔修|签到系统|宿主|隐藏副本|声控灯|纸人|棺材|阴气|香火)/g
+const DEEPSEEK_STYLE_PATTERN = /(酒旗|斜矗|鸬鹚|黑黢黢|龇(?:牙|了牙)|金箔|跑堂|一扬下巴|借过借过|麻溜|踅摸|打怵|搁在|不晓得)/g
 
 function clamp(value: number, min = 0, max = 100): number {
   return Math.max(min, Math.min(max, value))
@@ -109,6 +114,8 @@ export function detectZhuqueFingerprints(text: string): ZhuqueFingerprintEvidenc
   const connector = text.match(CONNECTOR_PATTERN)?.length ?? 0
   const emotionTemplate = text.match(EMOTION_TEMPLATE_PATTERN)?.length ?? 0
   const summaryClosure = text.match(SUMMARY_CLOSURE_PATTERN)?.length ?? 0
+  const domainTerms = text.match(LOW_PREDICTABILITY_DOMAIN_PATTERN)?.length ?? 0
+  const deepseekStyleTerms = text.match(DEEPSEEK_STYLE_PATTERN)?.length ?? 0
 
   // 权重来自 F6/F4/F1/F5 注入实验的相对下降幅度。比喻、微动作和句长不加罚。
   const penalty = Math.min(58,
@@ -116,6 +123,10 @@ export function detectZhuqueFingerprints(text: string): ZhuqueFingerprintEvidenc
     Math.min(18, connector * 4.5) +
     Math.min(15, emotionTemplate * 6) +
     Math.min(15, summaryClosure * 6)
+  )
+  const styleReduction = Math.min(26,
+    (domainTerms >= 2 ? 8 + domainTerms * 3 : 0) +
+    (deepseekStyleTerms >= 2 ? 8 + deepseekStyleTerms * 3 : 0)
   )
 
   const primaryReason = filmShot > 0
@@ -128,7 +139,17 @@ export function detectZhuqueFingerprints(text: string): ZhuqueFingerprintEvidenc
           ? `总结收束句×${summaryClosure}`
           : undefined
 
-  return { filmShot, connector, emotionTemplate, summaryClosure, penalty, primaryReason }
+  return {
+    filmShot,
+    connector,
+    emotionTemplate,
+    summaryClosure,
+    domainTerms,
+    deepseekStyleTerms,
+    penalty,
+    styleReduction,
+    primaryReason
+  }
 }
 
 /**
@@ -155,7 +176,7 @@ export function scoreZhuqueSegment(
 ): Omit<ZhuqueScoredSegment, 'category'> {
   const tokenRisk = computeZhuqueTokenRisk(metric, modelId)
   const evidence = detectZhuqueFingerprints(text)
-  const score = clamp(tokenRisk + evidence.penalty)
+  const score = clamp(tokenRisk + evidence.penalty - evidence.styleReduction)
 
   let reason = evidence.primaryReason
   if (!reason) {
@@ -172,22 +193,61 @@ export function classifyZhuqueSegments(
   scored: Array<Omit<ZhuqueScoredSegment, 'category'>>,
   modelId?: string
 ): ZhuqueScoredSegment[] {
-  const thresholds = getDetectThresholds(modelId).classify
+  if (scored.length === 0) return []
+
+  const orderedScores = scored.map(item => item.score).sort((a, b) => a - b)
+  const middle = Math.floor(orderedScores.length / 2)
+  const median = orderedScores.length % 2 === 0
+    ? (orderedScores[middle - 1] + orderedScores[middle]) / 2
+    : orderedScores[middle]
+
+  let largestGap = 0
+  let splitIndex = -1
+  for (let i = 1; i < orderedScores.length; i++) {
+    const gap = orderedScores[i] - orderedScores[i - 1]
+    if (gap > largestGap) {
+      largestGap = gap
+      splitIndex = i
+    }
+  }
+  const lowerCount = splitIndex
+  const upperCount = orderedScores.length - splitIndex
+  const mixedThreshold = splitIndex > 0
+    ? (orderedScores[splitIndex - 1] + orderedScores[splitIndex]) / 2
+    : 0
+  const hasMixedClusters = scored.length >= 4 && largestGap >= 12 &&
+    lowerCount >= 2 && upperCount >= 2 &&
+    orderedScores[splitIndex - 1] <= 52 && orderedScores[splitIndex] >= 55
+  const upperWithoutMinimum = orderedScores.slice(1)
+  const upperSpread = upperWithoutMinimum.length > 1
+    ? upperWithoutMinimum[upperWithoutMinimum.length - 1] - upperWithoutMinimum[0]
+    : 0
+  const hasHumanAnchorInSuspectDoc = median > 52 && median < 68 &&
+    orderedScores[0] <= 38 && upperSpread >= 8
+
   return scored.map((item, index) => {
     const previousRisk = scored[index - 1]?.score
     const nextRisk = scored[index + 1]?.score
-    const hasAiNeighbour = [previousRisk, nextRisk].some(score =>
-      typeof score === 'number' && score >= thresholds.aiFloor - 8
+    const hasUpperClusterNeighbour = [previousRisk, nextRisk].some(score =>
+      typeof score === 'number' && score > mixedThreshold
     )
 
     let category: AigcCategory
-    if (item.score <= thresholds.humanCeiling) {
-      category = 'human'
-    } else if (item.score >= thresholds.aiFloor) {
-      // K4/K5 实验证明，孤立 AI 段被人工段打断时通常降为“疑似AI”。
-      category = hasAiNeighbour || item.evidence.filmShot >= 2 ? 'ai' : 'suspected_ai'
+    if (hasMixedClusters) {
+      if (item.score <= mixedThreshold) {
+        category = 'human'
+      } else {
+        // Q6 的连续 AI 后半段保留 AI；K4/K5 的交替高风险段降为疑似。
+        category = hasUpperClusterNeighbour ? 'ai' : 'suspected_ai'
+      }
+    } else if (median <= 52) {
+      const hasVerifiedFingerprint = item.evidence.penalty >= 4 && item.score > 50
+      category = hasVerifiedFingerprint ? 'suspected_ai' : 'human'
+      if (item.evidence.filmShot >= 2 && item.score >= 68) category = 'ai'
+    } else if (median < 68) {
+      category = hasHumanAnchorInSuspectDoc && item.score <= 38 ? 'human' : 'suspected_ai'
     } else {
-      category = 'suspected_ai'
+      category = 'ai'
     }
 
     return { ...item, category }
@@ -220,4 +280,3 @@ export function computeZhuqueDistribution(segments: ZhuqueScoredSegment[]): Aigc
 export function toAigcSegments(segments: ZhuqueScoredSegment[]): AigcSegment[] {
   return segments.map(({ text, category, reason }) => ({ text, category, reason }))
 }
-

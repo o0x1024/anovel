@@ -1,0 +1,154 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { getLlama } from 'node-llama-cpp'
+import {
+  classifyZhuqueSegments,
+  computeZhuqueDistribution,
+  scoreZhuqueSegment,
+  segmentTextForZhuque
+} from '../src/main/perplexity/zhuque-alignment'
+
+const projectRoot = process.cwd()
+const defaultModel = path.join(
+  os.homedir(),
+  'Library/Application Support/anovel/models/qwen3.5-0.8b-q4/Qwen3.5-0.8B-Q4_K_M.gguf'
+)
+const modelPath = process.argv[2] || defaultModel
+const cachePath = '/tmp/anovel-zhuque-calibration-cache.json'
+
+const samples = [
+  { name: 'A1人工', file: 'A1-human.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } },
+  { name: 'A2纯AI', file: 'A2-ai.txt', expected: { human: 0, suspected_ai: 0, ai: 100 } },
+  { name: 'H1低频词', file: 'H1-ai-lowfreq-vocab-only.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
+  // 注入实验表只记录人工占比；不可臆造剩余疑似/AI的拆分。
+  { name: 'F6镜头链', file: 'F6-inject-filmshot.txt', expected: { human: 19 } },
+  { name: 'F4连接词', file: 'F4-inject-connector.txt', expected: { human: 61 } },
+  { name: 'F8均匀句长', file: 'F8-inject-uniform-sentlen.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } },
+  { name: 'G1修仙', file: 'G1-genre-xianxia.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
+  { name: 'G3推理', file: 'G3-genre-mystery.txt', expected: { human: 0, suspected_ai: 0, ai: 100 } },
+  { name: 'M4DeepSeek', file: 'M4-deepseek.txt', expected: { human: 0, suspected_ai: 100, ai: 0 } },
+  { name: 'Q6前置混合', file: 'Q6-50human-50ai.txt', expected: { human: 57.37, suspected_ai: 0, ai: 42.63 } },
+  { name: 'K4交替混合', file: 'K4-50mix-interleave.txt', expected: { human: 28.09, suspected_ai: 71.91, ai: 0 } },
+  { name: 'WS4词对交换', file: 'WS4-swap-A2-ai.txt', expected: { human: 100, suspected_ai: 0, ai: 0 } }
+]
+
+type TokenMetric = { charOffset: number; logProb: number; prob: number; inTop5: boolean }
+
+async function computeWholeMetrics(sequence: any, model: any, text: string): Promise<TokenMetric[]> {
+  let tokens = model.tokenize(text)
+  if (tokens.length > 3800) tokens = tokens.slice(0, 3800)
+  const tokenTexts = tokens.map((token: any) => model.detokenize([token]))
+  const charOffsets: number[] = []
+  let offset = 0
+  for (const tokenText of tokenTexts) {
+    charOffsets.push(offset)
+    offset += tokenText.length
+  }
+
+  await sequence.clearHistory()
+  const metrics: TokenMetric[] = []
+  const batchSize = 32
+  for (let start = 0; start < tokens.length - 1; start += batchSize) {
+    const end = Math.min(start + batchSize, tokens.length - 1)
+    const input = []
+    for (let i = start; i < end; i++) {
+      input.push([tokens[i], { generateNext: { probabilities: true } }])
+    }
+    if (end < tokens.length && end === tokens.length - 1) input.push(tokens[end])
+    const outputs = await sequence.controlledEvaluate(input)
+    for (let i = 0; i < end - start; i++) {
+      const output = outputs[i]
+      const nextToken = tokens[start + i + 1]
+      const probabilityMap = output?.next?.probabilities
+      const prob = probabilityMap?.get(nextToken) ?? 0
+      if (prob <= 0) continue
+      let rank = 0
+      for (const [, candidateProb] of probabilityMap) {
+        if (candidateProb > prob) rank++
+        else break
+      }
+      metrics.push({
+        charOffset: charOffsets[start + i + 1],
+        logProb: Math.log(prob),
+        prob,
+        inTop5: rank < 5
+      })
+    }
+  }
+  return metrics
+}
+
+function aggregate(text: string, tokenMetrics: TokenMetric[]) {
+  const segments = segmentTextForZhuque(text)
+  let offset = 0
+  return segments.map(segment => {
+    const start = offset
+    const end = start + segment.text.length
+    offset = end
+    const covered = tokenMetrics.filter(metric => metric.charOffset >= start && metric.charOffset < end)
+    const tokenCount = covered.length
+    const ppl = tokenCount > 0
+      ? Math.exp(-covered.reduce((sum, metric) => sum + metric.logProb, 0) / tokenCount)
+      : 0
+    return {
+      segment,
+      metric: {
+        ppl,
+        tokenCount,
+        top5Rate: tokenCount > 0 ? covered.filter(metric => metric.inTop5).length / tokenCount : 0,
+        avgProb: tokenCount > 0 ? covered.reduce((sum, metric) => sum + metric.prob, 0) / tokenCount : 0
+      }
+    }
+  })
+}
+
+async function main() {
+  if (!fs.existsSync(modelPath)) throw new Error(`模型不存在: ${modelPath}`)
+  const llama = await getLlama()
+  const model = await llama.loadModel({ modelPath })
+  const context = await model.createContext({ contextSize: 4096 })
+  const sequence = context.getSequence()
+  let totalError = 0
+  const cache: Record<string, ReturnType<typeof aggregate>> = fs.existsSync(cachePath)
+    ? JSON.parse(fs.readFileSync(cachePath, 'utf8'))
+    : {}
+
+  for (const sample of samples) {
+    const text = fs.readFileSync(path.join(projectRoot, 'docs/experiments', sample.file), 'utf8')
+    let aggregated = cache[sample.file]
+    if (!aggregated) {
+      const tokenMetrics = await computeWholeMetrics(sequence, model, text)
+      aggregated = aggregate(text, tokenMetrics)
+      cache[sample.file] = aggregated
+      fs.writeFileSync(cachePath, JSON.stringify(cache))
+    }
+    const scored = aggregated.map(({ segment, metric }) => scoreZhuqueSegment(segment.text, metric))
+    const classified = classifyZhuqueSegments(scored)
+    const distribution = computeZhuqueDistribution(classified)
+    const expectedEntries = Object.entries(sample.expected) as Array<[
+      keyof typeof distribution,
+      number
+    ]>
+    const error = expectedEntries.reduce(
+      (sum, [category, expected]) => sum + Math.abs(distribution[category] - expected),
+      0
+    ) / expectedEntries.length
+    totalError += error
+    const scores = classified.map(segment =>
+      `${Math.round(segment.score)}${segment.evidence.styleReduction ? `(-${segment.evidence.styleReduction})` : ''}`
+    ).join(',')
+    console.log(`${sample.name.padEnd(10)} 朱雀=${JSON.stringify(sample.expected)} 检测=${JSON.stringify(distribution)} 误差=${error.toFixed(1)} 分=${scores}`)
+  }
+
+  console.log(`平均三分类 MAE=${(totalError / samples.length).toFixed(1)}%`)
+  await sequence.dispose()
+  await context.dispose()
+  await model.dispose()
+  await llama.dispose()
+}
+
+main().catch(error => {
+  console.error(error)
+  process.exitCode = 1
+})

@@ -89,9 +89,9 @@ async function computeWholeText(text: string): Promise<TokenMetric[]> {
 
   post({ type: 'progress', progress: 5, message: '正在对全文进行困惑度推理…' })
 
-  // 分批计算，每批 BATCH_SIZE 个 token 请求概率，避免一次性分配全词表概率导致 OOM
-  // 每批约 256 × 150K × 8 ≈ 300MB 峰值，GC 可回收后再处理下一批
-  const BATCH_SIZE = 256
+  // node-llama-cpp 会把每个 token 的全词表概率展开为 JS Map；256 个 token
+  // 在 0.8B 模型上实测也会突破 4GB V8 堆。小批量可显著降低峰值内存。
+  const BATCH_SIZE = 32
   const metrics: TokenMetric[] = []
   const totalTokens = tokens.length - 1
   const totalBatches = Math.ceil(totalTokens / BATCH_SIZE)

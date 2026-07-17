@@ -153,7 +153,7 @@ const CIRCUMFERENCE = 2 * Math.PI * RADIUS
 
         <!-- Detector difference notice -->
         <div class="text-[10px] text-base-content/40 text-center px-1 mt-1 leading-relaxed">
-          本检测基于困惑度分析，与朱雀等分类器检测原理不同，结果可能有差异
+          根据朱雀实测样本校准：相邻词组可预测性、特征短语、约240字分段及首段权重
         </div>
       </div>
     </div>

@@ -15,6 +15,7 @@ import { buildTextDiff } from '../../../../shared/text-diff'
 import DeaiDiffText from './DeaiDiffText.vue'
 
 const LAB_TEXT_MAX = 50_000
+const ZHUQUE_MIN_TEXT_LENGTH = 350
 
 const props = defineProps<{
   inputText: string
@@ -139,6 +140,8 @@ const isStrongMode = computed(() => props.seedOpts.mode === 'strong')
 const displayContent = computed(() =>
   (props.result?.segments ?? []).map(seg => seg.text).join('') || props.inputText
 )
+const effectiveInputLength = computed(() => props.inputText.replace(/\s/g, '').length)
+const meetsZhuqueMinimum = computed(() => effectiveInputLength.value >= ZHUQUE_MIN_TEXT_LENGTH)
 
 const CATEGORY_COLORS: Record<AigcCategory, string> = {
   human: '#a3d977',
@@ -268,7 +271,7 @@ onUnmounted(() => {
         <button
           type="button"
           class="btn btn-primary btn-sm"
-          :disabled="!inputText.trim() || rewriting || applyingWordTable"
+          :disabled="!meetsZhuqueMinimum || rewriting || applyingWordTable"
           @click="emit('run')"
         >
           <font-awesome-icon icon="magnifying-glass" class="w-3.5 h-3.5" />
@@ -583,7 +586,7 @@ onUnmounted(() => {
             @input="onInput"
           />
           <span class="absolute bottom-2 right-3 text-[10px] text-base-content/40">
-            {{ inputText.length }} / {{ LAB_TEXT_MAX.toLocaleString() }}
+            有效 {{ effectiveInputLength }} 字 · 至少 {{ ZHUQUE_MIN_TEXT_LENGTH }} 字
           </span>
         </template>
 
@@ -654,7 +657,7 @@ onUnmounted(() => {
           {{ result.summary }}
         </div>
         <div class="text-[10px] text-base-content/40 text-center leading-relaxed">
-          本检测基于困惑度分析，与朱雀等分类器检测原理不同，结果可能有差异
+          根据朱雀实测样本校准：相邻词组可预测性、特征短语、约240字分段及首段权重
         </div>
       </div>
     </div>
