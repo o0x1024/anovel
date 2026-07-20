@@ -73,6 +73,24 @@ export function computeNumberAnchorRetention(source: string, target: string): nu
   return kept / total
 }
 
+function extractDialogueAnchors(text: string): string[] {
+  const anchors: string[] = []
+  const pattern = /[“「『"]([^”」』"\n]{2,})[”」』"]/g
+  for (const match of text.matchAll(pattern)) {
+    const anchor = match[1].replace(/\s+/g, '').trim()
+    if (anchor) anchors.push(anchor)
+  }
+  return anchors
+}
+
+export function computeDialogueRetention(source: string, target: string): number {
+  const anchors = extractDialogueAnchors(source)
+  if (anchors.length === 0) return 1
+  const compactTarget = target.replace(/\s+/g, '')
+  const retained = anchors.filter(anchor => compactTarget.includes(anchor)).length
+  return retained / anchors.length
+}
+
 function dedupeCandidates(candidates: RewriteCandidateInput[]): RewriteCandidateInput[] {
   const seen = new Set<string>()
   const unique: RewriteCandidateInput[] = []
@@ -93,10 +111,13 @@ export async function evaluateRewriteCandidates(params: {
   baselineDocScore?: number
   labModel?: LabModelOverride
   evaluateWithMetrics?: boolean
+  minimumChangeRatio?: number
+  allowDialogueChanges?: boolean
   onProgress?: (msg: string) => void
 }): Promise<RewriteSelection> {
   const { runId, originalText, baselineDocScore, labModel, onProgress } = params
   const evaluateWithMetrics = params.evaluateWithMetrics !== false
+  const minimumChangeRatio = params.minimumChangeRatio ?? MIN_CHANGE_RATIO
   const candidates = dedupeCandidates(params.candidates)
   if (candidates.length === 0) {
     throw new Error('没有可用的改写候选文本')
@@ -116,13 +137,18 @@ export async function evaluateRewriteCandidates(params: {
     }
 
     const changeRatio = computeChangeRatio(originalText, text)
-    if (changeRatio < MIN_CHANGE_RATIO) {
+    if (changeRatio < minimumChangeRatio) {
       issues.push(`改写幅度不足(${Math.round(changeRatio * 100)}%)`)
     }
 
     const numberAnchorRetention = computeNumberAnchorRetention(originalText, text)
     if (numberAnchorRetention < MIN_NUMBER_ANCHOR_RETENTION) {
       issues.push(`数字锚点保留不足(${Math.round(numberAnchorRetention * 100)}%)`)
+    }
+
+    const dialogueRetention = computeDialogueRetention(originalText, text)
+    if (!params.allowDialogueChanges && dialogueRetention < 1) {
+      issues.push(`对话原文保留不足(${Math.round(dialogueRetention * 100)}%)`)
     }
 
     let docScore = typeof baselineDocScore === 'number' ? baselineDocScore : 50
@@ -141,8 +167,13 @@ export async function evaluateRewriteCandidates(params: {
       const delta = docScore - baselineDocScore
       if (delta > 0) objectiveScore += delta * 0.8
     }
-    if (changeRatio < 0.12) objectiveScore += (0.12 - changeRatio) * 60
+    if (changeRatio < minimumChangeRatio) {
+      objectiveScore += (minimumChangeRatio - changeRatio) * 60
+    }
     if (numberAnchorRetention < 0.95) objectiveScore += (0.95 - numberAnchorRetention) * 40
+    if (!params.allowDialogueChanges && dialogueRetention < 1) {
+      objectiveScore += (1 - dialogueRetention) * 50
+    }
     if (issues.length > 0) objectiveScore += 10
 
     evaluations.push({

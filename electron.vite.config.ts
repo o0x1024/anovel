@@ -7,10 +7,11 @@ export default defineConfig({
     build: {
       outDir: 'out/main',
       rollupOptions: {
-        external: ['better-sqlite3', 'node-llama-cpp'],
+        external: ['better-sqlite3', 'node-llama-cpp', 'onnxruntime-node'],
         input: {
           index: path.resolve(__dirname, 'src/main/index.ts'),
-          'perplexity-worker': path.resolve(__dirname, 'src/main/perplexity/perplexity-worker.ts')
+          'perplexity-worker': path.resolve(__dirname, 'src/main/perplexity/perplexity-worker.ts'),
+          'supervised-aigc-worker': path.resolve(__dirname, 'src/main/supervised-aigc/worker.ts')
         },
         output: {
           entryFileNames: '[name].js'

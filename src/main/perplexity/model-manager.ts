@@ -34,6 +34,10 @@ function loadActiveModelId(): string {
       activeModelId = saved
       return saved
     }
+    if (saved) {
+      appPreferenceDAO.setPreference(ACTIVE_MODEL_PREF_KEY, DEFAULT_MODEL_ID)
+      appLogger.info('perplexity', `已移除检测模型 ${saved}，切换为 ${DEFAULT_MODEL_ID}`)
+    }
   } catch { /* DB not ready yet, use default */ }
   activeModelId = DEFAULT_MODEL_ID
   return activeModelId

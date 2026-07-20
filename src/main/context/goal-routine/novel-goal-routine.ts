@@ -95,11 +95,11 @@ import {
   capNovelAutomaticRepairTargets,
   isNovelChapterReadyForTransition,
   isTerminalNovelRepairError,
-  minimumNovelTurnBudget,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
   shouldPauseForReadOnlyNovelAudit
 } from './novel-goal-policy'
+import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
 
 import {
   NOVEL_GOAL_ROUTINE_PHASE_ORDER,
@@ -1337,10 +1337,7 @@ export async function runNovelGoalLoop(
     phase = explicitPhase ?? (fullConfig.incubatorEnabled ? 'incubate_outline' : 'materialize_settings')
   }
 
-  const targetChapters = loadWritingPlan(workId).targetChapters || 10
-  // 按卷交错后，每章至少需要一次大纲轮次和一次正文轮次；再为分卷门禁与基础阶段预留预算。
-  const minimumTurnsForNovel = minimumNovelTurnBudget(targetChapters)
-  fullConfig.maxTurns = Math.max(fullConfig.maxTurns, minimumTurnsForNovel)
+  fullConfig.maxTurns = requireGoalTurnLimit(fullConfig.maxTurns)
 
   const controller = new AbortController()
   activeLoops.set(workId, controller)

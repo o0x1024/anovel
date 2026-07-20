@@ -1,25 +1,24 @@
 import { parentPort, workerData } from 'worker_threads'
 
 interface WorkerRequest {
-  type: 'init' | 'compute' | 'computeWhole' | 'dispose'
+  type: 'init' | 'computeWindows' | 'dispose'
   modelPath?: string
-  segments?: Array<{ id: number; text: string }>
   text?: string
 }
 
-interface SegmentPPLResult {
-  id: number
+interface MetricSummary {
   ppl: number
   tokenCount: number
   top5Rate: number
   avgProb: number
 }
 
-/** 整文连续计算返回的每个 token 指标 */
+interface SegmentPPLResult extends MetricSummary {
+  id: number
+}
+
 interface TokenMetric {
-  /** token 在原始文本中的字符起始偏移 */
   charOffset: number
-  /** token 对应的原始文本长度（字符数） */
   charLen: number
   logProb: number
   prob: number
@@ -27,11 +26,19 @@ interface TokenMetric {
 }
 
 interface WorkerResponse {
-  type: 'ready' | 'result' | 'wholeResult' | 'error' | 'progress'
-  results?: SegmentPPLResult[]
-  tokenMetrics?: TokenMetric[]
+  type: 'ready' | 'windowResult' | 'error' | 'progress'
+  windows?: TokenWindowResult[]
   message?: string
   progress?: number
+}
+
+interface TokenWindowResult {
+  startToken: number
+  endToken: number
+  start: number
+  end: number
+  metric: MetricSummary
+  tokenMetrics: TokenMetric[]
 }
 
 let model: any = null
@@ -154,6 +161,114 @@ async function computeWholeText(text: string): Promise<TokenMetric[]> {
 }
 
 /**
+ * 逐个重叠 token 窗独立推理。每窗清空上下文，避免全文前缀长度和窗口位置
+ * 改变统计口径；384/192 对应 50% 重叠，尾窗至少保留 128 tokens。
+ */
+async function computeTokenWindows(text: string): Promise<TokenWindowResult[]> {
+  if (!model || !context || !sequence) throw new Error('模型未初始化')
+  const tokens = model.tokenize(text)
+  if (tokens.length < 2) return []
+
+  const tokenTexts = tokens.map((token: any) => {
+    try {
+      return model.detokenize([token])
+    } catch {
+      return ''
+    }
+  })
+  const charOffsets: number[] = []
+  let charCursor = 0
+  for (const tokenText of tokenTexts) {
+    charOffsets.push(charCursor)
+    charCursor += tokenText.length
+  }
+
+  const windowSize = 384
+  const stride = 192
+  const minimumTail = 128
+  const starts: number[] = []
+  for (let start = 0; start < tokens.length; start += stride) {
+    const remaining = tokens.length - start
+    if (starts.length > 0 && remaining < minimumTail) {
+      const anchored = Math.max(0, tokens.length - windowSize)
+      if (anchored !== starts[starts.length - 1]) starts.push(anchored)
+      break
+    }
+    starts.push(start)
+    if (start + windowSize >= tokens.length) break
+  }
+
+  const windows: TokenWindowResult[] = []
+  for (let windowIndex = 0; windowIndex < starts.length; windowIndex++) {
+    const startToken = starts[windowIndex]
+    const endToken = Math.min(tokens.length, startToken + windowSize)
+    const selected = tokens.slice(startToken, endToken)
+    await sequence.clearHistory()
+
+    let sumLogProb = 0
+    let probabilitySum = 0
+    let top5Matches = 0
+    let tokenCount = 0
+    const tokenMetrics: TokenMetric[] = []
+    const batchSize = 32
+    for (let batchStart = 0; batchStart < selected.length - 1; batchStart += batchSize) {
+      const batchEnd = Math.min(selected.length - 1, batchStart + batchSize)
+      const input = []
+      for (let index = batchStart; index < batchEnd; index++) {
+        input.push([selected[index], { generateNext: { probabilities: true } }])
+      }
+      const outputs = await sequence.controlledEvaluate(input)
+      for (let index = 0; index < batchEnd - batchStart; index++) {
+        const probabilityMap = outputs[index]?.next?.probabilities
+        const nextToken = selected[batchStart + index + 1]
+        const probability = probabilityMap?.get(nextToken) ?? 0
+        if (probability <= 0) continue
+        let rank = 0
+        for (const [, candidateProbability] of probabilityMap) {
+          if (candidateProbability > probability) rank++
+          else break
+        }
+        sumLogProb += Math.log(probability)
+        probabilitySum += probability
+        if (rank < 5) top5Matches++
+        tokenCount++
+        const globalTokenIndex = startToken + batchStart + index + 1
+        tokenMetrics.push({
+          charOffset: charOffsets[globalTokenIndex],
+          charLen: tokenTexts[globalTokenIndex].length,
+          logProb: Math.log(probability),
+          prob: probability,
+          inTop5: rank < 5
+        })
+      }
+    }
+
+    const lastToken = endToken - 1
+    windows.push({
+      startToken,
+      endToken,
+      start: startToken === 0 ? 0 : charOffsets[startToken],
+      end: endToken === tokens.length
+        ? text.length
+        : Math.min(text.length, charOffsets[lastToken] + tokenTexts[lastToken].length),
+      metric: tokenCount > 0 ? {
+        ppl: Math.exp(-sumLogProb / tokenCount),
+        tokenCount,
+        top5Rate: top5Matches / tokenCount,
+        avgProb: probabilitySum / tokenCount
+      } : { ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 },
+      tokenMetrics
+    })
+    post({
+      type: 'progress',
+      progress: Math.round(((windowIndex + 1) / starts.length) * 100),
+      message: `正在分析重叠窗口… ${windowIndex + 1}/${starts.length}`
+    })
+  }
+  return windows
+}
+
+/**
  * 兼容旧的分段计算模式（保留但不再作为主要路径）
  */
 async function computePerplexity(segments: Array<{ id: number; text: string }>): Promise<SegmentPPLResult[]> {
@@ -273,18 +388,15 @@ parentPort?.on('message', async (msg: WorkerRequest) => {
         if (!msg.modelPath) throw new Error('缺少 modelPath')
         await initModel(msg.modelPath)
         break
-      case 'compute':
-        if (!msg.segments?.length) throw new Error('缺少 segments')
-        const results = await computePerplexity(msg.segments)
-        post({ type: 'result', results })
-        break
-      case 'computeWhole':
+      case 'computeWindows':
         if (!msg.text) throw new Error('缺少 text')
-        const tokenMetrics = await computeWholeText(msg.text)
-        post({ type: 'wholeResult', tokenMetrics })
+        const windows = await computeTokenWindows(msg.text)
+        post({ type: 'windowResult', windows })
         break
       case 'dispose':
         await dispose()
+        post({ type: 'disposed' })
+        parentPort?.close()
         break
     }
   } catch (err) {

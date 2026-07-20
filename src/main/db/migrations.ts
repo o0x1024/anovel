@@ -36,6 +36,27 @@ function hasForeignKey(
  * 幂等增量迁移：每次获取 DB 连接时执行，兼容热更新后未重跑 initSchema 的情况
  */
 export function ensureIncrementalMigrations(db: Database.Database): void {
+  // V4.4: 按“场景 + AI 痕迹”检索的人工化改写成对案例。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS aigc_rewrite_examples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title VARCHAR(160) NOT NULL,
+      scene_types_json TEXT NOT NULL,
+      ai_symptoms_json TEXT NOT NULL,
+      original_text TEXT NOT NULL,
+      rewritten_text TEXT NOT NULL,
+      rewrite_principles_json TEXT NOT NULL,
+      preserved_facts_json TEXT NOT NULL DEFAULT '[]',
+      forbidden_changes_json TEXT NOT NULL DEFAULT '[]',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      priority INTEGER NOT NULL DEFAULT 50,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_aigc_rewrite_examples_enabled_priority
+      ON aigc_rewrite_examples(enabled, priority DESC, update_time DESC);
+  `)
+
   // V4.3: 章节版本保存完整合同快照，使多字段 AI 修复可原子回滚。
   if (hasTable(db, 'chapter_versions') && !hasColumn(db, 'chapter_versions', 'snapshot_json')) {
     db.exec(`ALTER TABLE chapter_versions ADD COLUMN snapshot_json TEXT`)

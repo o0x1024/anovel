@@ -1,5 +1,6 @@
 import type { AigcCategory, AigcDistribution, AigcSegment } from '../../shared/aigc-detect-types'
 import { getDetectThresholds } from './constants'
+import type { ZhuqueDistributionFeatures } from './zhuque-distribution-features'
 
 export const ZHUQUE_MIN_TEXT_LENGTH = 350
 export const ZHUQUE_TARGET_SEGMENT_LENGTH = 240
@@ -30,6 +31,7 @@ export interface ZhuqueScoredSegment {
   category: AigcCategory
   reason: string
   evidence: ZhuqueFingerprintEvidence
+  probabilities?: AigcDistribution
 }
 
 const SENTENCE_BOUNDARY_CHARS = new Set([
@@ -60,6 +62,72 @@ function median(values: number[]): number {
   return ordered.length % 2 === 0
     ? (ordered[middle - 1] + ordered[middle]) / 2
     : ordered[middle]
+}
+
+function sigmoid(value: number): number {
+  return 1 / (1 + Math.exp(-value))
+}
+
+function localWindowRisk(
+  features: ZhuqueDistributionFeatures,
+  start: number,
+  end: number
+): number {
+  let weightedRisk = 0
+  let totalOverlap = 0
+  for (const window of features.windowEvidence) {
+    const overlap = Math.max(0, Math.min(end, window.end) - Math.max(start, window.start))
+    if (overlap <= 0) continue
+    weightedRisk += window.risk * overlap
+    totalOverlap += overlap
+  }
+  return totalOverlap > 0 ? weightedRisk / totalOverlap : features.documentRisk
+}
+
+/**
+ * 把文档级结构信号分配到各局部段落。二分求出的偏置保证按最终展示权重
+ * 汇总后仍等于文档级信号，局部窗口只负责决定风险在段落间如何分布。
+ */
+function calibrateLocalStructuralSignals(
+  scored: Array<Omit<ZhuqueScoredSegment, 'category'>>,
+  features: ZhuqueDistributionFeatures,
+  documentSignal: number,
+  boundaries?: Array<{ start: number; end: number }>
+): number[] {
+  if (documentSignal <= 0 || scored.length === 0) return scored.map(() => 0)
+  if (documentSignal >= 1) return scored.map(() => 1)
+
+  let cursor = 0
+  const localRisks = scored.map((item, index) => {
+    const boundary = boundaries?.[index]
+    if (boundary) return localWindowRisk(features, boundary.start, boundary.end)
+    const start = cursor
+    cursor += item.text.length
+    return localWindowRisk(features, start, cursor)
+  })
+  const weights = scored.map((item, index) =>
+    Math.max(1, item.text.length) * positionWeight(index, scored.length)
+  )
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0)
+  const averageRisk = localRisks.reduce(
+    (sum, risk, index) => sum + risk * weights[index],
+    0
+  ) / totalWeight
+  const localOffsets = localRisks.map(risk => (risk - averageRisk) / 7)
+
+  let lower = -16
+  let upper = 16
+  for (let iteration = 0; iteration < 64; iteration++) {
+    const bias = (lower + upper) / 2
+    const averageSignal = localOffsets.reduce(
+      (sum, offset, index) => sum + sigmoid(bias + offset) * weights[index],
+      0
+    ) / totalWeight
+    if (averageSignal < documentSignal) lower = bias
+    else upper = bias
+  }
+  const bias = (lower + upper) / 2
+  return localOffsets.map(offset => sigmoid(bias + offset))
 }
 
 function countMatches(text: string, patterns: RegExp[]): number {
@@ -199,14 +267,13 @@ export function scoreZhuqueSegment(
 
 export function classifyZhuqueSegments(
   scored: Array<Omit<ZhuqueScoredSegment, 'category'>>,
-  modelId?: string
+  features: ZhuqueDistributionFeatures,
+  boundaries?: Array<{ start: number; end: number }>
 ): ZhuqueScoredSegment[] {
   if (scored.length === 0) return []
 
   const orderedScores = scored.map(item => item.score).sort((a, b) => a - b)
   const documentMedian = median(orderedScores)
-  // 短语权重只能改变局部窗口，不能反过来定义整篇文本的 token 来源。
-  // F4/F6 注入实验正是“人工底稿 + 局部指纹”，文档基线应先剥离这些局部修正。
   const tokenMedian = median(scored.map(item => clamp(
     item.score - item.evidence.penalty + item.evidence.styleReduction
   )))
@@ -240,6 +307,23 @@ export function classifyZhuqueSegments(
     : 0
   const hasHumanAnchorInSuspectDoc = documentMedian > 52 && documentMedian < 68 &&
     orderedScores[0] <= 38 && upperSpread >= 8
+  const concentratedWindowSignal = clamp(
+    clamp((features.documentRisk - 32) / 10, 0, 1) *
+    clamp((features.peakWindowRisk - 34) / 10, 0, 1) *
+    (0.4 + 0.6 * clamp(features.highRiskWindowShare / 15, 0, 1)),
+    0,
+    1
+  )
+  // 文档级多维证据和局部窗口集中度是两条独立证据链。不能相乘成硬门槛，
+  // 否则 350-600 字文本会因窗口数量少而把已成立的整篇结构风险直接清零。
+  const documentStructureSignal = clamp((features.documentRisk - 30) / 14, 0, 1)
+  const structuralSignal = Math.max(documentStructureSignal, concentratedWindowSignal)
+  const localStructuralSignals = calibrateLocalStructuralSignals(
+    scored,
+    features,
+    structuralSignal,
+    boundaries
+  )
 
   return scored.map((item, index) => {
     const previousRisk = scored[index - 1]?.score
@@ -247,26 +331,18 @@ export function classifyZhuqueSegments(
     const hasUpperClusterNeighbour = [previousRisk, nextRisk].some(score =>
       typeof score === 'number' && score > mixedThreshold
     )
-
-    let category: AigcCategory
     const followsFilmShotWindow = (scored[index - 1]?.evidence.filmShot ?? 0) >= 2
+    let category: AigcCategory
 
     if (hasLowPredictabilityDocumentStyle) {
-      // H1/M4/G1 实测都是整篇低可预测风格：即使内部存在高低双簇，也应统一落入疑似区，
-      // 不能误解释为 Q6/K4 那种人工与 AI 来源混合。
       category = 'suspected_ai'
     } else if (hasMixedClusters) {
-      if (item.score <= mixedThreshold) {
-        category = 'human'
-      } else {
-        // Q6 的连续 AI 后半段保留 AI；K4/K5 的交替高风险段降为疑似。
-        category = hasUpperClusterNeighbour ? 'ai' : 'suspected_ai'
-      }
+      if (item.score <= mixedThreshold) category = 'human'
+      else category = hasUpperClusterNeighbour ? 'ai' : 'suspected_ai'
     } else if (tokenMedian <= 52) {
       const hasVerifiedFingerprint = item.evidence.penalty >= 4 && item.score > 60
       category = hasVerifiedFingerprint ? 'suspected_ai' : 'human'
       if (item.evidence.filmShot >= 2 && item.score >= 68) category = 'ai'
-      // 电影镜头链的滑动窗口会污染紧随其后的上下文段，但普通连接词不扩散。
       if (followsFilmShotWindow && category === 'human') category = 'suspected_ai'
     } else if (documentMedian < 68) {
       category = hasHumanAnchorInSuspectDoc && item.score <= 38 ? 'human' : 'suspected_ai'
@@ -274,7 +350,29 @@ export function classifyZhuqueSegments(
       category = 'ai'
     }
 
-    return { ...item, category }
+    let reason = item.reason
+    let probabilities: AigcDistribution | undefined
+    // 结构证据连续削减“人工”权重，不再受 tokenMedian<=52 一票否决。
+    if (category === 'human' && structuralSignal > 0) {
+      const localStructuralSignal = localStructuralSignals[index]
+      const itemTokenRisk = clamp(
+        item.score - item.evidence.penalty + item.evidence.styleReduction
+      )
+      const aiShare = localStructuralSignal * clamp((itemTokenRisk - 30) / 20, 0, 1)
+      const suspectedShare = localStructuralSignal - aiShare
+      probabilities = {
+        human: (1 - localStructuralSignal) * 100,
+        suspected_ai: suspectedShare * 100,
+        ai: aiShare * 100
+      }
+      if (probabilities.ai >= probabilities.suspected_ai && probabilities.ai > probabilities.human) {
+        category = 'ai'
+      } else if (probabilities.suspected_ai > probabilities.human) {
+        category = 'suspected_ai'
+      }
+      reason = `${features.reasons[0] ?? '局部窗口结构风险偏高'}；${item.reason}`
+    }
+    return { ...item, category, reason, probabilities }
   })
 }
 
@@ -291,7 +389,14 @@ export function computeZhuqueDistribution(segments: ZhuqueScoredSegment[]): Aigc
   let total = 0
   segments.forEach((segment, index) => {
     const weight = Math.max(1, segment.text.length) * positionWeight(index, segments.length)
-    weighted[segment.category] += weight
+    const probabilities = segment.probabilities ?? {
+      human: segment.category === 'human' ? 100 : 0,
+      suspected_ai: segment.category === 'suspected_ai' ? 100 : 0,
+      ai: segment.category === 'ai' ? 100 : 0
+    }
+    weighted.human += weight * probabilities.human / 100
+    weighted.suspected_ai += weight * probabilities.suspected_ai / 100
+    weighted.ai += weight * probabilities.ai / 100
     total += weight
   })
 
@@ -301,6 +406,38 @@ export function computeZhuqueDistribution(segments: ZhuqueScoredSegment[]): Aigc
   return { human, suspected_ai, ai }
 }
 
+/**
+ * 句级最终类别按有效字符数汇总全文覆盖率。
+ * 顶部百分比必须与绿/黄/红正文面积使用同一个硬分类口径，不能继续累加软概率，
+ * 否则会再次出现“AI百分比非零但没有任何红句”的语义冲突。
+ */
+export function computeZhuqueSentenceDistribution(
+  segments: ZhuqueScoredSegment[]
+): AigcDistribution {
+  if (segments.length === 0) return { human: 0, suspected_ai: 0, ai: 0 }
+
+  const weighted = { human: 0, suspected_ai: 0, ai: 0 }
+  let total = 0
+  for (const segment of segments) {
+    const weight = Math.max(1, segment.text.replace(/\s/g, '').length)
+    weighted[segment.category] += weight
+    total += weight
+  }
+
+  const human = Math.round(weighted.human / total * 10000) / 100
+  const ai = Math.round(weighted.ai / total * 10000) / 100
+  return {
+    human,
+    suspected_ai: Math.round((100 - human - ai) * 100) / 100,
+    ai
+  }
+}
+
 export function toAigcSegments(segments: ZhuqueScoredSegment[]): AigcSegment[] {
-  return segments.map(({ text, category, reason }) => ({ text, category, reason }))
+  return segments.map(({ text, category, reason, probabilities }) => ({
+    text,
+    category,
+    reason,
+    probabilities
+  }))
 }

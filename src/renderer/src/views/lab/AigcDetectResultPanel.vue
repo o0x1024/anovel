@@ -2,12 +2,16 @@
 import { computed } from 'vue'
 import type { AigcDetectResult, AigcCategory } from '../../../../shared/aigc-detect-types'
 import { AIGC_CATEGORY_LABELS } from '../../../../shared/aigc-detect-types'
+import type { AigcSentencePatch } from '../../../../shared/aigc-sentence-rewrite-types'
+import AigcHighlightedText from './AigcHighlightedText.vue'
+import { summarizeAigcDisplayDistribution } from '../../../../shared/aigc-display-allocation'
 
 const props = defineProps<{
   result: AigcDetectResult | null
   status: 'idle' | 'running' | 'done' | 'error'
   errorMessage: string
   previewText?: string
+  rewritePatches?: AigcSentencePatch[]
 }>()
 
 const CATEGORY_COLORS: Record<AigcCategory, string> = {
@@ -16,15 +20,20 @@ const CATEGORY_COLORS: Record<AigcCategory, string> = {
   ai: '#f5a0a0'
 }
 
-const CATEGORY_BG_CLASSES: Record<AigcCategory, string> = {
-  human: 'bg-[#a3d977]/30',
-  suspected_ai: 'bg-[#f5deb3]/50',
-  ai: 'bg-[#f5a0a0]/40'
-}
+const displayDistribution = computed(() => props.result
+  ? summarizeAigcDisplayDistribution(props.result.segments, props.rewritePatches)
+  : { human: 0, suspected_ai: 0, ai: 0 }
+)
+
+const displaySummary = computed(() => {
+  if (!props.result || !props.rewritePatches?.length) return props.result?.summary ?? ''
+  const value = displayDistribution.value
+  return `逐句证据复核覆盖率：人工 ${value.human}%，疑似AI ${value.suspected_ai}%，AI特征 ${value.ai}%`
+})
 
 const donutSegments = computed(() => {
   if (!props.result) return []
-  const { distribution } = props.result
+  const distribution = displayDistribution.value
   const segments: Array<{ category: AigcCategory; percent: number; color: string; offset: number }> = []
   let offset = 0
   const order: AigcCategory[] = ['human', 'suspected_ai', 'ai']
@@ -45,6 +54,21 @@ function getStrokeDasharray(percent: number, circumference: number): string {
 
 const RADIUS = 54
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS
+
+const diagnosticItems = computed(() => {
+  const diagnostics = props.result?.diagnostics
+  if (!diagnostics) return []
+  return [
+    ['词语可预测性', diagnostics.tokenPredictability],
+    ['段落序列规律', diagnostics.sequenceRegularity],
+    ['信息密度均匀', diagnostics.informationUniformity],
+    ['因果即时闭合', diagnostics.causalClosure],
+    ['叙述长期稳定', diagnostics.voiceStability],
+    ['模板表达密度', diagnostics.templateDensity],
+    ['滑窗风险峰值', diagnostics.peakWindowRisk],
+    ['高风险窗占比', diagnostics.highRiskWindowShare]
+  ] as Array<[string, number]>
+})
 </script>
 
 <template>
@@ -81,16 +105,14 @@ const CIRCUMFERENCE = 2 * Math.PI * RADIUS
     <div v-else-if="result" class="flex gap-4 p-3 h-full min-h-0">
       <!-- Left: color-coded text segments -->
       <div class="flex-1 min-w-0 overflow-auto">
-        <div class="text-sm leading-relaxed whitespace-pre-wrap break-words">
-          <span
-            v-for="(seg, idx) in result.segments"
-            :key="idx"
-            class="rounded-sm px-0.5 relative group cursor-default"
-            :class="CATEGORY_BG_CLASSES[seg.category]"
-          >{{ seg.text }}<span
-              v-if="seg.reason"
-              class="absolute hidden group-hover:block left-0 top-full z-50 mt-1 px-2 py-1 text-[11px] bg-base-300 rounded shadow-lg whitespace-nowrap max-w-xs text-base-content"
-            >{{ AIGC_CATEGORY_LABELS[seg.category] }}：{{ seg.reason }}</span></span>
+        <AigcHighlightedText :segments="result.segments" :patches="rewritePatches" />
+
+        <div v-if="diagnosticItems.length" class="w-full border-t border-base-200 pt-2 space-y-1">
+          <div v-for="([label, value]) in diagnosticItems" :key="label" class="flex items-center gap-1 text-[10px]">
+            <span class="w-20 text-base-content/55">{{ label }}</span>
+            <progress class="progress progress-error h-1.5 flex-1" :value="value" max="100" />
+            <span class="w-7 text-right font-mono text-base-content/55">{{ Math.round(value) }}</span>
+          </div>
         </div>
       </div>
 
@@ -115,7 +137,7 @@ const CIRCUMFERENCE = 2 * Math.PI * RADIUS
           </svg>
           <div class="absolute inset-0 flex flex-col items-center justify-center">
             <span class="text-2xl font-extrabold text-white leading-none tracking-tight drop-shadow-sm">
-              {{ result.distribution.ai }}%
+              {{ displayDistribution.ai }}%
             </span>
             <span class="text-[11px] text-white/85 mt-1">AI特征</span>
           </div>
@@ -128,32 +150,32 @@ const CIRCUMFERENCE = 2 * Math.PI * RADIUS
               <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.human }" />
               {{ AIGC_CATEGORY_LABELS.human }}
             </span>
-            <span class="font-mono">{{ result.distribution.human }}%</span>
+            <span class="font-mono">{{ displayDistribution.human }}%</span>
           </div>
           <div class="flex items-center justify-between">
             <span class="flex items-center gap-1.5">
               <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.suspected_ai }" />
               {{ AIGC_CATEGORY_LABELS.suspected_ai }}
             </span>
-            <span class="font-mono">{{ result.distribution.suspected_ai }}%</span>
+            <span class="font-mono">{{ displayDistribution.suspected_ai }}%</span>
           </div>
           <div class="flex items-center justify-between">
             <span class="flex items-center gap-1.5">
               <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.ai }" />
               {{ AIGC_CATEGORY_LABELS.ai }}
             </span>
-            <span class="font-mono">{{ result.distribution.ai }}%</span>
+            <span class="font-mono">{{ displayDistribution.ai }}%</span>
           </div>
         </div>
 
         <!-- Summary -->
         <div class="text-[11px] text-base-content/60 text-center border-t border-base-200 pt-2 px-1 mt-auto">
-          {{ result.summary }}
+          {{ displaySummary }}
         </div>
 
         <!-- Detector difference notice -->
         <div class="text-[10px] text-base-content/40 text-center px-1 mt-1 leading-relaxed">
-          根据朱雀实测样本校准：相邻词组可预测性、特征短语、约240字分段及首段权重
+          检测阶段颜色表示句级概率类别；逐句分析后，红色只保留已定位到句内证据的目标，窗口级风险显示黄色
         </div>
       </div>
     </div>

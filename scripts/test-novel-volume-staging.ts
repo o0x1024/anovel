@@ -25,7 +25,6 @@ import {
   capNovelAutomaticRepairTargets,
   isNovelChapterReadyForTransition,
   isTerminalNovelRepairError,
-  minimumNovelTurnBudget,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
   shouldPauseForReadOnlyNovelAudit
@@ -41,14 +40,11 @@ assert.equal(ranges.length, 6)
 assert.deepEqual(ranges[0], { startChapter: 1, endChapter: 44 })
 assert.deepEqual(ranges.at(-1), { startChapter: 218, endChapter: 260 })
 
-// 400 万字 / 4000 字每章 = 1000 章：按现有 42 章/卷目标确定性拆成 24 卷；
-// 自动运行预算则按更保守的 40 章/卷（即25卷）预留。
+// 400 万字 / 4000 字每章 = 1000 章：按现有 42 章/卷目标确定性拆成 24 卷。
 const fourMillionRanges = planNovelVolumeRanges(1_000)
 assert.equal(fourMillionRanges.length, 24)
 assert.deepEqual(fourMillionRanges[0], { startChapter: 1, endChapter: 42 })
 assert.deepEqual(fourMillionRanges.at(-1), { startChapter: 960, endChapter: 1_000 })
-assert.equal(minimumNovelTurnBudget(1_000), 2_250)
-
 const volumeGateWindows = planNovelVolumeGateWindows(1, 43)
 assert.deepEqual(volumeGateWindows, [
   { startChapter: 1, endChapter: 8 },

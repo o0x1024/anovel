@@ -27,7 +27,6 @@ export interface StoryModelCapabilityInput {
   thinkingEnabled?: boolean
 }
 
-export const STORY_HARNESS_MAX_TURNS = 30
 export const STORY_HARNESS_MAX_CANDIDATES_PER_BEAT = 4
 
 /** 只有正文语义/连续性失败才消耗结构候选预算；格式和派生索引失败由各自熔断器处理。 */

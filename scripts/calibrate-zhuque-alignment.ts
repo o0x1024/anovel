@@ -1,13 +1,14 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { getLlama } from 'node-llama-cpp'
 import {
   classifyZhuqueSegments,
   computeZhuqueDistribution,
   scoreZhuqueSegment,
   segmentTextForZhuque
 } from '../src/main/perplexity/zhuque-alignment'
+import { analyzeZhuqueDistribution } from '../src/main/perplexity/zhuque-distribution-features'
+import { buildZhuqueTokenWindows } from '../src/main/perplexity/zhuque-token-windows'
 import {
   validateZhuqueCalibrationCorpus,
   ZHUQUE_CALIBRATION_SAMPLES
@@ -16,12 +17,12 @@ import {
 const projectRoot = process.cwd()
 const defaultModel = path.join(
   os.homedir(),
-  'Library/Application Support/anovel/models/qwen3.5-0.8b-q4/Qwen3.5-0.8B-Q4_K_M.gguf'
+  'Library/Application Support/anovel/models/qwen3.5-4b-q4/Qwen3.5-4B-Q4_K_M.gguf'
 )
 const modelPath = process.argv[2] || defaultModel
-const cachePath = '/tmp/anovel-zhuque-calibration-cache.json'
+const cachePath = '/tmp/anovel-zhuque-calibration-cache-v2.json'
 
-type TokenMetric = { charOffset: number; logProb: number; prob: number; inTop5: boolean }
+type TokenMetric = { charOffset: number; charLen: number; logProb: number; prob: number; inTop5: boolean }
 
 async function computeWholeMetrics(sequence: any, model: any, text: string): Promise<TokenMetric[]> {
   let tokens = model.tokenize(text)
@@ -58,6 +59,7 @@ async function computeWholeMetrics(sequence: any, model: any, text: string): Pro
       }
       metrics.push({
         charOffset: charOffsets[start + i + 1],
+        charLen: tokenTexts[start + i + 1].length,
         logProb: Math.log(prob),
         prob,
         inTop5: rank < 5
@@ -91,35 +93,49 @@ function aggregate(text: string, tokenMetrics: TokenMetric[]) {
   })
 }
 
+type AggregatedSample = ReturnType<typeof aggregate>
+type CachedSample = {
+  aggregated: AggregatedSample
+  windows: ReturnType<typeof buildZhuqueTokenWindows>
+}
+
 async function main() {
   const corpusErrors = validateZhuqueCalibrationCorpus()
   if (corpusErrors.length > 0) throw new Error(`朱雀校准语料无效：${corpusErrors.join('；')}`)
 
   let totalError = 0
-  const cache: Record<string, ReturnType<typeof aggregate>> = fs.existsSync(cachePath)
+  const cache: Record<string, CachedSample> = fs.existsSync(cachePath)
     ? JSON.parse(fs.readFileSync(cachePath, 'utf8'))
     : {}
   const missingSamples = ZHUQUE_CALIBRATION_SAMPLES.filter(sample => !cache[sample.file])
   if (missingSamples.length > 0 && !fs.existsSync(modelPath)) {
     throw new Error(`模型不存在: ${modelPath}`)
   }
-  const llama = missingSamples.length > 0 ? await getLlama() : undefined
+  const getLlama = missingSamples.length > 0
+    ? (await import('node-llama-cpp')).getLlama
+    : undefined
+  const llama = getLlama ? await getLlama() : undefined
   const model = llama ? await llama.loadModel({ modelPath }) : undefined
   const context = model ? await model.createContext({ contextSize: 4096 }) : undefined
   const sequence = context?.getSequence()
 
   for (const sample of ZHUQUE_CALIBRATION_SAMPLES) {
     const text = fs.readFileSync(path.join(projectRoot, 'docs/experiments', sample.file), 'utf8')
-    let aggregated = cache[sample.file]
-    if (!aggregated) {
+    let cached = cache[sample.file]
+    if (!cached) {
       if (!sequence) throw new Error(`样本 ${sample.file} 缺少缓存且模型未初始化`)
       const tokenMetrics = await computeWholeMetrics(sequence, model, text)
-      aggregated = aggregate(text, tokenMetrics)
-      cache[sample.file] = aggregated
+      cached = {
+        aggregated: aggregate(text, tokenMetrics),
+        windows: buildZhuqueTokenWindows(text, tokenMetrics)
+      }
+      cache[sample.file] = cached
       fs.writeFileSync(cachePath, JSON.stringify(cache))
     }
+    const { aggregated, windows } = cached
     const scored = aggregated.map(({ segment, metric }) => scoreZhuqueSegment(segment.text, metric))
-    const classified = classifyZhuqueSegments(scored)
+    const features = analyzeZhuqueDistribution(text, windows)
+    const classified = classifyZhuqueSegments(scored, features)
     const distribution = computeZhuqueDistribution(classified)
     const expectedEntries = Object.entries(sample.expected.distribution) as Array<[
       keyof typeof distribution,
@@ -134,7 +150,7 @@ async function main() {
       `${Math.round(segment.score)}${segment.evidence.styleReduction ? `(-${segment.evidence.styleReduction})` : ''}`
     ).join(',')
     const coverage = sample.expected.coverage === 'partial' ? ' 部分标注' : ''
-    console.log(`${sample.name.padEnd(10)} 朱雀=${JSON.stringify(sample.expected.distribution)}${coverage} 检测=${JSON.stringify(distribution)} 误差=${error.toFixed(1)} 分=${scores}`)
+    console.log(`${sample.name.padEnd(10)} 朱雀=${JSON.stringify(sample.expected.distribution)}${coverage} 检测=${JSON.stringify(distribution)} 误差=${error.toFixed(1)} 分=${scores} 文档=${features.documentRisk}/${features.sequenceRegularity}/${features.informationUniformity}/${features.causalClosure}/${features.voiceStability}`)
   }
 
   console.log(`已知标注字段平均 MAE=${(totalError / ZHUQUE_CALIBRATION_SAMPLES.length).toFixed(1)}%`)

@@ -5,13 +5,14 @@ import DeaiResultPanel from './DeaiResultPanel.vue'
 import DeaiHistoryDrawer from './DeaiHistoryDrawer.vue'
 import AigcDetectInputPanel from './AigcDetectInputPanel.vue'
 import WordTablePanel from './WordTablePanel.vue'
+import HumanRewriteReferencePanel from './HumanRewriteReferencePanel.vue'
 import BodyModelSelect from '../../components/BodyModelSelect.vue'
 import { useDeaiTask } from '../../composables/useDeaiTask'
 import { useAigcDetect } from '../../composables/useAigcDetect'
 import { useLabModel } from '../../composables/useLabModel'
 import { normalizeBodyParagraphSpacing } from '../../../../shared/normalize-body-text'
 
-type LabTab = 'deai' | 'aigc-detect' | 'wordtable'
+type LabTab = 'deai' | 'aigc-detect' | 'rewrite-reference' | 'wordtable'
 const activeTab = ref<LabTab>('aigc-detect')
 
 const { labModelType, labModelName, labThinkingEnabled, modelParams } = useLabModel()
@@ -44,8 +45,11 @@ const {
   rewriting: aigcRewriting,
   applyingWordTable: aigcApplyingWordTable,
   rewriteProgress: aigcRewriteProgress,
-  rewriteSelection: aigcRewriteSelection,
-  rewriteCompare: aigcRewriteCompare,
+  rewritePatches: aigcRewritePatches,
+  rewriteGoal: aigcRewriteGoal,
+  needsManualRecheck: aigcNeedsManualRecheck,
+  rewriteDecisions: aigcRewriteDecisions,
+  rewritePreviewText: aigcRewritePreviewText,
   errorMessage: aigcError,
   result: aigcResult,
   seedOpts: aigcSeedOpts,
@@ -53,6 +57,9 @@ const {
   run: aigcRun,
   rewrite: aigcRewrite,
   applyWordTableReplace: aigcApplyWordTable,
+  decideSentencePatch: aigcDecideSentencePatch,
+  acceptAllSentencePatches: aigcAcceptAllSentencePatches,
+  applyAcceptedSentencePatches: aigcApplyAcceptedSentencePatches,
   cancel: aigcCancel
 } = useAigcDetect()
 
@@ -132,6 +139,15 @@ function onAigcClearResult() {
   aigcStatus.value = 'idle'
 }
 
+function onApplyAcceptedSentencePatches() {
+  pageError.value = ''
+  try {
+    aigcApplyAcceptedSentencePatches()
+  } catch (error) {
+    pageError.value = error instanceof Error ? error.message : '应用逐句补丁失败'
+  }
+}
+
 async function onSelectHistory(taskId: number) {
   await loadFromHistory(taskId)
   showHistory.value = false
@@ -185,6 +201,13 @@ async function onStyleChanged(styleIdValue: number | null) {
           :class="{ 'tab-active': activeTab === 'wordtable' }"
           @click.prevent="activeTab = 'wordtable'"
         >词表替换</a>
+        <a
+          role="tab"
+          href="#"
+          class="tab"
+          :class="{ 'tab-active': activeTab === 'rewrite-reference' }"
+          @click.prevent="activeTab = 'rewrite-reference'"
+        >改写案例</a>
       </div>
 
       <div class="ml-auto flex items-center gap-2 shrink-0">
@@ -252,8 +275,11 @@ async function onStyleChanged(styleIdValue: number | null) {
         :rewriting="aigcRewriting"
         :applying-word-table="aigcApplyingWordTable"
         :rewrite-progress="aigcRewriteProgress"
-        :rewrite-selection="aigcRewriteSelection"
-        :rewrite-compare="aigcRewriteCompare"
+        :rewrite-patches="aigcRewritePatches"
+        :rewrite-goal="aigcRewriteGoal"
+        :needs-manual-recheck="aigcNeedsManualRecheck"
+        :rewrite-decisions="aigcRewriteDecisions"
+        :rewrite-preview-text="aigcRewritePreviewText"
         :result="aigcResult"
         :error-message="aigcError"
         :download-progress="aigcDownloadProgress"
@@ -263,7 +289,16 @@ async function onStyleChanged(styleIdValue: number | null) {
         @wordtable-apply="onAigcApplyWordTable"
         @cancel="aigcCancel"
         @clear-result="onAigcClearResult"
+        @accept-patch="aigcDecideSentencePatch($event, 'accepted')"
+        @reject-patch="aigcDecideSentencePatch($event, 'rejected')"
+        @accept-all-patches="aigcAcceptAllSentencePatches"
+        @apply-accepted-patches="onApplyAcceptedSentencePatches"
       />
+    </template>
+
+    <!-- Word Table tab content -->
+    <template v-if="activeTab === 'rewrite-reference'">
+      <HumanRewriteReferencePanel class="flex-1 min-h-0" />
     </template>
 
     <!-- Word Table tab content -->

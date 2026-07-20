@@ -41,13 +41,6 @@ export function novelPhaseFailureSignature(phase: string, errorCode: string, mes
   return `${phase}:${stage}:${errorCode}:${normalizedNovelFailureKind(message)}`
 }
 
-export function minimumNovelTurnBudget(targetChapters: number, targetChaptersPerVolume = 40): number {
-  const chapters = Math.max(1, Math.round(targetChapters))
-  const volumes = Math.max(1, Math.ceil(chapters / targetChaptersPerVolume))
-  // 每章至少预留一次大纲轮次和一次正文轮次，并覆盖卷级门禁与基础阶段。
-  return chapters * 2 + volumes * 8 + 50
-}
-
 export function isNovelChapterReadyForTransition(input: {
   qualityReady: boolean
   emotionReady: boolean

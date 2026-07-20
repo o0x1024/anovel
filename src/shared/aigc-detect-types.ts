@@ -3,7 +3,9 @@ export type AigcCategory = 'human' | 'suspected_ai' | 'ai'
 export interface AigcSegment {
   text: string
   category: AigcCategory
+  riskScore?: number
   reason?: string
+  probabilities?: AigcDistribution
 }
 
 export interface AigcDistribution {
@@ -16,6 +18,24 @@ export interface AigcDetectResult {
   segments: AigcSegment[]
   distribution: AigcDistribution
   summary: string
+  diagnostics?: AigcDetectDiagnostics
+}
+
+export interface AigcDetectDiagnostics {
+  tokenPredictability: number
+  sequenceRegularity: number
+  informationUniformity: number
+  causalClosure: number
+  voiceStability: number
+  templateDensity: number
+  windowRiskP75: number
+  peakWindowRisk: number
+  highRiskWindowShare: number
+  documentRisk: number
+  supervisedAiProbability?: number
+  detectorDisagreementShare?: number
+  supervisedModelId?: string
+  reasons: string[]
 }
 
 export interface AigcRewriteCandidateView {

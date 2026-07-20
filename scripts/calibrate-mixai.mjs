@@ -13,7 +13,7 @@ const projectRoot = path.resolve(__dirname, '..')
 
 const DEFAULT_MODEL = path.join(
   os.homedir(),
-  'Library/Application Support/anovel/models/qwen3.5-0.8b-q4/Qwen3.5-0.8B-Q4_K_M.gguf'
+  'Library/Application Support/anovel/models/qwen3.5-4b-q4/Qwen3.5-4B-Q4_K_M.gguf'
 )
 const MODEL_PATH = process.argv[2] || DEFAULT_MODEL
 

@@ -2,17 +2,23 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import type { AigcSeedOpts } from '../../composables/useAigcDetect'
 import { usePerplexityModels, type PplModelInfo } from '../../composables/usePerplexityModels'
+import { useSupervisedAigcModel } from '../../composables/useSupervisedAigcModel'
 import type {
   PerplexityEngineMode,
   PerplexityApiConfig,
-  AigcRewriteSelectionView,
-  AigcRewriteCompareView,
   AigcDetectResult,
   AigcCategory
 } from '../../../../shared/aigc-detect-types'
 import { AIGC_CATEGORY_LABELS } from '../../../../shared/aigc-detect-types'
-import { buildTextDiff } from '../../../../shared/text-diff'
-import DeaiDiffText from './DeaiDiffText.vue'
+import type {
+  AigcSentencePatch,
+  AigcSentencePatchDecision,
+  AigcRewriteGoalResult
+} from '../../../../shared/aigc-sentence-rewrite-types'
+import AigcSentenceRewritePanel from './AigcSentenceRewritePanel.vue'
+import AigcHighlightedText from './AigcHighlightedText.vue'
+import AigcDetectDetailDrawer from './AigcDetectDetailDrawer.vue'
+import { summarizeAigcDisplayDistribution } from '../../../../shared/aigc-display-allocation'
 
 const LAB_TEXT_MAX = 50_000
 const ZHUQUE_MIN_TEXT_LENGTH = 350
@@ -24,8 +30,11 @@ const props = defineProps<{
   rewriting?: boolean
   applyingWordTable?: boolean
   rewriteProgress?: { message: string; level?: 'info' | 'warn' } | null
-  rewriteSelection?: AigcRewriteSelectionView | null
-  rewriteCompare?: AigcRewriteCompareView | null
+  rewritePatches?: AigcSentencePatch[]
+  rewriteGoal?: AigcRewriteGoalResult | null
+  needsManualRecheck?: boolean
+  rewriteDecisions?: Record<string, AigcSentencePatchDecision>
+  rewritePreviewText?: string
   result?: AigcDetectResult | null
   errorMessage?: string
   downloadProgress?: { phase: string; percent: number; message: string } | null
@@ -39,15 +48,28 @@ const emit = defineEmits<{
   wordtableApply: []
   cancel: []
   clearResult: []
+  acceptPatch: [id: string]
+  rejectPatch: [id: string]
+  acceptAllPatches: []
+  applyAcceptedPatches: []
 }>()
 
 const {
   models, switchModel, deleteModel, downloadModel,
+  loading: modelSwitching,
   downloading, downloadProgress: modelDownloadProgress,
   refresh: refreshModels
 } = usePerplexityModels()
+const {
+  model: supervisedModel,
+  downloading: supervisedDownloading,
+  downloadProgress: supervisedDownloadProgress,
+  download: downloadSupervisedModel,
+  remove: removeSupervisedModel
+} = useSupervisedAigcModel()
 const showModelPanel = ref(false)
 const engineExpanded = ref(false)
+const showDetectDetails = ref(false)
 
 // API 配置
 const engineMode = ref<PerplexityEngineMode>('builtin')
@@ -117,7 +139,7 @@ function formatSize(bytes: number): string {
 }
 
 async function onSwitchModel(m: PplModelInfo) {
-  if (m.active) return
+  if (m.active || modelSwitching.value) return
   await switchModel(m.id)
 }
 
@@ -138,7 +160,7 @@ onMounted(() => {
 const isStrongMode = computed(() => props.seedOpts.mode === 'strong')
 
 const displayContent = computed(() =>
-  (props.result?.segments ?? []).map(seg => seg.text).join('') || props.inputText
+  props.rewritePreviewText || (props.result?.segments ?? []).map(seg => seg.text).join('') || props.inputText
 )
 const effectiveInputLength = computed(() => props.inputText.replace(/\s/g, '').length)
 const meetsZhuqueMinimum = computed(() => effectiveInputLength.value >= ZHUQUE_MIN_TEXT_LENGTH)
@@ -149,44 +171,21 @@ const CATEGORY_COLORS: Record<AigcCategory, string> = {
   ai: '#f5a0a0'
 }
 
-const CATEGORY_BG_CLASSES: Record<AigcCategory, string> = {
-  human: 'bg-[#a3d977]/30',
-  suspected_ai: 'bg-[#f5deb3]/50',
-  ai: 'bg-[#f5a0a0]/40'
-}
+const displayDistribution = computed(() => props.result
+  ? summarizeAigcDisplayDistribution(props.result.segments, props.rewritePatches)
+  : { human: 0, suspected_ai: 0, ai: 0 }
+)
 
-const RADIUS = 54
-const CIRCUMFERENCE = 2 * Math.PI * RADIUS
-
-const donutSegments = computed(() => {
-  if (!props.result) return []
-  const { distribution } = props.result
-  const segments: Array<{ category: AigcCategory; percent: number; color: string; offset: number }> = []
-  let offset = 0
-  const order: AigcCategory[] = ['human', 'suspected_ai', 'ai']
-  for (const cat of order) {
-    const percent = distribution[cat]
-    if (percent > 0) {
-      segments.push({ category: cat, percent, color: CATEGORY_COLORS[cat], offset })
-    }
-    offset += percent
-  }
-  return segments
+const displaySummary = computed(() => {
+  if (!props.result) return ''
+  if (!props.rewritePatches?.length) return props.result.summary
+  const value = displayDistribution.value
+  return `逐句证据复核覆盖率：人工 ${value.human}%，疑似AI ${value.suspected_ai}%，AI特征 ${value.ai}%`
 })
-
-function getStrokeDasharray(percent: number, circumference: number): string {
-  const len = (percent / 100) * circumference
-  return `${len} ${circumference - len}`
-}
 
 function toggleMode() {
   const newMode = isStrongMode.value ? 'fast' : 'strong'
   emit('update:seedOpts', { ...props.seedOpts, mode: newMode })
-}
-
-function onSeedTextInput(e: Event) {
-  const text = (e.target as HTMLTextAreaElement).value
-  emit('update:seedOpts', { ...props.seedOpts, seedText: text })
 }
 
 const copyHint = ref('')
@@ -217,7 +216,6 @@ function onInput(e: Event) {
 
 const canRewrite = computed(() => {
   if (!props.inputText.trim() || props.rewriting || props.applyingWordTable || !props.result) return false
-  if (isStrongMode.value && !props.seedOpts.seedText?.trim()) return false
   return true
 })
 
@@ -225,29 +223,6 @@ const canApplyWordTable = computed(() => {
   if (!props.inputText.trim() || props.rewriting || props.applyingWordTable) return false
   return true
 })
-
-const effectiveDownloadProgress = computed(() => {
-  return modelDownloadProgress.value || props.downloadProgress
-})
-
-const orderedRewriteEvaluations = computed(() => {
-  return [...(props.rewriteSelection?.evaluations || [])].sort((a, b) => a.objectiveScore - b.objectiveScore)
-})
-
-const compareExpanded = ref(true)
-const compareMode = ref<'diff' | 'rewritten'>('diff')
-const rewriteDiff = computed(() => {
-  if (!props.rewriteCompare) return { original: [], modified: [] }
-  return buildTextDiff(props.rewriteCompare.originalText, props.rewriteCompare.rewrittenText)
-})
-const hasRewriteChanges = computed(() => {
-  if (!props.rewriteCompare) return false
-  return props.rewriteCompare.originalText !== props.rewriteCompare.rewrittenText
-})
-
-function formatPercent(value: number): string {
-  return `${Math.round(value * 100)}%`
-}
 
 onUnmounted(() => {
   if (copyHintTimer) clearTimeout(copyHintTimer)
@@ -258,7 +233,7 @@ onUnmounted(() => {
   <div class="flex flex-col gap-2 flex-1 min-h-0">
     <!-- Controls bar -->
     <div class="flex items-center gap-2 flex-wrap shrink-0">
-      <template v-if="status !== 'running'">
+      <template v-if="status !== 'running' && !rewriting">
         <button
           v-if="result && status === 'done'"
           type="button"
@@ -275,7 +250,7 @@ onUnmounted(() => {
           @click="emit('run')"
         >
           <font-awesome-icon icon="magnifying-glass" class="w-3.5 h-3.5" />
-          {{ result ? '重新检测' : '开始检测' }}
+          {{ result || needsManualRecheck ? '重新检测' : '开始检测' }}
         </button>
         <button
           type="button"
@@ -318,9 +293,10 @@ onUnmounted(() => {
             :checked="isStrongMode"
             @change="toggleMode"
           />
-          <span class="text-xs" :class="isStrongMode ? 'font-medium' : 'text-base-content/50'">强力人工化</span>
+          <span class="text-xs" :class="isStrongMode ? 'font-medium' : 'text-base-content/50'">案例增强</span>
         </label>
       </template>
+
       <button
         v-else
         type="button"
@@ -330,6 +306,9 @@ onUnmounted(() => {
         <font-awesome-icon icon="stop" class="w-3.5 h-3.5" />
         取消
       </button>
+      <span v-if="needsManualRecheck && status !== 'running' && !rewriting" class="text-xs text-info">
+        改写已应用，当前文本尚未检测，请点击“重新检测”
+      </span>
       <span v-if="rewriting && rewriteProgress" class="text-xs" :class="rewriteProgress.level === 'warn' ? 'text-warning' : 'text-info'">
         <span v-if="rewriteProgress.level !== 'warn'" class="loading loading-spinner loading-xs mr-1" />
         <font-awesome-icon v-else icon="exclamation-circle" class="w-3 h-3 mr-1" />
@@ -369,6 +348,10 @@ onUnmounted(() => {
             class="badge badge-success badge-xs"
           >已连接</span>
         </template>
+        <span
+          class="badge badge-xs"
+          :class="supervisedModel?.ready ? 'badge-success' : 'badge-warning'"
+        >{{ supervisedModel?.ready ? '中文监督已就绪' : '中文监督未下载' }}</span>
       </button>
 
       <div v-if="engineExpanded" class="pl-4 mt-1 space-y-2">
@@ -410,19 +393,67 @@ onUnmounted(() => {
           >未下载</span>
         </div>
 
+        <div class="rounded-box border border-primary/25 bg-primary/5 p-2">
+          <div class="flex items-center gap-2">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs font-medium">{{ supervisedModel?.name || '中文监督检测模型' }}</span>
+                <span class="badge badge-primary badge-xs">融合必需</span>
+              </div>
+              <p class="text-[10px] text-base-content/50">
+                {{ supervisedModel?.description || '中文人工/AI监督分类证据' }}
+                <template v-if="supervisedModel"> · {{ formatSize(supervisedModel.sizeBytes) }}</template>
+              </p>
+            </div>
+            <span v-if="supervisedModel?.ready" class="badge badge-success badge-xs">已下载</span>
+            <button
+              v-if="supervisedModel?.ready"
+              type="button"
+              class="btn btn-ghost btn-xs btn-circle text-error/60"
+              title="删除中文监督模型"
+              @click="removeSupervisedModel"
+            >
+              <font-awesome-icon icon="trash" class="w-2.5 h-2.5" />
+            </button>
+            <button
+              v-else
+              type="button"
+              class="btn btn-outline btn-xs gap-1"
+              :disabled="supervisedDownloading"
+              @click="downloadSupervisedModel"
+            >
+              <span v-if="supervisedDownloading" class="loading loading-spinner loading-xs" />
+              <font-awesome-icon v-else icon="download" class="w-2.5 h-2.5" />
+              {{ supervisedDownloading ? '下载中' : '下载' }}
+            </button>
+          </div>
+          <div v-if="supervisedDownloadProgress?.phase === 'downloading'" class="mt-2">
+            <progress
+              class="progress progress-primary w-full"
+              :value="supervisedDownloadProgress.percent"
+              max="100"
+            />
+            <p class="text-[10px] text-base-content/50 mt-0.5">{{ supervisedDownloadProgress.message }}</p>
+          </div>
+        </div>
+
         <!-- 内置模型列表面板 -->
         <div v-if="engineMode === 'builtin' && showModelPanel" class="rounded-box border border-base-300 p-2 bg-base-200/50">
           <div
             v-for="m in models"
             :key="m.id"
             class="flex items-center gap-2 py-1.5 px-2 rounded-lg cursor-pointer hover:bg-base-300/50 transition-colors"
-            :class="{ 'bg-primary/10 border border-primary/30': m.active }"
+            :class="{
+              'bg-primary/10 border border-primary/30': m.active,
+              'pointer-events-none opacity-60': modelSwitching
+            }"
             @click="onSwitchModel(m)"
           >
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-1.5">
                 <span class="text-xs font-medium truncate">{{ m.name }}</span>
                 <span v-if="m.active" class="badge badge-primary badge-xs">当前</span>
+                <span v-else-if="modelSwitching" class="loading loading-spinner loading-xs" />
               </div>
               <p class="text-[10px] text-base-content/50 truncate">{{ m.description }} · {{ formatSize(m.sizeBytes) }}</p>
             </div>
@@ -546,253 +577,83 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Main content: text input / highlighted result + chart sidebar -->
-    <div class="flex-1 min-h-0 flex gap-3">
-      <div class="flex-1 min-h-0 relative flex flex-col">
-        <!-- Error -->
-        <div
-          v-if="status === 'error'"
-          class="flex-1 min-h-0 overflow-auto flex items-center justify-center p-4 text-error text-sm border border-error/20 rounded-lg bg-error/5"
-        >
-          {{ errorMessage }}
-        </div>
-
-        <!-- Result: highlighted segments -->
-        <div
-          v-else-if="result && status === 'done'"
-          class="flex-1 min-h-0 overflow-auto border border-base-300 rounded-lg bg-base-100 p-3"
-        >
-          <div class="text-sm leading-relaxed whitespace-pre-wrap break-words">
-            <span
-              v-for="(seg, idx) in result.segments"
-              :key="idx"
-              class="rounded-sm px-0.5 relative group cursor-default"
-              :class="CATEGORY_BG_CLASSES[seg.category]"
-            >{{ seg.text }}<span
-                v-if="seg.reason"
-                class="absolute hidden group-hover:block left-0 top-full z-50 mt-1 px-2 py-1 text-[11px] bg-base-300 rounded shadow-lg whitespace-nowrap max-w-xs text-base-content"
-              >{{ AIGC_CATEGORY_LABELS[seg.category] }}：{{ seg.reason }}</span></span>
-          </div>
-        </div>
-
-        <!-- Edit: textarea -->
-        <template v-else>
-          <textarea
-            :value="inputText"
-            :maxlength="LAB_TEXT_MAX"
-            class="textarea textarea-bordered w-full flex-1 min-h-[8rem] text-sm leading-relaxed resize-none font-mono"
-            placeholder="请输入待检测的文本内容…"
-            :disabled="status === 'running'"
-            @input="onInput"
-          />
-          <span class="absolute bottom-2 right-3 text-[10px] text-base-content/40">
-            有效 {{ effectiveInputLength }} 字 · 至少 {{ ZHUQUE_MIN_TEXT_LENGTH }} 字
-          </span>
-        </template>
-
-        <!-- Loading overlay -->
+    <!-- Main content: original on the left, detection and sentence patches on the right -->
+    <div class="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-3">
+      <section class="relative min-h-0 flex flex-col border border-base-300 rounded-lg bg-base-100 overflow-hidden">
+        <header class="px-3 py-2 border-b border-base-300 flex items-center justify-between shrink-0">
+          <span class="text-xs font-semibold">原文</span>
+          <span class="text-[10px] text-base-content/40">有效 {{ effectiveInputLength }} 字 · 至少 {{ ZHUQUE_MIN_TEXT_LENGTH }} 字</span>
+        </header>
+        <textarea
+          :value="inputText"
+          :maxlength="LAB_TEXT_MAX"
+          class="textarea w-full flex-1 min-h-[12rem] border-0 rounded-none text-sm leading-relaxed resize-none font-mono focus:outline-none"
+          placeholder="请输入待检测的文本内容…"
+          :disabled="status === 'running' || rewriting"
+          @input="onInput"
+        />
         <div
           v-if="status === 'running'"
-          class="absolute inset-0 flex items-center justify-center bg-base-100/60 rounded-lg z-10"
+          class="absolute inset-0 flex items-center justify-center bg-base-100/65 z-10"
         >
           <div class="flex flex-col items-center gap-2">
             <span class="loading loading-dots loading-lg text-primary" />
-            <span class="text-xs text-base-content/50">正在分析…</span>
+            <span class="text-xs text-base-content/50">正在分析检测窗口…</span>
           </div>
         </div>
-      </div>
+      </section>
 
-      <!-- Chart sidebar -->
-      <div
-        v-if="result && status === 'done'"
-        class="w-48 shrink-0 flex flex-col items-center gap-3 pt-2"
-      >
-        <div class="relative w-28 h-28">
-          <svg viewBox="0 0 140 140" class="w-full h-full -rotate-90">
-            <circle
-              v-for="(seg, idx) in donutSegments"
-              :key="idx"
-              cx="70" cy="70" :r="RADIUS"
-              fill="none"
-              :stroke="seg.color"
-              stroke-width="18"
-              :stroke-dasharray="getStrokeDasharray(seg.percent, CIRCUMFERENCE)"
-              :stroke-dashoffset="-((seg.offset / 100) * CIRCUMFERENCE)"
-            />
-            <circle cx="70" cy="70" r="43" class="fill-base-100" stroke="currentColor" stroke-width="1" opacity="0.2" />
-          </svg>
-          <div class="absolute inset-0 flex flex-col items-center justify-center">
-            <span class="text-xl font-extrabold leading-none tracking-tight">
-              {{ result.distribution.ai }}%
-            </span>
-            <span class="text-[10px] text-base-content/60 mt-0.5">AI特征</span>
-          </div>
-        </div>
-
-        <div class="flex flex-col gap-1 text-xs text-base-content/60 w-full">
-          <div class="flex items-center justify-between">
-            <span class="flex items-center gap-1.5">
-              <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.human }" />
-              {{ AIGC_CATEGORY_LABELS.human }}
-            </span>
-            <span class="font-mono">{{ result.distribution.human }}%</span>
-          </div>
-          <div class="flex items-center justify-between">
-            <span class="flex items-center gap-1.5">
-              <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.suspected_ai }" />
-              {{ AIGC_CATEGORY_LABELS.suspected_ai }}
-            </span>
-            <span class="font-mono">{{ result.distribution.suspected_ai }}%</span>
-          </div>
-          <div class="flex items-center justify-between">
-            <span class="flex items-center gap-1.5">
-              <span class="w-2.5 h-2.5 rounded-sm" :style="{ backgroundColor: CATEGORY_COLORS.ai }" />
-              {{ AIGC_CATEGORY_LABELS.ai }}
-            </span>
-            <span class="font-mono">{{ result.distribution.ai }}%</span>
-          </div>
-        </div>
-
-        <div class="text-[11px] text-base-content/50 text-center border-t border-base-200 pt-2 mt-auto leading-relaxed">
-          {{ result.summary }}
-        </div>
-        <div class="text-[10px] text-base-content/40 text-center leading-relaxed">
-          根据朱雀实测样本校准：相邻词组可预测性、特征短语、约240字分段及首段权重
-        </div>
-      </div>
-    </div>
-
-    <div
-      v-if="rewriteSelection && !rewriting"
-      class="rounded-box border border-base-300 bg-base-200/40 p-2 text-[11px] leading-relaxed"
-    >
-      <div class="flex items-center gap-2 flex-wrap">
-        <span class="font-medium text-base-content/80">改写候选评估</span>
-        <span class="badge badge-primary badge-xs">已选：{{ rewriteSelection.selectedKey }}</span>
-        <span class="text-base-content/60">
-          复检 {{ rewriteSelection.selectedDocScore.toFixed(1) }}
-          <template v-if="typeof rewriteSelection.baselineDocScore === 'number'">
-            / 基线 {{ rewriteSelection.baselineDocScore.toFixed(1) }}
-          </template>
-        </span>
-      </div>
-
-      <div class="mt-1 space-y-1">
+      <section class="min-h-0 flex flex-col gap-2">
         <div
-          v-for="item in orderedRewriteEvaluations"
-          :key="item.key"
-          class="rounded border px-2 py-1"
-          :class="item.key === rewriteSelection.selectedKey ? 'border-primary/40 bg-primary/5' : 'border-base-300/70 bg-base-100/40'"
-        >
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="font-medium">{{ item.key }}</span>
-            <span v-if="item.key === rewriteSelection.selectedKey" class="badge badge-primary badge-xs">当前采用</span>
-            <span class="text-base-content/55">objective {{ item.objectiveScore.toFixed(1) }}</span>
-            <span class="text-base-content/55">复检 {{ item.docScore.toFixed(1) }}</span>
-            <span class="text-base-content/55">改写幅度 {{ formatPercent(item.changeRatio) }}</span>
-            <span class="text-base-content/55">锚点保留 {{ formatPercent(item.numberAnchorRetention) }}</span>
-          </div>
-          <div v-if="item.issues.length > 0" class="text-warning mt-0.5">
-            {{ item.issues.join('；') }}
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div
-      v-if="rewriteCompare && !rewriting"
-      class="rounded-box border border-base-300 bg-base-200/30 p-2"
-    >
-      <button
-        type="button"
-        class="w-full flex items-center gap-2 text-left"
-        @click="compareExpanded = !compareExpanded"
-      >
-        <font-awesome-icon
-          icon="chevron-right"
-          class="w-2.5 h-2.5 text-base-content/50 transition-transform"
-          :class="{ 'rotate-90': compareExpanded }"
-        />
-        <span class="text-xs font-medium text-base-content/80">修改前后对比</span>
-        <span class="text-[11px] text-base-content/55 tabular-nums">
-          {{ rewriteCompare.originalText.length.toLocaleString() }} → {{ rewriteCompare.rewrittenText.length.toLocaleString() }} 字
-        </span>
-        <span
-          v-if="hasRewriteChanges"
-          class="text-[10px] text-base-content/45 inline-flex items-center gap-1"
-        >
-          <span class="inline-block w-2.5 h-2.5 rounded-sm bg-yellow-200/90 dark:bg-yellow-400/30" />
-          标黄为改动
-        </span>
-      </button>
-
-      <div v-if="compareExpanded" class="mt-2">
-        <div class="join join-horizontal mb-2">
-          <button
-            type="button"
-            class="btn btn-xs join-item"
-            :class="compareMode === 'diff' ? 'btn-primary' : 'btn-ghost'"
-            @click="compareMode = 'diff'"
-          >
-            对比
-          </button>
-          <button
-            type="button"
-            class="btn btn-xs join-item"
-            :class="compareMode === 'rewritten' ? 'btn-primary' : 'btn-ghost'"
-            @click="compareMode = 'rewritten'"
-          >
-            仅看改写后
-          </button>
-        </div>
-
-        <div
-          v-if="compareMode === 'diff'"
-          class="grid grid-cols-1 md:grid-cols-2 gap-2"
-        >
-          <article class="border border-base-300/80 rounded-md bg-base-200/20 flex flex-col min-h-0">
-            <h3 class="text-[11px] font-medium text-base-content/55 px-2 py-1 border-b border-base-300/50">
-              原文
-            </h3>
-            <div class="max-h-52 overflow-y-auto px-2 py-2">
-              <pre class="text-xs whitespace-pre-wrap break-words leading-5">
-                <DeaiDiffText
-                  v-if="hasRewriteChanges"
-                  :segments="rewriteDiff.original"
-                />
-                <template v-else>{{ rewriteCompare.originalText }}</template>
-              </pre>
-            </div>
-          </article>
-
-          <article class="border border-base-300/80 rounded-md bg-base-200/20 flex flex-col min-h-0">
-            <h3 class="text-[11px] font-medium text-base-content/55 px-2 py-1 border-b border-base-300/50">
-              改写后
-            </h3>
-            <div class="max-h-52 overflow-y-auto px-2 py-2">
-              <pre class="text-xs whitespace-pre-wrap break-words leading-5">
-                <DeaiDiffText
-                  v-if="hasRewriteChanges"
-                  :segments="rewriteDiff.modified"
-                />
-                <template v-else>{{ rewriteCompare.rewrittenText }}</template>
-              </pre>
-            </div>
-          </article>
-        </div>
+          v-if="status === 'error'"
+          class="shrink-0 p-3 text-error text-xs border border-error/20 rounded-lg bg-error/5"
+        >{{ errorMessage }}</div>
 
         <article
-          v-else
-          class="border border-base-300/80 rounded-md bg-base-200/20 flex flex-col min-h-0"
+          v-if="result && status === 'done'"
+          class="border border-base-300 rounded-lg bg-base-100 min-h-0 flex flex-col"
+          :class="(rewritePatches?.length || rewriting) ? 'max-h-[42%]' : 'flex-1'"
         >
-          <h3 class="text-[11px] font-medium text-base-content/55 px-2 py-1 border-b border-base-300/50">
-            改写后
-          </h3>
-          <div class="max-h-56 overflow-y-auto px-2 py-2">
-            <pre class="text-xs whitespace-pre-wrap break-words leading-5">{{ rewriteCompare.rewrittenText }}</pre>
+          <header class="px-3 py-2 border-b border-base-300 shrink-0">
+            <div class="flex items-center gap-2 flex-wrap text-[10px]">
+              <span class="text-xs font-semibold mr-auto">检测结果</span>
+              <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.human }">人工 {{ displayDistribution.human }}%</span>
+              <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.suspected_ai }">疑似 {{ displayDistribution.suspected_ai }}%</span>
+              <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.ai }">AI {{ displayDistribution.ai }}%</span>
+              <button type="button" class="btn btn-ghost btn-xs" @click="showDetectDetails = true">
+                <font-awesome-icon icon="chart-bar" class="w-3 h-3" />
+                详情
+              </button>
+            </div>
+            <p class="mt-1 text-[10px] text-base-content/50">{{ displaySummary }}</p>
+          </header>
+          <div class="flex-1 min-h-0 overflow-auto p-3">
+            <AigcHighlightedText :segments="result.segments" :patches="rewritePatches" />
           </div>
+          <footer class="px-3 py-1.5 border-t border-base-300 text-[9px] text-base-content/40 shrink-0">
+            检测阶段颜色表示句级概率类别；逐句分析后，红色只保留已定位到句内证据的目标，窗口级风险显示黄色
+          </footer>
         </article>
-      </div>
+
+        <AigcSentenceRewritePanel
+          v-if="rewritePatches?.length || rewriting"
+          class="flex-1 min-h-0"
+          :patches="rewritePatches || []"
+          :goal="rewriteGoal"
+          :decisions="rewriteDecisions || {}"
+          :preview-text="rewritePreviewText || ''"
+          :rewriting="rewriting"
+          @accept="emit('acceptPatch', $event)"
+          @reject="emit('rejectPatch', $event)"
+          @accept-all="emit('acceptAllPatches')"
+          @apply-accepted="emit('applyAcceptedPatches')"
+        />
+
+        <div
+          v-else-if="!result"
+          class="flex-1 min-h-0 border border-dashed border-base-300 rounded-lg flex items-center justify-center text-xs text-base-content/35"
+        >检测结果和逐句改写反馈将在这里显示</div>
+      </section>
     </div>
 
     <!-- 检测时的模型下载进度条 -->
@@ -808,22 +669,18 @@ onUnmounted(() => {
       />
     </div>
 
-    <!-- 强力人工化模式：种子文本输入 -->
+    <!-- 案例增强模式说明 -->
     <div v-if="isStrongMode && status !== 'running'" class="mt-1">
-      <label class="text-xs font-medium text-base-content/70 mb-1 block">
-        人工种子文本
-        <span class="font-normal text-base-content/50">（粘贴你自己写的段落，将前置到改写结果中）</span>
-      </label>
-      <textarea
-        :value="seedOpts.seedText || ''"
-        rows="4"
-        class="textarea textarea-bordered w-full text-sm leading-relaxed resize-none"
-        placeholder="粘贴你自己手写的文本段落（来自你的作品章节、大纲或随手写的片段）…"
-        @input="onSeedTextInput"
-      />
-      <p class="text-[10px] text-base-content/40 mt-0.5">
-        实验表明：前置约50%的人工文本可显著提升人工特征检测率
-      </p>
+      <div class="rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-base-content/65">
+        改写前会判断目标片段的场景和 AI 痕迹，只加载案例库中同时匹配的“改写前 → 人类改写后”案例；没有匹配案例时将停止并说明缺少的类型。
+      </div>
     </div>
+
+    <AigcDetectDetailDrawer
+      v-if="result"
+      :open="showDetectDetails"
+      :result="result"
+      @close="showDetectDetails = false"
+    />
   </div>
 </template>

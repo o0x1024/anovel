@@ -84,5 +84,6 @@ export {
   incubatorStateDAO
 } from './dao/incubator'
 export { aigcWordtableDAO } from './dao/aigc-wordtable-dao'
+export { humanRewriteReferenceDAO } from './dao/human-rewrite-reference-dao'
 export { knowledgeNoteDAO } from './dao/knowledge-note-dao'
 export type { KnowledgeNoteRow, KnowledgeNoteCreateInput, KnowledgeNoteUpdateInput } from './dao/knowledge-note-dao'

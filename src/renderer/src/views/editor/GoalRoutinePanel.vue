@@ -11,6 +11,7 @@ import {
 } from '../../../../shared/goal-routine-phases'
 import { formatDbUtcAsLocal } from '../../../../shared/local-datetime'
 import { isTotalWordCountInTargetRange } from '../../../../shared/body-word-target'
+import { requireGoalTurnLimit } from '../../../../shared/goal-turn-limit'
 import {
   QUALITY_AI_METRIC_DEFS,
   type QualityAiMetricKey
@@ -83,7 +84,6 @@ function loadConfig(): GoalConfig {
           ...saved.qualityMetricMins
         }
       }
-      if (props.workType !== 'novel') merged.maxTurns = Math.min(30, Math.max(1, merged.maxTurns))
       return merged
     }
   } catch { /* ignore */ }
@@ -353,7 +353,7 @@ function goalInvokePayload() {
     humanReviewTitleHook: config.value.humanReviewTitleHook,
     checkConsistencyGate: config.value.checkConsistencyGate,
     checkAntiAiRules: config.value.checkAntiAiRules,
-    maxTurns: config.value.maxTurns,
+    maxTurns: requireGoalTurnLimit(config.value.maxTurns),
     goalMatchMin: config.value.goalMatchMin,
     overallStoryMin: config.value.overallStoryMin,
     previewHookMin: config.value.previewHookMin,
@@ -626,10 +626,10 @@ watch(config, saveConfig, { deep: true })
           <p class="text-xs font-bold text-base-content/70">运行控制</p>
           <label class="flex items-center justify-between gap-3 text-xs">
             <span>轮次上限</span>
-            <input v-model.number="config.maxTurns" type="number" min="1" :max="workType === 'story' ? 30 : 100"
+            <input v-model.number="config.maxTurns" type="number" min="1" step="1"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
-          <p v-if="workType === 'story'" class="text-[11px] text-base-content/40 leading-relaxed">短故事最多 30 轮；达到上限后保留正文与候选并暂停，不会自动清零续跑。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">达到用户设置的轮次上限后保留正文与候选并暂停，不会自动修改运行预算。</p>
           <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节情节、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
         </div>
       </div>

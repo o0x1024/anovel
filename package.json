@@ -14,7 +14,13 @@
     "test:story-beat-staging": "jiti scripts/test-story-beat-staging.ts",
     "test:continuity-repair": "jiti scripts/test-story-continuity-repair-policy.ts",
     "test:continuity-escalation": "jiti scripts/test-story-continuity-escalation.ts",
-    "test:zhuque-alignment": "jiti scripts/test-zhuque-alignment.ts",
+    "test:zhuque-alignment": "jiti scripts/test-perplexity-model-registry.ts && jiti scripts/test-zhuque-experiment-corpus.ts && jiti scripts/test-zhuque-alignment.ts",
+    "evaluate:zhuque-supervised": "jiti scripts/evaluate-aigc-supervised-corpus.ts",
+    "test:aigc-supervised": "jiti scripts/test-aigc-supervised-fusion.ts && jiti scripts/test-aigc-supervised-tokenizer.ts",
+    "test:aigc-rewrite": "jiti scripts/test-aigc-rewrite-quality.ts && jiti scripts/test-aigc-sentence-patches.ts && jiti scripts/test-zhuque-sentence-attribution.ts && jiti scripts/test-aigc-display-allocation.ts && jiti scripts/test-human-rewrite-reference.ts && jiti scripts/test-human-rewrite-reference-presets.ts && node scripts/run-electron-test.mjs scripts/test-human-rewrite-reference-db.ts",
+    "dataset:sft": "node scripts/gen-sft-dataset.mjs",
+    "test:continuation-dataset": "node scripts/test-continuation-dataset.mjs",
+    "evaluate:finetuned-continuation": "node scripts/evaluate-finetuned-continuation.mjs",
     "test:novel-volume-staging": "jiti scripts/test-novel-volume-staging.ts",
     "test:novel-harness": "jiti scripts/test-novel-harness.ts",
     "test:novel-memory-commit": "node scripts/run-electron-test.mjs scripts/test-novel-memory-commit-db.ts",
@@ -35,7 +41,8 @@
     "dompurify": "^3.4.7",
     "mammoth": "^1.12.0",
     "marked": "^18.0.4",
-    "node-llama-cpp": "^3.18.1"
+    "node-llama-cpp": "^3.18.1",
+    "onnxruntime-node": "^1.27.0"
   },
   "devDependencies": {
     "@fortawesome/fontawesome-svg-core": "^7.2.0",
@@ -71,6 +78,10 @@
       "package.json"
     ],
     "asar": true,
+    "asarUnpack": [
+      "node_modules/onnxruntime-node/**/*",
+      "node_modules/onnxruntime-common/**/*"
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "target": [

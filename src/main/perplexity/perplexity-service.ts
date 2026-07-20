@@ -1,19 +1,28 @@
 import { Worker } from 'worker_threads'
 import path from 'path'
-import type { AigcDetectResult, AigcCategory, PerplexityApiConfig } from '../../shared/aigc-detect-types'
+import type { AigcDetectResult, AigcCategory, AigcDistribution, AigcSegment, PerplexityApiConfig } from '../../shared/aigc-detect-types'
 import { ensureModelReady, isModelReady, type DownloadProgressCallback } from './model-manager'
 import { resolveDetectModelId } from './constants'
 import { appLogger } from '../logger/app-logger'
 import { getActiveModelId } from './model-manager'
-import { computeViaApi, computeWholeViaApi, isDegenerateApiLogprobs, type TokenMetric } from './api-perplexity'
+import { computeWholeViaApi, isDegenerateApiLogprobs, type TokenMetric } from './api-perplexity'
 import { appPreferenceDAO } from '../db'
 import {
   classifyZhuqueSegments,
-  computeZhuqueDistribution,
+  computeZhuqueSentenceDistribution,
+  computeZhuqueTokenRisk,
+  detectZhuqueFingerprints,
   scoreZhuqueSegment,
-  segmentTextForZhuque,
-  toAigcSegments
 } from './zhuque-alignment'
+import { analyzeZhuqueDistribution } from './zhuque-distribution-features'
+import { categorizeZhuqueSentenceRisk } from './zhuque-rewrite-risk'
+import {
+  attributeTokenWindowsToSpans,
+  buildZhuqueTokenWindows,
+  splitZhuqueDisplaySentences,
+  type ZhuqueTextSpan,
+  type ZhuqueTokenWindow
+} from './zhuque-token-windows'
 
 export interface LabModelOverride {
   modelType?: string
@@ -24,53 +33,30 @@ function resolveApiConfig(): PerplexityApiConfig {
   return appPreferenceDAO.getPerplexityApiConfig()
 }
 
-/** 通过本机 OpenAI 兼容 API 计算困惑度（优先整文 echo，失败则逐段） */
-async function computePplViaLocalApi(
+/** API 检测必须返回带字符偏移的整文 logprobs，不能退回不等价的逐段复述。 */
+async function computeTokenMetricsViaApi(
   text: string,
-  segments: Array<{ id: number; text: string }>,
-  segmentBoundaries: Array<{ start: number; end: number }>,
   apiConfig: PerplexityApiConfig,
   onProgress?: (msg: string) => void
-): Promise<SegmentPPLResult[]> {
+): Promise<TokenMetric[]> {
   onProgress?.(`正在通过本地 API 检测 (${apiConfig.apiBase})…`)
   appLogger.info('perplexity', `使用本地 API 模式: ${apiConfig.apiBase}, 模型: ${apiConfig.modelName || '(默认)'}`)
-
-  try {
-    const tokenMetrics = await computeWholeViaApi(
-      text,
-      apiConfig.apiBase,
-      apiConfig.modelName,
-      onProgress,
-      apiConfig.apiKey
-    )
-    if (tokenMetrics.length > 0) {
-      return aggregateTokensBySegments(tokenMetrics, segmentBoundaries, segments)
-    }
-  } catch {
-    // /completions 可能不可用（如 MLX），退回逐段探测
-  }
-
-  return computeViaApi(
-    segments,
+  const tokenMetrics = await computeWholeViaApi(
+    text,
     apiConfig.apiBase,
     apiConfig.modelName,
     onProgress,
     apiConfig.apiKey
   )
-}
-
-interface SegmentPPLResult {
-  id: number
-  ppl: number
-  tokenCount: number
-  top5Rate: number
-  avgProb: number
+  if (tokenMetrics.length === 0) {
+    throw new Error('检测 API 未返回带字符偏移的 token logprobs，无法建立重叠 token 窗口')
+  }
+  return tokenMetrics
 }
 
 interface WorkerResponse {
-  type: 'ready' | 'result' | 'wholeResult' | 'error' | 'progress'
-  results?: SegmentPPLResult[]
-  tokenMetrics?: TokenMetric[]
+  type: 'ready' | 'windowResult' | 'error' | 'progress' | 'disposed'
+  windows?: ZhuqueTokenWindow[]
   message?: string
   progress?: number
 }
@@ -80,10 +66,9 @@ let workerReady = false
 let loadedModelPath: string | null = null
 
 /**
- * 困惑度 worker 串行锁：worker 是单例，computeWhole/compute 通过在同一个
- * worker 上挂 message handler 等待结果，本身没有并发保护。任意重入（如自动
- * 重写循环里对每段/候选分别打分）会让 handler 错配，触发 native eval 在脏
- * 上下文执行 → "Eval has failed"。此锁强制所有 worker 计算串行排队。
+ * 困惑度 worker 生命周期锁：模型加载、窗口计算、重建和释放必须作为一个
+ * 原子序列串行执行。否则切换模型可能在 native eval/init 尚未结束时终止线程，
+ * 或让多个 message handler 共享已经释放的 llama context，导致进程级崩溃。
  */
 let workerChain: Promise<unknown> = Promise.resolve()
 function withWorkerLock<T>(task: () => Promise<T>): Promise<T> {
@@ -96,13 +81,13 @@ function getWorkerPath(): string {
   return path.join(__dirname, 'perplexity-worker.js')
 }
 
-async function ensureWorker(modelPath: string): Promise<void> {
+async function ensureWorkerUnlocked(modelPath: string): Promise<void> {
   // If already loaded with same model, reuse
   if (worker && workerReady && loadedModelPath === modelPath) return
 
   // Model changed or worker not ready — rebuild
   if (worker) {
-    await terminateWorker()
+    await terminateWorkerUnlocked()
   }
 
   return new Promise<void>((resolve, reject) => {
@@ -139,17 +124,65 @@ async function ensureWorker(modelPath: string): Promise<void> {
   })
 }
 
-async function terminateWorker(): Promise<void> {
-  if (!worker) return
-  worker.postMessage({ type: 'dispose' })
-  await worker.terminate()
+async function terminateWorkerUnlocked(): Promise<void> {
+  const target = worker
+  if (!target) return
+
   worker = null
   workerReady = false
   loadedModelPath = null
+
+  const disposed = new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      target.off('message', onMessage)
+      target.off('error', onError)
+      target.off('exit', onExit)
+    }
+    const onMessage = (message: WorkerResponse) => {
+      if (message.type !== 'disposed') return
+      cleanup()
+      resolve()
+    }
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+    const onExit = () => {
+      cleanup()
+      resolve()
+    }
+    target.on('message', onMessage)
+    target.once('error', onError)
+    target.once('exit', onExit)
+  })
+
+  target.postMessage({ type: 'dispose' })
+  await disposed
+  if (target.threadId !== -1) await target.terminate()
 }
 
-function segmentText(text: string): Array<{ id: number; text: string }> {
-  return segmentTextForZhuque(text)
+function segmentText(text: string): ZhuqueTextSpan[] {
+  return splitZhuqueDisplaySentences(text)
+}
+
+function segmentProbabilities(category: AigcCategory, probabilities?: AigcDistribution): AigcDistribution {
+  return probabilities ?? {
+    human: category === 'human' ? 100 : 0,
+    suspected_ai: category === 'suspected_ai' ? 100 : 0,
+    ai: category === 'ai' ? 100 : 0
+  }
+}
+
+function classifySentences(
+  sentences: ZhuqueTextSpan[],
+  sentenceMetrics: ReturnType<typeof attributeTokenWindowsToSpans>,
+  documentFeatures: ReturnType<typeof analyzeZhuqueDistribution>,
+  detectModelId?: string
+) {
+  const scored = sentences.map((sentence, index) =>
+    scoreZhuqueSegment(sentence.text, sentenceMetrics[index], detectModelId)
+  )
+  return classifyZhuqueSegments(scored, documentFeatures, sentences)
 }
 
 export async function runPerplexityDetect(
@@ -175,47 +208,39 @@ export async function runPerplexityDetect(
     }
   }
 
-  // 计算每个段落的字符起止偏移
-  const segmentBoundaries = computeSegmentBoundaries(segments, text)
-
-  let pplResults: SegmentPPLResult[]
+  let tokenWindows: ZhuqueTokenWindow[]
+  let uniqueTokenCount = 0
 
   if (useApi) {
-    pplResults = await computePplViaLocalApi(
+    const tokenMetrics = await computeTokenMetricsViaApi(
       text,
-      segments,
-      segmentBoundaries,
       apiConfig,
       onProgress
     )
+    tokenWindows = buildZhuqueTokenWindows(text, tokenMetrics)
+    uniqueTokenCount = tokenMetrics.length
   } else {
     onProgress?.('正在准备困惑度检测模型…')
     const modelPath = await ensureModelReady(onDownloadProgress)
 
     onProgress?.('正在加载模型…')
-    await ensureWorker(modelPath)
-
-    onProgress?.('正在对全文进行连续困惑度计算…')
-    let tokenMetrics = await computeWholeInWorker(text)
-
-    if (tokenMetrics.length === 0 && text.trim().length > 20) {
-      appLogger.info('perplexity', '整文计算无结果，重建 worker 重试…')
-      await terminateWorker()
-      await ensureWorker(modelPath)
-      tokenMetrics = await computeWholeInWorker(text)
-    }
-
-    pplResults = aggregateTokensBySegments(tokenMetrics, segmentBoundaries, segments)
+    onProgress?.('正在建立重叠 token 证据窗口…')
+    tokenWindows = await computeWindowsWithModel(modelPath, text)
+    uniqueTokenCount = Math.max(...tokenWindows.map(window => window.endToken), 0)
   }
 
-  if (useApi && isDegenerateApiLogprobs(pplResults)) {
+  if (tokenWindows.length === 0) {
+    throw new Error('模型没有生成可用的 token 证据窗口')
+  }
+  if (useApi && isDegenerateApiLogprobs(tokenWindows.map(window => window.metric))) {
     throw new Error(
       `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法执行朱雀对齐检测`
     )
   }
 
   // 过滤有效结果
-  const validResults = pplResults.filter(r => r.ppl > 0 && r.ppl < 400 && r.tokenCount >= 2)
+  const validResults = tokenWindows.map(window => window.metric)
+    .filter(metric => metric.ppl > 0 && metric.ppl < 400 && metric.tokenCount >= 2)
   const pplValues = validResults.map(r => r.ppl)
   const top5Values = validResults.map(r => r.top5Rate)
 
@@ -224,9 +249,8 @@ export async function runPerplexityDetect(
   const avgTop5 = top5Values.length > 0
     ? top5Values.reduce((a, b) => a + b, 0) / top5Values.length : 0.4
 
-  const zeroCount = pplResults.filter(r => r.ppl === 0).length
-  const totalTokenCount = pplResults.reduce((s, r) => s + r.tokenCount, 0)
-  appLogger.info('perplexity', `PPL统计: 段落数=${segments.length}, 有效=${validResults.length}, 零值=${zeroCount}, 总tokens=${totalTokenCount}, 平均PPL=${avgPPL.toFixed(2)}, 平均Top5=${(avgTop5 * 100).toFixed(1)}%`)
+  const zeroCount = tokenWindows.filter(window => window.metric.ppl === 0).length
+  appLogger.info('perplexity', `PPL统计: 句子数=${segments.length}, token窗=${tokenWindows.length}, 有效窗=${validResults.length}, 零值=${zeroCount}, 唯一tokens=${uniqueTokenCount}, 平均PPL=${avgPPL.toFixed(2)}, 平均Top5=${(avgTop5 * 100).toFixed(1)}%`)
 
   const sortedPPL = [...pplValues].sort((a, b) => a - b)
   const p25 = sortedPPL[Math.floor(sortedPPL.length * 0.25)] || avgPPL
@@ -235,134 +259,142 @@ export async function runPerplexityDetect(
 
   appLogger.info('perplexity', `PPL分布: min=${sortedPPL[0]?.toFixed(2)}, p25=${p25.toFixed(2)}, median=${p50.toFixed(2)}, p75=${p75.toFixed(2)}, max=${sortedPPL[sortedPPL.length - 1]?.toFixed(2)}`)
 
-  const sampleDetails = pplResults.slice(0, 10).map((r, i) =>
+  const sampleDetails = tokenWindows.slice(0, 10).map(({ metric: r }, i) =>
     `[${i}]PPL=${r.ppl.toFixed(1)},T5=${(r.top5Rate * 100).toFixed(0)}%,tc=${r.tokenCount}`
   ).join(', ')
-  appLogger.info('perplexity', `段落明细(前10): ${sampleDetails}`)
+  appLogger.info('perplexity', `token窗口明细(前10): ${sampleDetails}`)
 
-  const scoredDrafts = segments.map((seg, i) => {
-    const metric = pplResults[i] ?? { id: seg.id, ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 }
-    return scoreZhuqueSegment(seg.text, metric, detectModelId)
+  const documentFeatures = analyzeZhuqueDistribution(text, tokenWindows)
+  const sentenceMetrics = attributeTokenWindowsToSpans(segments, tokenWindows)
+  const classifiedSentences = classifySentences(
+    segments,
+    sentenceMetrics,
+    documentFeatures,
+    detectModelId
+  )
+  const displaySentences = classifiedSentences.map(segment => {
+    const riskScore = continuousSentenceRisk(segment.score, documentFeatures.documentRisk)
+    const category = categorizeZhuqueSentenceRisk(riskScore)
+    return { ...segment, category, probabilities: undefined, riskScore }
   })
-  const classified = classifyZhuqueSegments(scoredDrafts, detectModelId)
-  const distribution = computeZhuqueDistribution(classified)
-  const resultSegments = toAigcSegments(classified)
-  const validScores = classified
-    .filter((_, i) => (pplResults[i]?.tokenCount ?? 0) >= 2)
+  const distribution = computeZhuqueSentenceDistribution(displaySentences)
+  const resultSegments: AigcSegment[] = displaySentences.map(segment => ({
+    text: segment.text,
+    category: segment.category,
+    riskScore: segment.riskScore,
+    reason: segment.reason,
+    probabilities: segmentProbabilities(segment.category)
+  }))
+  const validScores = classifiedSentences
+    .filter((_, i) => sentenceMetrics[i].tokenCount >= 2)
     .map(segment => segment.score)
   const rawDocScore = validScores.length > 0
     ? validScores.reduce((a, b) => a + b, 0) / validScores.length
     : 50
-  const fingerprintHits = classified.reduce(
-    (sum, segment) => sum + segment.evidence.filmShot + segment.evidence.connector +
-      segment.evidence.emotionTemplate + segment.evidence.summaryClosure,
-    0
-  )
+  const tokenPredictability = Math.round(
+    medianScore(classifiedSentences.map(segment =>
+      segment.score - segment.evidence.penalty + segment.evidence.styleReduction
+    )) * 10
+  ) / 10
+  const documentFingerprints = detectZhuqueFingerprints(text)
+  const fingerprintHits = documentFingerprints.filmShot + documentFingerprints.connector +
+    documentFingerprints.emotionTemplate + documentFingerprints.summaryClosure
 
   appLogger.info('perplexity', '朱雀对齐检测', {
     modelId: detectModelId,
-    segmentCount: segments.length,
+    sentenceCount: segments.length,
+    tokenWindowCount: tokenWindows.length,
     avgScore: Math.round(rawDocScore * 10) / 10,
+    documentFeatures,
     fingerprintHits,
     distribution
   })
 
-  const summary = `朱雀实验对齐估计：人工 ${distribution.human}%，疑似AI ${distribution.suspected_ai}%，AI特征 ${distribution.ai}%` +
-    (fingerprintHits > 0 ? `；命中特征短语 ${fingerprintHits} 处` : '')
+  const evidenceSummary = documentFeatures.reasons.length > 0
+    ? `；主要证据：${documentFeatures.reasons.join('、')}`
+    : ''
+  const summary = `逐句文本覆盖率：人工 ${distribution.human}%，疑似AI ${distribution.suspected_ai}%，AI特征 ${distribution.ai}%` +
+    (fingerprintHits > 0 ? `；命中特征短语 ${fingerprintHits} 处` : '') + evidenceSummary
 
-  return { segments: resultSegments, distribution, summary }
-}
-
-/**
- * 计算每个段落在原文中的字符起止偏移
- */
-function computeSegmentBoundaries(
-  segments: Array<{ id: number; text: string }>,
-  _fullText: string
-): Array<{ start: number; end: number }> {
-  const boundaries: Array<{ start: number; end: number }> = []
-  let offset = 0
-  for (const seg of segments) {
-    boundaries.push({ start: offset, end: offset + seg.text.length })
-    offset += seg.text.length
-  }
-  return boundaries
-}
-
-/**
- * 将 token 级别指标按段落边界聚合为段落级 PPL 结果
- */
-function aggregateTokensBySegments(
-  tokenMetrics: TokenMetric[],
-  boundaries: Array<{ start: number; end: number }>,
-  segments: Array<{ id: number; text: string }>
-): SegmentPPLResult[] {
-  return segments.map((seg, idx) => {
-    const { start, end } = boundaries[idx]
-
-    // 找出落在此段落范围内的 token
-    const segTokens = tokenMetrics.filter(t =>
-      t.charOffset >= start && t.charOffset < end
-    )
-
-    if (segTokens.length === 0) {
-      return { id: seg.id, ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 }
+  return {
+    segments: resultSegments,
+    distribution,
+    summary,
+    diagnostics: {
+      tokenPredictability,
+      sequenceRegularity: documentFeatures.sequenceRegularity,
+      informationUniformity: documentFeatures.informationUniformity,
+      causalClosure: documentFeatures.causalClosure,
+      voiceStability: documentFeatures.voiceStability,
+      templateDensity: documentFeatures.templateDensity,
+      windowRiskP75: documentFeatures.windowRiskP75,
+      peakWindowRisk: documentFeatures.peakWindowRisk,
+      highRiskWindowShare: documentFeatures.highRiskWindowShare,
+      documentRisk: documentFeatures.documentRisk,
+      reasons: documentFeatures.reasons
     }
+  }
+}
 
-    const sumLogProb = segTokens.reduce((s, t) => s + t.logProb, 0)
-    const ppl = Math.exp(-sumLogProb / segTokens.length)
-    const top5Rate = segTokens.filter(t => t.inTop5).length / segTokens.length
-    const avgProb = segTokens.reduce((s, t) => s + t.prob, 0) / segTokens.length
+function medianScore(values: number[]): number {
+  if (values.length === 0) return 50
+  const ordered = [...values].sort((a, b) => a - b)
+  const middle = Math.floor(ordered.length / 2)
+  return ordered.length % 2 === 0
+    ? (ordered[middle - 1] + ordered[middle]) / 2
+    : ordered[middle]
+}
 
-    return { id: seg.id, ppl, tokenCount: segTokens.length, top5Rate, avgProb }
+function continuousSentenceRisk(tokenAndFingerprintRisk: number, documentRisk: number): number {
+  return Math.round((tokenAndFingerprintRisk * 0.75 + documentRisk * 0.25) * 10) / 10
+}
+
+function weightedSentenceRisk(
+  segments: Array<{ text: string; score: number }>,
+  documentRisk: number
+): number {
+  let weighted = 0
+  let total = 0
+  for (const segment of segments) {
+    const weight = Math.max(1, segment.text.replace(/\s/g, '').length)
+    weighted += continuousSentenceRisk(segment.score, documentRisk) * weight
+    total += weight
+  }
+  return total > 0 ? Math.round(weighted / total * 10) / 10 : 0
+}
+
+function computeWindowsInWorkerUnlocked(text: string): Promise<ZhuqueTokenWindow[]> {
+  return new Promise<ZhuqueTokenWindow[]>((resolve, reject) => {
+    if (!worker) {
+      reject(new Error('工作线程未就绪'))
+      return
+    }
+    const handler = (msg: WorkerResponse) => {
+      if (msg.type === 'windowResult' && msg.windows) {
+        worker?.off('message', handler)
+        resolve(msg.windows)
+      } else if (msg.type === 'error') {
+        worker?.off('message', handler)
+        reject(new Error(msg.message || '窗口计算失败'))
+      }
+    }
+    worker.on('message', handler)
+    worker.postMessage({ type: 'computeWindows', text })
   })
 }
 
-/**
- * 通过 worker 执行整文连续计算（串行，避免重入触发 native eval 失败）
- */
-function computeWholeInWorker(text: string): Promise<TokenMetric[]> {
-  return withWorkerLock(() => new Promise<TokenMetric[]>((resolve, reject) => {
-    if (!worker) {
-      reject(new Error('工作线程未就绪'))
-      return
+function computeWindowsWithModel(modelPath: string, text: string): Promise<ZhuqueTokenWindow[]> {
+  return withWorkerLock(async () => {
+    await ensureWorkerUnlocked(modelPath)
+    let windows = await computeWindowsInWorkerUnlocked(text)
+    if (windows.length === 0 && text.trim().length > 20) {
+      appLogger.info('perplexity', '窗口计算无结果，重建 worker 重试…')
+      await terminateWorkerUnlocked()
+      await ensureWorkerUnlocked(modelPath)
+      windows = await computeWindowsInWorkerUnlocked(text)
     }
-
-    const handler = (msg: WorkerResponse) => {
-      if (msg.type === 'wholeResult' && msg.tokenMetrics) {
-        worker?.off('message', handler)
-        resolve(msg.tokenMetrics)
-      } else if (msg.type === 'error') {
-        worker?.off('message', handler)
-        reject(new Error(msg.message || '计算失败'))
-      }
-    }
-
-    worker.on('message', handler)
-    worker.postMessage({ type: 'computeWhole', text })
-  }))
-}
-
-function computeInWorker(segments: Array<{ id: number; text: string }>): Promise<SegmentPPLResult[]> {
-  return withWorkerLock(() => new Promise<SegmentPPLResult[]>((resolve, reject) => {
-    if (!worker) {
-      reject(new Error('工作线程未就绪'))
-      return
-    }
-
-    const handler = (msg: WorkerResponse) => {
-      if (msg.type === 'result' && msg.results) {
-        worker?.off('message', handler)
-        resolve(msg.results)
-      } else if (msg.type === 'error') {
-        worker?.off('message', handler)
-        reject(new Error(msg.message || '计算失败'))
-      }
-    }
-
-    worker.on('message', handler)
-    worker.postMessage({ type: 'compute', segments })
-  }))
+    return windows
+  })
 }
 
 export function isPerplexityModelReady(): boolean {
@@ -370,22 +402,26 @@ export function isPerplexityModelReady(): boolean {
 }
 
 export async function disposePerplexityWorker(): Promise<void> {
-  await terminateWorker()
+  await withWorkerLock(() => terminateWorkerUnlocked())
 }
 
-/** 段落级检测详情，供改写引导使用 */
+/** 句级检测详情，供逐句改写引导使用。 */
 export interface SegmentDetectDetail {
   text: string
+  /** 三分类融合后的改写优先级；不再等同于原始 token 分。 */
   aiScore: number
+  tokenScore: number
+  structuralRisk: number
   ppl: number
   top5Rate: number
   avgProb: number
   category: AigcCategory
+  probabilities: AigcDistribution
+  reason: string
 }
 
 /**
- * 快速检测并返回段落级指标详情（供改写引导使用）
- * 使用整文连续计算获得基于完整上下文的可靠评分
+ * 返回句级指标详情：检测在重叠 token 窗完成，随后把窗口概率归因到句子。
  */
 export async function getSegmentMetrics(
   text: string,
@@ -403,51 +439,60 @@ export async function getSegmentMetrics(
   const segments = segmentText(text)
   if (segments.length === 0) return { segments: [], docScore: 0 }
 
-  const segmentBoundaries = computeSegmentBoundaries(segments, text)
-  let pplResults: SegmentPPLResult[]
+  let tokenWindows: ZhuqueTokenWindow[]
 
   if (useApi) {
-    pplResults = await computePplViaLocalApi(
+    const tokenMetrics = await computeTokenMetricsViaApi(
       text,
-      segments,
-      segmentBoundaries,
       apiConfig,
       onProgress
     )
+    tokenWindows = buildZhuqueTokenWindows(text, tokenMetrics)
   } else {
     const modelPath = await ensureModelReady()
-    await ensureWorker(modelPath)
-    onProgress?.('正在计算困惑度…')
-    const tokenMetrics = await computeWholeInWorker(text)
-    pplResults = aggregateTokensBySegments(tokenMetrics, segmentBoundaries, segments)
+    onProgress?.('正在计算重叠 token 窗口…')
+    tokenWindows = await computeWindowsWithModel(modelPath, text)
   }
 
-  if (useApi && isDegenerateApiLogprobs(pplResults)) {
+  if (tokenWindows.length === 0) {
+    throw new Error('模型没有生成可用的 token 证据窗口')
+  }
+  const sentenceMetrics = attributeTokenWindowsToSpans(segments, tokenWindows)
+
+  if (useApi && isDegenerateApiLogprobs(tokenWindows.map(window => window.metric))) {
     throw new Error(
       `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法计算朱雀对齐段落指标`
     )
   }
 
-  const scored = classifyZhuqueSegments(segments.map((seg, i) => {
-    const r = pplResults[i] ?? { id: seg.id, ppl: 0, tokenCount: 0, top5Rate: 0, avgProb: 0 }
-    return scoreZhuqueSegment(seg.text, r, detectModelId)
-  }), detectModelId)
+  const documentFeatures = analyzeZhuqueDistribution(text, tokenWindows)
+  const classifiedSentences = classifySentences(
+    segments,
+    sentenceMetrics,
+    documentFeatures,
+    detectModelId
+  )
 
-  const details: SegmentDetectDetail[] = scored.map((segment, i) => {
-    const r = pplResults[i]
+  const details: SegmentDetectDetail[] = classifiedSentences.map((segment, i) => {
+    const metric = sentenceMetrics[i]
+    const aiScore = continuousSentenceRisk(segment.score, documentFeatures.documentRisk)
+    const category = categorizeZhuqueSentenceRisk(aiScore)
+    const probabilities = segmentProbabilities(category)
     return {
       text: segment.text,
-      aiScore: segment.score,
-      ppl: r?.ppl ?? 0,
-      top5Rate: r?.top5Rate ?? 0,
-      avgProb: r?.avgProb ?? 0,
-      category: segment.category
+      aiScore,
+      tokenScore: computeZhuqueTokenRisk(metric, detectModelId),
+      structuralRisk: Math.round((100 - probabilities.human) * 10) / 10,
+      ppl: metric.ppl,
+      top5Rate: metric.top5Rate,
+      avgProb: metric.avgProb,
+      category,
+      probabilities,
+      reason: segment.reason ?? ''
     }
   })
 
-  const validScores = details.filter(d => d.ppl > 0 && d.ppl < 400).map(d => d.aiScore)
-  const docScore = validScores.length > 0
-    ? validScores.reduce((a, b) => a + b, 0) / validScores.length : 50
+  const docScore = weightedSentenceRisk(classifiedSentences, documentFeatures.documentRisk)
 
   return { segments: details, docScore }
 }

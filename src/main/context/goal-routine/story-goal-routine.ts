@@ -154,9 +154,9 @@ import { GoalPhaseExhaustedError } from './goal-phase-error'
 import {
   resolveStoryModelCapability,
   stableStoryHash,
-  STORY_HARNESS_MAX_TURNS,
   canStartStoryFallbackEpoch
 } from '../../../shared/story-harness'
+import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
 
 export type Phase = GoalRoutinePhase
 
@@ -2569,10 +2569,7 @@ export async function runStoryGoalLoop(
     phase = explicitPhase ?? 'materialize_settings'
   }
 
-  fullConfig.maxTurns = Math.min(
-    STORY_HARNESS_MAX_TURNS,
-    Math.max(1, Math.floor(Number(fullConfig.maxTurns) || DEFAULT_STORY_GOAL_CONFIG.maxTurns))
-  )
+  fullConfig.maxTurns = requireGoalTurnLimit(fullConfig.maxTurns)
 
   const controller = new AbortController()
   activeLoops.set(workId, controller)

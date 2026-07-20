@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import { labTaskDAO, aigcWordtableDAO, appPreferenceDAO } from './db'
+import { labTaskDAO, aigcWordtableDAO, appPreferenceDAO, humanRewriteReferenceDAO } from './db'
 import { buildLabDeaiSystemPrompt } from './context/lab/lab-deai-prompt'
 import { cancelDeaiRewrite, parseLabUploadFile, runDeaiRewrite } from './context/lab/deai-rewrite'
 import { runAigcDetect, cancelAigcDetect, runAigcRewrite } from './context/lab/aigc-detect'
@@ -10,7 +10,15 @@ import { getModelStatus, deleteModel, isModelReady, listModels, switchModel, del
 import type { LabTaskCreateInput, LabUploadParseInput } from '../shared/lab-types'
 import type { AigcDetectResult } from '../shared/aigc-detect-types'
 import type { WordTableEntryInput } from '../shared/aigc-wordtable-types'
+import type { HumanRewriteReferenceInput } from '../shared/human-rewrite-reference-types'
+import { HUMAN_REWRITE_REFERENCE_PRESETS } from '../shared/human-rewrite-reference-presets'
 import type { WorkModelOptions } from '../shared/work-model-options'
+import {
+  deleteSupervisedAigcModel,
+  disposeSupervisedAigcWorker,
+  ensureSupervisedAigcModelReady,
+  getSupervisedAigcModelInfo
+} from './supervised-aigc'
 
 export function registerLabIpcHandlers(): void {
   ipcMain.handle('lab:getAntiAiPresets', () => ({
@@ -52,7 +60,7 @@ export function registerLabIpcHandlers(): void {
       text: string,
       detectResultJson?: string | null,
       modelOpts?: WorkModelOptions,
-      seedOpts?: { mode: 'fast' | 'strong'; seedText?: string; workId?: number; chapterId?: number }
+      seedOpts?: { mode: 'fast' | 'strong' }
     ) => {
       let detectResult: AigcDetectResult | null = null
       if (detectResultJson) {
@@ -66,6 +74,40 @@ export function registerLabIpcHandlers(): void {
     }
   )
   ipcMain.handle('lab:aigc-detect:cancel', (_e, runId: string) => cancelAigcDetect(runId))
+
+  // 人工化改写案例库
+  ipcMain.handle('lab:rewrite-reference:list', () => humanRewriteReferenceDAO.list())
+  ipcMain.handle('lab:rewrite-reference:create', (_e, input: HumanRewriteReferenceInput) => {
+    return humanRewriteReferenceDAO.create(input)
+  })
+  ipcMain.handle('lab:rewrite-reference:update', (_e, id: number, input: HumanRewriteReferenceInput) => {
+    return humanRewriteReferenceDAO.update(id, input)
+  })
+  ipcMain.handle('lab:rewrite-reference:toggle', (_e, id: number, enabled: boolean) => {
+    return humanRewriteReferenceDAO.toggleEnabled(id, enabled)
+  })
+  ipcMain.handle('lab:rewrite-reference:delete', (_e, id: number) => {
+    return humanRewriteReferenceDAO.delete(id)
+  })
+  ipcMain.handle('lab:rewrite-reference:list-presets', () => {
+    return HUMAN_REWRITE_REFERENCE_PRESETS.map(preset => ({
+      id: preset.id,
+      name: preset.name,
+      description: preset.description,
+      sourceTitle: preset.sourceTitle,
+      count: preset.examples.length
+    }))
+  })
+  ipcMain.handle('lab:rewrite-reference:import-preset', (_e, presetId: string) => {
+    const preset = HUMAN_REWRITE_REFERENCE_PRESETS.find(item => item.id === presetId)
+    if (!preset) throw new Error('改写案例预设不存在')
+    const existingKeys = new Set(
+      humanRewriteReferenceDAO.list().map(item => `${item.title}\n${item.originalText}`)
+    )
+    const pending = preset.examples.filter(item => !existingKeys.has(`${item.title}\n${item.originalText.trim()}`))
+    for (const input of pending) humanRewriteReferenceDAO.create(input)
+    return { imported: pending.length, skipped: preset.examples.length - pending.length }
+  })
 
   // 词表替换管理
   ipcMain.handle('lab:wordtable:list', () => aigcWordtableDAO.list())
@@ -129,6 +171,20 @@ export function registerLabIpcHandlers(): void {
     await ensureModelReady((progress) => {
       sender.send('perplexity:download-progress', progress)
     }, modelId)
+    return { success: true }
+  })
+
+  // 中文监督检测模型管理
+  ipcMain.handle('supervised-aigc:model-info', () => getSupervisedAigcModelInfo())
+  ipcMain.handle('supervised-aigc:download-model', async e => {
+    await ensureSupervisedAigcModelReady(progress => {
+      e.sender.send('supervised-aigc:download-progress', progress)
+    })
+    return { success: true }
+  })
+  ipcMain.handle('supervised-aigc:delete-model', async () => {
+    await disposeSupervisedAigcWorker()
+    deleteSupervisedAigcModel()
     return { success: true }
   })
 

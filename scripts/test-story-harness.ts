@@ -11,11 +11,14 @@ import {
   resolveStoryModelCapability,
   shouldBlockStoryAntiAi,
   stableStoryHash,
-  storyHarnessBudgetBlockers,
-  STORY_HARNESS_MAX_TURNS
+  storyHarnessBudgetBlockers
 } from '../src/shared/story-harness'
+import { requireGoalTurnLimit } from '../src/shared/goal-turn-limit'
 
-assert.equal(STORY_HARNESS_MAX_TURNS, 30)
+assert.equal(requireGoalTurnLimit(200), 200)
+assert.throws(() => requireGoalTurnLimit(0), /大于等于 1 的整数/)
+assert.throws(() => requireGoalTurnLimit(1.5), /大于等于 1 的整数/)
+assert.throws(() => requireGoalTurnLimit('200'), /大于等于 1 的整数/)
 assert.equal(canStartStoryFallbackEpoch(0), true)
 assert.equal(canStartStoryFallbackEpoch(1), false)
 const candidateContextA = buildStoryCandidateContextSource({ acceptedBody: '', outline: '旧节拍' })

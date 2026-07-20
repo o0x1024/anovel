@@ -7,16 +7,40 @@ import type {
   AigcDistribution,
   AigcRewriteSelectionView
 } from '../../../shared/aigc-detect-types'
-import { BODY_PARAGRAPH_SPACING_RULE, normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
+import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, aigcWordtableDAO } from '../../db'
-import { getWorkReferenceText } from '../anti-ai-rules'
-import { runPerplexityDetect, getSegmentMetrics, type SegmentDetectDetail, type LabModelOverride } from '../../perplexity'
+import { aigcWordtableDAO, humanRewriteReferenceDAO } from '../../db'
+import {
+  runPerplexityDetect,
+  getSegmentMetrics,
+  isMeaningfulRewriteImprovement,
+  isZhuqueRewriteTarget,
+  ZHUQUE_REWRITE_TARGET_SCORE,
+  type SegmentDetectDetail,
+  type LabModelOverride
+} from '../../perplexity'
 import { applyWordTable } from './aigc-wordtable-engine'
 import { BUILTIN_ANTI_AI_VOCAB } from './builtin-anti-ai-vocab'
 import { evaluateRewriteCandidates, type RewriteCandidateInput } from './aigc-rewrite-quality'
 import type { WorkModelOptions } from '../../../shared/work-model-options'
 import { ZHUQUE_MIN_TEXT_LENGTH } from '../../perplexity/zhuque-alignment'
+import {
+  HUMAN_REWRITE_AI_SYMPTOMS,
+  HUMAN_REWRITE_SCENE_TYPES,
+  type HumanRewritePlan,
+  type HumanRewriteReference
+} from '../../../shared/human-rewrite-reference-types'
+import {
+  findCopiedReferencePhrase,
+  formatHumanRewriteReferences,
+  parseHumanRewriteAssessments,
+  selectHumanRewriteReferences
+} from './human-rewrite-reference'
+import type { AigcSentenceRewriteResult } from '../../../shared/aigc-sentence-rewrite-types'
+import { runBlockRewrite } from './aigc-block-rewrite'
+import { requiresFullDocumentSceneRewrite } from './aigc-scene-rewrite-quality'
+import { runSupervisedAigcDetect } from '../../supervised-aigc'
+import { fuseAigcDetection } from './aigc-detect-fusion'
 
 const activeRuns = new Map<string, AiSessionHandle>()
 const activeRewriteRuns = new Map<string, AiSessionHandle>()
@@ -81,43 +105,6 @@ const AIGC_DETECT_SYSTEM_PROMPT = `你是 AIGC 文本检测器。
   "summary": "一句话结论"
 }`
 
-
-const AIGC_REWRITE_INTENSIVE_SYSTEM_PROMPT = [
-  '你是专业的去AI痕迹重写编辑。你的改写必须产生肉眼可见的实质性变化。',
-  '',
-  '核心目标：改写后的文本必须与原文有30%以上的文字差异。只替换个别词是不合格的。',
-  '',
-  '硬约束：',
-  '1. 保持人物、事件、时间线、世界观不变。',
-  '2. 每个叙述句都必须重组句式——换语序、拆合句子、变换主语。',
-  '3. 禁止照抄：连续10字以上与原文相同是绝对禁止的（专有名词和对话原文除外）。',
-  '4. 对话内容保持原样，但对话之间的叙述描写必须重写。',
-  '5. 仅输出改写正文，不要解释。',
-  '',
-  '★★★ 最高优先级——外部检测器（朱雀）最敏感的AI指纹（违反即判定失败）：',
-  '',
-  'A. 【致命】禁止"电影镜头链"式描写——这是检测器权重最高的特征：',
-  '   禁止连续的逐帧动作分镜：如"他转身→目光落在…上→嘴角微微上扬→缓缓开口"。',
-  '   禁止"目光落在/扫过/越过…上"的句式。',
-  '   禁止"嘴角微微上扬/微勾/一弯"。',
-  '   禁止"脚步顿了顿""缓缓回过头""视线从…移到…又收回"等镜头调度。',
-  '   替代方案：用一句复合句概括动作，或直接写结果省略中间过程。',
-  '',
-  'B. 【高危】禁止书面连接词/过渡词——检测器第二敏感的特征：',
-  '   禁用：然而、因此、此外、与此同时、值得注意的是、不难发现、由此可见、总而言之、不仅如此、尽管如此。',
-  '   替代：直接删除，或改用口语词（"结果""谁知""得了""这下"）。',
-  '',
-  'C. 【中危】禁止模板情感句和总结收束句：',
-  '   禁用："心中涌起一股…""眼中闪过一丝…""一股…涌上心头"。',
-  '   禁用段尾/章尾总结："这一刻他明白了…""或许这便是…""对于…而言…"。',
-  '   替代：删除这些句子，或改为具体动作/对话。',
-  '',
-  'D. 词汇选择偏口语化/低频化：多用具象、冷门、方言化的词，少用"标准书面语"。',
-  '   如：用"瞅/撩/蹓"代替"看/掀/走"，用"搁/撂/怼"代替"放/扔/说"。',
-].join('\n')
-
-const AIGC_REWRITE_STRONG_COLLOQUIAL_CONSTRAINT =
-  '\n10. 词汇选择必须偏口语化/方言化：用"瞅""搁""麻溜""寻思"替代"看""放""迅速""思考"，用"压根""愣是""回过味来"替代"完全""坚持""意识到"。'
 
 type DraftSegment = {
   id: number
@@ -714,18 +701,6 @@ function parseDetectResult(
   }
 }
 
-function buildRewriteCandidates(baseText: string): RewriteCandidateInput[] {
-  const normalized = normalizeModelBodyOutput(baseText, 'lab_deai').trim()
-  if (!normalized) return []
-  const vocabOnly = applyVocabDiversification(normalized)
-  const rhythmAndVocab = applyVocabDiversification(injectHumanNoise(normalized))
-  return [
-    { key: '直出改写', text: normalized },
-    { key: '词表增强', text: vocabOnly },
-    { key: '节奏扰动+词表', text: rhythmAndVocab }
-  ]
-}
-
 function buildRewriteSelectionView(
   runId: string,
   baselineDocScore: number | undefined,
@@ -748,97 +723,6 @@ function buildRewriteSelectionView(
       valid: item.valid
     }))
   }
-}
-
-function buildAigcRewriteUserPrompt(
-  text: string,
-  _detectResult?: AigcDetectResult | null,
-  _mode: 'normal' | 'intensive' = 'normal',
-  segmentMetrics?: SegmentDetectDetail[]
-): string {
-  const connectorHits = (text.match(CONNECTOR_REGEX) || []).length
-  const filmShotRe = /(?:目光|视线|眼神)(?:落在|扫过|越过|移到|停在|掠过).{0,15}上/g
-  const filmShotCount = (text.match(filmShotRe) || []).length
-  const cameraChainRe = /(?:他|她)(?:转身|回过头|抬起头|低下头|站起身|迈步|停下脚步)[^，。]{0,6}[。，]/g
-  const cameraChainCount = (text.match(cameraChainRe) || []).length
-  const emotionTemplateRe = /(?:心中|内心|胸口)(?:涌起|泛起|升起|掠过)(?:一股|一阵|一丝)/g
-  const emotionCount = (text.match(emotionTemplateRe) || []).length
-  const closureRe = /(?:这一刻[，,]?(?:他|她)?(?:明白|懂得|知道|意识到))|(?:或许[，,]?这(?:便|就)是)|(?:对于.{2,8}而言)/g
-  const closureCount = (text.match(closureRe) || []).length
-
-  const lines: string[] = [
-    '请把下面正文做“去AI味”润色：',
-    '- 不改剧情与角色关系',
-    '- 保留原段落数量与顺序',
-    '- 输出仅正文，不要解释',
-    '',
-    BODY_PARAGRAPH_SPACING_RULE,
-  ]
-
-  if (segmentMetrics && segmentMetrics.length > 0) {
-    const validSegs = segmentMetrics.filter(s => s.ppl > 0)
-    const aiSegments = segmentMetrics.filter(s => s.aiScore >= 55)
-    const highAiSegments = segmentMetrics.filter(s => s.aiScore >= 70)
-    const avgPpl = validSegs.length > 0 ? validSegs.reduce((a, s) => a + s.ppl, 0) / validSegs.length : 0
-    const avgTop5 = validSegs.length > 0 ? validSegs.reduce((a, s) => a + s.top5Rate, 0) / validSegs.length : 0
-
-    lines.push('')
-    lines.push('【困惑度检测结果——精准定位AI特征段落】')
-    lines.push(`- AI段落占比：${Math.round(aiSegments.length / Math.max(1, segmentMetrics.length) * 100)}%`)
-    lines.push(`- 高度AI段落：${highAiSegments.length}段（需重点改写）`)
-    lines.push(`- 平均困惑度：${avgPpl.toFixed(1)}（人类通常>80，当前${avgPpl < 60 ? '极低=太可预测' : avgPpl < 80 ? '偏低' : '正常'}）`)
-    lines.push(`- 平均Top-5命中率：${(avgTop5 * 100).toFixed(0)}%（人类通常<50%，当前${avgTop5 > 0.6 ? '极高=词选太明显' : avgTop5 > 0.5 ? '偏高' : '正常'}）`)
-
-    if (highAiSegments.length > 0 && highAiSegments.length <= 10) {
-      lines.push('')
-      lines.push('【以下段落AI特征最强，需彻底重写】')
-      for (const seg of highAiSegments.slice(0, 8)) {
-        const preview = seg.text.trim().slice(0, 40).replace(/\n/g, ' ')
-        const issue = seg.ppl < 50 ? '困惑度极低/太可预测'
-          : seg.top5Rate > 0.65 ? '词选太明显/Top5命中高'
-          : 'AI评分高'
-        lines.push(`- “${preview}…” → ${issue}，AI评分=${Math.round(seg.aiScore)}`)
-      }
-    }
-
-    lines.push('')
-    lines.push('【困惑度改写策略】')
-    if (avgPpl < 60) {
-      lines.push('- ★ 文本太“可预测”：使用更不常见的词汇搭配、倒装句、省略句')
-    }
-    if (avgTop5 > 0.55) {
-      lines.push('- ★ 词语选择太“正确”：故意使用非典型搭配，如“掀/扎/摁/蹓/搁/撒”替代常见动词')
-    }
-  }
-
-  const hasDangerousFingerprints = filmShotCount > 0 || cameraChainCount > 1 || connectorHits > 0 || emotionCount > 0 || closureCount > 0
-  if (hasDangerousFingerprints) {
-    lines.push('')
-    lines.push('【★★★ 外部检测器（朱雀）最敏感的AI指纹——必须全部消除 ★★★】')
-    if (filmShotCount > 0 || cameraChainCount > 1) {
-      lines.push(`- 【致命·权重最高】电影镜头链：检测到${filmShotCount}处“目光落在/扫过…上”、${cameraChainCount}处逐帧动作分镜。必须全部消除：改为一句复合句或省略中间动作。`)
-    }
-    if (connectorHits > 0) {
-      lines.push(`- 【高危】书面连接词：检测到${connectorHits}处（然而/因此/此外/与此同时等）。全部删除或改为口语词（“结果/谁知/这下/得了”）。`)
-    }
-    if (emotionCount > 0) {
-      lines.push(`- 【中危】模板情感句：检测到${emotionCount}处“心中涌起/泛起/升起一股…”。删除或改为具体动作。`)
-    }
-    if (closureCount > 0) {
-      lines.push(`- 【中危】总结收束句：检测到${closureCount}处“这一刻他明白了/或许这便是…”。直接删除。`)
-    }
-  }
-
-  lines.push('')
-  lines.push('【改写硬约束】')
-  lines.push('- 每个叙述段必须做实质改写：调整句式/语序，不可只换个别词')
-  lines.push('- 禁止连续15字以上与原文完全一致（专有名词除外）')
-  lines.push('- 词汇偏口语化/低频化：用具象冷门词替代标准书面语')
-  lines.push('- 对话段落保持原样，仅改动对话间的叙述/描写承接')
-  lines.push('')
-  lines.push('【待改写正文】')
-  lines.push(text)
-  return lines.join('\n')
 }
 
 function extractRewriteContent(raw: string): string {
@@ -1157,7 +1041,7 @@ export async function runAigcDetect(
     const labModel: LabModelOverride | undefined = modelOpts?.modelType
       ? { modelType: modelOpts.modelType, modelName: modelOpts.modelName }
       : undefined
-    const result = await runPerplexityDetect(
+    const statisticalResult = await runPerplexityDetect(
       text,
       (msg) => {
         reportProgress(msg)
@@ -1170,6 +1054,18 @@ export async function runAigcDetect(
       },
       labModel
     )
+    const supervisedResult = await runSupervisedAigcDetect(
+      text,
+      statisticalResult.segments,
+      message => reportProgress(message),
+      progress => {
+        sender.send('supervised-aigc:download-progress', progress)
+        if (progress.phase === 'downloading' || progress.phase === 'checking') {
+          reportProgress(progress.message)
+        }
+      }
+    )
+    const result = fuseAigcDetection(statisticalResult, supervisedResult)
 
     const { human, suspected_ai, ai } = result.distribution
     reportProgress(
@@ -1196,65 +1092,21 @@ export async function runAigcDetect(
   }
 }
 
-function fetchHumanSeed(workId?: number, chapterId?: number): string {
-  if (chapterId) {
-    const chapter = volumeChapterDAO.getChapter(chapterId)
-    if (chapter?.content) return sampleDocumentText(chapter.content, 2000)
-  }
-  if (workId) {
-    const ref = getWorkReferenceText(workId)
-    if (ref && ref.length > 200) return ref
-    const chapters = volumeChapterDAO.listChaptersByWork(workId)
-    const humanChapter = chapters.find(c => c.status === 'published' || c.word_count > 500)
-    if (humanChapter?.content) return sampleDocumentText(humanChapter.content, 2000)
-  }
-  return ''
-}
-
-function sampleDocumentText(text: string, maxLen: number): string {
-  const trimmed = text.trim()
-  if (trimmed.length <= maxLen) return trimmed
-  return trimmed.slice(0, maxLen)
-}
-
-/**
- * 将人工种子文本与改写结果逐段交替拼接。
- * 
- * 实验 DS2 证实：50%人工+50%AI 逐段交替 → 朱雀判定 100% 人工。
- * 对比 K2（人工尾置 39%）和 K5（三明治 27%），交替策略远优于简单前置/尾置。
- */
-function composeSeedAndRewrite(seed: string, rewritten: string): string {
-  const targetSeedLen = Math.max(seed.length, Math.floor(rewritten.length * 0.5))
-  const trimmedSeed = seed.slice(0, targetSeedLen)
-
-  const seedParas = trimmedSeed.split(/\n+/).filter(p => p.trim())
-  const rewriteParas = rewritten.split(/\n+/).filter(p => p.trim())
-
-  if (seedParas.length === 0) return rewritten
-  if (rewriteParas.length === 0) return trimmedSeed
-
-  const result: string[] = []
-  const maxLen = Math.max(seedParas.length, rewriteParas.length)
-
-  for (let i = 0; i < maxLen; i++) {
-    if (i < seedParas.length) result.push(seedParas[i])
-    if (i < rewriteParas.length) result.push(rewriteParas[i])
-  }
-
-  return result.join('\n')
-}
-
+/** 基于冻结检测证据生成场景块补丁；改写后由用户手动触发一次全文复检。 */
 export async function runAigcRewrite(
   sender: WebContents,
   runId: string,
   text: string,
   detectResult?: AigcDetectResult | null,
   modelOpts?: WorkModelOptions,
-  seedOpts?: { mode: 'fast' | 'strong'; seedText?: string; workId?: number; chapterId?: number }
-): Promise<string> {
+  seedOpts?: { mode: 'fast' | 'strong' }
+): Promise<AigcSentenceRewriteResult> {
   const input = text.trim()
   if (!input) throw new Error('待改写文本不能为空')
   if (input.length > 50000) throw new Error('文本超出 50000 字符限制')
+  if (!detectResult) throw new Error('一键改写需要当前文本的完整检测结果，请先重新检测')
+  const detectedText = detectResult.segments.map(segment => segment.text).join('').trim()
+  if (detectedText !== input) throw new Error('当前文本与检测结果不一致，请先重新检测')
 
   const prev = activeRewriteRuns.get(runId)
   if (prev) {
@@ -1266,6 +1118,10 @@ export async function runAigcRewrite(
 
   try {
     const isStrongMode = seedOpts?.mode === 'strong'
+    const referenceExamples = isStrongMode ? humanRewriteReferenceDAO.listEnabled() : []
+    if (isStrongMode && referenceExamples.length === 0) {
+      throw new Error('案例增强模式需要至少一条已启用的人工化改写案例')
+    }
     const rewriteLabModel: LabModelOverride | undefined = modelOpts?.modelType
       ? { modelType: modelOpts.modelType, modelName: modelOpts.modelName }
       : undefined
@@ -1280,7 +1136,7 @@ export async function runAigcRewrite(
       segMetrics = cached.segments
       baselineDocScore = cached.docScore
       detectionAvailable = true
-      const aiCount = segMetrics.filter(s => s.aiScore >= 50).length
+      const aiCount = segMetrics.filter(s => isZhuqueRewriteTarget(s.aiScore)).length
       appLogger.info('aigc-rewrite', `复用检测缓存: ${segMetrics.length}段, AI段落=${aiCount}, docScore=${cached.docScore.toFixed(1)}`)
       sender.send('lab:aigc-rewrite:progress', { runId, message: `复用检测结果：${aiCount}/${segMetrics.length} 段有AI特征` })
     } else {
@@ -1293,74 +1149,32 @@ export async function runAigcRewrite(
         baselineDocScore = metrics.docScore
         detectionAvailable = true
         cacheSegmentMetrics(input, segMetrics, metrics.docScore)
-        const aiCount = segMetrics.filter(s => s.aiScore >= 50).length
+        const aiCount = segMetrics.filter(s => isZhuqueRewriteTarget(s.aiScore)).length
         appLogger.info('aigc-rewrite', `困惑度预检测: ${segMetrics.length}段, AI段落=${aiCount}, docScore=${metrics.docScore.toFixed(1)}`)
         sender.send('lab:aigc-rewrite:progress', { runId, message: `检测完成：${aiCount}/${segMetrics.length} 段有AI特征` })
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
-        appLogger.warn('aigc-rewrite', `困惑度预检测跳过: ${reason}`)
-        sender.send('lab:aigc-rewrite:progress', {
-          runId,
-          message: `⚠️ 困惑度检测不可用（${reason.includes('模型') ? '检测模型未下载' : '检测失败'}），将使用基础模式改写`,
-          level: 'warn'
-        })
+        appLogger.warn('aigc-rewrite', `闭环检测失败: ${reason}`)
+        throw new Error(`自动去AI味需要可用的检测引擎：${reason}`)
       }
     }
 
     // Step 2: 根据检测结果选择改写策略
-    let result: string
-
-    if (detectionAvailable && segMetrics && segMetrics.length > 0) {
-      result = await runSegmentBySegmentRewrite(
-        sender, runId, session, segMetrics, isStrongMode, modelOpts
-      )
-    } else {
-      sender.send('lab:aigc-rewrite:progress', { runId, message: '使用整篇改写模式…' })
-      result = await runWholeTextRewrite(sender, runId, session, input, detectResult, isStrongMode, modelOpts)
+    if (!detectionAvailable || !segMetrics || segMetrics.length === 0 || baselineDocScore === undefined) {
+      throw new Error('自动去AI味没有取得有效的段落检测证据')
     }
-
-    // Step 3: 约束校验 + 候选自动选择（优先选择复检分更低且锚点保留更好的版本）
-    sender.send('lab:aigc-rewrite:progress', { runId, message: '正在执行改写约束校验…' })
-    const candidates = buildRewriteCandidates(result)
-    if (candidates.length > 0) {
-      const selection = await evaluateRewriteCandidates({
-        runId,
-        originalText: input,
-        candidates,
-        baselineDocScore,
-        labModel: rewriteLabModel,
-        evaluateWithMetrics: detectionAvailable,
-        onProgress: (message) => sender.send('lab:aigc-rewrite:progress', { runId, message })
-      })
-      const selected = selection.selected
-      result = selected.text
-      sender.send('lab:aigc-rewrite:selection', buildRewriteSelectionView(runId, baselineDocScore, selection))
-      const baselineSuffix = typeof baselineDocScore === 'number'
-        ? `（基线 ${baselineDocScore.toFixed(1)}）`
-        : ''
-      const warn = selected.issues.length > 0
-      sender.send('lab:aigc-rewrite:progress', {
-        runId,
-        message: `校验完成：采用「${selected.key}」方案，复检评分 ${selected.docScore.toFixed(1)} ${baselineSuffix}`.trim(),
-        level: warn ? 'warn' : 'info'
-      })
-      if (warn) {
-        sender.send('lab:aigc-rewrite:progress', {
-          runId,
-          message: `提示：${selected.issues.join('；')}`,
-          level: 'warn'
-        })
-      }
-    }
-
-    // Step 4: 强力模式前置种子文本
-    if (seedOpts?.mode === 'strong') {
-      const seedText = seedOpts.seedText?.trim()
-        || fetchHumanSeed(seedOpts.workId, seedOpts.chapterId)
-      if (seedText) {
-        result = composeSeedAndRewrite(seedText, result)
-      }
-    }
+    const result = await runBlockRewrite({
+      sender,
+      runId,
+      session,
+      input,
+      segments: segMetrics,
+      initialDistribution: detectResult.distribution,
+      fullDocumentRewrite: requiresFullDocumentSceneRewrite(detectResult.distribution),
+      strongMode: isStrongMode,
+      references: referenceExamples,
+      modelOpts
+    })
 
     session.complete(true)
     return result
@@ -1376,28 +1190,207 @@ export async function runAigcRewrite(
 // ─── 逐段精准改写 ───────────────────────────────────────────────────────────
 
 const SEGMENT_REWRITE_SYSTEM = [
-  '你是专业的文本润色编辑。你的任务是改写指定的段落，消除AI生成痕迹。',
+  '你是专业的文本编辑。只修复指定段落中已定位的问题，不做统一风格润色。',
   '',
   '规则：',
   '1. 只改写标记为【需改写】的段落。【上文】【下文】仅供理解语境，不要输出。',
   '2. 保持人物、事件、因果关系不变。',
-  '3. 必须重组句式：换语序、拆合句子、变换主语。',
-  '4. 禁止照抄：与原文连续相同不超过8字（专有名词除外）。',
-  '5. 对话原文保持不变，只改叙述和描写。',
-  '6. 只输出改写后的段落，按原段落顺序，每段之间空一行。不要编号，不要解释。',
+  '3. 只处理命中的模板、即时解释闭合或段落功能过满；其他句子原样保留。',
+  '4. 故事因果保持成立，但可以只保留动作或结果，把原因留给后文。',
+  '5. 对话只有在目标被判断为 dialogue 且案例明确展示对话改写时才允许修改；其他情况保持原样。',
+  '6. 返回 JSON：{"items":[{"id":目标编号,"text":"修复后的目标文本"}]}，不得输出其他内容。',
   '',
   '★ 检测器最敏感的AI指纹（必须消除）：',
   '- 【致命】禁止"电影镜头链"：不要逐帧写动作（"目光落在→嘴角上扬→缓缓开口"），用一句复合句概括或省略中间过程。',
   '- 【高危】删除书面连接词：然而/因此/此外/与此同时/不仅如此/尽管如此→直接删掉或换口语词。',
   '- 【中危】删除模板情感句："心中涌起…""眼中闪过一丝…"→删掉或改为具体动作。',
   '- 【中危】删除总结收束句："这一刻他明白了…""或许这便是…"→直接删除。',
-  '- 词汇选择偏口语/低频/方言化，少用"标准书面语"。',
+  '- 不随机加入口语、方言、生僻词、病句、错字或机械长短句。',
 ].join('\n')
 
 interface RewriteBatch {
   targetIndices: number[]
   contextStart: number
   contextEnd: number
+}
+
+type RewriteVariant = 'precise' | 'structural'
+
+const MAX_REWRITE_ROUNDS = 3
+
+function rewriteVariantLabel(variant: RewriteVariant): string {
+  return variant === 'precise' ? '精确修复' : '结构重组'
+}
+
+function segmentRewriteHint(segment: SegmentDetectDetail): string {
+  const reason = segment.reason || '局部生成轨迹偏强'
+  const probability = `人工${segment.probabilities.human.toFixed(0)}%/疑似${segment.probabilities.suspected_ai.toFixed(0)}%/AI${segment.probabilities.ai.toFixed(0)}%`
+  if (reason.includes('因果')) return `${probability}；${reason}。删减即时解释，允许原因延后出现`
+  if (reason.includes('信息')) return `${probability}；${reason}。只保留人物当下真正注意到的一条信息路径`
+  if (reason.includes('序列')) return `${probability}；${reason}。打断环境—反应—解释—推进的固定顺序`
+  if (reason.includes('语气') || reason.includes('距离')) return `${probability}；${reason}。让叙述距离服从人物当下感知`
+  if (reason.includes('模板') || reason.includes('镜头') || reason.includes('连接')) return `${probability}；${reason}。删除对应模板，不做同义词替换`
+  return `${probability}；${reason}。只处理这项可观察证据`
+}
+
+const HUMAN_REWRITE_CLASSIFY_SYSTEM = [
+  '你是人工化改写前置分类器。你只判断目标片段的叙事场景和可观察的 AI 痕迹，不改写文本。',
+  `sceneTypes 只能从以下枚举选择 1-2 项：${HUMAN_REWRITE_SCENE_TYPES.join(', ')}`,
+  `aiSymptoms 只能从以下枚举选择 1-3 项：${HUMAN_REWRITE_AI_SYMPTOMS.join(', ')}`,
+  'reason 必须说明片段中的具体证据，不能写空泛结论。',
+  '只返回 JSON：{"items":[{"id":0,"sceneTypes":["dialogue"],"aiSymptoms":["dialogue_template"],"reason":"具体证据"}]}'
+].join('\n')
+
+async function resolveHumanRewritePlans(
+  targetIndices: number[],
+  segMetrics: SegmentDetectDetail[],
+  references: HumanRewriteReference[],
+  cache: Map<string, HumanRewritePlan>,
+  session: AiSessionHandle,
+  modelOpts: WorkModelOptions | undefined
+): Promise<Map<number, HumanRewritePlan>> {
+  const plans = new Map<number, HumanRewritePlan>()
+  const uncached = targetIndices.filter(index => {
+    const cached = cache.get(segMetrics[index].text)
+    if (cached) plans.set(index, cached)
+    return !cached
+  })
+
+  if (uncached.length > 0) {
+    const promptItems = uncached.map(index => ({
+      id: index,
+      detectorEvidence: segmentRewriteHint(segMetrics[index]),
+      text: segMetrics[index].text.trim()
+    }))
+    const response = await modelService.chat(
+      {
+        prompt: JSON.stringify({ items: promptItems }, null, 2),
+        systemPrompt: HUMAN_REWRITE_CLASSIFY_SYSTEM,
+        step: 'ai_trace_polish',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0.1,
+        maxTokens: 1200,
+        modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
+        modelName: modelOpts?.modelName,
+        thinkingEnabled: false
+      },
+      { sessionHandle: session, keepSession: true, stream: false }
+    )
+    if (response.cancelled) throw new Error('已取消')
+    if (!response.success || !response.content?.trim()) {
+      throw new Error(response.error || '人工化改写场景分类失败')
+    }
+    const json = extractJsonObject(response.content)
+    if (!json) throw new Error('人工化改写场景分类未返回有效 JSON')
+    const assessments = parseHumanRewriteAssessments(json, uncached)
+    for (const index of uncached) {
+      const assessment = assessments.get(index)!
+      const matched = selectHumanRewriteReferences(assessment, references)
+      if (matched.length === 0) {
+        throw new Error(
+          `案例库没有匹配目标片段的案例：场景 ${assessment.sceneTypes.join('/')}，AI 痕迹 ${assessment.aiSymptoms.join('/')}`
+        )
+      }
+      const plan: HumanRewritePlan = { ...assessment, references: matched }
+      cache.set(segMetrics[index].text, plan)
+      plans.set(index, plan)
+    }
+  }
+
+  return plans
+}
+
+async function runDetectedRewriteLoop(
+  sender: WebContents,
+  runId: string,
+  session: AiSessionHandle,
+  input: string,
+  initialSegments: SegmentDetectDetail[],
+  initialDocScore: number,
+  isStrongMode: boolean,
+  modelOpts: WorkModelOptions | undefined,
+  labModel: LabModelOverride | undefined,
+  referenceExamples: HumanRewriteReference[]
+): Promise<string> {
+  let currentText = input
+  let currentSegments = initialSegments
+  let currentDocScore = initialDocScore
+  const referencePlanCache = new Map<string, HumanRewritePlan>()
+
+  for (let round = 1; round <= MAX_REWRITE_ROUNDS; round++) {
+    const targetCount = currentSegments.filter(segment => isZhuqueRewriteTarget(segment.aiScore)).length
+    if (targetCount === 0 || currentDocScore <= ZHUQUE_REWRITE_TARGET_SCORE) {
+      sender.send('lab:aigc-rewrite:progress', {
+        runId,
+        message: `闭环完成：剩余高风险段 ${targetCount}，复检评分 ${currentDocScore.toFixed(1)}`
+      })
+      break
+    }
+
+    sender.send('lab:aigc-rewrite:progress', {
+      runId,
+      message: `第 ${round}/${MAX_REWRITE_ROUNDS} 轮：为 ${targetCount} 个高风险段生成候选…`
+    })
+    const candidates: RewriteCandidateInput[] = []
+    for (const variant of ['precise', 'structural'] as RewriteVariant[]) {
+      const candidateText = await runSegmentBySegmentRewrite(
+        sender,
+        runId,
+        session,
+        currentSegments,
+        isStrongMode,
+        modelOpts,
+        variant,
+        referenceExamples,
+        referencePlanCache
+      )
+      candidates.push({ key: `第${round}轮·${rewriteVariantLabel(variant)}`, text: candidateText })
+    }
+
+    const selection = await evaluateRewriteCandidates({
+      runId,
+      originalText: currentText,
+      candidates,
+      baselineDocScore: currentDocScore,
+      labModel,
+      evaluateWithMetrics: true,
+      minimumChangeRatio: 0.01,
+      allowDialogueChanges: isStrongMode && Array.from(referencePlanCache.values()).some(
+        plan => plan.sceneTypes.includes('dialogue')
+      ),
+      onProgress: message => sender.send('lab:aigc-rewrite:progress', { runId, message })
+    })
+    const accepted = selection.evaluations.find(candidate =>
+      candidate.valid && isMeaningfulRewriteImprovement(currentDocScore, candidate.docScore)
+    )
+
+    if (!accepted) {
+      sender.send('lab:aigc-rewrite:progress', {
+        runId,
+        message: `第 ${round} 轮没有候选使评分至少下降1.5分，保留上一版`,
+        level: 'warn'
+      })
+      break
+    }
+
+    const acceptedSelection = { ...selection, selected: accepted }
+    sender.send('lab:aigc-rewrite:selection', buildRewriteSelectionView(runId, currentDocScore, acceptedSelection))
+    sender.send('lab:aigc-rewrite:progress', {
+      runId,
+      message: `第 ${round} 轮采用「${accepted.key}」：${currentDocScore.toFixed(1)} → ${accepted.docScore.toFixed(1)}`
+    })
+    currentText = accepted.text
+    currentDocScore = accepted.docScore
+
+    if (round < MAX_REWRITE_ROUNDS && currentDocScore > ZHUQUE_REWRITE_TARGET_SCORE) {
+      const nextMetrics = await getSegmentMetrics(currentText, undefined, labModel)
+      currentSegments = nextMetrics.segments
+      currentDocScore = nextMetrics.docScore
+    }
+  }
+
+  return currentText
 }
 
 /**
@@ -1409,10 +1402,12 @@ async function runSegmentBySegmentRewrite(
   session: AiSessionHandle,
   segMetrics: SegmentDetectDetail[],
   isStrongMode: boolean,
-  modelOpts?: WorkModelOptions
+  modelOpts: WorkModelOptions | undefined,
+  variant: RewriteVariant,
+  referenceExamples: HumanRewriteReference[],
+  referencePlanCache: Map<string, HumanRewritePlan>
 ): Promise<string> {
-  const AI_THRESHOLD = 45
-  const segmentsToRewrite = segMetrics.filter(s => s.aiScore >= AI_THRESHOLD)
+  const segmentsToRewrite = segMetrics.filter(s => isZhuqueRewriteTarget(s.aiScore))
   const totalSegs = segMetrics.length
   const rewriteCount = segmentsToRewrite.length
 
@@ -1423,13 +1418,13 @@ async function runSegmentBySegmentRewrite(
     return normalizeModelBodyOutput(segMetrics.map(s => s.text).join(''), 'lab_deai')
   }
 
-  appLogger.info('aigc-rewrite', `逐段改写: 总段落=${totalSegs}, 需改写=${rewriteCount}, 阈值=${AI_THRESHOLD}`)
+  appLogger.info('aigc-rewrite', `逐段改写: 方案=${variant}, 总段落=${totalSegs}, 需改写=${rewriteCount}`)
   sender.send('lab:aigc-rewrite:progress', {
-    runId, message: `开始逐段精准改写：${rewriteCount}/${totalSegs} 段需要改写`
+    runId, message: `${rewriteVariantLabel(variant)}：${rewriteCount}/${totalSegs} 段需要改写`
   })
 
   const resultSegments = segMetrics.map(s => s.text)
-  const batches = buildRewriteBatches(segMetrics, AI_THRESHOLD)
+  const batches = buildRewriteBatches(segMetrics)
 
   let completedBatches = 0
   for (const batch of batches) {
@@ -1438,7 +1433,17 @@ async function runSegmentBySegmentRewrite(
       runId, message: `正在改写第 ${completedBatches}/${batches.length} 批（${batch.targetIndices.length} 段）…`
     })
 
-    const rewritten = await rewriteBatch(segMetrics, batch, isStrongMode, session, modelOpts)
+    const rewritten = await rewriteBatch(
+      segMetrics,
+      batch,
+      isStrongMode,
+      session,
+      modelOpts,
+      variant,
+      referenceExamples,
+      referencePlanCache,
+      message => sender.send('lab:aigc-rewrite:progress', { runId, message })
+    )
 
     for (let i = 0; i < batch.targetIndices.length; i++) {
       const idx = batch.targetIndices[i]
@@ -1457,15 +1462,15 @@ async function runSegmentBySegmentRewrite(
   return finalText
 }
 
-function buildRewriteBatches(segMetrics: SegmentDetectDetail[], threshold: number): RewriteBatch[] {
+function buildRewriteBatches(segMetrics: SegmentDetectDetail[]): RewriteBatch[] {
   const batches: RewriteBatch[] = []
 
   let i = 0
   while (i < segMetrics.length) {
-    if (segMetrics[i].aiScore < threshold) { i++; continue }
+    if (!isZhuqueRewriteTarget(segMetrics[i].aiScore)) { i++; continue }
 
     const targets: number[] = []
-    while (i < segMetrics.length && segMetrics[i].aiScore >= threshold && targets.length < 5) {
+    while (i < segMetrics.length && isZhuqueRewriteTarget(segMetrics[i].aiScore) && targets.length < 5) {
       targets.push(i)
       i++
     }
@@ -1483,9 +1488,32 @@ async function rewriteBatch(
   batch: RewriteBatch,
   isStrongMode: boolean,
   session: AiSessionHandle,
-  modelOpts?: WorkModelOptions
+  modelOpts: WorkModelOptions | undefined,
+  variant: RewriteVariant,
+  referenceExamples: HumanRewriteReference[],
+  referencePlanCache: Map<string, HumanRewritePlan>,
+  onReferencePlan: (message: string) => void
 ): Promise<string[]> {
   const { targetIndices, contextStart, contextEnd } = batch
+
+  const referencePlans = isStrongMode
+    ? await resolveHumanRewritePlans(
+        targetIndices,
+        segMetrics,
+        referenceExamples,
+        referencePlanCache,
+        session,
+        modelOpts
+      )
+    : new Map<number, HumanRewritePlan>()
+
+  if (referencePlans.size > 0) {
+    const summary = targetIndices.map(index => {
+      const plan = referencePlans.get(index)!
+      return `目标${index + 1}=${plan.sceneTypes.join('/')}，案例：${plan.references.map(item => item.title).join('、')}`
+    }).join('；')
+    onReferencePlan(`案例匹配完成：${summary}`)
+  }
 
   const lines: string[] = []
   for (let idx = contextStart; idx <= contextEnd; idx++) {
@@ -1494,10 +1522,19 @@ async function rewriteBatch(
     const segText = seg.text.replace(/\n+$/, '').trim()
 
     if (isTarget) {
-      const hint = seg.ppl < 30 ? '（太可预测，需更不常规的表达）'
-        : seg.top5Rate > 0.6 ? '（用词太典型，需非常规搭配）'
-        : '（AI痕迹明显，需重构句式）'
-      lines.push(`【需改写】${hint}: ${segText}`)
+      const plan = referencePlans.get(idx)
+      if (plan) {
+        lines.push([
+          `【目标 ${idx} 的人工化改写依据】`,
+          `场景：${plan.sceneTypes.join(', ')}`,
+          `AI 痕迹：${plan.aiSymptoms.join(', ')}`,
+          `判断证据：${plan.reason}`,
+          formatHumanRewriteReferences(plan.references),
+          `【需改写｜id=${idx}｜${segmentRewriteHint(seg)}】\n${segText}`
+        ].join('\n'))
+      } else {
+        lines.push(`【需改写｜id=${idx}｜${segmentRewriteHint(seg)}】\n${segText}`)
+      }
     } else if (idx < targetIndices[0]) {
       lines.push(`【上文】: ${segText}`)
     } else {
@@ -1507,9 +1544,11 @@ async function rewriteBatch(
 
   let systemPrompt = SEGMENT_REWRITE_SYSTEM
   if (isStrongMode) {
-    systemPrompt += '\n9. 词汇偏口语化/方言化：用"瞅""搁""寻思"替代"看""放""思考"，用"压根""愣是"替代"完全""坚持"。'
+    systemPrompt += '\n9. 案例只用于学习人类作者如何取舍信息，不得复制案例原句；必须应用案例中的改写原则。'
   }
-
+  systemPrompt += variant === 'precise'
+    ? '\n10. 本候选采用精确修复：尽量少改，只删除或改写证据直接命中的句子。'
+    : '\n10. 本候选采用结构重组：允许重排命中段内部的信息顺序，但不得扩大到上下文段。'
   let content = ''
   const response = await modelService.chat(
     {
@@ -1536,91 +1575,47 @@ async function rewriteBatch(
   if (!response.success) throw new Error(response.error || '改写失败')
 
   const raw = response.content?.trim() || content.trim()
-  if (!raw) return targetIndices.map(idx => segMetrics[idx].text)
+  if (!raw) throw new Error('改写模型没有返回内容')
+  const json = extractJsonObject(raw)
+  if (!json) throw new Error('改写模型未返回有效 JSON')
+  const parsed = JSON.parse(json) as { items?: unknown[] }
+  if (!Array.isArray(parsed.items)) throw new Error('改写结果没有返回 items 数组')
 
-  const extracted = extractRewriteContent(raw)
-  const outputParts = extracted.split(/\n\s*\n/).filter(p => p.trim())
-
-  if (outputParts.length === targetIndices.length) {
-    return outputParts.map(p => p.trim())
+  const rewrittenById = new Map<number, string>()
+  const targetSet = new Set(targetIndices)
+  for (const rawItem of parsed.items) {
+    if (!rawItem || typeof rawItem !== 'object') continue
+    const item = rawItem as Record<string, unknown>
+    const id = Number(item.id)
+    const text = typeof item.text === 'string' ? item.text.trim() : ''
+    if (!Number.isInteger(id) || !targetSet.has(id) || !text || rewrittenById.has(id)) continue
+    rewrittenById.set(id, text)
+  }
+  if (rewrittenById.size !== targetIndices.length) {
+    throw new Error(`改写结果不完整：需要 ${targetIndices.length} 项，实际 ${rewrittenById.size} 项`)
   }
 
-  // 按行拆分作为备选
-  const outputLines = extracted.split('\n').filter(l => l.trim())
-  if (outputLines.length === targetIndices.length) {
-    return outputLines.map(l => l.trim())
-  }
-
-  // 行数不匹配：取前 N 个
-  if (outputLines.length > targetIndices.length) {
-    return outputLines.slice(0, targetIndices.length).map(l => l.trim())
-  }
-
-  const results: string[] = []
-  for (let i = 0; i < targetIndices.length; i++) {
-    results.push(outputLines[i]?.trim() || segMetrics[targetIndices[i]].text)
-  }
-  return results
-}
-
-// ─── 降级模式：整篇改写 ─────────────────────────────────────────────────────
-
-async function runWholeTextRewrite(
-  sender: WebContents,
-  runId: string,
-  session: AiSessionHandle,
-  input: string,
-  detectResult?: AigcDetectResult | null,
-  isStrongMode?: boolean,
-  modelOpts?: WorkModelOptions
-): Promise<string> {
-  const systemPrompt = isStrongMode
-    ? AIGC_REWRITE_INTENSIVE_SYSTEM_PROMPT + AIGC_REWRITE_STRONG_COLLOQUIAL_CONSTRAINT
-    : AIGC_REWRITE_INTENSIVE_SYSTEM_PROMPT
-
-  let fullContent = ''
-  const response = await modelService.chat(
-    {
-      prompt: buildAigcRewriteUserPrompt(input, detectResult, 'intensive'),
-      systemPrompt,
-      step: 'ai_trace_polish',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0.65,
-      modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
-      modelName: modelOpts?.modelName,
-      thinkingEnabled: modelOpts?.thinkingEnabled
-    },
-    {
-      sessionHandle: session,
-      keepSession: true,
-      stream: true,
-      onDelta: (delta) => { fullContent += delta },
-      onThinkingDelta: () => {}
+  return targetIndices.map(index => {
+    const original = segMetrics[index].text
+    const leading = original.match(/^\s*/)?.[0] ?? ''
+    const trailing = original.match(/\s*$/)?.[0] ?? ''
+    const rewritten = rewrittenById.get(index)!
+    const plan = referencePlans.get(index)
+    if (plan) {
+      const copied = findCopiedReferencePhrase(rewritten, plan.references)
+      if (copied) {
+        throw new Error(`改写结果复制了案例“${copied.referenceTitle}”中的连续原句，已拒绝采用`)
+      }
     }
-  )
-
-  if (response.cancelled) throw new Error('已取消')
-  if (!response.success) throw new Error(response.error || '一键改写失败')
-
-  const raw = response.content?.trim() || fullContent.trim()
-  if (!raw) throw new Error('模型未返回有效结果')
-
-  const normalized = normalizeModelBodyOutput(extractRewriteContent(raw), 'lab_deai')
-  if (!normalized.trim()) throw new Error('改写结果为空')
-
-  const minExpectedLength = Math.max(50, Math.floor(input.length * 0.3))
-  if (normalized.length < minExpectedLength) {
-    throw new Error('改写结果异常偏短，已拒绝覆盖原文')
-  }
-
-  return normalized
+    return `${leading}${rewritten}${trailing}`
+  })
 }
 
 export function cancelAigcDetect(runId: string): boolean {
-  const session = activeRuns.get(runId)
+  const session = activeRuns.get(runId) || activeRewriteRuns.get(runId)
   if (!session) return false
   aiSessionManager.cancel(session.id)
   activeRuns.delete(runId)
+  activeRewriteRuns.delete(runId)
   return true
 }

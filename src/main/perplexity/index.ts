@@ -7,3 +7,11 @@ export { isDegenerateApiLogprobs } from './api-perplexity'
 export type { PerplexityModelDef } from './constants'
 export { testApiConnection, computeViaApi, computeWholeViaApi } from './api-perplexity'
 export type { TokenMetric } from './api-perplexity'
+export {
+  ZHUQUE_REWRITE_RISK_THRESHOLD,
+  ZHUQUE_REWRITE_TARGET_SCORE,
+  ZHUQUE_REWRITE_MIN_IMPROVEMENT,
+  computeZhuqueRewriteRisk,
+  isZhuqueRewriteTarget,
+  isMeaningfulRewriteImprovement
+} from './zhuque-rewrite-risk'

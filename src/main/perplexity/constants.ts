@@ -14,9 +14,18 @@ export interface PerplexityModelDef {
 
 export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
   {
+    id: 'qwen3.5-4b-q4',
+    name: 'Qwen3.5 4B (推荐)',
+    description: '中文AIGC检测基座，中文小说实测与朱雀方向更一致',
+    filename: 'Qwen3.5-4B-Q4_K_M.gguf',
+    url: 'https://modelscope.cn/models/unsloth/Qwen3.5-4B-GGUF/resolve/master/Qwen3.5-4B-Q4_K_M.gguf',
+    sizeBytes: 2_740_937_888,
+    contextSize: 4096,
+  },
+  {
     id: 'qwen3.5-0.8b-q4',
-    name: 'Qwen3.5 0.8B (推荐)',
-    description: '2026最新，原生多模态架构，最轻量',
+    name: 'Qwen3.5 0.8B',
+    description: '轻量级实验模型',
     filename: 'Qwen3.5-0.8B-Q4_K_M.gguf',
     url: 'https://modelscope.cn/models/unsloth/Qwen3.5-0.8B-GGUF/resolve/master/Qwen3.5-0.8B-Q4_K_M.gguf',
     sizeBytes: 532_517_120,
@@ -50,24 +59,6 @@ export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
     contextSize: 4096,
   },
   {
-    id: 'qwen3.5-4b-q4',
-    name: 'Qwen3.5 4B',
-    description: '2026最新，最佳性价比，推荐升级',
-    filename: 'Qwen3.5-4B-Q4_K_M.gguf',
-    url: 'https://modelscope.cn/models/unsloth/Qwen3.5-4B-GGUF/resolve/master/Qwen3.5-4B-Q4_K_M.gguf',
-    sizeBytes: 2_740_937_888,
-    contextSize: 4096,
-  },
-  {
-    id: 'minicpm3-4b-q4',
-    name: 'MiniCPM3 4B',
-    description: '清华 OpenBMB，中文优化',
-    filename: 'minicpm3-4b-q4_k_m.gguf',
-    url: 'https://modelscope.cn/models/openbmb/MiniCPM3-4B-GGUF/resolve/master/minicpm3-4b-q4_k_m.gguf',
-    sizeBytes: 2_500_000_000,
-    contextSize: 2048,
-  },
-  {
     id: 'qwen3.5-9b-q4',
     name: 'Qwen3.5 9B',
     description: '最高精度，需要较多内存（约5.7GB）',
@@ -78,17 +69,12 @@ export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
   },
 ]
 
-export const DEFAULT_MODEL_ID = 'qwen3.5-0.8b-q4'
-
-// 兼容旧常量（供 calibrate 脚本使用）
-export const PERPLEXITY_MODEL_ID = DEFAULT_MODEL_ID
-const _defaultDef = PERPLEXITY_MODELS.find(m => m.id === DEFAULT_MODEL_ID)!
-export const PERPLEXITY_MODEL_FILENAME = _defaultDef.filename
-export const PERPLEXITY_MODEL_URL = _defaultDef.url
-export const PERPLEXITY_MODEL_SIZE_BYTES = _defaultDef.sizeBytes
+export const DEFAULT_MODEL_ID = 'qwen3.5-4b-q4'
 
 export function getModelDef(modelId: string): PerplexityModelDef {
-  return PERPLEXITY_MODELS.find(m => m.id === modelId) || PERPLEXITY_MODELS[0]
+  const definition = PERPLEXITY_MODELS.find(model => model.id === modelId)
+  if (!definition) throw new Error(`未知的困惑度检测模型：${modelId}`)
+  return definition
 }
 
 export function getModelDir(userDataPath: string, modelId?: string): string {

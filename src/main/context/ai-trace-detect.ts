@@ -392,17 +392,6 @@ export function detectAiTraces(content: string): AiTraceReport {
     })
   }
 
-  const paragraphPeriodResult = detectMultiplePeriodsPerParagraph(text)
-  if (paragraphPeriodResult.count >= 1) {
-    issues.push({
-      type: 'multiple_periods_per_paragraph',
-      label: `单段多句号（${paragraphPeriodResult.count}段）— 每段最多 1 个句号`,
-      severity: 'warning',
-      count: paragraphPeriodResult.count,
-      examples: paragraphPeriodResult.examples
-    })
-  }
-
   const sandwichDialogue = detectDialogueActionSandwich(text)
   if (sandwichDialogue.count >= 1) {
     issues.push({
@@ -583,7 +572,7 @@ export const AI_TRACE_POLISH_PROMPT = [
   '4. 修复平行否定结构：“没X，也没Y”“不X，也不Y”，改为不对称表达或只保留一个否定。',
   '5. 修复动词回声：相邻句中同一动词重复（“盯着…盯了”），换用近义词或省略重复。',
   '6. 修复形容词回环递进：“X很Y，Y得连Z都W”“我语气很平，”等假装冷静的标签句，直接删除，不要换成同类模板。',
-  '7. 修复单段多句号：每段最多保留 1 个“。”，多余句号改逗号、分号或拆成新段。',
+  '7. 修复机械断句：只合并本应连续且共享施事者的碎片动作，不设置每段句号数量。',
   '8. 修复“不是A，而是B”“不是A，是B”“这不是A，这是B”：删除该句式，改成直接叙述或动作呈现。',
   '9. 修复动作插入对话中间：把动作移到对话前后独立成段，完整台词单独成段。',
   '',
