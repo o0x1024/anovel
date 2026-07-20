@@ -9,7 +9,7 @@ import type {
 } from '../../../shared/aigc-detect-types'
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
 import { appLogger } from '../../logger/app-logger'
-import { aigcWordtableDAO, humanRewriteReferenceDAO } from '../../db'
+import { aigcWordtableDAO, appPreferenceDAO, humanRewriteReferenceDAO } from '../../db'
 import {
   runPerplexityDetect,
   getSegmentMetrics,
@@ -21,7 +21,13 @@ import {
 } from '../../perplexity'
 import { applyWordTable } from './aigc-wordtable-engine'
 import { BUILTIN_ANTI_AI_VOCAB } from './builtin-anti-ai-vocab'
-import { evaluateRewriteCandidates, type RewriteCandidateInput } from './aigc-rewrite-quality'
+import {
+  computeChangeRatio,
+  computeDialogueRetention,
+  computeNumberAnchorRetention,
+  evaluateRewriteCandidates,
+  type RewriteCandidateInput
+} from './aigc-rewrite-quality'
 import type { WorkModelOptions } from '../../../shared/work-model-options'
 import { ZHUQUE_MIN_TEXT_LENGTH } from '../../perplexity/zhuque-alignment'
 import {
@@ -39,11 +45,18 @@ import {
 import type { AigcSentenceRewriteResult } from '../../../shared/aigc-sentence-rewrite-types'
 import { runBlockRewrite } from './aigc-block-rewrite'
 import { requiresFullDocumentSceneRewrite } from './aigc-scene-rewrite-quality'
+import {
+  evaluateAigcRewriteVerification,
+  markAiAssistedRewrite,
+  runBoundedRewriteAttempts
+} from '../../../shared/aigc-rewrite-verification'
 import { runSupervisedAigcDetect } from '../../supervised-aigc'
 import { fuseAigcDetection } from './aigc-detect-fusion'
 
 const activeRuns = new Map<string, AiSessionHandle>()
 const activeRewriteRuns = new Map<string, AiSessionHandle>()
+const MAX_LOCAL_REWRITE_ATTEMPTS = 3
+const MAX_SENTENCE_REWRITE_ATTEMPTS = 4
 
 interface CachedSegmentMetrics {
   textHash: number
@@ -1054,17 +1067,7 @@ export async function runAigcDetect(
       },
       labModel
     )
-    const supervisedResult = await runSupervisedAigcDetect(
-      text,
-      statisticalResult.segments,
-      message => reportProgress(message),
-      progress => {
-        sender.send('supervised-aigc:download-progress', progress)
-        if (progress.phase === 'downloading' || progress.phase === 'checking') {
-          reportProgress(progress.message)
-        }
-      }
-    )
+    const supervisedResult = await runSupervisedAigcDetect(text, statisticalResult.segments, message => reportProgress(message))
     const result = fuseAigcDetection(statisticalResult, supervisedResult)
 
     const { human, suspected_ai, ai } = result.distribution
@@ -1092,7 +1095,188 @@ export async function runAigcDetect(
   }
 }
 
-/** 基于冻结检测证据生成场景块补丁；改写后由用户手动触发一次全文复检。 */
+function mergeFusedDetectionRisk(
+  metrics: SegmentDetectDetail[],
+  detectResult: AigcDetectResult
+): SegmentDetectDetail[] {
+  if (metrics.length !== detectResult.segments.length) return metrics
+  return metrics.map((metric, index) => {
+    const fused = detectResult.segments[index]
+    const fallbackRisk = fused.category === 'ai' ? 82 : fused.category === 'suspected_ai' ? 52 : 20
+    return {
+      ...metric,
+      aiScore: Math.max(metric.aiScore, fused.riskScore ?? fallbackRisk),
+      reason: fused.reason || metric.reason
+    }
+  })
+}
+
+async function runLocalRewriteVerification(
+  sender: WebContents,
+  runId: string,
+  text: string,
+  labModel: LabModelOverride | undefined
+): Promise<AigcDetectResult> {
+  const report = (message: string) => sender.send('lab:aigc-rewrite:progress', { runId, message })
+  const statisticalResult = await runPerplexityDetect(
+    text,
+    report,
+    progress => {
+      sender.send('perplexity:download-progress', progress)
+      if (progress.phase === 'downloading' || progress.phase === 'checking') report(progress.message)
+    },
+    labModel
+  )
+  const supervisedResult = await runSupervisedAigcDetect(text, statisticalResult.segments, report)
+  return fuseAigcDetection(statisticalResult, supervisedResult)
+}
+
+function preserveSentenceWhitespace(original: string, rewritten: string): string {
+  const leading = original.match(/^\s*/)?.[0] ?? ''
+  const trailing = original.match(/\s*$/)?.[0] ?? ''
+  return `${leading}${rewritten.trim()}${trailing}`
+}
+
+function extractSentenceRewriteTexts(content: string): string[] {
+  const json = extractJsonObject(content)
+  if (!json) return []
+  try {
+    const parsed = JSON.parse(json) as { text?: unknown; candidates?: unknown[] }
+    const values = Array.isArray(parsed.candidates)
+      ? parsed.candidates.flatMap(item => {
+          if (!item || typeof item !== 'object') return []
+          const text = (item as { text?: unknown }).text
+          return typeof text === 'string' && text.trim() ? [text.trim()] : []
+        })
+      : typeof parsed.text === 'string' && parsed.text.trim() ? [parsed.text.trim()] : []
+    return Array.from(new Set(values)).slice(0, 2)
+  } catch {
+    return []
+  }
+}
+
+export async function runAigcSentenceRewrite(
+  sender: WebContents,
+  runId: string,
+  text: string,
+  detectResult: AigcDetectResult,
+  segmentIndex: number,
+  modelOpts?: WorkModelOptions
+): Promise<{ text: string; result: AigcDetectResult; segmentIndex: number; applied: boolean; reason?: string }> {
+  const originalText = detectResult.segments.map(segment => segment.text).join('')
+  if (originalText.trim() !== text.trim()) throw new Error('当前文本与检测结果不一致，请先重新检测')
+  const target = detectResult.segments[segmentIndex]
+  if (!target) throw new Error('目标句不存在，请重新检测后再试')
+  if (target.category === 'human') throw new Error('人工特征句无需句级改写')
+
+  const session = aiSessionManager.create(sender, 'AI 实验室 · 句级人工化改写')
+  activeRewriteRuns.set(runId, session)
+  const labModel: LabModelOverride | undefined = modelOpts?.modelType
+    ? { modelType: modelOpts.modelType, modelName: modelOpts.modelName }
+    : undefined
+  const targetStart = detectResult.segments.slice(0, segmentIndex).reduce((sum, segment) => sum + segment.text.length, 0)
+  const targetEnd = targetStart + target.text.length
+  let lastReason = '没有生成可用候选'
+
+  try {
+    for (let attempt = 1; attempt <= MAX_SENTENCE_REWRITE_ATTEMPTS; attempt++) {
+      sender.send('lab:aigc-rewrite:progress', {
+        runId,
+        message: `句级改写第 ${attempt}/${MAX_SENTENCE_REWRITE_ATTEMPTS} 轮：生成候选…`
+      })
+      const minLength = Math.ceil(target.text.length * 0.7)
+      const maxLength = Math.floor(target.text.length * 1.35)
+      const response = await modelService.chat({
+        prompt: [
+          `【原句】\n${target.text}`,
+          `【当前检测依据】\n${target.reason || '句级统计与中文监督模型判为高风险'}`,
+          '【改写要求】\n保持事实、人物、数字、因果和引号内对白不变。改变信息起点、句法骨架和叙述落点；避免整齐排比、对称对照、书面连接词、总结升华、比喻收束、设问与感叹。不要只做同义词替换。',
+          `每个候选必须在${minLength}-${maxLength}个字符之间。`,
+          '生成两个结构明显不同的候选。只返回 JSON：{"candidates":[{"text":"候选一"},{"text":"候选二"}]}。不得输出原句、解释或 Markdown。',
+          lastReason === '没有生成可用候选' ? '' : `【上一轮未通过】\n${lastReason}`
+        ].filter(Boolean).join('\n\n'),
+        systemPrompt: '你是专业中文小说编辑。严格只返回合法 JSON；每个 text 只能包含一个改写后的目标句，不得夹带原句、分析或其他版本。',
+        step: 'lab_aigc_rewrite',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0.8,
+        maxTokens: Math.max(300, target.text.length * 3),
+        modelType: modelOpts?.modelType as import('../../model/types').ModelType | undefined,
+        modelName: modelOpts?.modelName,
+        thinkingEnabled: modelOpts?.thinkingEnabled
+      }, { sessionHandle: session, keepSession: true, stream: false })
+      if (response.cancelled) throw new Error('已取消')
+      if (!response.success || !response.content?.trim()) {
+        lastReason = response.error || '模型未返回改写内容'
+        continue
+      }
+
+      const extractedCandidates = extractSentenceRewriteTexts(response.content)
+      if (extractedCandidates.length === 0) {
+        lastReason = '模型未按多候选 JSON 契约返回'
+        continue
+      }
+      const candidateFailures: string[] = []
+      for (let candidateIndex = 0; candidateIndex < extractedCandidates.length; candidateIndex++) {
+        const candidate = preserveSentenceWhitespace(
+          target.text,
+          normalizeModelBodyOutput(extractedCandidates[candidateIndex], 'lab_deai')
+        )
+        const changeRatio = computeChangeRatio(target.text, candidate)
+        const lengthRatio = candidate.length / Math.max(1, target.text.length)
+        if (changeRatio < 0.15) {
+          candidateFailures.push(`候选${candidateIndex + 1}改写幅度不足（${Math.round(changeRatio * 100)}%）`)
+          continue
+        }
+        if (lengthRatio < 0.7 || lengthRatio > 1.35) {
+          candidateFailures.push(`候选${candidateIndex + 1}长度比例不合规（${lengthRatio.toFixed(2)}）`)
+          continue
+        }
+        if (computeNumberAnchorRetention(target.text, candidate) < 1) {
+          candidateFailures.push(`候选${candidateIndex + 1}数字事实未完整保留`)
+          continue
+        }
+        if (computeDialogueRetention(target.text, candidate) < 1) {
+          candidateFailures.push(`候选${candidateIndex + 1}引号内对白未逐字保留`)
+          continue
+        }
+
+        const rewrittenText = `${text.slice(0, targetStart)}${candidate}${text.slice(targetEnd)}`
+        sender.send('lab:aigc-rewrite:progress', {
+          runId,
+          message: `句级改写第 ${attempt}/${MAX_SENTENCE_REWRITE_ATTEMPTS} 轮：复检候选 ${candidateIndex + 1}/${extractedCandidates.length}…`
+        })
+        const verification = await runLocalRewriteVerification(sender, runId, rewrittenText, labModel)
+        const gate = evaluateAigcRewriteVerification(verification)
+        if (gate.passed) {
+          const verifiedDetection = markAiAssistedRewrite(verification, 'sentence')
+          session.complete(true)
+          sender.send('lab:aigc-rewrite:progress', {
+            runId,
+            message: '句级改写通过生成质量与本地风险门禁；结果已标记为AI辅助改写'
+          })
+          return { text: rewrittenText, result: verifiedDetection, segmentIndex, applied: true }
+        }
+        const { human, suspected_ai, ai } = verification.distribution
+        candidateFailures.push(
+          `候选${candidateIndex + 1}本地复检为人工特征${human}%、疑似AI${suspected_ai}%、AI${ai}%（${gate.reasons.join('；')}）`
+        )
+      }
+      lastReason = candidateFailures.join('；') || '没有候选通过本地融合检测'
+    }
+    const reason = `句级改写未通过生成质量与本地风险门禁：${lastReason}`
+    sender.send('lab:aigc-rewrite:progress', { runId, message: reason, level: 'warn' })
+    session.complete(false, reason)
+    return { text, result: detectResult, segmentIndex, applied: false, reason }
+  } catch (error) {
+    session.complete(false, error instanceof Error ? error.message : '句级改写失败')
+    throw error
+  } finally {
+    activeRewriteRuns.delete(runId)
+  }
+}
+
+/** 基于冻结检测证据生成场景块补丁，以生成质量与本地风险双门禁作为自动应用条件。 */
 export async function runAigcRewrite(
   sender: WebContents,
   runId: string,
@@ -1113,14 +1297,61 @@ export async function runAigcRewrite(
     prev.complete(false, '已取消')
   }
 
-  const session = aiSessionManager.create(sender, 'AI 实验室 · 一键去AI味')
+  const session = aiSessionManager.create(sender, 'AI 实验室 · 一键去AI味', [
+    '准备检测证据',
+    '生成改写候选',
+    '本地融合复检'
+  ])
   activeRewriteRuns.set(runId, session)
+  session.setStepRunning(0)
+
+  // 预检测阶段尚未发起 LLM 请求；此处先展示用户选择或全局默认，实际调用时会由 modelService
+  // 以最终解析到的模型覆盖，避免浮窗在等待检测证据时长期只显示“准备中”。
+  const globalModel = appPreferenceDAO.getGlobalLlmDefault()
+  const initialModelType = modelOpts?.modelType ?? globalModel.provider
+  const initialModelName = modelOpts?.modelName ?? globalModel.modelName ?? undefined
+  if (initialModelType) session.setModelInfo(initialModelType, initialModelName)
+  const reportProgress = (message: string, level?: 'info' | 'warn') => {
+    session.emitPhase(message)
+    sender.send('lab:aigc-rewrite:progress', { runId, message, level })
+  }
+  reportProgress('正在准备改写任务与检测证据…')
 
   try {
     const isStrongMode = seedOpts?.mode === 'strong'
     const referenceExamples = isStrongMode ? humanRewriteReferenceDAO.listEnabled() : []
     if (isStrongMode && referenceExamples.length === 0) {
       throw new Error('案例增强模式需要至少一条已启用的人工化改写案例')
+    }
+    const initialGate = evaluateAigcRewriteVerification(detectResult)
+    if (initialGate.passed) {
+      const result: AigcSentenceRewriteResult = {
+        originalText: input,
+        finalText: input,
+        patches: [],
+        goal: {
+          status: 'achieved',
+          humanPercent: detectResult.distribution.human,
+          suspectedAiPercent: detectResult.distribution.suspected_ai,
+          aiPercent: detectResult.distribution.ai,
+          iterations: 0,
+          remainingSentenceIds: [],
+          targetCoveragePercent: 0,
+          passedCoveragePercent: 100,
+          fullDocumentRewrite: false,
+          localVerification: {
+            attempts: 0,
+            distribution: detectResult.distribution,
+            passed: true,
+            reasons: []
+          }
+        },
+        verifiedDetection: detectResult
+      }
+      session.setStepDone(0)
+      reportProgress('当前文本已经通过本地风险门禁，无需AI改写')
+      session.complete(true)
+      return result
     }
     const rewriteLabModel: LabModelOverride | undefined = modelOpts?.modelType
       ? { modelType: modelOpts.modelType, modelName: modelOpts.modelName }
@@ -1138,12 +1369,12 @@ export async function runAigcRewrite(
       detectionAvailable = true
       const aiCount = segMetrics.filter(s => isZhuqueRewriteTarget(s.aiScore)).length
       appLogger.info('aigc-rewrite', `复用检测缓存: ${segMetrics.length}段, AI段落=${aiCount}, docScore=${cached.docScore.toFixed(1)}`)
-      sender.send('lab:aigc-rewrite:progress', { runId, message: `复用检测结果：${aiCount}/${segMetrics.length} 段有AI特征` })
+      reportProgress(`复用检测结果：${aiCount}/${segMetrics.length} 段有AI特征`)
     } else {
-      sender.send('lab:aigc-rewrite:progress', { runId, message: '正在分析文本AI特征分布…' })
+      reportProgress('正在分析文本AI特征分布…')
       try {
         const metrics = await getSegmentMetrics(input, (msg) => {
-          sender.send('lab:aigc-rewrite:progress', { runId, message: msg })
+          reportProgress(msg)
         }, rewriteLabModel)
         segMetrics = metrics.segments
         baselineDocScore = metrics.docScore
@@ -1151,7 +1382,7 @@ export async function runAigcRewrite(
         cacheSegmentMetrics(input, segMetrics, metrics.docScore)
         const aiCount = segMetrics.filter(s => isZhuqueRewriteTarget(s.aiScore)).length
         appLogger.info('aigc-rewrite', `困惑度预检测: ${segMetrics.length}段, AI段落=${aiCount}, docScore=${metrics.docScore.toFixed(1)}`)
-        sender.send('lab:aigc-rewrite:progress', { runId, message: `检测完成：${aiCount}/${segMetrics.length} 段有AI特征` })
+        reportProgress(`检测完成：${aiCount}/${segMetrics.length} 段有AI特征`)
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
         appLogger.warn('aigc-rewrite', `闭环检测失败: ${reason}`)
@@ -1163,21 +1394,101 @@ export async function runAigcRewrite(
     if (!detectionAvailable || !segMetrics || segMetrics.length === 0 || baselineDocScore === undefined) {
       throw new Error('自动去AI味没有取得有效的段落检测证据')
     }
-    const result = await runBlockRewrite({
-      sender,
-      runId,
-      session,
-      input,
-      segments: segMetrics,
-      initialDistribution: detectResult.distribution,
-      fullDocumentRewrite: requiresFullDocumentSceneRewrite(detectResult.distribution),
-      strongMode: isStrongMode,
-      references: referenceExamples,
-      modelOpts
+    segMetrics = mergeFusedDetectionRisk(segMetrics, detectResult)
+    const loop = await runBoundedRewriteAttempts(MAX_LOCAL_REWRITE_ATTEMPTS, async attempt => {
+      session.setStepDone(0)
+      session.setStepRunning(1)
+      reportProgress(`第 ${attempt}/${MAX_LOCAL_REWRITE_ATTEMPTS} 轮：生成改写候选…`)
+      const candidate = await runBlockRewrite({
+        sender,
+        runId,
+        session,
+        input,
+        segments: segMetrics,
+        initialDistribution: detectResult.distribution,
+        fullDocumentRewrite: requiresFullDocumentSceneRewrite(detectResult.distribution),
+        strongMode: isStrongMode,
+        references: referenceExamples,
+        modelOpts,
+        onProgress: reportProgress
+      })
+
+      if (candidate.goal.status !== 'awaiting_recheck') {
+        const value: AigcSentenceRewriteResult = {
+          ...candidate,
+          goal: {
+            ...candidate.goal,
+            status: 'not_achieved',
+            localVerification: {
+              attempts: attempt,
+              distribution: detectResult.distribution,
+              passed: false,
+              reasons: ['没有足够候选通过生成质量与覆盖门禁']
+            }
+          }
+        }
+        return { accepted: false, value }
+      }
+
+      session.setStepDone(1)
+      session.setStepRunning(2)
+      reportProgress(`第 ${attempt}/${MAX_LOCAL_REWRITE_ATTEMPTS} 轮：正在对全文执行本地融合检测复检…`)
+      const verification = await runLocalRewriteVerification(sender, runId, candidate.finalText, rewriteLabModel)
+      const gate = evaluateAigcRewriteVerification(verification)
+      if (gate.passed) {
+        const verifiedDetection = markAiAssistedRewrite(verification, 'full_document')
+        const result: AigcSentenceRewriteResult = {
+          ...candidate,
+          goal: {
+            ...candidate.goal,
+            status: 'achieved',
+            humanPercent: verification.distribution.human,
+            suspectedAiPercent: verification.distribution.suspected_ai,
+            aiPercent: verification.distribution.ai,
+            iterations: attempt,
+            localVerification: {
+              attempts: attempt,
+              distribution: verification.distribution,
+              passed: true,
+              reasons: []
+            }
+          },
+          verifiedDetection
+        }
+        session.setStepDone(2)
+        reportProgress(`生成质量与本地风险门禁通过：人工特征 ${verification.distribution.human}% · 疑似AI ${verification.distribution.suspected_ai}% · AI ${verification.distribution.ai}%；已标记为AI辅助改写`)
+        return { accepted: true, value: result }
+      }
+
+      const value: AigcSentenceRewriteResult = {
+        ...candidate,
+        goal: {
+          ...candidate.goal,
+          status: 'not_achieved',
+          humanPercent: verification.distribution.human,
+          suspectedAiPercent: verification.distribution.suspected_ai,
+          aiPercent: verification.distribution.ai,
+          iterations: attempt,
+          localVerification: {
+            attempts: attempt,
+            distribution: verification.distribution,
+            passed: false,
+            reasons: gate.reasons
+          }
+        }
+      }
+      reportProgress(`第 ${attempt} 轮未通过本地风险门禁：${gate.reasons.join('；')}，继续生成候选`, 'warn')
+      session.setStepDone(2)
+      return { accepted: false, value }
     })
 
-    session.complete(true)
-    return result
+    if (loop.accepted) {
+      session.complete(true)
+      return loop.value
+    }
+    reportProgress(`已完成 ${loop.attempts} 轮，仍未同时通过生成质量与本地风险门禁；未应用任何改写`, 'warn')
+    session.complete(false, '改写未通过双重门禁')
+    return loop.value
   } catch (error) {
     const message = error instanceof Error ? error.message : '一键改写失败'
     session.complete(false, message)
@@ -1266,7 +1577,7 @@ async function resolveHumanRewritePlans(
       {
         prompt: JSON.stringify({ items: promptItems }, null, 2),
         systemPrompt: HUMAN_REWRITE_CLASSIFY_SYSTEM,
-        step: 'ai_trace_polish',
+        step: 'lab_aigc_rewrite',
         enrichWorkContext: false,
         enrichNarrativeMemory: false,
         temperature: 0.1,
@@ -1554,7 +1865,7 @@ async function rewriteBatch(
     {
       prompt: lines.join('\n'),
       systemPrompt,
-      step: 'ai_trace_polish',
+      step: 'lab_aigc_rewrite',
       enrichWorkContext: false,
       enrichNarrativeMemory: false,
       temperature: 0.65,

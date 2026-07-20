@@ -194,6 +194,29 @@ function outlineCharCount(outline: string | null | undefined): number {
   return (outline ?? '').replace(/\s/g, '').length
 }
 
+function formatOutlineForDisplay(outline: string | null | undefined): string {
+  const text = outline?.trim()
+  if (!text) return ''
+  const sectionLabels = [
+    '开场状态',
+    '必须覆盖',
+    '禁止越界',
+    '结尾落点',
+    '连续性约束',
+    '能力/状态约束',
+    '情节节点',
+    '章末钩子',
+    '戏剧契约'
+  ]
+  let formatted = text
+  for (const label of sectionLabels) {
+    formatted = formatted
+      .replaceAll(`${label}：`, `【${label}】`)
+      .replaceAll(`${label}:`, `【${label}】`)
+  }
+  return formatted.replace(/\s*(【[^】\r\n]+】)\s*/g, '\n$1\n').trim()
+}
+
 function outlineLengthLabel(ch: Chapter): string {
   const n = outlineCharCount(ch.outline)
   if (!n) return ''
@@ -246,8 +269,35 @@ function preserveNumericConstraints(currentOutline: string | null | undefined, r
 }
 
 function parseCharacterNames(raw: string | null | undefined): string[] {
-  if (!raw?.trim()) return []
-  return raw.split(/[,，、]/).map(s => s.trim()).filter(Boolean)
+  const text = raw?.trim()
+  if (!text) return []
+
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text) as unknown
+      if (Array.isArray(parsed)) {
+        return [...new Set(
+          parsed
+            .filter((item): item is string => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(Boolean)
+        )]
+      }
+    } catch {
+      // 继续兼容历史数据中的逗号分隔字符串或不完整 JSON。
+    }
+  }
+
+  return [...new Set(
+    text
+      .split(/[,，、]/)
+      .map(item => item.trim().replace(/^[\[\s"']+|[\]\s"']+$/g, ''))
+      .filter(Boolean)
+  )]
+}
+
+function formatCharacterNamesInput(raw: string | null | undefined): string {
+  return parseCharacterNames(raw).join(', ')
 }
 
 function beatRoleLabel(role: string | null | undefined): string {
@@ -404,6 +454,10 @@ const selectedChapter = computed(() =>
   chapters.value.find(c => c.id === selectedChapterId.value) ?? null
 )
 
+const selectedChapterOutlineDisplay = computed(() =>
+  formatOutlineForDisplay(selectedChapter.value?.outline)
+)
+
 const selectedChapterCharacters = computed(() =>
   parseCharacterNames(selectedChapter.value?.characters)
 )
@@ -480,7 +534,7 @@ function editChapter(ch: Chapter) {
   chapterForeshadow.value = ch.foreshadow_target || ''
   chapterNextHook.value = ch.next_hook || ''
   chapterPovMode.value = ch.pov_mode || ''
-  chapterCharacters.value = ch.characters || ''
+  chapterCharacters.value = formatCharacterNamesInput(ch.characters)
   void loadChapterVersions(ch.id)
 }
 
@@ -1649,7 +1703,7 @@ async function clearDiagnosisResult() {
                 v-if="selectedChapter.outline"
                 class="text-sm text-base-content/70 whitespace-pre-wrap leading-relaxed"
               >
-                {{ selectedChapter.outline }}
+                {{ selectedChapterOutlineDisplay }}
               </p>
               <p v-else class="text-sm text-base-content/40 italic">{{ workType === 'story' ? '暂无大纲，可点击「AI 生成大纲」或「编辑」' : '暂无章节大纲，可点击「AI 生成章节大纲」或「编辑」' }}</p>
             </div>

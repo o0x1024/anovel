@@ -3,7 +3,7 @@ import { appLogger } from '../../logger/app-logger'
 import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
 import { extractJsonText } from '../parse-json-extract'
 
-export interface StructuredModelOutputOptions<T extends Record<string, unknown>> {
+export interface StructuredModelOutputOptions<T> {
   workId: number
   label: string
   attempts?: number
@@ -19,7 +19,7 @@ export interface StructuredModelOutputOptions<T extends Record<string, unknown>>
  * 结构化模型调用的统一故障边界：格式/截断只在当前业务轮次内重试，
  * 不把一次弱模型漂移直接升级为整个目标循环失败。
  */
-export async function requestStructuredModelOutput<T extends Record<string, unknown>>(
+export async function requestStructuredModelOutput<T>(
   options: StructuredModelOutputOptions<T>
 ): Promise<T> {
   const attempts = Math.max(1, options.attempts ?? 2)

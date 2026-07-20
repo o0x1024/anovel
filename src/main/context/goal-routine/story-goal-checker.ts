@@ -142,6 +142,7 @@ export interface GoalCheckResult {
   storyIssues: string[]
   storyHardBlockers: string[]
   forensicIssues: StoryForensicIssue[]
+  harnessIssues: StoryHarnessIssue[]
   systemicIssues: NovelSystemIssue[]
   previewReport: string | null
   chapterDiagnostics: GoalChapterDiagnostic[]
@@ -248,11 +249,24 @@ export async function checkStoryGoal(
 
   // ---- 1.5 确定性完整性与设定矛盾：先于所有模型评分执行 ----
   if (isStory) {
+    const storyPovModes = chapters.map(chapter => chapter.pov_mode?.trim() ?? '')
+    if (storyPovModes.some(mode => !mode)) {
+      reasons.push('全篇叙事视角合同未冻结：存在缺少 pov_mode 的节拍')
+    } else if (new Set(storyPovModes).size > 1) {
+      reasons.push(`全篇叙事视角漂移：${[...new Set(storyPovModes)].join('、')}`)
+    }
     chapters.forEach((chapter, index) => {
       if (!chapter.content?.trim()) return
+      let povCharacter = ''
+      try {
+        const names = JSON.parse(chapter.characters ?? '[]') as unknown
+        if (Array.isArray(names)) povCharacter = String(names[0] ?? '').trim()
+      } catch { /* 非 JSON 角色字段交给其他门禁处理 */ }
       harnessIssues.push(...detectStoryTextIntegrityIssues(chapter.content, {
         chapterId: chapter.id,
-        finalBeat: index === chapters.length - 1
+        finalBeat: index === chapters.length - 1,
+        povMode: chapter.pov_mode,
+        povCharacter
       }))
     })
     const settings = coreSettingDAO.listByWork(workId)
@@ -473,7 +487,7 @@ export async function checkStoryGoal(
   if (chapterPlanComplete && isStory && content > 0 && content === total
     && (config.goalMatchMin > 0 || config.overallStoryMin > 0 || config.previewHookMin > 0 || config.proseReadMin > 0)) {
     try {
-      const assessment = await assessWholeStory(workId, config, signal)
+      const assessment = await assessWholeStory(workId, config, signal, onProgress)
       goalMatchScore = assessment.goalMatchScore
       goalMatchReason = assessment.goalMatchReason
       overallStoryScore = assessment.overallStoryScore
@@ -621,6 +635,7 @@ export async function checkStoryGoal(
     storyIssues,
     storyHardBlockers,
     forensicIssues,
+    harnessIssues,
     systemicIssues,
     previewReport,
     chapterDiagnostics,

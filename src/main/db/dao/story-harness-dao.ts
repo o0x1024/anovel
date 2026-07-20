@@ -42,6 +42,8 @@ export interface StoryIssueLedgerRow {
   expected_result: string | null
   message: string
   attempts: number
+  clean_confirmations: number
+  last_checked_hash: string | null
   status: 'open' | 'resolved' | 'stalled'
   first_seen_time: string
   last_seen_time: string
@@ -54,6 +56,14 @@ export interface StoryReleaseSnapshotRow {
   label: string
   content_hash: string
   is_frozen: number
+  create_time: string
+}
+
+export interface StoryLeadVersionRow {
+  id: number
+  work_id: number
+  description: string
+  source_step: string
   create_time: string
 }
 
@@ -250,21 +260,60 @@ export class StoryHarnessDAO extends BaseDAO {
   syncIssues(workId: number, current: StoryHarnessIssue[]): void {
     this.transaction(() => {
       const keys = new Set(current.map(storyHarnessIssueKey))
-      const openRows = this.all<{ id: number; issue_key: string }>(
-        "SELECT id, issue_key FROM story_issue_ledger WHERE work_id = ? AND status IN ('open', 'stalled')",
+      const openRows = this.all<{
+        id: number
+        issue_key: string
+        chapter_ids_json: string | null
+        evidence_json: string | null
+        message: string
+        expected_result: string | null
+        clean_confirmations: number
+        last_checked_hash: string | null
+      }>(
+        `SELECT id, issue_key, chapter_ids_json, evidence_json, message, expected_result,
+                clean_confirmations, last_checked_hash
+         FROM story_issue_ledger
+         WHERE work_id = ? AND status IN ('open', 'stalled')`,
         [workId]
       )
       for (const row of openRows) {
         if (!keys.has(row.issue_key)) {
-          this.run(
-            "UPDATE story_issue_ledger SET status = 'resolved', resolved_time = datetime('now'), last_seen_time = datetime('now') WHERE id = ?",
-            [row.id]
-          )
+          const scopeHash = this.issueScopeContentHash(workId, {
+            chapterIdsJson: row.chapter_ids_json,
+            evidenceJson: row.evidence_json,
+            message: row.message,
+            expectedResult: row.expected_result
+          })
+          const confirmations = row.last_checked_hash === scopeHash
+            ? row.clean_confirmations + 1
+            : 1
+          if (confirmations >= 2) {
+            this.run(
+              `UPDATE story_issue_ledger
+               SET status = 'resolved', resolved_time = datetime('now'),
+                   clean_confirmations = ?, last_checked_hash = ?, last_seen_time = datetime('now')
+               WHERE id = ?`,
+              [confirmations, scopeHash, row.id]
+            )
+          } else {
+            this.run(
+              `UPDATE story_issue_ledger
+               SET clean_confirmations = ?, last_checked_hash = ?, last_seen_time = datetime('now')
+               WHERE id = ?`,
+              [confirmations, scopeHash, row.id]
+            )
+          }
         }
       }
 
       for (const value of current) {
         const key = storyHarnessIssueKey(value)
+        const scopeHash = this.issueScopeContentHash(workId, {
+          chapterIds: value.chapterIds,
+          evidence: value.evidence,
+          message: value.message,
+          expectedResult: value.expectedResult
+        })
         this.run(
           `INSERT INTO story_issue_ledger (
             work_id, issue_key, code, severity, scope, chapter_ids_json,
@@ -280,6 +329,8 @@ export class StoryHarnessDAO extends BaseDAO {
             expected_result = excluded.expected_result,
             message = excluded.message,
             status = CASE WHEN story_issue_ledger.status = 'stalled' THEN 'stalled' ELSE 'open' END,
+            clean_confirmations = 0,
+            last_checked_hash = ?,
             resolved_time = NULL,
             last_seen_time = datetime('now')`,
           [
@@ -292,11 +343,93 @@ export class StoryHarnessDAO extends BaseDAO {
             JSON.stringify(value.evidence),
             JSON.stringify(value.invariants ?? []),
             value.expectedResult,
-            value.message
+            value.message,
+            scopeHash
           ]
         )
       }
     })
+  }
+
+  private issueScopeContentHash(workId: number, input: {
+    chapterIds?: number[]
+    chapterIdsJson?: string | null
+    evidence?: string[]
+    evidenceJson?: string | null
+    message: string
+    expectedResult?: string | null
+  }): string {
+    let chapterIds = input.chapterIds ?? []
+    if (chapterIds.length === 0 && input.chapterIdsJson) {
+      try {
+        const parsed = JSON.parse(input.chapterIdsJson) as unknown
+        if (Array.isArray(parsed)) chapterIds = parsed.filter(Number.isInteger) as number[]
+      } catch { /* 非法旧数据按空作用域处理 */ }
+    }
+    let evidence = input.evidence ?? []
+    if (evidence.length === 0 && input.evidenceJson) {
+      try {
+        const parsed = JSON.parse(input.evidenceJson) as unknown
+        if (Array.isArray(parsed)) evidence = parsed.map(String)
+      } catch { /* 非法旧数据不参与导语判断 */ }
+    }
+    const leadRelevant = /导语/.test([
+      input.message,
+      input.expectedResult ?? '',
+      ...evidence
+    ].join('\n'))
+    const work = leadRelevant
+      ? this.get<{ description: string | null }>('SELECT description FROM works WHERE id = ?', [workId])
+      : undefined
+    const rows = chapterIds.length > 0
+      ? this.all<{ id: number; content: string | null }>(
+          `SELECT id, content FROM chapters WHERE id IN (${chapterIds.map(() => '?').join(',')}) ORDER BY id`,
+          chapterIds
+        )
+      : []
+    return stableStoryHash(JSON.stringify({
+      description: leadRelevant ? work?.description?.trim() ?? '' : undefined,
+      chapters: rows.map(row => ({ id: row.id, content: row.content?.trim() ?? '' }))
+    }))
+  }
+
+  replaceLeadWithVersion(workId: number, description: string, sourceStep = 'story_lead_repair'): number {
+    const next = description.trim()
+    if (!next) throw new Error('导语修复结果为空，禁止覆盖')
+    return this.transaction(() => {
+      const work = this.get<{ description: string | null }>('SELECT description FROM works WHERE id = ?', [workId])
+      if (!work) throw new Error('作品不存在，无法修复导语')
+      const versionId = this.insert(
+        'INSERT INTO story_lead_versions (work_id, description, source_step) VALUES (?, ?, ?)',
+        [workId, work.description ?? '', sourceStep]
+      )
+      this.run(
+        'UPDATE works SET description = ?, update_time = CURRENT_TIMESTAMP WHERE id = ?',
+        [next, workId]
+      )
+      return versionId
+    })
+  }
+
+  listLeadVersions(workId: number, limit = 20): StoryLeadVersionRow[] {
+    return this.all<StoryLeadVersionRow>(
+      'SELECT * FROM story_lead_versions WHERE work_id = ? ORDER BY id DESC LIMIT ?',
+      [workId, limit]
+    )
+  }
+
+  private currentStoryContentHash(workId: number): string {
+    const work = this.get<{ description: string | null }>('SELECT description FROM works WHERE id = ?', [workId])
+    const chapters = this.all<{ id: number; content: string | null }>(
+      `SELECT c.id, c.content FROM chapters c
+       JOIN volumes v ON v.id = c.volume_id
+       WHERE v.work_id = ? ORDER BY v.sort, c.sort`,
+      [workId]
+    )
+    return stableStoryHash(JSON.stringify({
+      description: work?.description?.trim() ?? '',
+      chapters: chapters.map(chapter => ({ id: chapter.id, content: chapter.content?.trim() ?? '' }))
+    }))
   }
 
   incrementIssueAttempt(workId: number, issueKey: string, maxAttempts: number): number {
@@ -329,6 +462,11 @@ export class StoryHarnessDAO extends BaseDAO {
 
   createReleaseSnapshot(workId: number, label = 'release_ready'): number {
     return this.transaction(() => {
+      const unresolved = this.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM story_issue_ledger WHERE work_id = ? AND status IN ('open', 'stalled')",
+        [workId]
+      )?.n ?? 0
+      if (unresolved > 0) throw new Error(`仍有 ${unresolved} 项未关闭的短故事硬伤，禁止创建发布快照`)
       const work = this.get<Record<string, unknown>>('SELECT * FROM works WHERE id = ?', [workId])
       if (!work) throw new Error('作品不存在，无法创建发布快照')
       const chapters = this.all<ChapterSnapshotRow>(

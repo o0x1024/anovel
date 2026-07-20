@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import {
+  filterStoryRepairLedgerIssues,
   routeStoryForensicRepair,
-  storyForensicFingerprint
+  storyForensicFingerprint,
+  storyForensicIssueKeys
 } from '../src/main/context/goal-routine/story-forensic-repair'
 import type { StoryForensicIssue } from '../src/main/context/goal-routine/story-whole-evaluator'
 
@@ -30,6 +32,8 @@ const first = routeStoryForensicRepair(chapters, [issue()], 1)
 assert.equal(first.mode, 'dynamic')
 assert.equal(first.action, 'paragraph')
 assert.deepEqual(first.targetChapterIds, [14])
+assert.equal(first.targetLead, false)
+assert.deepEqual(first.issueKeys, ['TIMELINE_CONTRADICTION:14'])
 
 const second = routeStoryForensicRepair(chapters, [issue()], 2)
 assert.equal(second.mode, 'dynamic')
@@ -46,6 +50,29 @@ const cluster = routeStoryForensicRepair(chapters, [issue({
 })], 1)
 assert.equal(cluster.action, 'beat')
 assert.deepEqual(cluster.targetChapterIds, [12, 14])
+
+const leadDuplicate = issue({
+  code: 'DUPLICATED_EVENT',
+  scope: 'beat_cluster',
+  chapterTitles: ['导语', '第一拍'],
+  repairChapterTitles: ['导语', '第一拍'],
+  message: '导语和第一拍重复完整事件',
+  recommendedAction: '只精简导语，保留第一拍'
+})
+const leadRoute = routeStoryForensicRepair(chapters, [leadDuplicate], 1)
+assert.equal(leadRoute.targetLead, true)
+assert.deepEqual(leadRoute.targetChapterIds, [])
+assert.deepEqual(storyForensicIssueKeys(chapters, [leadDuplicate]), ['DUPLICATED_EVENT:11'])
+
+const ledgerRows = [
+  { issue_key: 'EVIDENCE_STATE_REGRESSION:11,14', status: 'stalled' },
+  { issue_key: 'DUPLICATED_EVENT:11', status: 'open' }
+]
+assert.deepEqual(
+  filterStoryRepairLedgerIssues(ledgerRows, leadRoute.issueKeys),
+  [ledgerRows[1]],
+  '同一节拍上的旧问题不得触发当前问题的熔断'
+)
 
 const globalIssue = issue({
   code: 'BROKEN_CLIMAX_MECHANISM',

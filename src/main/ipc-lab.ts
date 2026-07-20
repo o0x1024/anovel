@@ -2,7 +2,7 @@ import { ipcMain } from 'electron'
 import { labTaskDAO, aigcWordtableDAO, appPreferenceDAO, humanRewriteReferenceDAO } from './db'
 import { buildLabDeaiSystemPrompt } from './context/lab/lab-deai-prompt'
 import { cancelDeaiRewrite, parseLabUploadFile, runDeaiRewrite } from './context/lab/deai-rewrite'
-import { runAigcDetect, cancelAigcDetect, runAigcRewrite } from './context/lab/aigc-detect'
+import { runAigcDetect, cancelAigcDetect, runAigcRewrite, runAigcSentenceRewrite } from './context/lab/aigc-detect'
 import { applyWordTable } from './context/lab/aigc-wordtable-engine'
 import { SURFACE_ANTI_AI_PRESETS, DEEP_ANTI_AI_PRESETS } from './context/anti-ai-rules'
 import { WORDTABLE_PRESETS } from '../shared/wordtable-presets'
@@ -71,6 +71,18 @@ export function registerLabIpcHandlers(): void {
         }
       }
       return runAigcRewrite(e.sender, runId, text, detectResult, modelOpts, seedOpts)
+    }
+  )
+  ipcMain.handle(
+    'lab:aigc-detect:sentence-rewrite',
+    async (e, runId: string, text: string, detectResultJson: string, segmentIndex: number, modelOpts?: WorkModelOptions) => {
+      let detectResult: AigcDetectResult
+      try {
+        detectResult = JSON.parse(detectResultJson) as AigcDetectResult
+      } catch {
+        throw new Error('检测结果无效，请重新检测后再试')
+      }
+      return runAigcSentenceRewrite(e.sender, runId, text, detectResult, segmentIndex, modelOpts)
     }
   )
   ipcMain.handle('lab:aigc-detect:cancel', (_e, runId: string) => cancelAigcDetect(runId))

@@ -112,7 +112,8 @@ export function beatGateIssueSignature(issues: string[], beatCount: number): str
       /continuity_contract|连续性|时间|地点|知识|证据|entry_facts|exit_facts|knowledge_changes/.test(issue) ? 'continuity' : '',
       /tension_plan|张力|压力/.test(issue) ? 'tension' : '',
       /dramatic_contract|info_gap|目标|阻力|代价|转折|不可逆/.test(issue) ? 'dramatic' : '',
-      /next_hook|next_question|续集|钩子|最终拍|闭环/.test(issue) ? 'ending' : ''
+      /next_hook|next_question|续集|钩子|最终拍|闭环/.test(issue) ? 'ending' : '',
+      /pov_mode|叙事视角|视角漂移/.test(issue) ? 'pov' : ''
     ].filter(Boolean)
     return (types.length > 0 ? types : ['semantic']).map(type => `${prefix}:${type}`)
   })
@@ -136,6 +137,7 @@ export function compactBeatSkeletons(chapters: ParsedChapter[]): Array<Record<st
     beat_role: chapter.beat_role,
     foreshadow_target: chapter.foreshadow_target,
     next_hook: chapter.next_hook,
+    pov_mode: chapter.pov_mode,
     characters: chapter.characters
   }))
 }
@@ -152,6 +154,7 @@ export function mergeStagedBeat(
   const replaceContinuity = replaceAll || /continuity_contract|连续性|时间|地点|知识|证据|entry_facts|exit_facts|knowledge_changes/.test(issueText)
   const replaceTension = replaceAll || /tension_plan|张力|压力/.test(issueText)
   const replaceEmotion = replaceAll || /emotion_contract|情绪|certainty|action_impulse/.test(issueText)
+  const replacePov = replaceAll || /pov_mode|叙事视角|视角漂移/.test(issueText)
   const merged: ParsedChapter = {
     ...skeleton,
     // 事件链和标题由全篇骨架锁定，单拍补全不得悄悄改写全篇结构。
@@ -160,6 +163,9 @@ export function mergeStagedBeat(
     beat_role: current?.beat_role ?? enriched.beat_role ?? skeleton.beat_role,
     foreshadow_target: current?.foreshadow_target ?? enriched.foreshadow_target ?? skeleton.foreshadow_target,
     next_hook: current?.next_hook ?? enriched.next_hook ?? skeleton.next_hook,
+    pov_mode: replacePov
+      ? (enriched.pov_mode ?? skeleton.pov_mode ?? current?.pov_mode)
+      : current?.pov_mode,
     characters: current?.characters ?? enriched.characters ?? skeleton.characters,
     dramatic_contract: replaceDramatic ? (enriched.dramatic_contract ?? current?.dramatic_contract) : current?.dramatic_contract,
     continuity_contract: replaceContinuity ? (enriched.continuity_contract ?? current?.continuity_contract) : current?.continuity_contract,

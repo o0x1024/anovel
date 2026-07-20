@@ -58,7 +58,7 @@ const statusMeta = {
   <section class="border border-base-300 rounded-lg bg-base-100 min-h-0 flex flex-col">
     <header class="px-3 py-2 border-b border-base-300 flex items-center gap-2 shrink-0">
       <span class="text-xs font-semibold">全文场景块改写</span>
-      <span class="text-[10px] text-base-content/50">事实锚点 · 深度重组 · 覆盖门禁 · 改完后手动复检</span>
+      <span class="text-[10px] text-base-content/50">事实锚点 · 深度重组 · 全文双模型复检 · 失败不写回</span>
       <span v-if="rewriting" class="loading loading-spinner loading-xs ml-auto" />
       <template v-else-if="passedCount > 0 && canApplyPatches">
         <button type="button" class="btn btn-ghost btn-xs ml-auto" @click="emit('acceptAll')">
@@ -84,20 +84,27 @@ const statusMeta = {
     >
       <div class="font-medium">
         {{ goal.status === 'achieved'
-          ? '初始检测已全部为人工特征，无需改写'
+          ? '生成质量与本地风险门禁通过'
           : goal.status === 'awaiting_recheck'
-            ? '改写已生成，待重新检测'
-            : '场景块覆盖不足，拒绝应用' }}
+            ? '仅通过生成质量门禁，尚未完成风险复检'
+            : '改写未通过双重门禁，拒绝应用' }}
       </div>
       <div v-if="goal.status === 'awaiting_recheck'" class="mt-0.5">
-        已生成 {{ passedCount }} 个场景块补丁，通过块覆盖 {{ goal.passedCoveragePercent }}%。请接受并应用，再点击“重新检测”一次获取最终结果。
+        已生成 {{ passedCount }} 个场景块补丁，通过块覆盖 {{ goal.passedCoveragePercent }}%。如手动应用部分补丁，必须重新检测，旧结果不会沿用。
         <template v-if="goal.remainingSentenceIds.length">另有 {{ goal.remainingSentenceIds.length }} 个目标块未生成有效补丁。</template>
       </div>
       <div v-else-if="goal.status === 'not_achieved'" class="mt-0.5 tabular-nums">
-        目标文本覆盖 {{ goal.targetCoveragePercent }}%，通过质量门禁的块仅覆盖 {{ goal.passedCoveragePercent }}%，不允许应用不完整改写。
+        <template v-if="goal.localVerification">
+          已完成 {{ goal.localVerification.attempts }} 轮本地复检，当前为人工特征 {{ goal.humanPercent }}% · 疑似AI {{ goal.suspectedAiPercent }}% · AI {{ goal.aiPercent }}%；未应用改写。
+          <template v-if="goal.localVerification.reasons.length">原因：{{ goal.localVerification.reasons.join('；') }}。</template>
+        </template>
+        <template v-else>
+          目标文本覆盖 {{ goal.targetCoveragePercent }}%，通过质量门禁的块仅覆盖 {{ goal.passedCoveragePercent }}%，不允许应用不完整改写。
+        </template>
       </div>
       <div v-else class="mt-0.5 tabular-nums">
-        初始检测：人工 {{ goal.humanPercent }}% · 疑似AI {{ goal.suspectedAiPercent }}% · AI {{ goal.aiPercent }}%
+        本地特征覆盖：人工特征 {{ goal.humanPercent }}% · 疑似AI {{ goal.suspectedAiPercent }}% · AI {{ goal.aiPercent }}%
+        <template v-if="goal.localVerification">（第 {{ goal.localVerification.attempts }} 轮通过）</template>
       </div>
     </div>
 

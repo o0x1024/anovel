@@ -304,6 +304,8 @@ async function assessStoryForensics(
         '你是短故事整篇法医审计员。只报告有原文证据、足以否决成稿的硬伤，不评价文笔，不用小瑕疵凑数。',
         '硬伤包括：时间线互相矛盾；人物或道具空间无过渡跳变；同一关键事件重复发生；证据状态/人物知识倒退；前文制造的关键阻碍被后文直接跳过；主角胜利依赖反派降智、临时权威、巧合或终局新证据；核心承诺未回收；结尾突然开启未经铺垫的新主线；生成提示残留。',
         '证据流程略有戏剧化可以接受，但若证据本身无法证明主张，或处理结果无任何已铺垫依据，属于硬伤。',
+        '逐项核对故事合同 rule_proofs：正文中的制度执行者、触发条件、所需证据和后果必须一致；若核心压迫只靠一条现实中无法执行、主角可轻易拒绝或申诉绕开的规则，属于 BROKEN_CLIMAX_MECHANISM。',
+        '逐项核对 climax_evidence_chain：证据必须按约定来源和持有人提前出现，并由人物动作触发。自动弹文件、恰好群发短信、临时权威背书、主角此前不知道的新证据均属于 DEUS_EX_MACHINA。',
         'code 必须从以下固定集合选择：TIMELINE_CONTRADICTION、SPATIAL_JUMP、DUPLICATED_EVENT、EVIDENCE_STATE_REGRESSION、KNOWLEDGE_REGRESSION、OBSTACLE_BYPASS、DEUS_EX_MACHINA、UNPAYED_CORE_PROMISE、UNFORESHADOWED_NEW_ARC、META_RESIDUE、BROKEN_CLIMAX_MECHANISM、OTHER_HARD_BLOCKER。',
         'scope 只允许 sentence/scene/beat_cluster/story_engine。chapter_titles 是证据位置，repair_chapter_titles 是实际必须修改的最小节拍集。',
         '单句时间/数字错误用sentence；单场证据或知情断裂用scene；需要“前面铺垫+后面兑现”联动用beat_cluster；合同或高潮机制本身不可行才用story_engine。',
@@ -396,6 +398,9 @@ async function assessProseBlindRead(
   signal?: AbortSignal
 ): Promise<ProseBlindRead> {
   const policy = resolveStoryGenrePolicy(genreText)
+  const proseEvidence = mergedBody.length <= DIRECT_BODY_CHAR_LIMIT
+    ? `【匿名完整正文】\n${mergedBody}`
+    : blindReadSamples(mergedBody)
   const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
     workId,
     label: '原文盲读',
@@ -412,13 +417,14 @@ async function assessProseBlindRead(
         responseSchema: { name: 'story_prose_blind_read', schema: STORY_PROSE_BLIND_SCHEMA, strict: false },
         systemPrompt: [
           '你是独立短故事盲读编辑。你看不到标题、大纲、评分表和剧情摘要，只按普通读者阅读原文切片。',
-          '重点识别：重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
+          '重点识别：残句、错词、标点或对话边界破损、第一/第三人称漂移、重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
+          '只要存在读者一眼可见的残句、乱码式错词或叙事人称漂移，score 不得高于 69，issues 必须引用对应原文。',
           '格式完整、反转数量和问号不能加分。只有自然、可信、能让人继续读的原文才能高分。',
           formatGenrePolicy(policy, 'evaluationRules'),
           '只输出 JSON：{"score":75,"reason":"一句话总评","issues":["带原文现象的具体问题"]}'
         ].join('\n\n'),
         prompt: [
-          blindReadSamples(mergedBody),
+          proseEvidence,
           attempt > 1 ? `【格式重试】${error}。返回更短的完整 JSON。` : ''
         ].filter(Boolean).join('\n\n')
       }),
@@ -451,7 +457,8 @@ function storyModeGuidance(text: string): string {
 export async function assessWholeStory(
   workId: number,
   config: StoryGoalConfig,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
 ): Promise<StoryWholeAssessment> {
   const blocks = chapterBlocks(workId)
   const work = workDAO.getById(workId)
@@ -482,8 +489,10 @@ export async function assessWholeStory(
     evidence = `【完整正文】\n${mergedBody}`
   } else {
     const summaries: StoryChunkSummary[] = []
-    for (const chunk of splitStoryChunks(publishedBlocks)) {
+    const chunks = splitStoryChunks(publishedBlocks)
+    for (const [index, chunk] of chunks.entries()) {
       if (signal?.aborted) throw new Error('已取消')
+      onProgress?.(`目标验收：正在压缩整篇证据 ${index + 1}/${chunks.length}`)
       summaries.push(await summarizeChunk(workId, chunk, signal))
     }
     evidence = `【逐段证据摘要】\n${JSON.stringify(summaries, null, 2)}`
@@ -503,12 +512,15 @@ export async function assessWholeStory(
     config.goalDescription
   ].join('\n'))
   const genreText = [work?.genre ?? '', work?.tags ?? '', config.goalDescription].join('\n')
+  onProgress?.('目标验收：正在进行整篇原文盲读')
   const proseRead = await assessProseBlindRead(workId, mergedBody, genreText, signal)
+  onProgress?.('目标验收：正在进行时间线、证据链与巧合法医审计')
   const forensicIssues = await assessStoryForensics(workId, publishedBlocks, mergedBody, evidence, signal)
   const hardBlockers = forensicIssues.map(issue =>
     `${issue.code}：${issue.message}${issue.evidence.length > 0 ? `（${issue.evidence.join('；')}）` : ''}`
   )
 
+  onProgress?.('目标验收：正在进行整篇结构、目标匹配与追读力终审')
   const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
     workId,
     label: '整篇终审',

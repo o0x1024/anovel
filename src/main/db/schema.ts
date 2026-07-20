@@ -246,6 +246,8 @@ export function initSchema(): void {
       expected_result TEXT,
       message TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
+      clean_confirmations INTEGER NOT NULL DEFAULT 0,
+      last_checked_hash VARCHAR(80),
       status VARCHAR(20) NOT NULL DEFAULT 'open',
       first_seen_time DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_seen_time DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -270,6 +272,18 @@ export function initSchema(): void {
 
     CREATE INDEX IF NOT EXISTS idx_story_release_work
       ON story_release_snapshots(work_id, create_time);
+
+    CREATE TABLE IF NOT EXISTS story_lead_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      description TEXT NOT NULL,
+      source_step VARCHAR(50) NOT NULL DEFAULT 'story_lead_repair',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_lead_versions_work
+      ON story_lead_versions(work_id, id);
 
     -- ============================================
     -- 伏笔追踪表（V1.5）

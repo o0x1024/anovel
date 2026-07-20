@@ -161,8 +161,7 @@ async function computeWholeText(text: string): Promise<TokenMetric[]> {
 }
 
 /**
- * 逐个重叠 token 窗独立推理。每窗清空上下文，避免全文前缀长度和窗口位置
- * 改变统计口径；384/192 对应 50% 重叠，尾窗至少保留 128 tokens。
+ * 逐个重叠 token 窗独立推理，保证窗口边缘也有完整前文证据。
  */
 async function computeTokenWindows(text: string): Promise<TokenWindowResult[]> {
   if (!model || !context || !sequence) throw new Error('模型未初始化')

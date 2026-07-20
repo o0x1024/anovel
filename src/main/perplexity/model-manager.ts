@@ -2,6 +2,7 @@ import { app } from 'electron'
 import fs from 'fs'
 import path from 'path'
 import axios from 'axios'
+import crypto from 'crypto'
 import {
   PERPLEXITY_MODELS,
   DEFAULT_MODEL_ID,
@@ -25,6 +26,77 @@ const ACTIVE_MODEL_PREF_KEY = 'perplexity_active_model'
 
 let downloadInProgress = false
 let activeModelId: string | null = null
+
+interface VerifiedModelManifest {
+  modelId: string
+  filename: string
+  sizeBytes: number
+  mtimeMs: number
+  sha256: string
+}
+
+function verifiedManifestPath(userDataPath: string, modelId: string): string {
+  return path.join(getModelDir(userDataPath, modelId), 'verified.json')
+}
+
+function readVerifiedManifest(userDataPath: string, modelId: string): VerifiedModelManifest | null {
+  try {
+    return JSON.parse(fs.readFileSync(verifiedManifestPath(userDataPath, modelId), 'utf8')) as VerifiedModelManifest
+  } catch {
+    return null
+  }
+}
+
+function modelArtifactReady(userDataPath: string, def: PerplexityModelDef): boolean {
+  const modelPath = getModelFilePath(userDataPath, def.id)
+  if (!fs.existsSync(modelPath)) return false
+  const stat = fs.statSync(modelPath)
+  if (stat.size !== def.sizeBytes) return false
+  if (!def.sha256) return true
+  const manifest = readVerifiedManifest(userDataPath, def.id)
+  return manifest?.modelId === def.id &&
+    manifest.filename === def.filename &&
+    manifest.sizeBytes === stat.size &&
+    manifest.mtimeMs === stat.mtimeMs &&
+    manifest.sha256 === def.sha256
+}
+
+async function sha256(filePath: string): Promise<string> {
+  const hash = crypto.createHash('sha256')
+  await new Promise<void>((resolve, reject) => {
+    const stream = fs.createReadStream(filePath)
+    stream.on('data', chunk => hash.update(chunk))
+    stream.once('end', resolve)
+    stream.once('error', reject)
+  })
+  return hash.digest('hex')
+}
+
+async function verifyModelArtifact(
+  userDataPath: string,
+  def: PerplexityModelDef,
+  modelPath: string
+): Promise<void> {
+  if (!fs.existsSync(modelPath)) throw new Error(`缺少模型文件 ${def.filename}`)
+  const stat = fs.statSync(modelPath)
+  if (stat.size !== def.sizeBytes) {
+    throw new Error(`${def.filename} 大小校验失败：${stat.size}/${def.sizeBytes}`)
+  }
+  const actualHash = def.sha256 ? await sha256(modelPath) : ''
+  if (def.sha256 && actualHash !== def.sha256) {
+    throw new Error(`${def.filename} SHA-256 校验失败，文件可能损坏或来源已变化`)
+  }
+  if (def.sha256) {
+    const manifest: VerifiedModelManifest = {
+      modelId: def.id,
+      filename: def.filename,
+      sizeBytes: stat.size,
+      mtimeMs: stat.mtimeMs,
+      sha256: actualHash
+    }
+    fs.writeFileSync(verifiedManifestPath(userDataPath, def.id), JSON.stringify(manifest, null, 2), 'utf8')
+  }
+}
 
 function loadActiveModelId(): string {
   if (activeModelId) return activeModelId
@@ -50,11 +122,7 @@ export function getActiveModelId(): string {
 export function isModelReady(modelId?: string): boolean {
   const id = modelId || loadActiveModelId()
   const def = getModelDef(id)
-  const modelPath = getModelFilePath(app.getPath('userData'), id)
-  if (!fs.existsSync(modelPath)) return false
-  const stat = fs.statSync(modelPath)
-  // 文件大于声明大小的 50% 即视为有效（声明大小可能偏大，实际以下载完成为准）
-  return stat.size > def.sizeBytes * 0.5 && stat.size > 10_000_000
+  return modelArtifactReady(app.getPath('userData'), def)
 }
 
 export async function ensureModelReady(
@@ -85,6 +153,29 @@ export async function ensureModelReady(
     return modelPath
   }
 
+  // 兼容升级前已完整下载但尚无验证清单的正式模型：首次使用时补做一次摘要校验。
+  if (fs.existsSync(modelPath) && fs.statSync(modelPath).size === def.sizeBytes) {
+    onProgress?.({
+      phase: 'checking',
+      percent: 0,
+      downloadedBytes: 0,
+      totalBytes: def.sizeBytes,
+      message: `正在校验 ${def.name} 完整性…`
+    })
+    try {
+      await verifyModelArtifact(userDataPath, def, modelPath)
+      return modelPath
+    } catch (error) {
+      appLogger.warn(
+        'perplexity',
+        `模型完整性校验失败，将重新下载: ${error instanceof Error ? error.message : String(error)}`
+      )
+      fs.unlinkSync(modelPath)
+      const manifestPath = verifiedManifestPath(userDataPath, def.id)
+      if (fs.existsSync(manifestPath)) fs.unlinkSync(manifestPath)
+    }
+  }
+
   if (downloadInProgress) {
     throw new Error('模型正在下载中，请稍候')
   }
@@ -112,7 +203,11 @@ async function downloadModel(
   let startByte = 0
   if (fs.existsSync(tempPath)) {
     const stat = fs.statSync(tempPath)
-    startByte = stat.size
+    if (stat.size < def.sizeBytes) {
+      startByte = stat.size
+    } else {
+      fs.unlinkSync(tempPath)
+    }
   }
 
   appLogger.info('perplexity', `开始下载模型: ${def.name} (${def.url}), 起始字节: ${startByte}`)
@@ -136,10 +231,15 @@ async function downloadModel(
     timeout: 30000
   })
 
-  const totalBytes = startByte + parseInt(String(response.headers['content-length'] || '0'), 10)
+  const resumed = startByte > 0 && response.status === 206
+  if (startByte > 0 && !resumed) {
+    appLogger.warn('perplexity', '下载源未接受断点续传，将从头下载模型')
+    startByte = 0
+  }
+  const totalBytes = def.sizeBytes
   let downloadedBytes = startByte
 
-  const writer = fs.createWriteStream(tempPath, { flags: startByte > 0 ? 'a' : 'w' })
+  const writer = fs.createWriteStream(tempPath, { flags: resumed ? 'a' : 'w' })
 
   return new Promise<void>((resolve, reject) => {
     const stream = response.data as NodeJS.ReadableStream
@@ -147,7 +247,7 @@ async function downloadModel(
     stream.on('data', (chunk: Buffer) => {
       downloadedBytes += chunk.length
       writer.write(chunk)
-      const percent = Math.floor((downloadedBytes / totalBytes) * 100)
+      const percent = Math.min(99, Math.floor((downloadedBytes / totalBytes) * 100))
       onProgress?.({
         phase: 'downloading',
         percent,
@@ -158,17 +258,25 @@ async function downloadModel(
     })
 
     stream.on('end', () => {
-      writer.end(() => {
-        fs.renameSync(tempPath, modelPath)
-        appLogger.info('perplexity', `模型下载完成: ${def.name} → ${modelPath}`)
-        onProgress?.({
-          phase: 'ready',
-          percent: 100,
-          downloadedBytes: totalBytes,
-          totalBytes,
-          message: '模型下载完成'
-        })
-        resolve()
+      writer.end(async () => {
+        try {
+          await verifyModelArtifact(userDataPath, def, tempPath)
+          fs.renameSync(tempPath, modelPath)
+          // rename 会改变路径但不改变 mtime；以最终路径重写清单，便于后续精确命中。
+          await verifyModelArtifact(userDataPath, def, modelPath)
+          appLogger.info('perplexity', `模型下载并校验完成: ${def.name} → ${modelPath}`)
+          onProgress?.({
+            phase: 'ready',
+            percent: 100,
+            downloadedBytes: def.sizeBytes,
+            totalBytes: def.sizeBytes,
+            message: '模型下载并校验完成'
+          })
+          resolve()
+        } catch (error) {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath)
+          reject(error instanceof Error ? error : new Error(String(error)))
+        }
       })
     })
 
@@ -205,7 +313,7 @@ export function listModels(): ModelInfo[] {
     let ready = false
     if (fs.existsSync(modelPath)) {
       localSizeBytes = fs.statSync(modelPath).size
-      ready = localSizeBytes > def.sizeBytes * 0.5 && localSizeBytes > 10_000_000
+      ready = modelArtifactReady(userDataPath, def)
     }
     return {
       id: def.id,
@@ -237,8 +345,10 @@ export function deleteModelById(modelId: string): void {
   const userDataPath = app.getPath('userData')
   const modelPath = getModelFilePath(userDataPath, modelId)
   const tempPath = modelPath + '.downloading'
+  const manifestPath = verifiedManifestPath(userDataPath, modelId)
   if (fs.existsSync(modelPath)) fs.unlinkSync(modelPath)
   if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath)
+  if (fs.existsSync(manifestPath)) fs.unlinkSync(manifestPath)
 
   const dir = getModelDir(userDataPath, modelId)
   if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {

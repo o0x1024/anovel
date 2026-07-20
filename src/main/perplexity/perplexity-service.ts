@@ -1,12 +1,9 @@
 import { Worker } from 'worker_threads'
 import path from 'path'
-import type { AigcDetectResult, AigcCategory, AigcDistribution, AigcSegment, PerplexityApiConfig } from '../../shared/aigc-detect-types'
+import type { AigcDetectResult, AigcCategory, AigcDistribution, AigcSegment } from '../../shared/aigc-detect-types'
 import { ensureModelReady, isModelReady, type DownloadProgressCallback } from './model-manager'
-import { resolveDetectModelId } from './constants'
+import { PRODUCTION_DETECT_MODEL_ID } from './constants'
 import { appLogger } from '../logger/app-logger'
-import { getActiveModelId } from './model-manager'
-import { computeWholeViaApi, isDegenerateApiLogprobs, type TokenMetric } from './api-perplexity'
-import { appPreferenceDAO } from '../db'
 import {
   classifyZhuqueSegments,
   computeZhuqueSentenceDistribution,
@@ -18,7 +15,6 @@ import { analyzeZhuqueDistribution } from './zhuque-distribution-features'
 import { categorizeZhuqueSentenceRisk } from './zhuque-rewrite-risk'
 import {
   attributeTokenWindowsToSpans,
-  buildZhuqueTokenWindows,
   splitZhuqueDisplaySentences,
   type ZhuqueTextSpan,
   type ZhuqueTokenWindow
@@ -27,31 +23,6 @@ import {
 export interface LabModelOverride {
   modelType?: string
   modelName?: string
-}
-
-function resolveApiConfig(): PerplexityApiConfig {
-  return appPreferenceDAO.getPerplexityApiConfig()
-}
-
-/** API 检测必须返回带字符偏移的整文 logprobs，不能退回不等价的逐段复述。 */
-async function computeTokenMetricsViaApi(
-  text: string,
-  apiConfig: PerplexityApiConfig,
-  onProgress?: (msg: string) => void
-): Promise<TokenMetric[]> {
-  onProgress?.(`正在通过本地 API 检测 (${apiConfig.apiBase})…`)
-  appLogger.info('perplexity', `使用本地 API 模式: ${apiConfig.apiBase}, 模型: ${apiConfig.modelName || '(默认)'}`)
-  const tokenMetrics = await computeWholeViaApi(
-    text,
-    apiConfig.apiBase,
-    apiConfig.modelName,
-    onProgress,
-    apiConfig.apiKey
-  )
-  if (tokenMetrics.length === 0) {
-    throw new Error('检测 API 未返回带字符偏移的 token logprobs，无法建立重叠 token 窗口')
-  }
-  return tokenMetrics
 }
 
 interface WorkerResponse {
@@ -64,6 +35,28 @@ interface WorkerResponse {
 let worker: Worker | null = null
 let workerReady = false
 let loadedModelPath: string | null = null
+
+// AIGC 检测和紧随其后的一键改写会使用同一篇文本。保留有限时间的窗口证据，
+// 避免为了取得句级指标再次执行一整轮 4B 模型推理。
+const TOKEN_WINDOW_CACHE_TTL_MS = 5 * 60 * 1000
+const TOKEN_WINDOW_CACHE_MAX_METRICS = 24_000
+let recentTokenWindowCache: { text: string; windows: ZhuqueTokenWindow[]; timestamp: number } | null = null
+
+function cacheTokenWindows(text: string, windows: ZhuqueTokenWindow[]): void {
+  const metricCount = windows.reduce((sum, window) => sum + (window.tokenMetrics?.length ?? 0), 0)
+  if (metricCount > TOKEN_WINDOW_CACHE_MAX_METRICS) return
+  recentTokenWindowCache = { text, windows, timestamp: Date.now() }
+}
+
+function getCachedTokenWindows(text: string): ZhuqueTokenWindow[] | null {
+  const cached = recentTokenWindowCache
+  if (!cached) return null
+  if (Date.now() - cached.timestamp > TOKEN_WINDOW_CACHE_TTL_MS) {
+    recentTokenWindowCache = null
+    return null
+  }
+  return cached.text === text ? cached.windows : null
+}
 
 /**
  * 困惑度 worker 生命周期锁：模型加载、窗口计算、重建和释放必须作为一个
@@ -189,15 +182,9 @@ export async function runPerplexityDetect(
   text: string,
   onProgress?: (msg: string) => void,
   onDownloadProgress?: DownloadProgressCallback,
-  labModel?: LabModelOverride
+  _labModel?: LabModelOverride
 ): Promise<AigcDetectResult> {
-  const apiConfig = resolveApiConfig()
-  const useApi = apiConfig.mode === 'api'
-  const detectModelId = resolveDetectModelId({
-    useApi,
-    apiModelName: apiConfig.modelName,
-    localModelId: getActiveModelId()
-  })
+  const detectModelId = PRODUCTION_DETECT_MODEL_ID
 
   const segments = segmentText(text)
   if (segments.length === 0) {
@@ -211,31 +198,17 @@ export async function runPerplexityDetect(
   let tokenWindows: ZhuqueTokenWindow[]
   let uniqueTokenCount = 0
 
-  if (useApi) {
-    const tokenMetrics = await computeTokenMetricsViaApi(
-      text,
-      apiConfig,
-      onProgress
-    )
-    tokenWindows = buildZhuqueTokenWindows(text, tokenMetrics)
-    uniqueTokenCount = tokenMetrics.length
-  } else {
-    onProgress?.('正在准备困惑度检测模型…')
-    const modelPath = await ensureModelReady(onDownloadProgress)
+  onProgress?.('正在准备固定版本 Qwen3.5 4B 检测模型…')
+  const modelPath = await ensureModelReady(onDownloadProgress, PRODUCTION_DETECT_MODEL_ID)
 
-    onProgress?.('正在加载模型…')
-    onProgress?.('正在建立重叠 token 证据窗口…')
-    tokenWindows = await computeWindowsWithModel(modelPath, text)
-    uniqueTokenCount = Math.max(...tokenWindows.map(window => window.endToken), 0)
-  }
+  onProgress?.('正在加载模型…')
+  onProgress?.('正在建立重叠 token 证据窗口…')
+  tokenWindows = await computeWindowsWithModel(modelPath, text, onProgress)
+  cacheTokenWindows(text, tokenWindows)
+  uniqueTokenCount = Math.max(...tokenWindows.map(window => window.endToken), 0)
 
   if (tokenWindows.length === 0) {
     throw new Error('模型没有生成可用的 token 证据窗口')
-  }
-  if (useApi && isDegenerateApiLogprobs(tokenWindows.map(window => window.metric))) {
-    throw new Error(
-      `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法执行朱雀对齐检测`
-    )
   }
 
   // 过滤有效结果
@@ -266,12 +239,7 @@ export async function runPerplexityDetect(
 
   const documentFeatures = analyzeZhuqueDistribution(text, tokenWindows)
   const sentenceMetrics = attributeTokenWindowsToSpans(segments, tokenWindows)
-  const classifiedSentences = classifySentences(
-    segments,
-    sentenceMetrics,
-    documentFeatures,
-    detectModelId
-  )
+  const classifiedSentences = classifySentences(segments, sentenceMetrics, documentFeatures, detectModelId)
   const displaySentences = classifiedSentences.map(segment => {
     const riskScore = continuousSentenceRisk(segment.score, documentFeatures.documentRisk)
     const category = categorizeZhuqueSentenceRisk(riskScore)
@@ -297,30 +265,23 @@ export async function runPerplexityDetect(
     )) * 10
   ) / 10
   const documentFingerprints = detectZhuqueFingerprints(text)
-  const fingerprintHits = documentFingerprints.filmShot + documentFingerprints.connector +
-    documentFingerprints.emotionTemplate + documentFingerprints.summaryClosure
-
+  const fingerprintHits = documentFingerprints.filmShot + documentFingerprints.connector + documentFingerprints.emotionTemplate + documentFingerprints.summaryClosure
   appLogger.info('perplexity', '朱雀对齐检测', {
     modelId: detectModelId,
     sentenceCount: segments.length,
     tokenWindowCount: tokenWindows.length,
     avgScore: Math.round(rawDocScore * 10) / 10,
-    documentFeatures,
-    fingerprintHits,
-    distribution
+    documentFeatures, fingerprintHits, distribution
   })
-
-  const evidenceSummary = documentFeatures.reasons.length > 0
-    ? `；主要证据：${documentFeatures.reasons.join('、')}`
-    : ''
-  const summary = `逐句文本覆盖率：人工 ${distribution.human}%，疑似AI ${distribution.suspected_ai}%，AI特征 ${distribution.ai}%` +
-    (fingerprintHits > 0 ? `；命中特征短语 ${fingerprintHits} 处` : '') + evidenceSummary
+  const summary = `逐句文本覆盖率：人工 ${distribution.human}%，疑似AI ${distribution.suspected_ai}%，AI特征 ${distribution.ai}%`
 
   return {
     segments: resultSegments,
     distribution,
     summary,
     diagnostics: {
+      statisticalModelId: detectModelId,
+      policyVersion: 'aigc-fusion-v1',
       tokenPredictability,
       sequenceRegularity: documentFeatures.sequenceRegularity,
       informationUniformity: documentFeatures.informationUniformity,
@@ -363,14 +324,19 @@ function weightedSentenceRisk(
   return total > 0 ? Math.round(weighted / total * 10) / 10 : 0
 }
 
-function computeWindowsInWorkerUnlocked(text: string): Promise<ZhuqueTokenWindow[]> {
+function computeWindowsInWorkerUnlocked(
+  text: string,
+  onProgress?: (message: string) => void
+): Promise<ZhuqueTokenWindow[]> {
   return new Promise<ZhuqueTokenWindow[]>((resolve, reject) => {
     if (!worker) {
       reject(new Error('工作线程未就绪'))
       return
     }
     const handler = (msg: WorkerResponse) => {
-      if (msg.type === 'windowResult' && msg.windows) {
+      if (msg.type === 'progress') {
+        if (msg.message) onProgress?.(msg.message)
+      } else if (msg.type === 'windowResult' && msg.windows) {
         worker?.off('message', handler)
         resolve(msg.windows)
       } else if (msg.type === 'error') {
@@ -383,22 +349,26 @@ function computeWindowsInWorkerUnlocked(text: string): Promise<ZhuqueTokenWindow
   })
 }
 
-function computeWindowsWithModel(modelPath: string, text: string): Promise<ZhuqueTokenWindow[]> {
+function computeWindowsWithModel(
+  modelPath: string,
+  text: string,
+  onProgress?: (message: string) => void
+): Promise<ZhuqueTokenWindow[]> {
   return withWorkerLock(async () => {
     await ensureWorkerUnlocked(modelPath)
-    let windows = await computeWindowsInWorkerUnlocked(text)
+    let windows = await computeWindowsInWorkerUnlocked(text, onProgress)
     if (windows.length === 0 && text.trim().length > 20) {
       appLogger.info('perplexity', '窗口计算无结果，重建 worker 重试…')
       await terminateWorkerUnlocked()
       await ensureWorkerUnlocked(modelPath)
-      windows = await computeWindowsInWorkerUnlocked(text)
+      windows = await computeWindowsInWorkerUnlocked(text, onProgress)
     }
     return windows
   })
 }
 
 export function isPerplexityModelReady(): boolean {
-  return isModelReady()
+  return isModelReady(PRODUCTION_DETECT_MODEL_ID)
 }
 
 export async function disposePerplexityWorker(): Promise<void> {
@@ -426,32 +396,24 @@ export interface SegmentDetectDetail {
 export async function getSegmentMetrics(
   text: string,
   onProgress?: (msg: string) => void,
-  labModel?: LabModelOverride
+  _labModel?: LabModelOverride
 ): Promise<{ segments: SegmentDetectDetail[]; docScore: number }> {
-  const apiConfig = resolveApiConfig()
-  const useApi = apiConfig.mode === 'api'
-  const detectModelId = resolveDetectModelId({
-    useApi,
-    apiModelName: apiConfig.modelName,
-    localModelId: getActiveModelId()
-  })
+  const detectModelId = PRODUCTION_DETECT_MODEL_ID
 
   const segments = segmentText(text)
   if (segments.length === 0) return { segments: [], docScore: 0 }
 
   let tokenWindows: ZhuqueTokenWindow[]
 
-  if (useApi) {
-    const tokenMetrics = await computeTokenMetricsViaApi(
-      text,
-      apiConfig,
-      onProgress
-    )
-    tokenWindows = buildZhuqueTokenWindows(text, tokenMetrics)
+  const cachedWindows = getCachedTokenWindows(text)
+  if (cachedWindows) {
+    onProgress?.('复用本次检测的重叠 token 证据窗口…')
+    tokenWindows = cachedWindows
   } else {
-    const modelPath = await ensureModelReady()
-    onProgress?.('正在计算重叠 token 窗口…')
-    tokenWindows = await computeWindowsWithModel(modelPath, text)
+    const modelPath = await ensureModelReady(undefined, PRODUCTION_DETECT_MODEL_ID)
+    onProgress?.('正在按回车分段计算 Qwen3.5 4B 证据…')
+    tokenWindows = await computeParagraphWindows(modelPath, segments, onProgress)
+    cacheTokenWindows(text, tokenWindows)
   }
 
   if (tokenWindows.length === 0) {
@@ -459,11 +421,6 @@ export async function getSegmentMetrics(
   }
   const sentenceMetrics = attributeTokenWindowsToSpans(segments, tokenWindows)
 
-  if (useApi && isDegenerateApiLogprobs(tokenWindows.map(window => window.metric))) {
-    throw new Error(
-      `模型 ${apiConfig.modelName || detectModelId || 'unknown'} 未返回有效 logprobs，无法计算朱雀对齐段落指标`
-    )
-  }
 
   const documentFeatures = analyzeZhuqueDistribution(text, tokenWindows)
   const classifiedSentences = classifySentences(

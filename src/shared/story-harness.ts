@@ -217,7 +217,10 @@ function issue(
 
 export function storyHarnessIssueKey(value: StoryHarnessIssue): string {
   const chapters = [...(value.chapterIds ?? [])].sort((a, b) => a - b).join(',')
-  return `${value.code}:${value.scope}:${chapters}`
+  // scope 是评估器给出的修复建议，不是问题身份。同一条时间线硬伤可能在
+  // 两次独立审计中分别被标成 engine/cluster；把 scope 放进 key 会让旧问题
+  // 被误判为已解决，同时创建一条“新”问题。
+  return `${value.code}:${chapters}`
 }
 
 export function stableStoryHash(text: string): string {
@@ -236,7 +239,12 @@ function nonEmptyLines(text: string): string[] {
 /** 不依赖模型的成稿完整性检查。 */
 export function detectStoryTextIntegrityIssues(
   text: string,
-  options: { chapterId?: number; finalBeat?: boolean } = {}
+  options: {
+    chapterId?: number
+    finalBeat?: boolean
+    povMode?: string | null
+    povCharacter?: string | null
+  } = {}
 ): StoryHarnessIssue[] {
   const issues: StoryHarnessIssue[] = []
   const chapterIds = options.chapterId == null ? undefined : [options.chapterId]
@@ -271,6 +279,40 @@ export function detectStoryTextIntegrityIssues(
       'TRUNCATED_SENTENCE', 'sentence', dangling.slice(0, 4),
       '正文存在明显截断句', '补全承载的因果或对话；无法补全时删除残句'
     ))
+  }
+
+  const corrupted = nonEmptyLines(trimmed).filter(line =>
+    /(?:[一二三四五六七八九十\d]+挺钟|[一二三四五六七八九十\d]+颇为钟)/.test(line)
+    || /只要[^。！？\n]{0,40}(?:揭穿|证明|告诉|拿出|查清|逼迫)$/.test(line)
+  )
+  if (corrupted.length > 0) {
+    push(issue(
+      'CORRUPTED_SENTENCE', 'sentence', corrupted.slice(0, 4),
+      '正文存在明显错词或未完成的承重句', '只修复对应句子的错词或缺失成分，不改变剧情事实'
+    ))
+  }
+
+  const povMode = options.povMode?.trim()
+  const povCharacter = options.povCharacter?.trim()
+  if (povMode && trimmed.length >= 400) {
+    // 对话中的“我”不代表叙事视角；只统计引号外的叙述文本。
+    const narration = trimmed.replace(/“[^”]*”/g, '')
+    const firstPersonCount = (narration.match(/我(?:们|的|在|要|想|看|听|说|没|不|把|从|向|又|也|就|才|已经|仍|正|刚)?/g) ?? []).length
+    const characterCount = povCharacter
+      ? (narration.match(new RegExp(povCharacter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length
+      : 0
+    if (povMode === 'first' && povCharacter && characterCount >= 3 && firstPersonCount <= 1) {
+      push(issue(
+        'POV_DRIFT', 'beat', [`叙述段中“${povCharacter}”出现 ${characterCount} 次，“我”仅 ${firstPersonCount} 次`],
+        '第一人称故事在本拍漂移为第三人称叙述', '保持事件不变，将叙述恢复为冻结的第一人称视角'
+      ))
+    }
+    if (povMode === 'third_limited' && firstPersonCount >= 6) {
+      push(issue(
+        'POV_DRIFT', 'beat', [`引号外第一人称叙述信号出现 ${firstPersonCount} 次`],
+        '第三人称限知故事在本拍漂移为第一人称叙述', '保持事件不变，将叙述恢复为冻结的第三人称限知视角'
+      ))
+    }
   }
 
   const meta = nonEmptyLines(trimmed).filter(line =>

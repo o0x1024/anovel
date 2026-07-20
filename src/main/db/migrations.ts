@@ -914,4 +914,29 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
         ON story_release_snapshots(work_id, create_time);
     `)
   } catch { /* 已存在 */ }
+
+  try {
+    if (hasTable(db, 'story_issue_ledger') && !hasColumn(db, 'story_issue_ledger', 'clean_confirmations')) {
+      db.exec(`ALTER TABLE story_issue_ledger ADD COLUMN clean_confirmations INTEGER NOT NULL DEFAULT 0`)
+    }
+    if (hasTable(db, 'story_issue_ledger') && !hasColumn(db, 'story_issue_ledger', 'last_checked_hash')) {
+      db.exec(`ALTER TABLE story_issue_ledger ADD COLUMN last_checked_hash VARCHAR(80)`)
+    }
+  } catch { /* 已存在 */ }
+
+  // 短故事导语是独立于章节的发布正文；自动修复前必须保留可回滚版本。
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS story_lead_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_id INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        source_step VARCHAR(50) NOT NULL DEFAULT 'story_lead_repair',
+        create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_story_lead_versions_work
+        ON story_lead_versions(work_id, id);
+    `)
+  } catch { /* 已存在 */ }
 }

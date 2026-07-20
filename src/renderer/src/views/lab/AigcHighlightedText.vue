@@ -8,6 +8,11 @@ import { resolveAigcDisplayCategories } from '../../../../shared/aigc-display-al
 const props = defineProps<{
   segments: AigcSegment[]
   patches?: AigcSentencePatch[]
+  sentenceRewriting?: boolean
+}>()
+
+const emit = defineEmits<{
+  rewriteSentence: [index: number]
 }>()
 
 const CATEGORY_BG_CLASSES: Record<AigcCategory, string> = {
@@ -58,9 +63,18 @@ function tooltipLabel(displayCategory: AigcCategory, patch?: AigcSentencePatch):
       class="aigc-sentence relative group cursor-default rounded-sm px-0.5 py-[0.22em]"
       :class="CATEGORY_BG_CLASSES[displayCategory]"
     >{{ segment.text }}<span
-        v-if="segment.reason || patch?.evidence || patch?.status === 'unchanged'"
+        v-if="segment.reason || patch?.evidence || patch?.status === 'unchanged' || displayCategory !== 'human'"
         class="aigc-tooltip absolute hidden group-hover:inline-block left-0 top-full z-50 mt-1 w-max max-w-sm px-2.5 py-1.5 text-[11px] leading-relaxed text-left whitespace-normal break-words bg-base-300 text-base-content rounded shadow-lg"
-      >{{ tooltipLabel(displayCategory, patch) }} · {{ segmentProbabilityLabel(segment) }}：{{ segment.reason }}</span></span>
+      >
+        <span>{{ tooltipLabel(displayCategory, patch) }} · {{ segmentProbabilityLabel(segment) }}：{{ segment.reason }}</span>
+        <button
+          v-if="displayCategory !== 'human'"
+          type="button"
+          class="btn btn-primary btn-xs mt-1.5 block"
+          :disabled="sentenceRewriting"
+          @click.stop="emit('rewriteSentence', index)"
+        >{{ sentenceRewriting ? '句级改写中…' : '句级改写' }}</button>
+      </span></span>
   </div>
 </template>
 

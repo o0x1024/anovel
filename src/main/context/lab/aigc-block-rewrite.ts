@@ -156,7 +156,7 @@ async function analyzeBlock(
     const response = await modelService.chat({
       prompt: [payload, retryFeedback].filter(Boolean).join('\n\n'),
       systemPrompt: BLOCK_ANALYZE_SYSTEM,
-      step: 'ai_trace_polish',
+      step: 'lab_aigc_rewrite',
       enrichWorkContext: false,
       enrichNarrativeMemory: false,
       temperature: 0.1,
@@ -227,7 +227,7 @@ async function generateBlockCandidates(params: {
       retryFeedback ? `【上一轮候选失败反馈】\n${retryFeedback}` : ''
     ].filter(Boolean).join('\n\n'),
     systemPrompt: BLOCK_REWRITE_SYSTEM,
-    step: 'ai_trace_polish',
+    step: 'lab_aigc_rewrite',
     enrichWorkContext: false,
     enrichNarrativeMemory: false,
     temperature: 0.72,
@@ -305,6 +305,7 @@ export async function runBlockRewrite(params: {
   strongMode: boolean
   references: HumanRewriteReference[]
   modelOpts?: WorkModelOptions
+  onProgress?: (message: string) => void
 }): Promise<AigcSentenceRewriteResult> {
   const {
     sender,
@@ -316,8 +317,16 @@ export async function runBlockRewrite(params: {
     fullDocumentRewrite,
     strongMode,
     references,
-    modelOpts
+    modelOpts,
+    onProgress
   } = params
+  const reportProgress = (message: string) => {
+    if (onProgress) {
+      onProgress(message)
+      return
+    }
+    sender.send('lab:aigc-rewrite:progress', { runId, message })
+  }
   const units = splitStableSentences(input)
   if (units.length !== segments.length) {
     throw new Error(`语义块改写无法建立检测映射：原文${units.length}句，检测结果${segments.length}句`)
@@ -382,10 +391,7 @@ export async function runBlockRewrite(params: {
     state.touched = true
     state.status = 'analyzing'
     emit(state)
-    sender.send('lab:aigc-rewrite:progress', {
-      runId,
-      message: `语义块生成${completedBlocks + 1}/${targetIndices.length}：逐句诊断第${targetIndex + 1}块（${state.anchor.sentenceIds.length}句）…`
-    })
+    reportProgress(`语义块生成${completedBlocks + 1}/${targetIndices.length}：逐句诊断第${targetIndex + 1}块（${state.anchor.sentenceIds.length}句）…`)
     const blockDetails = segments.slice(
       state.segmentStart,
       state.segmentStart + state.anchor.sentenceIds.length
@@ -412,10 +418,7 @@ export async function runBlockRewrite(params: {
     let accepted: CandidateEvaluation | undefined
     let feedback = ''
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
-      sender.send('lab:aigc-rewrite:progress', {
-        runId,
-        message: `语义块生成${completedBlocks + 1}/${targetIndices.length}：生成第${attempt}/${MAX_GENERATION_ATTEMPTS}轮候选…`
-      })
+      reportProgress(`语义块生成${completedBlocks + 1}/${targetIndices.length}：生成第${attempt}/${MAX_GENERATION_ATTEMPTS}轮候选…`)
       const candidates = await generateBlockCandidates({
         state,
         previousText: states[targetIndex - 1]?.text ?? '',
@@ -485,13 +488,10 @@ export async function runBlockRewrite(params: {
     fullDocumentRewrite
   }
   const finalText = states.map(state => state.text).join('')
-  sender.send('lab:aigc-rewrite:progress', {
-    runId,
-    message: targetIndices.length === 0
+  reportProgress(targetIndices.length === 0
       ? '初始检测已经全部为人工特征，无需改写'
       : coverageSatisfied
         ? `场景块生成完成：${passedCount}/${targetIndices.length}个块通过，覆盖${goal.passedCoveragePercent}%；请应用后手动重新检测`
-        : `场景块覆盖仅${goal.passedCoveragePercent}%，未达到${REQUIRED_TARGET_COVERAGE * 100}%质量门禁，拒绝应用不完整改写`
-  })
+        : `场景块覆盖仅${goal.passedCoveragePercent}%，未达到${REQUIRED_TARGET_COVERAGE * 100}%质量门禁，拒绝应用不完整改写`)
   return { originalText: input, finalText, patches: orderedPatches, goal }
 }

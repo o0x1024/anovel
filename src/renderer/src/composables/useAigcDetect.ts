@@ -38,6 +38,7 @@ export function useAigcDetect() {
   const inputText = ref('')
   const status = ref<'idle' | 'running' | 'done' | 'error'>('idle')
   const rewriting = ref(false)
+  const sentenceRewriting = ref(false)
   const applyingWordTable = ref(false)
   const rewriteProgress = ref<{ message: string; level?: 'info' | 'warn' } | null>(null)
   const rewriteSelection = ref<AigcRewriteSelectionView | null>(null)
@@ -149,9 +150,17 @@ export function useAigcDetect() {
       rewriteGoal.value = rewriteResult.goal
       const decisions = { ...rewriteDecisions.value }
       for (const patch of rewriteResult.patches) {
-        if (patch.status === 'passed' && !decisions[patch.id]) decisions[patch.id] = 'pending'
+        if (patch.status === 'passed' && !decisions[patch.id]) {
+          decisions[patch.id] = rewriteResult.goal.status === 'achieved' ? 'accepted' : 'pending'
+        }
       }
       rewriteDecisions.value = decisions
+      if (rewriteResult.goal.status === 'achieved' && rewriteResult.verifiedDetection) {
+        inputText.value = rewriteResult.finalText
+        result.value = rewriteResult.verifiedDetection
+        status.value = 'done'
+        needsManualRecheck.value = false
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : '一键改写失败'
       if (msg !== '已取消') {
@@ -161,6 +170,39 @@ export function useAigcDetect() {
       throw error
     } finally {
       rewriting.value = false
+    }
+  }
+
+  async function rewriteSentence(segmentIndex: number, labModelParams?: WorkModelOptions) {
+    const text = inputText.value.trim()
+    if (!text || !result.value) throw new Error('请先完成检测后再进行句级改写')
+    if (rewriting.value || sentenceRewriting.value || applyingWordTable.value) return
+
+    sentenceRewriting.value = true
+    errorMessage.value = ''
+    try {
+      const runId = `aigc-sentence-rw-${Date.now()}-${++runIdCounter}`
+      currentRewriteRunId.value = runId
+      const rewritten = await window.anovel.invoke(
+        'lab:aigc-detect:sentence-rewrite',
+        runId,
+        text,
+        JSON.stringify(result.value),
+        segmentIndex,
+        labModelParams ?? {}
+      ) as { text: string; result: AigcDetectResult; applied: boolean; reason?: string }
+      if (!rewritten.applied) throw new Error(rewritten.reason || '句级改写未通过生成质量与本地风险门禁')
+      inputText.value = rewritten.text
+      result.value = rewritten.result
+      status.value = 'done'
+      needsManualRecheck.value = false
+      clearSentenceRewrite()
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : '句级改写失败'
+      errorMessage.value = msg
+      throw error
+    } finally {
+      sentenceRewriting.value = false
     }
   }
 
@@ -343,6 +385,7 @@ export function useAigcDetect() {
     inputText,
     status,
     rewriting,
+    sentenceRewriting,
     applyingWordTable,
     rewriteProgress,
     rewriteSelection,
@@ -360,6 +403,7 @@ export function useAigcDetect() {
     downloadProgress,
     run,
     rewrite,
+    rewriteSentence,
     applyWordTableReplace,
     decideSentencePatch,
     acceptAllSentencePatches,

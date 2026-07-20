@@ -11,7 +11,8 @@ export interface NovelOutlineBatchItem {
   nextHook: string
   characters: string[]
   outlineDiagnosis: string
-  emotionContract: EmotionContract
+  /** 正文生成前由独立情绪引擎按章补全，章节骨架批次不再承担该高维合同。 */
+  emotionContract: EmotionContract | null
   resourceBudgets: ChapterResourceBudgetInput[]
 }
 
@@ -75,7 +76,7 @@ export class NovelOutlineDAO extends BaseDAO {
             item.nextHook,
             JSON.stringify(item.characters),
             item.outlineDiagnosis,
-            JSON.stringify(item.emotionContract)
+            item.emotionContract ? JSON.stringify(item.emotionContract) : null
           ]
         )
         ids.push(chapterId)

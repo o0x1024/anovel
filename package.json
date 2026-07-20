@@ -17,7 +17,7 @@
     "test:zhuque-alignment": "jiti scripts/test-perplexity-model-registry.ts && jiti scripts/test-zhuque-experiment-corpus.ts && jiti scripts/test-zhuque-alignment.ts",
     "evaluate:zhuque-supervised": "jiti scripts/evaluate-aigc-supervised-corpus.ts",
     "test:aigc-supervised": "jiti scripts/test-aigc-supervised-fusion.ts && jiti scripts/test-aigc-supervised-tokenizer.ts",
-    "test:aigc-rewrite": "jiti scripts/test-aigc-rewrite-quality.ts && jiti scripts/test-aigc-sentence-patches.ts && jiti scripts/test-zhuque-sentence-attribution.ts && jiti scripts/test-aigc-display-allocation.ts && jiti scripts/test-human-rewrite-reference.ts && jiti scripts/test-human-rewrite-reference-presets.ts && node scripts/run-electron-test.mjs scripts/test-human-rewrite-reference-db.ts",
+    "test:aigc-rewrite": "jiti scripts/test-aigc-rewrite-quality.ts && jiti scripts/test-aigc-sentence-patches.ts && jiti scripts/test-zhuque-sentence-attribution.ts && jiti scripts/test-aigc-display-allocation.ts && jiti scripts/test-aigc-rewrite-verification.ts && jiti scripts/test-human-rewrite-reference.ts && jiti scripts/test-human-rewrite-reference-presets.ts && node scripts/run-electron-test.mjs scripts/test-human-rewrite-reference-db.ts",
     "dataset:sft": "node scripts/gen-sft-dataset.mjs",
     "test:continuation-dataset": "node scripts/test-continuation-dataset.mjs",
     "evaluate:finetuned-continuation": "node scripts/evaluate-finetuned-continuation.mjs",

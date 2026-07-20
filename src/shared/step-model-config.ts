@@ -133,6 +133,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'goal_generate_beats', label: '目标章节情节' },
       { step: 'goal_novel_volume_plan', label: '长篇分卷合同' },
       { step: 'goal_novel_chapter_batch', label: '长篇章节批次' },
+      { step: 'goal_novel_chapter_contract', label: '长篇单章结构合同' },
       { step: 'goal_novel_volume_chapter_gate', label: '长篇分卷章节窗口门禁' },
       { step: 'goal_novel_volume_chapter_repair', label: '长篇分卷章节定点修复' },
       { step: 'goal_novel_volume_evaluation', label: '长篇分卷终审' },
@@ -169,7 +170,9 @@ export const WORK_BODY_SLOT_STEPS = new Set(['body_generation'])
 export const EXPLICIT_REQUEST_MODEL_STEPS = new Set([
   'quality_diagnosis_ai',
   'critique_dual_channel',
-  'assistant_chat'
+  'assistant_chat',
+  // AI 实验室右上角的临时选模：未选时仍由全局默认模型兜底。
+  'lab_aigc_rewrite'
 ])
 
 /** 会采纳请求 modelType/modelName 的全部 step（正文槽位 + 显式传入） */

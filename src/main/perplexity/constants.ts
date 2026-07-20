@@ -10,6 +10,8 @@ export interface PerplexityModelDef {
   url: string
   sizeBytes: number
   contextSize: number
+  /** 正式检测工件必须固定摘要；实验模型可暂不提供。 */
+  sha256?: string
 }
 
 export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
@@ -21,6 +23,7 @@ export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
     url: 'https://modelscope.cn/models/unsloth/Qwen3.5-4B-GGUF/resolve/master/Qwen3.5-4B-Q4_K_M.gguf',
     sizeBytes: 2_740_937_888,
     contextSize: 4096,
+    sha256: '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4',
   },
   {
     id: 'qwen3.5-0.8b-q4',
@@ -70,6 +73,8 @@ export const PERPLEXITY_MODELS: PerplexityModelDef[] = [
 ]
 
 export const DEFAULT_MODEL_ID = 'qwen3.5-4b-q4'
+/** AI 实验室正式检测只允许使用这套已校准、已固定摘要的统计基座。 */
+export const PRODUCTION_DETECT_MODEL_ID = DEFAULT_MODEL_ID
 
 export function getModelDef(modelId: string): PerplexityModelDef {
   const definition = PERPLEXITY_MODELS.find(model => model.id === modelId)

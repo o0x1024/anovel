@@ -105,6 +105,10 @@ const diagnosticItems = computed(() => {
     <div v-else-if="result" class="flex gap-4 p-3 h-full min-h-0">
       <!-- Left: color-coded text segments -->
       <div class="flex-1 min-w-0 overflow-auto">
+        <div
+          v-if="result.authorship?.mode === 'ai_assisted'"
+          class="mb-2 rounded border border-info/25 bg-info/5 px-2.5 py-2 text-[11px] text-info"
+        >来源记录：AI辅助改写。下方比例仅表示当前本地特征覆盖，不代表人工作者身份。</div>
         <AigcHighlightedText :segments="result.segments" :patches="rewritePatches" />
 
         <div v-if="diagnosticItems.length" class="w-full border-t border-base-200 pt-2 space-y-1">
@@ -175,7 +179,7 @@ const diagnosticItems = computed(() => {
 
         <!-- Detector difference notice -->
         <div class="text-[10px] text-base-content/40 text-center px-1 mt-1 leading-relaxed">
-          检测阶段颜色表示句级概率类别；逐句分析后，红色只保留已定位到句内证据的目标，窗口级风险显示黄色
+          百分比表示当前检测版本的特征覆盖，不是作者身份概率；红色为已定位AI特征，黄色为疑似或窗口风险
         </div>
       </div>
     </div>

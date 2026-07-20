@@ -59,6 +59,7 @@ const skeleton: ParsedChapter = {
   outline: '节点一\n节点二\n下一拍钩子：搜身诬陷',
   beat_role: 'B',
   next_hook: '谁把项链放进书包？',
+  pov_mode: 'first',
   characters: '["沈知屿","苏曼妮"]'
 }
 const enriched: ParsedChapter = {
@@ -75,8 +76,10 @@ const merged = mergeStagedBeat(skeleton, enriched)
 assert.equal(merged.title, skeleton.title)
 assert.equal(merged.outline, skeleton.outline)
 assert.equal(merged.beat_role, 'A')
+assert.equal(merged.pov_mode, 'first')
 assert.equal(merged.dramatic_contract?.obstacle, '校方压制')
 assert.equal(merged.continuity_contract?.time_anchor, '公示期第1天')
+assert.equal(compactBeatSkeletons([skeleton])[0].pov_mode, 'first')
 const preservedDiagnosis = JSON.parse(mergeStoryBlueprintDiagnosis(JSON.stringify({
   dramatic_contract: { obstacle: '旧阻碍' },
   continuity_contract: { end_location: '三楼' },
@@ -98,6 +101,7 @@ assert.deepEqual(compactBeatSkeletons([skeleton]), [{
   beat_role: skeleton.beat_role,
   foreshadow_target: undefined,
   next_hook: skeleton.next_hook,
+  pov_mode: skeleton.pov_mode,
   characters: skeleton.characters
 }])
 assert.equal(exactStageCountError(5, 5, '骨架'), null)

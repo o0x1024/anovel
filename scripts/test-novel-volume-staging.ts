@@ -9,13 +9,17 @@ import {
   NOVEL_VOLUME_GATE_MAX_REPAIR_TARGETS_PER_ISSUE,
   NOVEL_VOLUME_GATE_MAX_WINDOW_SIZE,
   classifyVolumeGenerationFailure,
+  chapterSkeletonBatchSchema,
+  chapterStructureContractSchema,
   checkNovelVolumeRepairBudget,
   locateNovelVolumeGateEvidenceFragments,
+  missingChapterStructureFields,
   planNovelChapterBatch,
   planNovelVolumeGateWindows,
   planNovelVolumeRanges,
   replaceUniqueRepairText,
   resolveNovelVolumeWorkflowCheckpoint,
+  selectDeterministicNovelRepairChapterNumbers,
   selectNovelVolumeGateRepairTargets,
   validatePartialVolumePlan,
   volumeGenerationProfile
@@ -57,6 +61,14 @@ assert.deepEqual(volumeGateWindows, [
 assert.ok(volumeGateWindows.every(range => range.endChapter - range.startChapter + 1 <= NOVEL_VOLUME_GATE_MAX_WINDOW_SIZE))
 assert.ok(volumeGateWindows.every(range => range.endChapter - range.startChapter + 1 >= 6))
 assert.equal(NOVEL_VOLUME_GATE_MAX_REPAIR_CLUSTER, 2)
+assert.deepEqual(
+  selectDeterministicNovelRepairChapterNumbers('PAYOFF_DEBT_STREAK', [15, 16, 17, 18]),
+  [18]
+)
+assert.deepEqual(
+  selectDeterministicNovelRepairChapterNumbers('REPEATED_SOLUTION', [15, 16, 17, 18]),
+  [17, 18]
+)
 assert.deepEqual(planNovelVolumeGateWindows(9, 12), [{ startChapter: 9, endChapter: 12 }])
 assert.throws(() => planNovelVolumeGateWindows(5, 4), /章节范围非法/)
 
@@ -209,10 +221,30 @@ assert.ok(truncatedProfile.maxTokens > VOLUME_CONTRACT_MAX_TOKENS)
 
 assert.deepEqual(planNovelChapterBatch(1, 44), {
   end: 3,
-  maxTokens: 9000,
+  maxTokens: 6000,
   contextChars: 6000,
   compact: false
 })
+
+const skeletonSchemaText = JSON.stringify(chapterSkeletonBatchSchema(1, 3))
+assert.doesNotMatch(skeletonSchemaText, /emotion_contract|dramatic_contract|pattern_contract|resource_budget/)
+assert.match(skeletonSchemaText, /next_hook/)
+const contractSchemaText = JSON.stringify(chapterStructureContractSchema(1))
+assert.match(contractSchemaText, /dramatic_contract/)
+assert.match(contractSchemaText, /antagonist_tactic/)
+assert.match(contractSchemaText, /resource_budget/)
+assert.deepEqual(missingChapterStructureFields({
+  chapterNumber: 1,
+  dramatic_contract: Object.fromEntries([
+    'scene_promise', 'protagonist_want', 'obstacle', 'info_gap', 'pressure_escalation',
+    'turn', 'irreversible_change', 'payoff_or_debt', 'next_question'
+  ].map(key => [key, key])),
+  pattern_contract: Object.fromEntries([
+    'conflict_type', 'protagonist_method', 'anticipated_opponent_adjustment', 'location_type',
+    'hook_type', 'cost_type', 'relationship_delta', 'volume_objective_delta'
+  ].map(key => [key, key])),
+  resource_budget: []
+}), ['dramatic_contract.stakes', 'pattern_contract.antagonist_tactic'])
 assert.deepEqual(planNovelChapterBatch(4, 44), {
   end: 4,
   maxTokens: NOVEL_SINGLE_CHAPTER_MAX_TOKENS,

@@ -409,6 +409,7 @@ export class VolumeChapterDAO extends BaseDAO {
     outline?: string; content?: string; word_count?: number
     model_type?: string; style_id?: number; generation_round?: number
     snapshot?: ChapterRow
+    snapshot_json?: string
   }): number {
     const snapshot = data.snapshot ?? this.getChapter(chapterId)
     const latest = this.get<{ v: number }>(
@@ -422,7 +423,7 @@ export class VolumeChapterDAO extends BaseDAO {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [chapterId, latest?.v ?? 1, data.outline ?? null, data.content ?? null,
         data.word_count ?? 0, data.model_type ?? null, data.style_id ?? null, data.generation_round ?? 1,
-        snapshot ? JSON.stringify(snapshot) : null]
+        data.snapshot_json ?? (snapshot ? JSON.stringify(snapshot) : null)]
     )
   }
 

@@ -157,6 +157,10 @@ interface ConsistencyGateResult {
   passed: boolean
   blockers: string[]
   warnings: string[]
+  execution?: {
+    passed: boolean
+    coverage: Array<{ event: string; verdict: 'covered' | 'partial' | 'missing'; evidence: string; reason: string }>
+  }
 }
 
 interface BudgetPreview {
@@ -639,9 +643,50 @@ function budgetPressureClass(pressure: BudgetPreview['pressure']): string {
   return 'text-success'
 }
 
+async function repairNovelExecutionBeforePreview(chapterId: number, initialContent: string): Promise<string> {
+  if (workType.value !== 'novel' || !initialContent.trim()) return initialContent
+  let content = initialContent
+  for (let round = 0; round <= 2; round++) {
+    const gate = await window.anovel.invoke(
+      'consistency:gate', props.workId, chapterId, content
+    ) as ConsistencyGateResult
+    gateResult.value = gate
+    if (gate.passed) return content
+    if (!gate.execution || round >= 2) {
+      showToast('warning', `正文已保留为候选，但情节点覆盖/章际衔接未通过：${gate.blockers.slice(0, 2).join('；')}`)
+      return content
+    }
+    showToast('info', `正在修复情节点覆盖与章际衔接（${round + 1}/2）`)
+    const repaired = await window.anovel.invoke(
+      'novel:repairExecutionCandidate',
+      props.workId,
+      chapterId,
+      content,
+      gate.blockers
+    ) as { success: boolean; content?: string; error?: string }
+    if (!repaired.success || !repaired.content?.trim()) {
+      showToast('error', repaired.error || '章节执行定向修复失败')
+      return content
+    }
+    content = repaired.content
+  }
+  return content
+}
+
 async function generateBody() {
   const ch = selectedChapter.value
   if (!ch || generatingBody.value) return
+
+  if (workType.value === 'novel') {
+    const chapterIndex = chapters.value.findIndex(item => item.id === ch.id)
+    const previousPending = chapterIndex > 0
+      ? [...chapters.value.slice(0, chapterIndex)].reverse().find(item => item.content?.trim() && item.status === 'memory_pending')
+      : null
+    if (previousPending) {
+      showToast('error', `上一章「${previousPending.title}」的最终叙事记忆尚未同步，不能继续生成本章`)
+      return
+    }
+  }
 
   const chapterId = ch.id
   generatingBody.value = true
@@ -688,6 +733,10 @@ async function generateBody() {
     }
     if (content && autoRewrite.value) {
       content = await applyAutoRewrite(content)
+      result.value = content
+    }
+    if (content && workType.value === 'novel') {
+      content = await repairNovelExecutionBeforePreview(chapterId, content)
       result.value = content
     }
     if (content) {
@@ -1272,7 +1321,7 @@ async function adjustWordCount(action: 'expand' | 'compress') {
   }
 }
 
-async function extractNarrativeMemory(chapterId: number, content: string) {
+async function extractNarrativeMemory(chapterId: number, content: string): Promise<boolean> {
   extractingMemory.value = true
   memoryExtractMsg.value = ''
   try {
@@ -1285,7 +1334,7 @@ async function extractNarrativeMemory(chapterId: number, content: string) {
     }
     if (!extract.success) {
       memoryExtractMsg.value = `叙事记忆更新失败：${extract.error}`
-      return
+      return false
     }
 
     // AI 语义检测伏笔回收（替换旧硬编码匹配）
@@ -1308,6 +1357,7 @@ async function extractNarrativeMemory(chapterId: number, content: string) {
 
     memoryExtractMsg.value = `叙事记忆已更新：+${extract.planted ?? 0} 伏笔${resolveMsg} · ${extract.snapshots ?? 0} 角色快照`
     if (selectedChapterId.value) await loadNarrativeMemory(selectedChapterId.value)
+    return true
   } finally {
     extractingMemory.value = false
   }
@@ -1336,6 +1386,10 @@ async function saveToChapter() {
       gateResult.value = gate
       if (!gate.passed) {
         const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
+        if (gate.execution) {
+          alert(`${msg}\n\n长篇章节的情节点覆盖与章际衔接属于硬门禁，不能强制跳过。请先修复正文。`)
+          return
+        }
         if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
       } else if (gate.warnings.length > 0) {
         const msg = gate.warnings.slice(0, 5).join('\n')
@@ -1347,7 +1401,7 @@ async function saveToChapter() {
     const updateFields: Record<string, unknown> = {
       content: result.value,
       word_count: wordCount,
-      status: 'draft'
+      status: !isClearing && workType.value === 'novel' ? 'memory_pending' : 'draft'
     }
     await window.anovel.invoke('chapter:update', ch.id, updateFields)
     if (!isClearing) {
@@ -1362,7 +1416,8 @@ async function saveToChapter() {
       chapters.value[idx] = {
         ...chapters.value[idx],
         content: result.value || null,
-        word_count: wordCount
+        word_count: wordCount,
+        status: updateFields.status as string
       }
     }
     clearCachedBodyContent(ch.id)
@@ -1389,6 +1444,24 @@ async function saveToChapter() {
     return
   } finally {
     savingChapter.value = false
+  }
+
+  if (workType.value === 'novel') {
+    let synced = false
+    try {
+      synced = await extractNarrativeMemory(ch.id, result.value)
+    } catch (e) {
+      memoryExtractMsg.value = `叙事记忆更新失败：${e instanceof Error ? e.message : String(e)}`
+    }
+    if (synced) {
+      await window.anovel.invoke('chapter:update', ch.id, { status: 'completed' })
+      const index = chapters.value.findIndex(chapter => chapter.id === ch.id)
+      if (index >= 0) chapters.value[index] = { ...chapters.value[index], status: 'completed' }
+      showToast('success', '正文、章节合同与最终叙事记忆已提交')
+    } else {
+      showToast('error', '正文已保存为待同步状态；叙事记忆成功前不会允许生成下一章')
+    }
+    return
   }
 
   const updateMemory = confirm(

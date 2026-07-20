@@ -19,9 +19,18 @@ export interface AigcDetectResult {
   distribution: AigcDistribution
   summary: string
   diagnostics?: AigcDetectDiagnostics
+  /** 来源记录与检测结论分离；检测器不能把AI辅助改写重新声明为人工创作。 */
+  authorship?: {
+    mode: 'ai_assisted'
+    method: 'full_document' | 'sentence'
+    note: string
+  }
 }
 
 export interface AigcDetectDiagnostics {
+  /** 可审计的正式统计基座与策略版本。 */
+  statisticalModelId?: string
+  policyVersion?: string
   tokenPredictability: number
   sequenceRegularity: number
   informationUniformity: number

@@ -7,6 +7,17 @@ export interface ChapterSceneBudget {
   targetWords: number
 }
 
+export interface ChapterExecutionScene {
+  id: string
+  label: string
+  purpose: string
+  targetWords: number
+  entryFacts: string[]
+  mustCover: string[]
+  exitFacts: string[]
+  forbiddenEvents: string[]
+}
+
 export interface ChapterExecutionContractInput {
   chapterId: number
   chapterTitle: string
@@ -33,15 +44,18 @@ export interface ChapterExecutionContract {
   forbiddenEvents: string[]
   endingState: string
   abilityConstraints: string
+  continuityConstraints: string
+  sourceOutlineHash: string
   characterNames: string[]
   dialogueMode: ChapterDialogueMode
   dialogueRange: [number, number]
   sceneBudgets: ChapterSceneBudget[]
+  scenes: ChapterExecutionScene[]
   errors: string[]
   warnings: string[]
 }
 
-const TAGS = ['开场状态', '必须覆盖', '禁止越界', '结尾落点', '能力/状态约束', '连续性约束'] as const
+const TAGS = ['开场状态', '必须覆盖', '禁止越界', '结尾落点', '能力/状态约束', '连续性约束', '情节节点', '章末钩子', '戏剧契约'] as const
 
 function extractTaggedText(outline: string, tag: typeof TAGS[number]): string {
   const startToken = `【${tag}】`
@@ -55,13 +69,69 @@ function extractTaggedText(outline: string, tag: typeof TAGS[number]): string {
   return outline.slice(contentStart, next ?? outline.length).trim().slice(0, 1200)
 }
 
+function stableTextHash(text: string): string {
+  let value = 2166136261
+  for (let index = 0; index < text.length; index++) {
+    value ^= text.charCodeAt(index)
+    value = Math.imul(value, 16777619)
+  }
+  return (value >>> 0).toString(16).padStart(8, '0')
+}
+
 function splitContractItems(text: string): string[] {
   if (!text) return []
   return text
     .split(/[；;。\n]+/)
-    .map(item => item.trim().replace(/^[\d一二三四五六七八九十]+[.、)]\s*/, '').slice(0, 400))
+    .map(item => item.trim().replace(/^(?:[-*•]\s*|[\d一二三四五六七八九十]+[.、)]\s*)/, '').slice(0, 400))
     .filter(Boolean)
     .slice(0, 12)
+}
+
+function deriveOutlineEvents(outline: string): string[] {
+  const plotNodes = splitContractItems(extractTaggedText(outline, '情节节点'))
+  if (plotNodes.length > 0) return plotNodes
+  const firstTag = outline.search(/【[^】]+】/)
+  const untaggedNarrative = firstTag >= 0 ? outline.slice(0, firstTag) : outline
+  return splitContractItems(untaggedNarrative)
+    .filter(item => !/^(?:开场状态|必须覆盖|禁止越界|结尾落点|能力\/状态约束|连续性约束)/.test(item))
+    .slice(0, 12)
+}
+
+function allocateExecutionScenes(
+  wordTarget: number,
+  requiredEvents: string[],
+  openingState: string,
+  endingState: string,
+  forbiddenEvents: string[]
+): ChapterExecutionScene[] {
+  if (requiredEvents.length === 0) return []
+  const sceneCount = Math.min(6, requiredEvents.length)
+  const groups = Array.from({ length: sceneCount }, () => [] as string[])
+  requiredEvents.forEach((event, index) => {
+    groups[Math.min(sceneCount - 1, Math.floor(index * sceneCount / requiredEvents.length))].push(event)
+  })
+  let allocated = 0
+  return groups.map((mustCover, index) => {
+    const targetWords = index === groups.length - 1
+      ? Math.max(0, wordTarget - allocated)
+      : Math.round(wordTarget / groups.length)
+    allocated += targetWords
+    const previousEvent = index > 0 ? groups[index - 1].at(-1) : null
+    return {
+      id: `scene_${index + 1}`,
+      label: `场景${index + 1}：${mustCover[0].slice(0, 28)}`,
+      purpose: mustCover.join('；'),
+      targetWords,
+      entryFacts: index === 0
+        ? [openingState].filter(Boolean)
+        : previousEvent ? [`承接上一场已完成事件：${previousEvent}`] : [],
+      mustCover,
+      exitFacts: index === groups.length - 1
+        ? [endingState].filter(Boolean)
+        : [mustCover.at(-1) ?? ''].filter(Boolean),
+      forbiddenEvents
+    }
+  })
 }
 
 function allocateSceneBudgets(wordTarget: number): ChapterSceneBudget[] {
@@ -89,11 +159,16 @@ function normalizeComparable(text: string): string {
 export function buildChapterExecutionContract(input: ChapterExecutionContractInput): ChapterExecutionContract {
   const outline = input.outline?.trim() ?? ''
   const wordTarget = Math.max(0, Math.round(input.wordTarget))
-  const openingState = extractTaggedText(outline, '开场状态')
-  const requiredEvents = splitContractItems(extractTaggedText(outline, '必须覆盖'))
+  const explicitOpeningState = extractTaggedText(outline, '开场状态')
+  const explicitRequiredEvents = splitContractItems(extractTaggedText(outline, '必须覆盖'))
+  const fallbackEvents = explicitRequiredEvents.length === 0 ? deriveOutlineEvents(outline) : []
+  const requiredEvents = explicitRequiredEvents.length > 0 ? explicitRequiredEvents : fallbackEvents
   const forbiddenEvents = splitContractItems(extractTaggedText(outline, '禁止越界'))
-  const endingState = extractTaggedText(outline, '结尾落点')
+  const explicitEndingState = extractTaggedText(outline, '结尾落点')
+  const openingState = explicitOpeningState || (requiredEvents[0] ? `承接上一章最终状态，进入：${requiredEvents[0]}` : '')
+  const endingState = explicitEndingState || requiredEvents.at(-1) || ''
   const abilityConstraints = extractTaggedText(outline, '能力/状态约束')
+  const continuityConstraints = extractTaggedText(outline, '连续性约束')
   const characterNames = [...new Set((input.characterNames ?? []).map(name => name.trim()).filter(Boolean))]
   const dialogueEvidence = [outline, ...(input.characterSpeechStyles ?? [])].join('\n')
   const muteInteraction = /哑巴|不会说话|无法说话|全程无对话|全程没有对话|无声互动/.test(dialogueEvidence)
@@ -112,9 +187,10 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
   const warnings: string[] = []
   if (wordTarget <= 0) errors.push('章节目标字数必须大于 0')
   if (!outline) errors.push('章节大纲为空，无法编译执行合同')
-  if (!openingState) warnings.push('大纲没有显式【开场状态】，将以正文连续性状态为准')
+  if (!explicitOpeningState) warnings.push('大纲没有显式【开场状态】，已从首个情节节点推导并以正文连续性状态为准')
   if (requiredEvents.length === 0) warnings.push('大纲没有可拆分的【必须覆盖】节点')
-  if (!endingState) warnings.push('大纲没有显式【结尾落点】，将以章末钩子为准')
+  else if (explicitRequiredEvents.length === 0) warnings.push('大纲没有显式【必须覆盖】，已将情节节点编译为可验收事件')
+  if (!explicitEndingState) warnings.push('大纲没有显式【结尾落点】，已使用最后一个情节节点作为停止边界')
   if (muteInteraction) warnings.push('检测到无声互动章节：通用对话密度规则已由非语言互动质量替代')
 
   const forbiddenNormalized = forbiddenEvents.map(normalizeComparable).filter(Boolean)
@@ -139,10 +215,16 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
     forbiddenEvents,
     endingState,
     abilityConstraints,
+    continuityConstraints,
+    sourceOutlineHash: stableTextHash(outline),
     characterNames,
     dialogueMode,
     dialogueRange,
-    sceneBudgets: allocateSceneBudgets(wordTarget),
+    sceneBudgets: requiredEvents.length > 0
+      ? allocateExecutionScenes(wordTarget, requiredEvents, openingState, endingState, forbiddenEvents)
+        .map(scene => ({ label: scene.label, targetWords: scene.targetWords }))
+      : allocateSceneBudgets(wordTarget),
+    scenes: allocateExecutionScenes(wordTarget, requiredEvents, openingState, endingState, forbiddenEvents),
     errors,
     warnings
   }
@@ -165,10 +247,18 @@ export function formatChapterExecutionContract(contract: ChapterExecutionContrac
     contract.forbiddenEvents.length ? `禁止越界：\n${contract.forbiddenEvents.map((item, i) => `${i + 1}. ${item}`).join('\n')}` : '',
     contract.endingState ? `结尾状态：${contract.endingState}` : '',
     contract.abilityConstraints ? `能力/状态约束：${contract.abilityConstraints}` : '',
+    contract.continuityConstraints ? `连续性约束：${contract.continuityConstraints}` : '',
     contract.characterNames.length ? `本章角色：${contract.characterNames.join('、')}` : '',
     `互动模式：${dialogueRule}`,
-    '【场景字数预算 - 在既定情节内展开，不得新增支线】',
-    ...contract.sceneBudgets.map((item, i) => `${i + 1}. ${item.label}：约${item.targetWords}字（允许±20%）`),
+    '【场景执行清单 - 必须按顺序完成，在既定情节内展开】',
+    ...(contract.scenes.length > 0
+      ? contract.scenes.map(scene => [
+          `${scene.id} ${scene.label}：约${scene.targetWords}字（允许±20%）`,
+          `  必须覆盖：${scene.mustCover.join('；')}`,
+          scene.entryFacts.length ? `  进入事实：${scene.entryFacts.join('；')}` : '',
+          scene.exitFacts.length ? `  退出事实：${scene.exitFacts.join('；')}` : ''
+        ].filter(Boolean).join('\n'))
+      : contract.sceneBudgets.map((item, i) => `${i + 1}. ${item.label}：约${item.targetWords}字（允许±20%）`)),
     '冲突处理：章节事实与边界 > 连续性和能力限制 > 字数范围 > 通用文风偏好。若规则冲突，执行本合同。'
   ].filter(Boolean).join('\n')
 }

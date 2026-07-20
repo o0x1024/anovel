@@ -43,6 +43,7 @@ const {
   inputText: aigcInputText,
   status: aigcStatus,
   rewriting: aigcRewriting,
+  sentenceRewriting: aigcSentenceRewriting,
   applyingWordTable: aigcApplyingWordTable,
   rewriteProgress: aigcRewriteProgress,
   rewritePatches: aigcRewritePatches,
@@ -56,6 +57,7 @@ const {
   downloadProgress: aigcDownloadProgress,
   run: aigcRun,
   rewrite: aigcRewrite,
+  rewriteSentence: aigcRewriteSentence,
   applyWordTableReplace: aigcApplyWordTable,
   decideSentencePatch: aigcDecideSentencePatch,
   acceptAllSentencePatches: aigcAcceptAllSentencePatches,
@@ -66,10 +68,6 @@ const {
 const pageError = ref('')
 
 function requireLabModelParams() {
-  if (!labModelType.value) {
-    pageError.value = '请先在右上角选择模型'
-    return null
-  }
   return modelParams()
 }
 
@@ -86,10 +84,9 @@ async function onRun() {
 
 async function onAigcRun() {
   pageError.value = ''
-  const params = requireLabModelParams()
-  if (!params) return
   try {
-    await aigcRun(params)
+    // AIGC 检测使用内置困惑度/监督检测模型；右上角模型仅用于改写类 LLM 调用。
+    await aigcRun()
   } catch (error) {
     if ((error instanceof Error ? error.message : '') !== '已取消') {
       pageError.value = error instanceof Error ? error.message : '检测失败'
@@ -106,6 +103,19 @@ async function onAigcRewrite() {
   } catch (error) {
     if ((error instanceof Error ? error.message : '') !== '已取消') {
       pageError.value = error instanceof Error ? error.message : '改写失败'
+    }
+  }
+}
+
+async function onAigcSentenceRewrite(segmentIndex: number) {
+  pageError.value = ''
+  const params = requireLabModelParams()
+  if (!params) return
+  try {
+    await aigcRewriteSentence(segmentIndex, params)
+  } catch (error) {
+    if ((error instanceof Error ? error.message : '') !== '已取消') {
+      pageError.value = error instanceof Error ? error.message : '句级改写失败'
     }
   }
 }
@@ -214,7 +224,6 @@ async function onStyleChanged(styleIdValue: number | null) {
         <BodyModelSelect
           v-model:model-type="labModelType"
           v-model:model-name="labModelName"
-          explicit-selection
         />
         <label
           class="flex items-center gap-1 cursor-pointer shrink-0"
@@ -273,6 +282,7 @@ async function onStyleChanged(styleIdValue: number | null) {
         v-model:seed-opts="aigcSeedOpts"
         :status="aigcStatus"
         :rewriting="aigcRewriting"
+        :sentence-rewriting="aigcSentenceRewriting"
         :applying-word-table="aigcApplyingWordTable"
         :rewrite-progress="aigcRewriteProgress"
         :rewrite-patches="aigcRewritePatches"
@@ -286,6 +296,7 @@ async function onStyleChanged(styleIdValue: number | null) {
         class="flex-1 min-h-0"
         @run="onAigcRun"
         @rewrite="onAigcRewrite"
+        @sentence-rewrite="onAigcSentenceRewrite"
         @wordtable-apply="onAigcApplyWordTable"
         @cancel="aigcCancel"
         @clear-result="onAigcClearResult"

@@ -17,8 +17,6 @@ import { outlineConstraintsForWordTarget } from '../../../shared/outline-constra
 import { DEFAULT_WORDS_PER_CHAPTER } from '../../../shared/writing-plan-presets'
 import { loadWritingPlan } from '../writing-plan'
 import { withGoalLoopModelOptions } from './story-goal-model'
-import { normalizeEmotionContract, validateEmotionContract } from '../../../shared/emotion-contract'
-import { EMOTION_CONTRACT_JSON_SHAPE } from './emotion-engine'
 import type { GoalCheckResult } from './story-goal-checker'
 import { goldenOutlineContract } from '../../../shared/golden-opening'
 import { retentionEvaluationRules, retentionPlanningRules } from './reader-retention'
@@ -28,6 +26,7 @@ import {
   validatePleasureEngineScale
 } from './novel-scale-contract'
 import { detectChapterPatternIssues } from './novel-systemic-gate'
+import { requestStructuredModelOutput } from './structured-model-output'
 
 const OUTLINE_BATCH_SIZE = 1
 const GOLDEN_OPENING_BATCH_SIZE = 3
@@ -44,6 +43,7 @@ export const NOVEL_VOLUME_GATE_MAX_REPAIR_TARGETS_PER_ISSUE = 4
 export const NOVEL_VOLUME_GATE_MAX_REPAIRED_CHAPTERS = 6
 export const NOVEL_VOLUME_GATE_MAX_REWRITES_PER_CHAPTER = 1
 const NOVEL_VOLUME_GATE_ASSESS_MAX_TOKENS = 2400
+const NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION = 2
 
 const NOVEL_VOLUME_GATE_HARD_ISSUE_CODES = new Set([
   'STATE_CONTINUITY_BREAK',
@@ -67,7 +67,8 @@ const NOVEL_VOLUME_GATE_REPAIR_FIELDS = [
   'dramatic_contract.turn',
   'dramatic_contract.irreversible_change',
   'dramatic_contract.payoff_or_debt',
-  'dramatic_contract.next_question'
+  'dramatic_contract.next_question',
+  'tension_plan.payoff_type'
 ] as const
 
 const NOVEL_VOLUME_GATE_ASSESSMENT_SCHEMA: Record<string, unknown> = {
@@ -242,6 +243,7 @@ export interface NovelVolumeGateRepairControl {
 
 export interface NovelVolumeGateCheckpoint {
   version: 2
+  repairProtocolVersion?: number
   volume: string
   round: number
   snapshotFingerprint: string
@@ -265,6 +267,14 @@ export interface NovelGoalPersistentState {
   chapterVolumeGateCheckpoint?: NovelVolumeGateCheckpoint
   checkedBodyVolumes?: string[]
   pleasureVolumeFingerprint?: string
+  pendingChapterSkeletonBatch?: {
+    volumeName: string
+    volumeFingerprint: string
+    start: number
+    end: number
+    skeletons: NovelChapterSkeleton[]
+    items?: NovelOutlineBatchItem[]
+  }
   repairPlan?: unknown
   overallRepairRounds?: number
   repairStall?: { signature: string; issueFingerprint?: string; blockerCount?: number; count: number }
@@ -388,7 +398,7 @@ export function planNovelChapterBatch(
   const timeout = /timeout|timed out|超时/i.test(failureMessage ?? '')
   return {
     end: Math.min(volumeEnd, start + count - 1),
-    maxTokens: start === 1 ? 9000 : NOVEL_SINGLE_CHAPTER_MAX_TOKENS,
+    maxTokens: start === 1 ? 6000 : NOVEL_SINGLE_CHAPTER_MAX_TOKENS,
     contextChars: timeout ? 3500 : 6000,
     compact: timeout
   }
@@ -459,6 +469,7 @@ export function resetNovelGoalStateFromVolumePlan(workId: number): void {
     chapterVolumeGateCheckpoint: undefined,
     checkedBodyVolumes: undefined,
     pleasureVolumeFingerprint: undefined,
+    pendingChapterSkeletonBatch: undefined,
     repairPlan: undefined,
     overallRepairRounds: 0,
     repairStall: undefined,
@@ -1489,8 +1500,7 @@ function deterministicVolumeGateIssues(
   }).filter(issue => issue.severity === 'blocker').flatMap(issue => {
     const affected = [...new Set(issue.chapterIds.map(id => numberById.get(id)).filter((value): value is number => value != null))]
     if (affected.length === 0) return []
-    // 确定性窗口问题优先改后出现的重复/停滞章，不把整个五章窗口全部重写。
-    const chapterNumbers = affected.slice(-NOVEL_VOLUME_GATE_MAX_REPAIR_CLUSTER)
+    const chapterNumbers = selectDeterministicNovelRepairChapterNumbers(issue.code, affected)
     return [{
       source: 'deterministic' as const,
       code: issue.code,
@@ -1503,6 +1513,13 @@ function deterministicVolumeGateIssues(
       requiredFix: issue.recommendedAction
     }]
   })
+}
+
+/** 确定性问题只选择消除门禁所需的最小章节集合。 */
+export function selectDeterministicNovelRepairChapterNumbers(code: string, affected: number[]): number[] {
+  const unique = [...new Set(affected)]
+  if (code === 'PAYOFF_DEBT_STREAK') return unique.slice(-1)
+  return unique.slice(-NOVEL_VOLUME_GATE_MAX_REPAIR_CLUSTER)
 }
 
 function planVolumeGateRepairClusters(issues: NovelVolumeGateIssue[]): Array<{
@@ -1556,7 +1573,7 @@ async function repairVolumeChapterCluster(input: {
   chapterNumbers: number[]
   issues: NovelVolumeGateIssue[]
   signal?: AbortSignal
-}): Promise<Array<{ chapterId: number; versionId: number }>> {
+}): Promise<Array<{ chapterId: number; versionId: number; chapterNumber: number }>> {
   const chapters = volumeChapterDAO.listChapters(input.volumeId)
   const chaptersByNumber = new Map(chapters.map((chapter, index) => [input.contract.startChapter + index, chapter]))
   const targets = input.chapterNumbers.map(number => chaptersByNumber.get(number)).filter((chapter): chapter is VolumeGateChapter => !!chapter)
@@ -1581,6 +1598,7 @@ async function repairVolumeChapterCluster(input: {
       outline: chapter.outline,
       next_hook: chapter.next_hook,
       dramatic_contract: diagnosis.dramatic_contract ?? {},
+      tension_plan: diagnosis.tension_plan ?? {},
       resource_budgets_read_only: resourceLedgerDAO.listBudgetsByChapter(input.workId, chapter.id)
     }
   })
@@ -1601,9 +1619,11 @@ async function repairVolumeChapterCluster(input: {
       },
       systemPrompt: [
         '你是长篇小说章节合同定点修复编辑。只输出合法 JSON，不要 markdown、解释或评估。',
-        `只允许修改指定的 ${input.chapterNumbers.length} 章，patches 必须逐章且仅返回这些章，不得改相邻章。`,
+        `只允许修改指定的 ${input.chapterNumbers.length} 个候选章节；patches 只能返回候选章节中的最小非空子集，不得改相邻章。`,
         '只做最小文本替换：每个 operation 的 oldText 必须逐字且唯一存在于当前字段，newText 只修正点名的连续性事实。',
-        `field 只允许：${NOVEL_VOLUME_GATE_REPAIR_FIELDS.join('、')}。不得重写整章，不得改标题、角色、节拍、情绪合同、pattern_contract 或资源预算。`,
+        `field 只允许：${NOVEL_VOLUME_GATE_REPAIR_FIELDS.join('、')}。不得重写整章，不得改标题、角色、beat_role、情绪合同、pattern_contract 或资源预算。`,
+        'patches 可以只返回指定章节中的最小非空子集；不要为了凑齐章节数修改不需要改的章节。',
+        '修复 PAYOFF_DEBT_STREAK 时，至少一章必须把 tension_plan.payoff_type 从 debt 改为 partial 或 major，并同步修改该章 outline 或 dramatic_contract，使阶段兑现与人物状态变化有实际剧情依据。',
         '格式：{"patches":[{"chapterNumber":1,"operations":[{"field":"outline","oldText":"当前字段中的逐字短段","newText":"修正后短段"}]}]}'
       ].join('\n'),
       prompt: [
@@ -1622,11 +1642,14 @@ async function repairVolumeChapterCluster(input: {
     throw new Error(`分卷「${input.contract.name}」第 ${input.chapterNumbers.join('、')} 章定点修复失败：${response.error || '模型未返回内容'}`)
   }
   const parsed = parseObject(response.content, `分卷「${input.contract.name}」定点修复`)
-  if (!Array.isArray(parsed.patches) || parsed.patches.length !== input.chapterNumbers.length) {
-    throw new NovelPipelineError('OUTPUT_INVALID', `分卷「${input.contract.name}」定点修复补丁数量不匹配`)
+  if (!Array.isArray(parsed.patches) || parsed.patches.length === 0 || parsed.patches.length > input.chapterNumbers.length) {
+    throw new NovelPipelineError('OUTPUT_INVALID', `分卷「${input.contract.name}」定点修复必须返回候选章节的最小非空子集`)
   }
   const seen = new Set<number>()
+  const requiresPayoffRepair = clusterIssues.some(issue => issue.code === 'PAYOFF_DEBT_STREAK')
+  let payoffRepairSatisfied = false
   const validatedPatches: Array<{
+    chapterNumber: number
     chapter: VolumeGateChapter
     fields: Parameters<typeof volumeChapterDAO.updateChapterWithVersion>[1]
   }> = []
@@ -1651,9 +1674,15 @@ async function repairVolumeChapterCluster(input: {
       && !Array.isArray(diagnosis.dramatic_contract)
       ? { ...diagnosis.dramatic_contract as Record<string, unknown> }
       : {}
+    const tensionPlan = diagnosis.tension_plan && typeof diagnosis.tension_plan === 'object'
+      && !Array.isArray(diagnosis.tension_plan)
+      ? { ...diagnosis.tension_plan as Record<string, unknown> }
+      : {}
     let outlineChanged = false
     let nextHookChanged = false
     let diagnosisChanged = false
+    let dramaticContractChanged = false
+    let tensionPayoffChanged = false
     for (const rawOperation of patch.operations) {
       if (!rawOperation || typeof rawOperation !== 'object' || Array.isArray(rawOperation)) {
         throw new NovelPipelineError('OUTPUT_INVALID', `第 ${chapterNumber} 章最小补丁 operation 非法`)
@@ -1671,34 +1700,63 @@ async function repairVolumeChapterCluster(input: {
       } else if (field === 'next_hook') {
         nextHook = replaceUniqueRepairText({ chapterNumber, field, current: nextHook, oldText, newText })
         nextHookChanged = true
+      } else if (field === 'tension_plan.payoff_type') {
+        const current = String(tensionPlan.payoff_type ?? '')
+        const payoffType = replaceUniqueRepairText({ chapterNumber, field, current, oldText, newText })
+        if (!['debt', 'partial', 'major', 'aftertaste'].includes(payoffType)) {
+          throw new NovelPipelineError('OUTPUT_INVALID', `第 ${chapterNumber} 章 tension_plan.payoff_type 非法`)
+        }
+        tensionPlan.payoff_type = payoffType
+        diagnosisChanged = true
+        tensionPayoffChanged = true
       } else {
         const key = field.slice('dramatic_contract.'.length)
         const current = String(dramaticContract[key] ?? '')
         dramaticContract[key] = replaceUniqueRepairText({ chapterNumber, field, current, oldText, newText })
         diagnosisChanged = true
+        dramaticContractChanged = true
       }
+    }
+    if (
+      tensionPayoffChanged
+      && ['partial', 'major'].includes(String(tensionPlan.payoff_type ?? ''))
+      && (outlineChanged || dramaticContractChanged)
+    ) {
+      payoffRepairSatisfied = true
     }
     if (!outlineChanged && !nextHookChanged && !diagnosisChanged) {
       throw new NovelPipelineError('OUTPUT_INVALID', `第 ${chapterNumber} 章最小补丁没有产生变更`)
     }
     validatedPatches.push({
+      chapterNumber,
       chapter,
       fields: {
         ...(outlineChanged ? { outline } : {}),
         ...(nextHookChanged ? { next_hook: nextHook } : {}),
         ...(diagnosisChanged ? {
-          outline_diagnosis: JSON.stringify({ ...diagnosis, dramatic_contract: dramaticContract })
+          outline_diagnosis: JSON.stringify({
+            ...diagnosis,
+            dramatic_contract: dramaticContract,
+            tension_plan: tensionPlan
+          })
         } : {})
       }
     })
   }
-  if (seen.size !== input.chapterNumbers.length) {
-    throw new NovelPipelineError('OUTPUT_INVALID', `分卷「${input.contract.name}」定点修复没有覆盖全部点名章节`)
+  if (requiresPayoffRepair && !payoffRepairSatisfied) {
+    throw new NovelPipelineError(
+      'OUTPUT_INVALID',
+      'PAYOFF_DEBT_STREAK 修复必须同时产生 partial/major 阶段兑现，并修改大纲或戏剧合同作为剧情依据'
+    )
   }
-  return volumeChapterDAO.updateChaptersWithVersionsAtomic(validatedPatches.map(patch => ({
+  const versions = volumeChapterDAO.updateChaptersWithVersionsAtomic(validatedPatches.map(patch => ({
     chapterId: patch.chapter.id,
     fields: patch.fields
   })))
+  return versions.map((version, index) => ({
+    ...version,
+    chapterNumber: validatedPatches[index].chapterNumber
+  }))
 }
 
 async function runVolumeChapterGate(
@@ -1710,7 +1768,14 @@ async function runVolumeChapterGate(
 ): Promise<{ score: number; rounds: number }> {
   const volume = volumeChapterDAO.listVolumes(workId).find(item => item.name === contract.name)
   if (!volume) throw new NovelPipelineError('PREREQUISITE_MISSING', `分卷「${contract.name}」尚未落库`)
-  const savedCheckpoint = readNovelGoalState(workId).chapterVolumeGateCheckpoint
+  let savedCheckpoint = readNovelGoalState(workId).chapterVolumeGateCheckpoint
+  if (savedCheckpoint?.version === 2
+    && savedCheckpoint.volume === contract.name
+    && savedCheckpoint.repairProtocolVersion !== NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION) {
+    updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: undefined, failure: undefined })
+    savedCheckpoint = undefined
+    onProgress?.(`检测到旧版自动修复检查点，已保留现有章节并从「${contract.name}」门禁重新诊断`)
+  }
   if (savedCheckpoint?.version === 2 && savedCheckpoint.volume === contract.name && savedCheckpoint.stalled) {
     throw new NovelPipelineError('REPAIR_STALL', savedCheckpoint.stalled.reason)
   }
@@ -1773,7 +1838,7 @@ async function runVolumeChapterGate(
       if (signal?.aborted) throw new Error('已取消')
       const cluster = repair.clusters[clusterIndex]
       onProgress?.(`正在修复第 ${cluster.chapterNumbers.join('、')} 章（${clusterIndex + 1}/${repair.clusters.length}）`)
-      let versions: Array<{ chapterId: number; versionId: number }>
+      let versions: Array<{ chapterId: number; versionId: number; chapterNumber: number }>
       try {
         versions = await repairVolumeChapterCluster({
           workId,
@@ -1788,7 +1853,7 @@ async function runVolumeChapterGate(
         if (error instanceof NovelPipelineError && error.code === 'OUTPUT_INVALID') {
           stallAndRollback(
             current,
-            `分卷「${contract.name}」第 ${cluster.chapterNumbers.join('、')} 章最小补丁无法逐字验证，已拒绝落库并暂停`
+            `分卷「${contract.name}」第 ${cluster.chapterNumbers.join('、')} 章最小补丁验证失败，已拒绝落库并暂停：${error.message}`
           )
         }
         throw error
@@ -1796,16 +1861,22 @@ async function runVolumeChapterGate(
       const refreshed = volumeChapterDAO.listChapters(volume.id)
       const control = current.repairControl!
       const rewriteCounts = { ...control.rewriteCounts }
-      for (const chapterNumber of cluster.chapterNumbers) {
+      const changedChapterNumbers = [...new Set(versions.map(version => version.chapterNumber))]
+      for (const chapterNumber of changedChapterNumbers) {
         rewriteCounts[String(chapterNumber)] = (rewriteCounts[String(chapterNumber)] ?? 0) + 1
       }
+      const previouslyChanged = control.changedChapterNumbers.filter(number => !cluster.chapterNumbers.includes(number))
       current = {
         ...current,
         snapshotFingerprint: volumeGateSnapshotFingerprint(refreshed),
         repairControl: {
           ...control,
+          changedChapterNumbers: [...new Set([...previouslyChanged, ...changedChapterNumbers])],
           rewriteCounts,
-          lastRoundVersions: [...control.lastRoundVersions, ...versions]
+          lastRoundVersions: [
+            ...control.lastRoundVersions,
+            ...versions.map(({ chapterId, versionId }) => ({ chapterId, versionId }))
+          ]
         },
         repair: { ...repair, nextClusterIndex: clusterIndex + 1 }
       }
@@ -1825,6 +1896,7 @@ async function runVolumeChapterGate(
     updateNovelGoalState(workId, {
       chapterVolumeGateCheckpoint: {
         version: 2,
+        repairProtocolVersion: NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION,
         volume: contract.name,
         round: checkpoint.round + 1,
         snapshotFingerprint: volumeGateSnapshotFingerprint(refreshed),
@@ -1844,6 +1916,7 @@ async function runVolumeChapterGate(
     const snapshotFingerprint = volumeGateSnapshotFingerprint(chapters)
     const currentSaved = readNovelGoalState(workId).chapterVolumeGateCheckpoint
     const savedMatchesSnapshot = currentSaved?.version === 2
+      && currentSaved.repairProtocolVersion === NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION
       && currentSaved.volume === contract.name
       && currentSaved.round === rounds
       && currentSaved.snapshotFingerprint === snapshotFingerprint
@@ -1851,6 +1924,7 @@ async function runVolumeChapterGate(
       ? currentSaved
       : {
           version: 2,
+          repairProtocolVersion: NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION,
           volume: contract.name,
           round: rounds,
           snapshotFingerprint,
@@ -2115,14 +2189,208 @@ function validateResourceBudgets(
   }
 }
 
-function validateChapterBatch(input: {
+interface NovelChapterSkeleton {
+  chapterNumber: number
+  title: string
+  outline: string
+  arcPhase: string
+  payoffRole: string
+  tensionLevel: number
+  payoffType: 'debt' | 'partial' | 'major' | 'aftertaste'
+  foreshadowTarget: string | null
+  nextHook: string
+  characters: string[]
+}
+
+const DRAMATIC_CONTRACT_KEYS = [
+  'scene_promise', 'protagonist_want', 'obstacle', 'stakes', 'info_gap',
+  'pressure_escalation', 'turn', 'irreversible_change', 'payoff_or_debt', 'next_question'
+] as const
+
+const PATTERN_CONTRACT_KEYS = [
+  'conflict_type', 'protagonist_method', 'antagonist_tactic', 'anticipated_opponent_adjustment',
+  'location_type', 'hook_type', 'cost_type', 'relationship_delta', 'volume_objective_delta'
+] as const
+
+export function chapterSkeletonBatchSchema(start: number, end: number): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['startChapter', 'endChapter', 'chapters'],
+    properties: {
+      startChapter: { type: 'integer', const: start },
+      endChapter: { type: 'integer', const: end },
+      chapters: {
+        type: 'array',
+        minItems: end - start + 1,
+        maxItems: end - start + 1,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: [
+            'chapterNumber', 'title', 'outline', 'arc_phase', 'payoff_role',
+            'tension_level', 'payoff_type', 'foreshadow_target', 'next_hook', 'characters'
+          ],
+          properties: {
+            chapterNumber: { type: 'integer', minimum: start, maximum: end },
+            title: { type: 'string' },
+            outline: { type: 'string' },
+            arc_phase: { type: 'string' },
+            payoff_role: { type: 'string', enum: ['A', 'B', 'C'] },
+            tension_level: { type: 'integer', minimum: 1, maximum: 10 },
+            payoff_type: { type: 'string', enum: ['debt', 'partial', 'major', 'aftertaste'] },
+            foreshadow_target: { type: 'string' },
+            next_hook: { type: 'string' },
+            characters: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'string' } }
+          }
+        }
+      }
+    }
+  }
+}
+
+export function chapterStructureContractSchema(chapterNumber: number): Record<string, unknown> {
+  const stringProperties = (keys: readonly string[]) => Object.fromEntries(keys.map(key => [key, { type: 'string' }]))
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['chapterNumber', 'dramatic_contract', 'pattern_contract', 'resource_budget'],
+    properties: {
+      chapterNumber: { type: 'integer', const: chapterNumber },
+      dramatic_contract: {
+        type: 'object',
+        additionalProperties: false,
+        required: [...DRAMATIC_CONTRACT_KEYS],
+        properties: stringProperties(DRAMATIC_CONTRACT_KEYS)
+      },
+      pattern_contract: {
+        type: 'object',
+        additionalProperties: false,
+        required: [...PATTERN_CONTRACT_KEYS],
+        properties: stringProperties(PATTERN_CONTRACT_KEYS)
+      },
+      resource_budget: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: [
+            'owner', 'resource', 'unit', 'start_min', 'start_max', 'end_min', 'end_max',
+            'allowed_events', 'forbidden_events', 'reason'
+          ],
+          properties: {
+            owner: { type: ['string', 'null'] },
+            resource: { type: 'string' },
+            unit: { type: ['string', 'null'] },
+            start_min: { type: ['number', 'null'] },
+            start_max: { type: ['number', 'null'] },
+            end_min: { type: ['number', 'null'] },
+            end_max: { type: ['number', 'null'] },
+            allowed_events: { type: ['string', 'null'] },
+            forbidden_events: { type: ['string', 'null'] },
+            reason: { type: ['string', 'null'] }
+          }
+        }
+      }
+    }
+  }
+}
+
+export function missingChapterStructureFields(parsed: Record<string, unknown>): string[] {
+  const missing: string[] = []
+  const dramatic = parsed.dramatic_contract && typeof parsed.dramatic_contract === 'object'
+    && !Array.isArray(parsed.dramatic_contract)
+    ? parsed.dramatic_contract as Record<string, unknown>
+    : {}
+  const pattern = parsed.pattern_contract && typeof parsed.pattern_contract === 'object'
+    && !Array.isArray(parsed.pattern_contract)
+    ? parsed.pattern_contract as Record<string, unknown>
+    : {}
+  for (const key of DRAMATIC_CONTRACT_KEYS) {
+    if (typeof dramatic[key] !== 'string' || !dramatic[key].trim()) missing.push(`dramatic_contract.${key}`)
+  }
+  for (const key of PATTERN_CONTRACT_KEYS) {
+    if (typeof pattern[key] !== 'string' || !pattern[key].trim()) missing.push(`pattern_contract.${key}`)
+  }
+  if (!Array.isArray(parsed.resource_budget)) missing.push('resource_budget')
+  return missing
+}
+
+function chapterStructurePatchSchema(chapterNumber: number, missingFields: string[]): Record<string, unknown> {
+  const full = chapterStructureContractSchema(chapterNumber)
+  const fullProperties = (full.properties ?? {}) as Record<string, Record<string, unknown>>
+  const dramaticKeys = missingFields
+    .filter(field => field.startsWith('dramatic_contract.'))
+    .map(field => field.slice('dramatic_contract.'.length))
+  const patternKeys = missingFields
+    .filter(field => field.startsWith('pattern_contract.'))
+    .map(field => field.slice('pattern_contract.'.length))
+  const patchProperties: Record<string, unknown> = {}
+  const required: string[] = []
+  if (dramaticKeys.length > 0) {
+    required.push('dramatic_contract')
+    patchProperties.dramatic_contract = {
+      type: 'object', additionalProperties: false, required: dramaticKeys,
+      properties: Object.fromEntries(dramaticKeys.map(key => [key, { type: 'string' }]))
+    }
+  }
+  if (patternKeys.length > 0) {
+    required.push('pattern_contract')
+    patchProperties.pattern_contract = {
+      type: 'object', additionalProperties: false, required: patternKeys,
+      properties: Object.fromEntries(patternKeys.map(key => [key, { type: 'string' }]))
+    }
+  }
+  if (missingFields.includes('resource_budget')) {
+    required.push('resource_budget')
+    patchProperties.resource_budget = fullProperties.resource_budget
+  }
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['chapterNumber', 'patch'],
+    properties: {
+      chapterNumber: { type: 'integer', const: chapterNumber },
+      patch: {
+        type: 'object',
+        additionalProperties: false,
+        required,
+        properties: patchProperties
+      }
+    }
+  }
+}
+
+function mergeChapterStructurePatch(
+  base: Record<string, unknown>,
+  patchResponse: Record<string, unknown>
+): Record<string, unknown> {
+  const patch = patchResponse.patch && typeof patchResponse.patch === 'object' && !Array.isArray(patchResponse.patch)
+    ? patchResponse.patch as Record<string, unknown>
+    : {}
+  const mergeObject = (key: string): Record<string, unknown> => ({
+    ...(base[key] && typeof base[key] === 'object' && !Array.isArray(base[key])
+      ? base[key] as Record<string, unknown>
+      : {}),
+    ...(patch[key] && typeof patch[key] === 'object' && !Array.isArray(patch[key])
+      ? patch[key] as Record<string, unknown>
+      : {})
+  })
+  return {
+    ...base,
+    chapterNumber: patchResponse.chapterNumber ?? base.chapterNumber,
+    dramatic_contract: mergeObject('dramatic_contract'),
+    pattern_contract: mergeObject('pattern_contract'),
+    resource_budget: patch.resource_budget ?? base.resource_budget
+  }
+}
+
+function validateChapterSkeletonBatch(input: {
   parsed: Record<string, unknown>
   start: number
   end: number
   outlineMin: number
-  workId: number
-  previousChapterId: number | null
-}): NovelOutlineBatchItem[] {
+}): NovelChapterSkeleton[] {
   if (Number(input.parsed.startChapter) !== input.start || Number(input.parsed.endChapter) !== input.end) {
     throw new NovelPipelineError('CONTRACT_INVALID', `章节批次范围不匹配，期望 ${input.start}-${input.end}`)
   }
@@ -2131,8 +2399,7 @@ function validateChapterBatch(input: {
     throw new NovelPipelineError('CONTRACT_INVALID', `章节批次数量不匹配，期望 ${input.end - input.start + 1} 章，实际 ${Array.isArray(raw) ? raw.length : 0} 章`)
   }
 
-  const budgetRows: Array<{ chapterNumber: number; budgets: ChapterResourceBudgetInput[] }> = []
-  const items = raw.map((value, index) => {
+  return raw.map((value, index) => {
     if (!value || typeof value !== 'object') {
       throw new NovelPipelineError('CONTRACT_INVALID', `章节批次第 ${index + 1} 项不是对象`)
     }
@@ -2156,38 +2423,70 @@ function validateChapterBatch(input: {
     if (!['debt', 'partial', 'major', 'aftertaste'].includes(payoffType)) {
       throw new NovelPipelineError('CONTRACT_INVALID', `第 ${chapterNumber} 章 payoff_type 非法`)
     }
-    const contract = validateDramaticContract(row.dramatic_contract, chapterNumber)
-    const patternContract = validatePatternContract(row.pattern_contract, chapterNumber)
-    const emotionContract = normalizeEmotionContract(row.emotion_contract)
-    if (!emotionContract || validateEmotionContract(emotionContract).length > 0) {
-      throw new NovelPipelineError('CONTRACT_INVALID', `第 ${chapterNumber} 章缺少完整 emotion_contract`)
-    }
-    const budgets = normalizeChapterResourceBudgets(row.resource_budget).filter(budget =>
-      budget.start_min != null && budget.start_max != null && budget.end_min != null && budget.end_max != null
-    )
-    budgetRows.push({ chapterNumber, budgets })
-    const diagnosis = {
-      arc_phase: textField(row, 'arc_phase', `第 ${chapterNumber} 章`),
-      dramatic_contract: contract,
-      pattern_contract: patternContract,
-      tension_plan: { level: tensionLevel, payoff_type: payoffType },
-      emotion_contract: emotionContract
-    }
     return {
+      chapterNumber,
       title: textField(row, 'title', `第 ${chapterNumber} 章`),
       outline,
-      arcPhase: diagnosis.arc_phase,
+      arcPhase: textField(row, 'arc_phase', `第 ${chapterNumber} 章`),
       payoffRole,
+      tensionLevel,
+      payoffType: payoffType as NovelChapterSkeleton['payoffType'],
       foreshadowTarget: String(row.foreshadow_target ?? '').trim() || null,
       nextHook: textField(row, 'next_hook', `第 ${chapterNumber} 章`),
-      characters: normalizeCharacters(row.characters, chapterNumber),
-      outlineDiagnosis: JSON.stringify(diagnosis),
-      emotionContract,
-      resourceBudgets: budgets
+      characters: normalizeCharacters(row.characters, chapterNumber)
     }
   })
-  validateResourceBudgets(input.workId, input.previousChapterId, budgetRows)
-  return items
+}
+
+function validateChapterStructureContract(
+  parsed: Record<string, unknown>,
+  chapterNumber: number
+): {
+  dramaticContract: Record<string, unknown>
+  patternContract: Record<string, string>
+  resourceBudgets: ChapterResourceBudgetInput[]
+} {
+  if (Number(parsed.chapterNumber) !== chapterNumber) {
+    throw new NovelPipelineError('CONTRACT_INVALID', `章节结构合同编号不匹配，期望第 ${chapterNumber} 章`)
+  }
+  const dramaticContract = validateDramaticContract(parsed.dramatic_contract, chapterNumber)
+  for (const key of DRAMATIC_CONTRACT_KEYS) {
+    textField(dramaticContract, key, `第 ${chapterNumber} 章 dramatic_contract`)
+  }
+  const patternContract = validatePatternContract(parsed.pattern_contract, chapterNumber)
+  const resourceBudgets = normalizeChapterResourceBudgets(parsed.resource_budget).filter(budget =>
+    budget.start_min != null && budget.start_max != null && budget.end_min != null && budget.end_max != null
+  )
+  return { dramaticContract, patternContract, resourceBudgets }
+}
+
+function validateChapterResourceBudgetCompleteness(
+  workId: number,
+  chapterNumber: number,
+  previousBudgets: Map<string, ChapterResourceBudgetInput>,
+  budgets: ChapterResourceBudgetInput[]
+): void {
+  const required = resourceLedgerDAO.listConstraints(workId).filter(isNumericConstraint)
+  if (required.length === 0) {
+    if (budgets.length > 0) {
+      throw new NovelPipelineError('CONTRACT_INVALID', `第 ${chapterNumber} 章没有数值资源约束，resource_budget 必须为空数组`)
+    }
+    return
+  }
+  const current = new Map(budgets.map(budget => [budgetKey(budget), budget]))
+  for (const constraint of required) {
+    const key = budgetKey(constraint)
+    const budget = current.get(key)
+    if (!budget) throw new NovelPipelineError('CONTRACT_INVALID', `第 ${chapterNumber} 章缺少资源预算 ${key}`)
+    if (budget.start_min == null || budget.start_max == null || budget.end_min == null || budget.end_max == null) {
+      throw new NovelPipelineError('CONTRACT_INVALID', `第 ${chapterNumber} 章资源 ${key} 缺少完整起止区间`)
+    }
+    const previous = previousBudgets.get(key)
+    if (previous?.end_min != null && previous.end_max != null) {
+      budget.start_min = previous.end_min
+      budget.start_max = previous.end_max
+    }
+  }
 }
 
 function formatRecentOutlineContext(workId: number): string {
@@ -2203,7 +2502,7 @@ function formatRecentOutlineContext(workId: number): string {
     .join('\n\n')
 }
 
-async function generateChapterBatch(input: {
+async function generateChapterSkeletonBatch(input: {
   workId: number
   goal: string
   volume: NovelVolumeContract
@@ -2211,18 +2510,9 @@ async function generateChapterBatch(input: {
   end: number
   correction?: string
   signal?: AbortSignal
-}): Promise<NovelOutlineBatchItem[]> {
+}): Promise<NovelChapterSkeleton[]> {
   const plan = loadWritingPlan(input.workId)
   const constraints = outlineConstraintsForWordTarget(plan.wordsPerChapter || DEFAULT_WORDS_PER_CHAPTER)
-  const resourceConstraints = formatResourceConstraintsForPrompt(input.workId)
-  const previousChapter = volumeChapterDAO.listChaptersByWork(input.workId).at(-1)
-  const previousBudgets = new Map<string, ChapterResourceBudgetInput>()
-  if (previousChapter) {
-    for (const budget of resourceLedgerDAO.listBudgetsByChapter(input.workId, previousChapter.id)) {
-      previousBudgets.set(budgetKey(budget), budget)
-    }
-  }
-  const budgetExample = resourceBudgetExample(input.workId, previousBudgets)
   const outputExample = {
     startChapter: input.start,
     endChapter: input.end,
@@ -2234,22 +2524,9 @@ async function generateChapterBatch(input: {
       payoff_role: 'B',
       tension_level: 6,
       payoff_type: 'debt',
-      dramatic_contract: {
-        scene_promise: '本章场景承诺', protagonist_want: '主角目标', obstacle: '阻力', stakes: '失败代价',
-        info_gap: '信息差', pressure_escalation: '压力升级', turn: '中段转折', irreversible_change: '不可逆变化',
-        payoff_or_debt: '兑现或债务', next_question: '结尾问题'
-      },
-      pattern_contract: {
-        conflict_type: '抽象冲突类型', protagonist_method: '主角本章核心解法', antagonist_tactic: '对手策略',
-        anticipated_opponent_adjustment: '对手基于既有失败的调整或不适用', location_type: '场景功能类型',
-        hook_type: '章末钩子类型', cost_type: '主角实际支付的代价', relationship_delta: '核心关系变化或无变化',
-        volume_objective_delta: '本卷核心目标的可验证推进'
-      },
-      emotion_contract: EMOTION_CONTRACT_JSON_SHAPE,
       foreshadow_target: '',
       next_hook: '下一章钩子',
-      characters: ['主角'],
-      resource_budget: budgetExample
+      characters: ['主角']
     }]
   }
   const ctx = buildWorkContext(input.workId, { includeVolumes: true, includeCoreSettings: true })
@@ -2260,73 +2537,239 @@ async function generateChapterBatch(input: {
     failure?.phase === 'generate_beats' ? failure.message : undefined
   )
   const recentOutlineContext = formatRecentOutlineContext(input.workId)
-  const request = withGoalLoopModelOptions(input.workId, {
+  return requestStructuredModelOutput<NovelChapterSkeleton[]>({
     workId: input.workId,
-    step: 'goal_novel_chapter_batch',
-    enrichWorkContext: false,
-    enrichNarrativeMemory: false,
-    temperature: 0.2,
-    maxTokens: profile.maxTokens,
-    thinkingEnabled: false,
-    forceThinkingDisabled: true,
-    systemPrompt: [
-      '你是长篇小说章节结构编辑。只输出合法 JSON 对象，不要 markdown、前言、总结或解释。',
-      `只生成第 ${input.start}-${input.end} 章，不得生成范围外章节。`,
-      input.start === input.end
-        ? '本次只生成一章完整合同，优先保证 JSON 完整闭合，禁止附加解释。'
-        : '本次只生成黄金前三章，字段必须精炼，优先保证 JSON 完整闭合。',
-      goldenOutlineContract('novel', input.start, input.end),
-      retentionPlanningRules('novel'),
-      `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须包含【开场状态】【必须覆盖】【禁止越界】【结尾落点】【连续性约束】。`,
-      '每章必须有戏剧契约：目标、阻力、失败代价、中段转折、不可逆变化和结尾问题。',
-      '每章必须有 emotion_contract：依恋锚点、事件意义、人物表里冲突、读者信息位置、有代价选择和跨章余波缺一不可。',
-      '每章必须有 pattern_contract，用抽象语义声明冲突、解法、对手策略及学习、场景功能、钩子、代价、关系变化和分卷目标推进。',
-      '同一批次内不得连续复用相同 conflict_type+protagonist_method 或 hook_type；对手失败后必须调整策略。',
-      'payoff_role 只允许 A/B/C；payoff_type 只允许 debt/partial/major/aftertaste；tension_level 为1-10。',
-      resourceConstraints ? '每章必须为全书资源账本中可数值化的资源输出完整 resource_budget，起止区间必须承接上一章；境界、身份等枚举状态写入角色状态和戏剧契约，不得伪造数值区间。' : 'resource_budget 输出空数组。',
-      'resource_budget 必须按账本逐项输出，owner 和 resource 必须与账本完全一致，禁止遗漏或改名。',
-      `合法 JSON 结构示例：${JSON.stringify(outputExample)}`
-    ].join('\n'),
-    prompt: [
-      `【用户目标】\n${input.goal.trim() || '自动策划一部长篇小说'}`,
-      `【当前分卷合同】\n${JSON.stringify(input.volume, null, 2)}`,
-      resourceConstraints,
-      previousResourceBudgetContext(previousBudgets),
-      input.correction && !/timeout|timed out|超时/i.test(input.correction)
-        ? `【上一次输出未通过合同校验，本次必须逐项修正】\n${input.correction}`
-        : '',
-      recentOutlineContext ? `【最近章节，必须连续承接】\n${recentOutlineContext}` : '',
-      `【作品上下文（${profile.compact ? '超时后压缩' : '必要摘要'}）】\n${ctx.text.slice(0, profile.contextChars)}`
-    ].filter(Boolean).join('\n\n')
+    label: `第 ${input.start}-${input.end} 章骨架批次`,
+    attempts: 2,
+    signal: input.signal,
+    request: async (_attempt, lastError) => modelService.chat(
+      {
+        ...withGoalLoopModelOptions(input.workId, {
+          workId: input.workId,
+          step: 'goal_novel_chapter_batch',
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          temperature: 0.2,
+          maxTokens: input.start === 1 ? 6000 : Math.min(4200, profile.maxTokens),
+          thinkingEnabled: false,
+          forceThinkingDisabled: true,
+          responseSchema: {
+            name: 'novel_chapter_skeleton_batch',
+            schema: chapterSkeletonBatchSchema(input.start, input.end),
+            strict: true
+          },
+          systemPrompt: [
+            '你是长篇小说章节骨架编辑。只输出严格 Schema 要求的 JSON，不要合同、情绪分析、资源预算、markdown 或解释。',
+            `只生成第 ${input.start}-${input.end} 章，不得生成范围外章节。`,
+            input.start === input.end
+              ? '本次只规划一章剧情骨架。'
+              : '本次联合规划黄金前三章，只负责连续剧情骨架，形成“立钩子→扩承诺→首兑现”。',
+            goldenOutlineContract('novel', input.start, input.end),
+            retentionPlanningRules('novel'),
+            `每章大纲 ${constraints.charsMin}-${constraints.charsMax} 字，必须包含【开场状态】【必须覆盖】【禁止越界】【结尾落点】【连续性约束】。`,
+            'payoff_role 只允许 A/B/C；payoff_type 只允许 debt/partial/major/aftertaste；tension_level 为1-10。',
+            '不得输出 dramatic_contract、pattern_contract、emotion_contract 或 resource_budget；这些由后续独立阶段生成。',
+            `最小结构示例：${JSON.stringify(outputExample)}`
+          ].join('\n'),
+          prompt: [
+            `【用户目标】\n${input.goal.trim() || '自动策划一部长篇小说'}`,
+            `【当前分卷合同】\n${JSON.stringify(input.volume, null, 2)}`,
+            input.correction && !/timeout|timed out|超时/i.test(input.correction)
+              ? `【上一轮骨架问题】\n${input.correction}`
+              : '',
+            lastError !== '未知结构化输出错误' ? `【上一轮 JSON 错误】\n${lastError}` : '',
+            recentOutlineContext ? `【最近章节，必须连续承接】\n${recentOutlineContext}` : '',
+            `【作品上下文（${profile.compact ? '超时后压缩' : '必要摘要'}）】\n${ctx.text.slice(0, profile.contextChars)}`
+          ].filter(Boolean).join('\n\n')
+        }),
+        thinkingEnabled: false,
+        forceThinkingDisabled: true
+      },
+      { stream: false, signal: input.signal }
+    ),
+    validate: parsed => validateChapterSkeletonBatch({
+      parsed,
+      start: input.start,
+      end: input.end,
+      outlineMin: constraints.charsMin
+    })
   })
-  const response = await modelService.chat(
-    { ...request, thinkingEnabled: false, forceThinkingDisabled: true },
-    { stream: false, signal: input.signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(`章节情节批次生成失败：${response.error || '模型未返回内容'}`)
+}
+
+async function generateChapterStructureContract(input: {
+  workId: number
+  goal: string
+  volume: NovelVolumeContract
+  skeleton: NovelChapterSkeleton
+  previousBudgets: Map<string, ChapterResourceBudgetInput>
+  recentOutlineContext: string
+  signal?: AbortSignal
+}): Promise<ReturnType<typeof validateChapterStructureContract>> {
+  const resourceConstraints = formatResourceConstraintsForPrompt(input.workId)
+  const example = {
+    chapterNumber: input.skeleton.chapterNumber,
+    dramatic_contract: Object.fromEntries(DRAMATIC_CONTRACT_KEYS.map(key => [key, key])),
+    pattern_contract: Object.fromEntries(PATTERN_CONTRACT_KEYS.map(key => [key, key])),
+    resource_budget: resourceBudgetExample(input.workId, input.previousBudgets)
   }
-  if (response.finishReason === 'length') {
-    throw new NovelPipelineError(
-      'OUTPUT_INVALID',
-      `章节情节输出被截断（finishReason=length）：第 ${input.start}-${input.end} 章，将缩小任务后从断点重试`
-    )
-  }
-  const parsed = parseObject(response.content, `第 ${input.start}-${input.end} 章批次`)
-  return validateChapterBatch({
-    parsed,
-    start: input.start,
-    end: input.end,
-    outlineMin: constraints.charsMin,
+  let partialContract: Record<string, unknown> | null = null
+  let missingFields: string[] = []
+  return requestStructuredModelOutput({
     workId: input.workId,
-    previousChapterId: previousChapter?.id ?? null
+    label: `第 ${input.skeleton.chapterNumber} 章结构合同`,
+    attempts: 3,
+    signal: input.signal,
+    request: async (attempt, lastError) => modelService.chat(
+      {
+        ...withGoalLoopModelOptions(input.workId, {
+          workId: input.workId,
+          step: 'goal_novel_chapter_contract',
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          temperature: 0.1,
+          maxTokens: 3200,
+          thinkingEnabled: false,
+          forceThinkingDisabled: true,
+          responseSchema: {
+            name: missingFields.length > 0
+              ? 'novel_chapter_structure_missing_fields'
+              : 'novel_chapter_structure_contract',
+            schema: missingFields.length > 0
+              ? chapterStructurePatchSchema(input.skeleton.chapterNumber, missingFields)
+              : chapterStructureContractSchema(input.skeleton.chapterNumber),
+            strict: true
+          },
+          systemPrompt: [
+            '你是长篇小说单章结构合同编辑。剧情骨架已经冻结；只补充这一章的结构合同和资源预算，不得改写标题、大纲、角色或钩子。',
+            'dramatic_contract 和 pattern_contract 的每个字段都必须是非空字符串。',
+            'pattern_contract 使用抽象语义；对手无调整时明确填写“不适用：原因”，禁止省略 antagonist_tactic。',
+            resourceConstraints
+              ? 'resource_budget 必须按资源账本逐项完整输出，名称不得改写，开章区间承接上一章。'
+              : 'resource_budget 必须输出空数组。',
+            attempt > 1
+              ? missingFields.length > 0
+                ? `上一轮只有以下字段缺失：${missingFields.join('、')}。只在 patch 中返回这些字段，禁止返回或改写其他字段。`
+                : '上一轮有结构或格式错误。本轮保持已有剧情含义，禁止重新设计章节。'
+              : '',
+            `结构示例：${JSON.stringify(example)}`
+          ].filter(Boolean).join('\n'),
+          prompt: [
+            `【用户目标】\n${input.goal.trim() || '自动策划一部长篇小说'}`,
+            `【分卷合同】\n${JSON.stringify(input.volume)}`,
+            `【冻结的章节骨架】\n${JSON.stringify(input.skeleton, null, 2)}`,
+            resourceConstraints,
+            previousResourceBudgetContext(input.previousBudgets),
+            input.recentOutlineContext ? `【最近章节模式，只读】\n${input.recentOutlineContext}` : '',
+            partialContract && missingFields.length > 0
+              ? `【已通过字段，只读且禁止重写】\n${JSON.stringify(partialContract, null, 2)}`
+              : '',
+            attempt > 1 ? `【上一轮缺失/非法字段】\n${lastError}` : ''
+          ].filter(Boolean).join('\n\n')
+        }),
+        thinkingEnabled: false,
+        forceThinkingDisabled: true
+      },
+      { stream: false, signal: input.signal }
+    ),
+    validate: parsed => {
+      const candidate = partialContract && parsed.patch
+        ? mergeChapterStructurePatch(partialContract, parsed)
+        : parsed
+      try {
+        const validated = validateChapterStructureContract(candidate, input.skeleton.chapterNumber)
+        validateChapterResourceBudgetCompleteness(
+          input.workId,
+          input.skeleton.chapterNumber,
+          input.previousBudgets,
+          validated.resourceBudgets
+        )
+        return validated
+      } catch (error) {
+        const missing = missingChapterStructureFields(candidate)
+        if (/资源|resource_budget/.test(error instanceof Error ? error.message : String(error))) {
+          missing.push('resource_budget')
+        }
+        if (missing.length > 0) {
+          partialContract = candidate
+          missingFields = [...new Set(missing)]
+        } else {
+          partialContract = null
+          missingFields = []
+        }
+        throw error
+      }
+    }
   })
+}
+
+async function enrichChapterSkeletons(input: {
+  workId: number
+  goal: string
+  volume: NovelVolumeContract
+  skeletons: NovelChapterSkeleton[]
+  existingItems?: NovelOutlineBatchItem[]
+  signal?: AbortSignal
+  onProgress?: (message: string) => void
+  onCheckpoint?: (items: NovelOutlineBatchItem[]) => void
+}): Promise<NovelOutlineBatchItem[]> {
+  const previousChapter = volumeChapterDAO.listChaptersByWork(input.workId).at(-1)
+  const previousBudgets = new Map<string, ChapterResourceBudgetInput>()
+  if (previousChapter) {
+    for (const budget of resourceLedgerDAO.listBudgetsByChapter(input.workId, previousChapter.id)) {
+      previousBudgets.set(budgetKey(budget), budget)
+    }
+  }
+  const recentOutlineContext = formatRecentOutlineContext(input.workId)
+  const items: NovelOutlineBatchItem[] = (input.existingItems ?? []).slice(0, input.skeletons.length)
+  const budgetRows: Array<{ chapterNumber: number; budgets: ChapterResourceBudgetInput[] }> = items.map((item, index) => ({
+    chapterNumber: input.skeletons[index].chapterNumber,
+    budgets: item.resourceBudgets
+  }))
+  for (const item of items) {
+    for (const budget of item.resourceBudgets) previousBudgets.set(budgetKey(budget), budget)
+  }
+  for (let index = items.length; index < input.skeletons.length; index++) {
+    const skeleton = input.skeletons[index]
+    input.onProgress?.(`正在补全第 ${skeleton.chapterNumber} 章结构合同（${index + 1}/${input.skeletons.length}）`)
+    const contract = await generateChapterStructureContract({
+      workId: input.workId,
+      goal: input.goal,
+      volume: input.volume,
+      skeleton,
+      previousBudgets,
+      recentOutlineContext,
+      signal: input.signal
+    })
+    budgetRows.push({ chapterNumber: skeleton.chapterNumber, budgets: contract.resourceBudgets })
+    for (const budget of contract.resourceBudgets) previousBudgets.set(budgetKey(budget), budget)
+    const diagnosis = {
+      arc_phase: skeleton.arcPhase,
+      dramatic_contract: contract.dramaticContract,
+      pattern_contract: contract.patternContract,
+      tension_plan: { level: skeleton.tensionLevel, payoff_type: skeleton.payoffType }
+    }
+    items.push({
+      title: skeleton.title,
+      outline: skeleton.outline,
+      arcPhase: skeleton.arcPhase,
+      payoffRole: skeleton.payoffRole,
+      foreshadowTarget: skeleton.foreshadowTarget,
+      nextHook: skeleton.nextHook,
+      characters: skeleton.characters,
+      outlineDiagnosis: JSON.stringify(diagnosis),
+      emotionContract: null,
+      resourceBudgets: contract.resourceBudgets
+    })
+    input.onCheckpoint?.([...items])
+  }
+  validateResourceBudgets(input.workId, previousChapter?.id ?? null, budgetRows)
+  return items
 }
 
 async function assessGoldenThreeOutlineBatch(
   workId: number,
   goal: string,
-  items: NovelOutlineBatchItem[],
+  items: NovelChapterSkeleton[],
   signal?: AbortSignal
 ): Promise<{ passed: boolean; score: number; issues: string[] }> {
   const firstThree = items.slice(0, 3)
@@ -2568,27 +3011,64 @@ export async function generateNextNovelOutlineBatch(
     state.failure?.phase === 'generate_beats' ? state.failure.message : undefined
   )
   const end = batchProfile.end
+  const volumeFingerprint = createHash('sha256').update(JSON.stringify(volume)).digest('hex')
   onProgress?.(`正在生成章节情节第 ${start}-${end} 章（剩余 ${targetChapters - existing.length} 章）`)
   let correction = state.failure?.phase === 'generate_beats' ? state.failure.message : undefined
-  let items: NovelOutlineBatchItem[] = []
-  for (let round = 1; round <= MAX_GATE_REPAIR_ROUNDS; round++) {
-    items = await generateChapterBatch({ workId, goal, volume, start, end, correction, signal })
-    if (start !== 1 || end < 3) break
-    onProgress?.(`正在执行黄金前三章联合门禁（第 ${round} 轮）`)
-    const gate = await assessGoldenThreeOutlineBatch(workId, goal, items, signal)
-    if (gate.passed) {
-      onProgress?.(`黄金前三章联合门禁通过（${gate.score}分）`)
-      break
+  const pendingSkeletons = state.pendingChapterSkeletonBatch
+  const canResumeSkeletons = pendingSkeletons?.volumeName === volume.name
+    && pendingSkeletons.volumeFingerprint === volumeFingerprint
+    && pendingSkeletons.start === start
+    && pendingSkeletons.end === end
+    && pendingSkeletons.skeletons.length === end - start + 1
+    && (pendingSkeletons.items?.length ?? 0) <= pendingSkeletons.skeletons.length
+  let skeletons: NovelChapterSkeleton[] = canResumeSkeletons ? pendingSkeletons!.skeletons : []
+  if (canResumeSkeletons) {
+    onProgress?.(
+      `检测到第 ${start}-${end} 章骨架检查点和 ${pendingSkeletons?.items?.length ?? 0} 章已完成合同，继续补全剩余单章合同`
+    )
+  } else {
+    for (let round = 1; round <= MAX_GATE_REPAIR_ROUNDS; round++) {
+      skeletons = await generateChapterSkeletonBatch({ workId, goal, volume, start, end, correction, signal })
+      if (start !== 1 || end < 3) break
+      onProgress?.(`正在执行黄金前三章联合门禁（第 ${round} 轮）`)
+      const gate = await assessGoldenThreeOutlineBatch(workId, goal, skeletons, signal)
+      if (gate.passed) {
+        onProgress?.(`黄金前三章联合门禁通过（${gate.score}分）`)
+        break
+      }
+      if (round === MAX_GATE_REPAIR_ROUNDS) {
+        throw new NovelPipelineError(
+          'CONTRACT_INVALID',
+          `黄金前三章连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未通过门禁：${gate.issues.join('；') || `${gate.score}分`}`
+        )
+      }
+      correction = `黄金前三章门禁未通过（${gate.score}分），必须整体重建第1至3章：${gate.issues.join('；')}`
+      onProgress?.(`黄金前三章骨架未通过（${gate.score}分），正在整体重建骨架`)
     }
-    if (round === MAX_GATE_REPAIR_ROUNDS) {
-      throw new NovelPipelineError(
-        'CONTRACT_INVALID',
-        `黄金前三章连续 ${MAX_GATE_REPAIR_ROUNDS} 轮未通过门禁：${gate.issues.join('；') || `${gate.score}分`}`
-      )
-    }
-    correction = `黄金前三章门禁未通过（${gate.score}分），必须整体重建第1至3章：${gate.issues.join('；')}`
-    onProgress?.(`黄金前三章未通过（${gate.score}分），正在整体重建首批章节`)
+    updateNovelGoalState(workId, {
+      pendingChapterSkeletonBatch: { volumeName: volume.name, volumeFingerprint, start, end, skeletons, items: [] }
+    })
+    onProgress?.(`第 ${start}-${end} 章骨架已冻结，后续结构合同失败不会重抽骨架`)
   }
+  const items = await enrichChapterSkeletons({
+    workId,
+    goal,
+    volume,
+    skeletons,
+    existingItems: canResumeSkeletons ? pendingSkeletons?.items : undefined,
+    signal,
+    onProgress,
+    onCheckpoint: completedItems => updateNovelGoalState(workId, {
+      pendingChapterSkeletonBatch: {
+        volumeName: volume.name,
+        volumeFingerprint,
+        start,
+        end,
+        skeletons,
+        items: completedItems
+      }
+    })
+  })
   const volumeIndex = volumePlan.findIndex(item => item.name === volume.name)
   novelOutlineDAO.commitBatch({
     workId,
@@ -2600,6 +3080,7 @@ export async function generateNextNovelOutlineBatch(
     chapterStartSort: start - volume.startChapter + 1,
     items
   })
+  updateNovelGoalState(workId, { pendingChapterSkeletonBatch: undefined })
 
   const total = volumeChapterDAO.listChaptersByWork(workId).length
   if (total !== end) {

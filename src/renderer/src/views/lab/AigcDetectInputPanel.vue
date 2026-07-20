@@ -1,14 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import type { AigcSeedOpts } from '../../composables/useAigcDetect'
 import { usePerplexityModels, type PplModelInfo } from '../../composables/usePerplexityModels'
 import { useSupervisedAigcModel } from '../../composables/useSupervisedAigcModel'
-import type {
-  PerplexityEngineMode,
-  PerplexityApiConfig,
-  AigcDetectResult,
-  AigcCategory
-} from '../../../../shared/aigc-detect-types'
+import type { AigcDetectResult, AigcCategory } from '../../../../shared/aigc-detect-types'
 import { AIGC_CATEGORY_LABELS } from '../../../../shared/aigc-detect-types'
 import type {
   AigcSentencePatch,
@@ -22,12 +17,14 @@ import { summarizeAigcDisplayDistribution } from '../../../../shared/aigc-displa
 
 const LAB_TEXT_MAX = 50_000
 const ZHUQUE_MIN_TEXT_LENGTH = 350
+const PRODUCTION_MODEL_ID = 'qwen3.5-4b-q4'
 
 const props = defineProps<{
   inputText: string
   seedOpts: AigcSeedOpts
   status: 'idle' | 'running' | 'done' | 'error'
   rewriting?: boolean
+  sentenceRewriting?: boolean
   applyingWordTable?: boolean
   rewriteProgress?: { message: string; level?: 'info' | 'warn' } | null
   rewritePatches?: AigcSentencePatch[]
@@ -45,6 +42,7 @@ const emit = defineEmits<{
   'update:seedOpts': [value: AigcSeedOpts]
   run: []
   rewrite: []
+  sentenceRewrite: [index: number]
   wordtableApply: []
   cancel: []
   clearResult: []
@@ -55,10 +53,8 @@ const emit = defineEmits<{
 }>()
 
 const {
-  models, switchModel, deleteModel, downloadModel,
-  loading: modelSwitching,
+  models, deleteModel, downloadModel,
   downloading, downloadProgress: modelDownloadProgress,
-  refresh: refreshModels
 } = usePerplexityModels()
 const {
   model: supervisedModel,
@@ -67,84 +63,17 @@ const {
   download: downloadSupervisedModel,
   remove: removeSupervisedModel
 } = useSupervisedAigcModel()
-const showModelPanel = ref(false)
 const engineExpanded = ref(false)
 const showDetectDetails = ref(false)
-
-// API 配置
-const engineMode = ref<PerplexityEngineMode>('builtin')
-const apiBase = ref('http://localhost:1234/v1')
-const apiModelName = ref('')
-const apiTesting = ref(false)
-const apiTestResult = ref<{ success: boolean; message: string } | null>(null)
-
-const apiPresets = [
-  { name: 'LM Studio', base: 'http://localhost:1234/v1', needsKey: false },
-  { name: 'Ollama', base: 'http://localhost:11434/v1', needsKey: false },
-]
-
-const displayApiModel = computed(() => apiModelName.value)
-
-function applyPreset(preset: { name: string; base: string; needsKey: boolean; model?: string }) {
-  apiBase.value = preset.base
-  if (preset.model) apiModelName.value = preset.model
-  apiTestResult.value = null
-  saveApiConfig()
-}
-
-async function loadApiConfig() {
-  try {
-    const config = await window.anovel.invoke('perplexity:get-api-config') as PerplexityApiConfig
-    engineMode.value = config.mode
-    apiBase.value = config.apiBase
-    apiModelName.value = config.modelName
-  } catch { /* ignore */ }
-}
-
-async function saveApiConfig() {
-  await window.anovel.invoke('perplexity:set-api-config', {
-    mode: engineMode.value,
-    apiBase: apiBase.value,
-    modelName: apiModelName.value
-  })
-}
-
-async function switchEngineMode(mode: PerplexityEngineMode) {
-  engineMode.value = mode
-  await saveApiConfig()
-}
-
-async function onApiBaseBlur() { await saveApiConfig() }
-async function onModelNameBlur() { await saveApiConfig() }
-async function testConnection() {
-  apiTesting.value = true
-  apiTestResult.value = null
-  try {
-    const result = await window.anovel.invoke(
-      'perplexity:test-api',
-      apiBase.value,
-      apiModelName.value
-    ) as { success: boolean; message: string }
-    apiTestResult.value = result
-  } catch (err) {
-    apiTestResult.value = { success: false, message: String(err) }
-  } finally {
-    apiTesting.value = false
-  }
-}
+const productionModel = computed(() => models.value.find(model => model.id === PRODUCTION_MODEL_ID))
 
 function formatSize(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)}GB`
   return `${Math.round(bytes / 1e6)}MB`
 }
 
-async function onSwitchModel(m: PplModelInfo) {
-  if (m.active || modelSwitching.value) return
-  await switchModel(m.id)
-}
-
 async function onDeleteModel(m: PplModelInfo) {
-  if (!m.ready || m.active) return
+  if (!m.ready) return
   await deleteModel(m.id)
 }
 
@@ -153,10 +82,6 @@ async function onDownloadModel(m: PplModelInfo) {
   await downloadModel(m.id)
 }
 
-onMounted(() => {
-  refreshModels()
-  loadApiConfig()
-})
 const isStrongMode = computed(() => props.seedOpts.mode === 'strong')
 
 const displayContent = computed(() =>
@@ -309,14 +234,14 @@ onUnmounted(() => {
       <span v-if="needsManualRecheck && status !== 'running' && !rewriting" class="text-xs text-info">
         改写已应用，当前文本尚未检测，请点击“重新检测”
       </span>
-      <span v-if="rewriting && rewriteProgress" class="text-xs" :class="rewriteProgress.level === 'warn' ? 'text-warning' : 'text-info'">
+      <span v-if="(rewriting || sentenceRewriting) && rewriteProgress" class="text-xs" :class="rewriteProgress.level === 'warn' ? 'text-warning' : 'text-info'">
         <span v-if="rewriteProgress.level !== 'warn'" class="loading loading-spinner loading-xs mr-1" />
         <font-awesome-icon v-else icon="exclamation-circle" class="w-3 h-3 mr-1" />
         {{ rewriteProgress.message }}
       </span>
     </div>
 
-    <!-- 检测引擎选择（默认折叠） -->
+    <!-- 正式检测器固定版本（默认折叠） -->
     <div class="shrink-0">
       <button
         type="button"
@@ -328,26 +253,12 @@ onUnmounted(() => {
           class="w-2.5 h-2.5 text-base-content/40 transition-transform"
           :class="{ 'rotate-90': engineExpanded }"
         />
-        <span class="text-xs text-base-content/50">检测引擎:</span>
-        <template v-if="engineMode === 'builtin'">
-          <span class="text-xs font-medium">{{ models.find(m => m.active)?.name || '内置模型' }}</span>
-          <span
-            v-if="models.find(m => m.active)?.ready"
-            class="badge badge-success badge-xs"
-          >就绪</span>
-          <span
-            v-else-if="models.find(m => m.active)"
-            class="badge badge-warning badge-xs"
-          >未下载</span>
-        </template>
-        <template v-else>
-          <span class="text-xs font-medium">本地部署</span>
-          <span v-if="displayApiModel" class="text-xs text-base-content/60">· {{ displayApiModel }}</span>
-          <span
-            v-if="apiTestResult?.success"
-            class="badge badge-success badge-xs"
-          >已连接</span>
-        </template>
+        <span class="text-xs text-base-content/50">正式检测器:</span>
+        <span class="text-xs font-medium">{{ productionModel?.name || 'Qwen3.5 4B' }}</span>
+        <span
+          class="badge badge-xs"
+          :class="productionModel?.ready ? 'badge-success' : 'badge-warning'"
+        >{{ productionModel?.ready ? '完整性已验证' : '未下载或待验证' }}</span>
         <span
           class="badge badge-xs"
           :class="supervisedModel?.ready ? 'badge-success' : 'badge-warning'"
@@ -355,42 +266,43 @@ onUnmounted(() => {
       </button>
 
       <div v-if="engineExpanded" class="pl-4 mt-1 space-y-2">
-        <div class="flex items-center gap-2">
-          <div class="join">
+        <p class="rounded border border-info/20 bg-info/5 px-2 py-1.5 text-[10px] text-base-content/60">
+          为保证分数可复现，正式检测固定使用已校准的 Qwen3.5 4B 与固定中文监督模型；实验模型或任意API不参与正式结论。
+        </p>
+
+        <div v-if="productionModel" class="rounded-box border border-primary/25 bg-primary/5 p-2">
+          <div class="flex items-center gap-2">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-1.5">
+                <span class="text-xs font-medium">{{ productionModel.name }}</span>
+                <span class="badge badge-primary badge-xs">固定统计基座</span>
+              </div>
+              <p class="text-[10px] text-base-content/50">{{ productionModel.description }} · {{ formatSize(productionModel.sizeBytes) }}</p>
+            </div>
+            <span v-if="productionModel.ready" class="badge badge-success badge-xs">完整性已验证</span>
             <button
+              v-if="productionModel.ready"
               type="button"
-              class="btn btn-xs join-item"
-              :class="engineMode === 'builtin' ? 'btn-primary' : 'btn-ghost'"
-              @click="switchEngineMode('builtin')"
-            >内置模型</button>
+              class="btn btn-ghost btn-xs btn-circle text-error/60"
+              title="删除正式统计模型"
+              @click="onDeleteModel(productionModel)"
+            ><font-awesome-icon icon="trash" class="w-2.5 h-2.5" /></button>
             <button
+              v-else
               type="button"
-              class="btn btn-xs join-item"
-              :class="engineMode === 'api' ? 'btn-primary' : 'btn-ghost'"
-              @click="switchEngineMode('api')"
-            >本地部署</button>
+              class="btn btn-outline btn-xs gap-1"
+              :disabled="!!downloading"
+              @click="onDownloadModel(productionModel)"
+            >
+              <span v-if="downloading === productionModel.id" class="loading loading-spinner loading-xs" />
+              <font-awesome-icon v-else icon="download" class="w-2.5 h-2.5" />
+              {{ downloading === productionModel.id ? '下载中' : '下载并验证' }}
+            </button>
           </div>
-          <button
-            v-if="engineMode === 'builtin'"
-            type="button"
-            class="btn btn-ghost btn-xs gap-1"
-            @click="showModelPanel = !showModelPanel"
-          >
-            <span class="text-xs font-medium">{{ models.find(m => m.active)?.name || '未选择' }}</span>
-            <font-awesome-icon
-              icon="chevron-down"
-              class="w-2.5 h-2.5 transition-transform"
-              :class="{ 'rotate-180': showModelPanel }"
-            />
-          </button>
-          <span
-            v-if="engineMode === 'builtin' && models.find(m => m.active)?.ready"
-            class="badge badge-success badge-xs"
-          >已下载</span>
-          <span
-            v-else-if="engineMode === 'builtin' && models.find(m => m.active)"
-            class="badge badge-warning badge-xs"
-          >未下载</span>
+          <div v-if="modelDownloadProgress?.phase === 'downloading'" class="mt-2">
+            <progress class="progress progress-primary w-full" :value="modelDownloadProgress.percent" max="100" />
+            <p class="text-[10px] text-base-content/50 mt-0.5">{{ modelDownloadProgress.message }}</p>
+          </div>
         </div>
 
         <div class="rounded-box border border-primary/25 bg-primary/5 p-2">
@@ -436,144 +348,6 @@ onUnmounted(() => {
             <p class="text-[10px] text-base-content/50 mt-0.5">{{ supervisedDownloadProgress.message }}</p>
           </div>
         </div>
-
-        <!-- 内置模型列表面板 -->
-        <div v-if="engineMode === 'builtin' && showModelPanel" class="rounded-box border border-base-300 p-2 bg-base-200/50">
-          <div
-            v-for="m in models"
-            :key="m.id"
-            class="flex items-center gap-2 py-1.5 px-2 rounded-lg cursor-pointer hover:bg-base-300/50 transition-colors"
-            :class="{
-              'bg-primary/10 border border-primary/30': m.active,
-              'pointer-events-none opacity-60': modelSwitching
-            }"
-            @click="onSwitchModel(m)"
-          >
-            <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-1.5">
-                <span class="text-xs font-medium truncate">{{ m.name }}</span>
-                <span v-if="m.active" class="badge badge-primary badge-xs">当前</span>
-                <span v-else-if="modelSwitching" class="loading loading-spinner loading-xs" />
-              </div>
-              <p class="text-[10px] text-base-content/50 truncate">{{ m.description }} · {{ formatSize(m.sizeBytes) }}</p>
-            </div>
-            <div class="flex items-center gap-1 shrink-0">
-              <template v-if="m.ready">
-                <span class="badge badge-success badge-xs gap-0.5">
-                  <font-awesome-icon icon="check" class="w-2 h-2" />
-                  已下载
-                </span>
-                <button
-                  v-if="!m.active"
-                  type="button"
-                  class="btn btn-ghost btn-xs btn-circle text-error/60 hover:text-error"
-                  title="删除此模型"
-                  @click.stop="onDeleteModel(m)"
-                >
-                  <font-awesome-icon icon="trash" class="w-2.5 h-2.5" />
-                </button>
-              </template>
-              <template v-else>
-                <button
-                  type="button"
-                  class="btn btn-outline btn-xs gap-1"
-                  :disabled="!!downloading"
-                  :class="{ 'loading': downloading === m.id }"
-                  @click.stop="onDownloadModel(m)"
-                >
-                  <span v-if="downloading === m.id" class="loading loading-spinner loading-xs" />
-                  <font-awesome-icon v-else icon="download" class="w-2.5 h-2.5" />
-                  {{ downloading === m.id ? '下载中' : '下载' }}
-                </button>
-              </template>
-            </div>
-          </div>
-
-          <!-- 模型下载进度（手动触发） -->
-          <div v-if="modelDownloadProgress && modelDownloadProgress.phase === 'downloading'" class="mt-2 px-2">
-            <div class="flex items-center gap-2 text-xs text-base-content/60">
-              <span class="loading loading-spinner loading-xs" />
-              <span>{{ modelDownloadProgress.message }}</span>
-            </div>
-            <progress
-              class="progress progress-primary w-full mt-1"
-              :value="modelDownloadProgress.percent"
-              max="100"
-            />
-          </div>
-
-          <p class="text-[10px] text-base-content/40 mt-2 px-2">
-            点击"下载"按钮预先下载模型，或选择模型后首次检测时自动下载。
-          </p>
-        </div>
-
-        <!-- 本地部署 API 配置面板 -->
-        <div v-if="engineMode === 'api'" class="rounded-box border border-base-300 p-3 bg-base-200/50 space-y-2">
-          <p class="text-[10px] text-base-content/50">
-            连接本机 LM Studio、Ollama 或 llama.cpp server（需支持 logprobs / echo 模式）。
-          </p>
-
-          <div class="flex items-center gap-1.5 flex-wrap">
-            <span class="text-[10px] text-base-content/50">快捷预设:</span>
-            <button
-              v-for="preset in apiPresets"
-              :key="preset.name"
-              type="button"
-              class="btn btn-ghost btn-xs"
-              @click="applyPreset(preset)"
-            >{{ preset.name }}</button>
-          </div>
-
-          <div class="form-control">
-            <label class="label py-0.5">
-              <span class="label-text text-xs">API 地址</span>
-              <span class="label-text-alt text-[10px] text-base-content/40">自动补全 /v1 路径</span>
-            </label>
-            <input
-              v-model="apiBase"
-              type="text"
-              class="input input-bordered input-sm text-xs font-mono"
-              placeholder="http://localhost:1234/v1"
-              @blur="onApiBaseBlur"
-            />
-          </div>
-
-          <div class="form-control">
-            <label class="label py-0.5">
-              <span class="label-text text-xs">模型名称</span>
-              <span class="label-text-alt text-[10px] text-base-content/40">留空使用服务当前加载的模型</span>
-            </label>
-            <input
-              v-model="apiModelName"
-              type="text"
-              class="input input-bordered input-sm text-xs font-mono"
-              placeholder="留空自动使用当前加载的模型"
-              @blur="onModelNameBlur"
-            />
-          </div>
-          <div class="flex items-center gap-2 flex-wrap">
-            <button
-              type="button"
-              class="btn btn-outline btn-xs"
-              :disabled="apiTesting"
-              @click="testConnection"
-            >
-              <span v-if="apiTesting" class="loading loading-spinner loading-xs" />
-              <font-awesome-icon v-else icon="plug" class="w-2.5 h-2.5" />
-              测试连接
-            </button>
-            <span
-              v-if="apiTestResult"
-              class="text-[11px]"
-              :class="apiTestResult.success ? 'text-success' : 'text-error'"
-            >
-              {{ apiTestResult.message }}
-            </span>
-          </div>
-          <p class="text-[10px] text-base-content/40">
-            仅支持本机部署、且提供 logprobs（echo 模式）的 OpenAI 兼容服务，如 LM Studio、Ollama、llama.cpp server。
-          </p>
-        </div>
       </div>
     </div>
 
@@ -617,7 +391,7 @@ onUnmounted(() => {
           <header class="px-3 py-2 border-b border-base-300 shrink-0">
             <div class="flex items-center gap-2 flex-wrap text-[10px]">
               <span class="text-xs font-semibold mr-auto">检测结果</span>
-              <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.human }">人工 {{ displayDistribution.human }}%</span>
+              <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.human }">人工特征 {{ displayDistribution.human }}%</span>
               <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.suspected_ai }">疑似 {{ displayDistribution.suspected_ai }}%</span>
               <span class="badge badge-xs" :style="{ backgroundColor: CATEGORY_COLORS.ai }">AI {{ displayDistribution.ai }}%</span>
               <button type="button" class="btn btn-ghost btn-xs" @click="showDetectDetails = true">
@@ -626,12 +400,21 @@ onUnmounted(() => {
               </button>
             </div>
             <p class="mt-1 text-[10px] text-base-content/50">{{ displaySummary }}</p>
+            <p
+              v-if="result.authorship?.mode === 'ai_assisted'"
+              class="mt-1 rounded border border-info/25 bg-info/5 px-2 py-1 text-[10px] text-info"
+            >来源记录：AI辅助改写。下方比例仅表示当前本地特征覆盖，不代表人工作者身份。</p>
           </header>
           <div class="flex-1 min-h-0 overflow-auto p-3">
-            <AigcHighlightedText :segments="result.segments" :patches="rewritePatches" />
+            <AigcHighlightedText
+              :segments="result.segments"
+              :patches="rewritePatches"
+              :sentence-rewriting="sentenceRewriting"
+              @rewrite-sentence="emit('sentenceRewrite', $event)"
+            />
           </div>
           <footer class="px-3 py-1.5 border-t border-base-300 text-[9px] text-base-content/40 shrink-0">
-            检测阶段颜色表示句级概率类别；逐句分析后，红色只保留已定位到句内证据的目标，窗口级风险显示黄色
+            百分比表示当前检测版本的句级特征覆盖，不是作者身份概率；红色为已定位AI特征，黄色为疑似或窗口风险
           </footer>
         </article>
 

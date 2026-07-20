@@ -110,6 +110,38 @@ export function compileChapterExecutionContract(
   })
 }
 
+export function persistChapterExecutionContract(
+  workId: number,
+  chapterId: number,
+  wordTargetOverride?: number
+): ChapterExecutionContract | null {
+  const contract = compileChapterExecutionContract(workId, chapterId, wordTargetOverride)
+  if (!contract) return null
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  let diagnosis: Record<string, unknown> = {}
+  let diagnosisReadable = true
+  try {
+    const parsed = chapter?.outline_diagnosis?.trim()
+      ? JSON.parse(chapter.outline_diagnosis) as unknown
+      : null
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      diagnosis = parsed as Record<string, unknown>
+    }
+  } catch { diagnosisReadable = false }
+  if (!diagnosisReadable) return contract
+  const current = diagnosis.execution_contract_v2 as {
+    sourceOutlineHash?: unknown
+    wordTarget?: unknown
+  } | undefined
+  if (current?.sourceOutlineHash !== contract.sourceOutlineHash || current?.wordTarget !== contract.wordTarget) {
+    volumeChapterDAO.updateChapter(chapterId, {
+      outline_diagnosis: JSON.stringify({ ...diagnosis, execution_contract_v2: contract }),
+      quality_assessment_json: null
+    })
+  }
+  return contract
+}
+
 export interface ChapterExecutionContextResult {
   text: string
   sectionChars: Record<string, number>

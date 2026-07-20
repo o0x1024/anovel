@@ -122,6 +122,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <section class="rounded-lg border border-base-300 bg-base-200/30 p-3">
             <h3 class="text-xs font-semibold">检测说明</h3>
             <p class="mt-1 text-xs leading-5 text-base-content/65">{{ result.summary }}</p>
+            <p v-if="result.diagnostics?.statisticalModelId" class="mt-1 text-[10px] text-base-content/45">
+              检测版本：{{ result.diagnostics.policyVersion || '未记录' }} · 统计基座 {{ result.diagnostics.statisticalModelId }} · 监督模型 {{ result.diagnostics.supervisedModelId || '未记录' }}
+            </p>
+            <p v-if="result.authorship?.mode === 'ai_assisted'" class="mt-2 rounded bg-info/10 px-2 py-1 text-[10px] text-info">
+              {{ result.authorship.note }}
+            </p>
             <div v-if="result.diagnostics?.reasons.length" class="mt-2 flex gap-1 flex-wrap">
               <span v-for="reason in result.diagnostics.reasons" :key="reason" class="badge badge-warning badge-sm">
                 {{ reason }}

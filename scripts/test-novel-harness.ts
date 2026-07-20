@@ -20,6 +20,10 @@ import {
   isRecognizedNovelHardFail
 } from '../src/shared/chapter-execution-contract'
 import { QUALITY_AI_METRIC_DEFS, type QualityAiMetricKey } from '../src/shared/quality-ai-score'
+import {
+  parseNovelCoverageEvidence,
+  validateNovelExecutionContract
+} from '../src/main/context/goal-routine/novel-execution-gate'
 
 assert(TARGET_WORD_PRESETS.includes(4_000_000))
 assert.deepEqual(
@@ -151,6 +155,44 @@ assert.equal(muteContract.sceneBudgets.reduce((sum, item) => sum + item.targetWo
 const adaptedStyle = adaptBodyStyleTextForContract('3. 对话占比不低于50%\n其他风格规则', muteContract)
 assert.doesNotMatch(adaptedStyle, /不低于50%/)
 assert.match(adaptedStyle, /无声互动场景/)
+
+const freeformContract = buildChapterExecutionContract({
+  chapterId: 2,
+  chapterTitle: '账本后的脚步',
+  chapterOrdinal: 2,
+  outline: [
+    '主角冲进后院，发现掌柜正在烧毁账本。',
+    '主角先从火里抢账本，没有立刻追人。',
+    '翻开后才发现被烧的是一本假账。',
+    '【连续性约束】承接上一章主角已经受伤、掌柜仍在后院的状态。',
+    '【禁止越界】不得在本章揭露幕后主使。'
+  ].join('\n'),
+  characterNames: ['主角', '掌柜'],
+  wordTarget: 2400
+})
+assert(freeformContract.requiredEvents.length >= 3)
+assert(freeformContract.scenes.length >= 3)
+assert.equal(freeformContract.scenes.flatMap(scene => scene.mustCover).length, freeformContract.requiredEvents.length)
+assert.equal(freeformContract.scenes.reduce((sum, scene) => sum + scene.targetWords, 0), 2400)
+assert.match(freeformContract.continuityConstraints, /主角已经受伤/)
+assert.deepEqual(validateNovelExecutionContract(freeformContract), [])
+const coverage = parseNovelCoverageEvidence([
+  {
+    event: freeformContract.requiredEvents[0],
+    verdict: 'covered',
+    evidence: '主角冲进后院，发现掌柜正在烧毁账本。',
+    reason: '事件完整发生'
+  },
+  {
+    event: freeformContract.requiredEvents[1],
+    verdict: 'covered',
+    evidence: '正文中不存在的伪证据',
+    reason: '误判为覆盖'
+  }
+], freeformContract, '主角冲进后院，发现掌柜正在烧毁账本。')
+assert.equal(coverage[0].verdict, 'covered')
+assert.equal(coverage[1].verdict, 'missing')
+assert(coverage.slice(2).every(item => item.verdict === 'missing'))
 
 const metricMins = Object.fromEntries(
   QUALITY_AI_METRIC_DEFS.map(metric => [metric.key, 78])

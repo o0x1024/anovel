@@ -6,7 +6,10 @@ import { VolumeChapterDAO } from '../src/main/db/dao/chapter-dao'
 const db = new Database(':memory:')
 db.pragma('foreign_keys = ON')
 db.exec(`
-  CREATE TABLE works (id INTEGER PRIMARY KEY, title TEXT, description TEXT);
+  CREATE TABLE works (
+    id INTEGER PRIMARY KEY, title TEXT, description TEXT,
+    update_time TEXT DEFAULT CURRENT_TIMESTAMP
+  );
   CREATE TABLE volumes (id INTEGER PRIMARY KEY, work_id INTEGER NOT NULL, name TEXT, sort INTEGER);
   CREATE TABLE chapters (
     id INTEGER PRIMARY KEY, volume_id INTEGER NOT NULL, title TEXT, outline TEXT,
@@ -34,6 +37,7 @@ db.exec(`
     code TEXT NOT NULL, severity TEXT NOT NULL, scope TEXT NOT NULL,
     chapter_ids_json TEXT, evidence_json TEXT, invariants_json TEXT, expected_result TEXT,
     message TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open',
+    clean_confirmations INTEGER NOT NULL DEFAULT 0, last_checked_hash TEXT,
     first_seen_time TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_time TEXT DEFAULT CURRENT_TIMESTAMP,
     resolved_time TEXT, UNIQUE(work_id, issue_key)
   );
@@ -42,12 +46,21 @@ db.exec(`
     content_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL, is_frozen INTEGER NOT NULL DEFAULT 1,
     create_time TEXT DEFAULT CURRENT_TIMESTAMP
   );
-  INSERT INTO works VALUES (1, '测试故事', '');
+  CREATE TABLE story_lead_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL,
+    description TEXT NOT NULL, source_step TEXT NOT NULL DEFAULT 'story_lead_repair',
+    create_time TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  INSERT INTO works (id, title, description) VALUES (1, '测试故事', '旧导语完整复述第一拍');
   INSERT INTO volumes VALUES (1, 1, '正文', 1);
   INSERT INTO chapters (
     id, volume_id, title, outline, content, word_count, sort, status,
     emotion_assessment_json, quality_assessment_json, update_time
   ) VALUES (1, 1, '第一拍', '大纲', '不可丢失的正式正文', 9, 1, 'completed', NULL, NULL, CURRENT_TIMESTAMP);
+  INSERT INTO chapters (
+    id, volume_id, title, outline, content, word_count, sort, status,
+    emotion_assessment_json, quality_assessment_json, update_time
+  ) VALUES (2, 1, '第二拍', '大纲', '与问题无关的正文', 8, 2, 'completed', NULL, NULL, CURRENT_TIMESTAMP);
 `)
 
 const dao = new StoryHarnessDAO(db)
@@ -93,7 +106,20 @@ dao.incrementIssueAttempt(1, key, 2)
 dao.syncIssues(1, [issue])
 assert.equal(dao.listIssues(1)[0].status, 'stalled')
 dao.syncIssues(1, [])
+assert.equal(dao.listIssues(1)[0].status, 'stalled')
+assert.equal(dao.listIssues(1)[0].clean_confirmations, 1)
+assert.throws(() => dao.createReleaseSnapshot(1), /未关闭/)
+db.prepare("UPDATE chapters SET content = '第二拍发生无关变化' WHERE id = 2").run()
+dao.syncIssues(1, [])
 assert.equal(dao.listIssues(1)[0].status, 'resolved')
+
+const leadVersionId = dao.replaceLeadWithVersion(1, '新导语只保留一个具体悬念')
+assert.ok(leadVersionId > 0)
+assert.equal(
+  (db.prepare('SELECT description FROM works WHERE id = 1').get() as { description: string }).description,
+  '新导语只保留一个具体悬念'
+)
+assert.equal(dao.listLeadVersions(1)[0].description, '旧导语完整复述第一拍')
 
 const snapshotId = dao.createReleaseSnapshot(1)
 assert.ok(snapshotId > 0)

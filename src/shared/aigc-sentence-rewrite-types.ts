@@ -2,6 +2,7 @@ import type {
   HumanRewriteAiSymptom,
   HumanRewriteSceneType
 } from './human-rewrite-reference-types'
+import type { AigcDetectResult, AigcDistribution } from './aigc-detect-types'
 
 export const AIGC_REWRITE_REQUIRED_TARGET_COVERAGE_PERCENT = 85
 
@@ -59,6 +60,8 @@ export interface AigcSentenceRewriteResult {
   finalText: string
   patches: AigcSentencePatch[]
   goal: AigcRewriteGoalResult
+  /** 仅在生成质量门禁与本地风险门禁均通过时返回。 */
+  verifiedDetection?: AigcDetectResult
 }
 
 export interface AigcRewriteGoalResult {
@@ -71,6 +74,13 @@ export interface AigcRewriteGoalResult {
   targetCoveragePercent: number
   passedCoveragePercent: number
   fullDocumentRewrite: boolean
+  /** 一键改写完成前的本地融合检测复检结果，不代表作者身份。 */
+  localVerification?: {
+    attempts: number
+    distribution: AigcDistribution
+    passed: boolean
+    reasons: string[]
+  }
 }
 
 export interface StableSentenceUnit {

@@ -11,6 +11,7 @@ import {
   resolveStoryModelCapability,
   shouldBlockStoryAntiAi,
   stableStoryHash,
+  storyHarnessIssueKey,
   storyHarnessBudgetBlockers
 } from '../src/shared/story-harness'
 import { requireGoalTurnLimit } from '../src/shared/goal-turn-limit'
@@ -49,6 +50,12 @@ assert.deepEqual(
 assert.ok(detectStoryTextIntegrityIssues('“你回来了。').some(issue => issue.code === 'UNBALANCED_QUOTES'))
 assert.ok(detectStoryTextIntegrityIssues('他说：\n“').some(issue => issue.code === 'ISOLATED_QUOTE'))
 assert.ok(detectStoryTextIntegrityIssues('我本来想说，但是').some(issue => issue.code === 'TRUNCATED_SENTENCE'))
+assert.ok(detectStoryTextIntegrityIssues('老师讲了四挺钟的课，我记了四颇为钟的笔记。').some(issue => issue.code === 'CORRUPTED_SENTENCE'))
+assert.ok(detectStoryTextIntegrityIssues('她以为我是真穷，只要当众揭穿').some(issue => issue.code === 'CORRUPTED_SENTENCE'))
+assert.ok(detectStoryTextIntegrityIssues(
+  '林晚走进教室。'.repeat(80),
+  { povMode: 'first', povCharacter: '林晚' }
+).some(issue => issue.code === 'POV_DRIFT'))
 assert.ok(detectStoryTextIntegrityIssues(
   '旧事终于结束。'.repeat(30) + '下一个任务已经送到门口。',
   { finalBeat: true }
@@ -104,5 +111,9 @@ assert.deepEqual(storyHarnessBudgetBlockers(
 ), ['同一问题已达到修复上限', '当前节拍候选已达到上限', '整篇审计已达到上限'])
 assert.equal(stableStoryHash('同一正文'), stableStoryHash('同一正文'))
 assert.notEqual(stableStoryHash('正文甲'), stableStoryHash('正文乙'))
+assert.equal(
+  storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'engine', chapterIds: [2, 1], evidence: [], message: '时间冲突', expectedResult: '修复' }),
+  storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'cluster', chapterIds: [1, 2], evidence: [], message: '同一时间冲突', expectedResult: '修复' })
+)
 
 console.log('story harness deterministic tests passed')

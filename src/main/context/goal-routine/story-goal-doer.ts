@@ -79,8 +79,12 @@ import {
 } from '../../../shared/chapter-execution-contract'
 import {
   buildChapterExecutionContext,
-  compileChapterExecutionContract
+  persistChapterExecutionContract
 } from '../chapter-execution-context'
+import {
+  assessNovelExecutionCandidate,
+  repairNovelExecutionCandidate
+} from './novel-execution-gate'
 
 function storyCandidateContextSource(
   workId: number,
@@ -388,6 +392,62 @@ function buildBodyPrompt(
   ].filter(Boolean).join('\n\n')
 }
 
+async function generateNovelBodyByScenes(input: {
+  workId: number
+  chapterId: number
+  contract: ChapterExecutionContract
+  basePrompt: string
+  systemPrompt: string
+  signal?: AbortSignal
+  onProgress?: (message: string) => void
+  startIndex?: number
+  initialContent?: string
+}): Promise<{ success: boolean; content: string; completedSceneCount: number; error?: string }> {
+  const completed: string[] = input.initialContent?.trim() ? [input.initialContent.trim()] : []
+  const startIndex = Math.max(0, Math.min(input.startIndex ?? 0, input.contract.scenes.length))
+  for (let index = startIndex; index < input.contract.scenes.length; index++) {
+    if (input.signal?.aborted) {
+      return { success: false, content: completed.join('\n\n'), completedSceneCount: index, error: '已取消' }
+    }
+    const scene = input.contract.scenes[index]
+    input.onProgress?.(`正在生成${scene.label}（${index + 1}/${input.contract.scenes.length}）`)
+    const priorTail = completed.join('\n\n').slice(-1800)
+    const response = await modelService.chat(
+      withGoalLoopModelOptions(input.workId, {
+        workId: input.workId,
+        chapterId: input.chapterId,
+        step: 'body_generation_scene',
+        maxTokens: Math.max(1800, Math.min(5000, scene.targetWords * 2)),
+        temperature: 0.65,
+        enrichWorkContext: false,
+        enrichNarrativeMemory: index === 0,
+        systemPrompt: [
+          input.systemPrompt,
+          '你正在分场景完成同一章节。只输出当前场景正文，不输出场景标题、编号、自检或后续场景。',
+          '当前场景必须从已完成正文末尾之后继续，禁止复述。完成本场 mustCover 并停在 exitFacts，不得提前写后续场景。'
+        ].join('\n\n'),
+        prompt: [
+          input.basePrompt,
+          `【当前只写这一场】\n${JSON.stringify(scene, null, 2)}`,
+          priorTail ? `【本章已完成正文尾部】\n${priorTail}` : '',
+          `当前场景目标约 ${scene.targetWords} 字，只写正文。`
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal: input.signal }
+    )
+    if (!response.success || !response.content?.trim()) {
+      return {
+        success: false,
+        content: completed.join('\n\n'),
+        completedSceneCount: index,
+        error: response.error || `${scene.label}生成失败`
+      }
+    }
+    completed.push(normalizeModelBodyOutput(response.content.trim(), 'body_generation'))
+  }
+  return { success: true, content: completed.join('\n\n'), completedSceneCount: input.contract.scenes.length }
+}
+
 /**
  * 为指定节拍/章节生成正文：headless 生成 → humanize（仅轻量）→ 写库（带版本快照）。
  * 不掺 autoRewrite；去AI 由 checker 判定、fix 阶段针对性处理。
@@ -430,7 +490,7 @@ export async function generateBeatBody(
   const plan = loadWritingPlan(workId)
   const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
   const executionContract = workType === 'novel'
-    ? compileChapterExecutionContract(workId, chapterId, wordTarget)
+    ? persistChapterExecutionContract(workId, chapterId, wordTarget)
     : null
   if (workType === 'novel' && !executionContract) {
     return { success: false, content: '', wordCount: 0, failureKind: 'contract', error: '章节不存在，无法编译正文执行合同' }
@@ -482,24 +542,89 @@ export async function generateBeatBody(
     })
   }
 
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      prompt,
-      systemPrompt,
-      step: 'body_generation',
-      workId,
-      maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
-      temperature: workType === 'novel' ? 0.75 : undefined,
-      enrichWorkContext: workType !== 'novel',
-      chapterId,
-      volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
-      enrichNarrativeMemory: true
-    }),
-    { stream: false, signal }
-  )
+  let sceneResume: { startIndex: number; initialContent: string } | undefined
+  if (workType === 'novel' && executionContract?.scenes.length) {
+    const latestVersion = volumeChapterDAO.listVersions(chapterId)[0]
+    const partial = latestVersion?.model_type === 'novel_scene_partial' && latestVersion.content?.trim()
+      ? latestVersion
+      : undefined
+    if (partial?.snapshot_json) {
+      try {
+        const snapshot = JSON.parse(partial.snapshot_json) as {
+          contractHash?: unknown
+          completedSceneCount?: unknown
+        }
+        const completedSceneCount = Number(snapshot.completedSceneCount)
+        if (
+          snapshot.contractHash === executionContract.sourceOutlineHash
+          && Number.isInteger(completedSceneCount)
+          && completedSceneCount > 0
+          && completedSceneCount < executionContract.scenes.length
+        ) {
+          sceneResume = { startIndex: completedSceneCount, initialContent: partial.content ?? '' }
+          onProgress?.(`检测到同一章节合同的分场景断点，从第 ${completedSceneCount + 1} 场继续`)
+        }
+      } catch { /* 旧版本快照不是断点元数据 */ }
+    }
+  }
+
+  const response = workType === 'novel' && executionContract?.scenes.length
+    ? await generateNovelBodyByScenes({
+        workId,
+        chapterId,
+        contract: executionContract,
+        basePrompt: prompt,
+        systemPrompt,
+        signal,
+        onProgress,
+        startIndex: sceneResume?.startIndex,
+        initialContent: sceneResume?.initialContent
+      })
+    : await modelService.chat(
+        withGoalLoopModelOptions(workId, {
+          prompt,
+          systemPrompt,
+          step: 'body_generation',
+          workId,
+          maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
+          temperature: workType === 'novel' ? 0.75 : undefined,
+          enrichWorkContext: workType !== 'novel',
+          chapterId,
+          volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
+          enrichNarrativeMemory: true
+        }),
+        { stream: false, signal }
+      )
 
   if (!response.success || !response.content?.trim()) {
-    return { success: false, content: '', wordCount: 0, error: response.error || '生成失败' }
+    if (workType === 'novel' && response.content?.trim() && executionContract) {
+      volumeChapterDAO.createVersion(chapterId, {
+        outline: existingChapter?.outline ?? undefined,
+        content: response.content,
+        word_count: countWords(response.content),
+        model_type: 'novel_scene_partial',
+        snapshot_json: JSON.stringify({
+          contractHash: executionContract.sourceOutlineHash,
+          completedSceneCount: 'completedSceneCount' in response ? response.completedSceneCount : 0,
+          partialChars: response.content.length,
+          error: response.error || '分场景生成中断'
+        })
+      })
+    }
+    return { success: false, content: response.content ?? '', wordCount: 0, error: response.error || '生成失败' }
+  }
+
+  if (workType === 'novel' && executionContract?.scenes.length && 'completedSceneCount' in response) {
+    volumeChapterDAO.createVersion(chapterId, {
+      outline: existingChapter?.outline ?? undefined,
+      content: response.content,
+      word_count: countWords(response.content),
+      model_type: 'novel_scene_complete',
+      snapshot_json: JSON.stringify({
+        contractHash: executionContract.sourceOutlineHash,
+        completedSceneCount: response.completedSceneCount
+      })
+    })
   }
 
   return persistGeneratedBody(
@@ -636,11 +761,89 @@ async function persistGeneratedBody(
   let wordCount = countWords(content)
   let continuityRepairRounds = 0
 
+  if (workType === 'novel') {
+    const contract = persistChapterExecutionContract(workId, chapterId)
+    if (!contract) {
+      return { success: false, content, wordCount, failureKind: 'contract', error: '无法编译长篇章节执行合同' }
+    }
+    for (let round = 0; round <= 2; round++) {
+      onProgress?.(`正在核验章节情节点覆盖与章际衔接（${round + 1}/3）`)
+      const gate = await assessNovelExecutionCandidate(workId, chapterId, content, contract, signal)
+      if (gate.passed) break
+      wordCount = countWords(content)
+      volumeChapterDAO.createVersion(chapterId, {
+        outline: currentChapter?.outline ?? undefined,
+        content,
+        word_count: wordCount,
+        model_type: 'novel_execution_candidate',
+        generation_round: round + 1,
+        snapshot_json: JSON.stringify({
+          contractHash: contract.sourceOutlineHash,
+          gate
+        })
+      })
+      if (round >= 2) {
+        return {
+          success: false,
+          content,
+          wordCount,
+          continuityRepairRounds: round,
+          continuityBlockers: gate.blockers,
+          requiresEscalation: true,
+          failureKind: 'continuity',
+          error: `章节情节点覆盖/衔接经过 2 轮定向修复仍未通过：${gate.blockers.join('；')}`
+        }
+      }
+      onProgress?.(`章节执行门禁未通过，正在定向修复（${round + 1}/2）`)
+      const repaired = await repairNovelExecutionCandidate(
+        workId,
+        chapterId,
+        content,
+        contract,
+        gate.blockers,
+        signal
+      )
+      if (!repaired.success) {
+        return {
+          success: false,
+          content,
+          wordCount,
+          continuityBlockers: gate.blockers,
+          requiresEscalation: true,
+          failureKind: 'continuity',
+          error: repaired.error || '章节执行定向修复失败'
+        }
+      }
+      content = normalizeModelBodyOutput(repaired.content, 'body_generation')
+      try { content = humanizeText(content) } catch { /* 保留模型正文 */ }
+      antiAiRepair = await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
+      content = antiAiRepair.content
+      antiAiRepairs += antiAiRepair.repairs
+      antiAiRepairRounds += antiAiRepair.rounds
+      if (antiAiRepair.remaining > 0) {
+        return {
+          success: false,
+          content,
+          wordCount: countWords(content),
+          error: `章节执行修复后仍有 ${antiAiRepair.remaining} 处泛白类模板反应`
+        }
+      }
+      continuityRepairRounds = round + 1
+    }
+  }
+
   if (workType === 'story') {
     const chapters = volumeChapterDAO.listChaptersByWork(workId)
+    let povCharacter = ''
+    try {
+      const names = JSON.parse(currentChapter?.characters ?? '[]') as unknown
+      if (Array.isArray(names)) povCharacter = String(names[0] ?? '').trim()
+    } catch { /* 角色字段不合法时仍继续其余确定性检查 */ }
     const integrityIssues = detectStoryTextIntegrityIssues(content, {
       chapterId,
-      finalBeat: chapters.length > 0 && chapters[chapters.length - 1]?.id === chapterId
+      finalBeat: chapters.length > 0 && chapters[chapters.length - 1]?.id === chapterId,
+      povMode: currentChapter?.pov_mode,
+      povCharacter
     })
     if (integrityIssues.some(issue => issue.severity === 'blocker')) {
       const error = `正文确定性门禁未通过：${integrityIssues.map(issue => issue.message).join('；')}`

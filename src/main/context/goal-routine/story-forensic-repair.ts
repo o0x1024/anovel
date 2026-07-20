@@ -6,6 +6,8 @@ export interface StoryForensicRepairRoute {
   mode: StoryForensicRepairMode
   action: 'paragraph' | 'scene' | 'beat' | 'storyline'
   targetChapterIds: number[]
+  targetLead: boolean
+  issueKeys: string[]
   hint: string
   fingerprint: string
 }
@@ -31,6 +33,39 @@ function resolveIds(
     .map(chapter => chapter.id)))]
 }
 
+function issueChapterIds(
+  chapters: Array<{ id: number; title: string }>,
+  issue: StoryForensicIssue
+): number[] {
+  return resolveIds(chapters, issue.chapterTitles)
+}
+
+function repairTitlesForIssue(issue: StoryForensicIssue): string[] {
+  const titles = issue.repairChapterTitles.length > 0 ? issue.repairChapterTitles : issue.chapterTitles
+  const leadFirstBeatDuplicate = issue.code === 'DUPLICATED_EVENT'
+    && titles.some(title => title.trim() === '导语')
+    && /(?:保留|不改|不得改).{0,12}(?:第一拍|第一节拍|首拍)/.test(issue.recommendedAction)
+  return leadFirstBeatDuplicate ? titles.filter(title => title.trim() === '导语') : titles
+}
+
+/** 与问题账本使用相同的稳定身份：问题码 + 证据所在节拍，不使用修复作用域。 */
+export function storyForensicIssueKeys(
+  chapters: Array<{ id: number; title: string }>,
+  issues: StoryForensicIssue[]
+): string[] {
+  return [...new Set(issues
+    .filter(issue => issue.code !== 'FORENSIC_EVALUATOR_ERROR')
+    .map(issue => `${issue.code}:${issueChapterIds(chapters, issue).sort((a, b) => a - b).join(',')}`))]
+}
+
+export function filterStoryRepairLedgerIssues<T extends { issue_key: string }>(
+  rows: T[],
+  plannedIssueKeys: string[]
+): T[] {
+  const keys = new Set(plannedIssueKeys)
+  return rows.filter(row => keys.has(row.issue_key))
+}
+
 function expandNeighbors(chapters: Array<{ id: number; title: string }>, ids: number[]): number[] {
   const indexes = ids.map(id => chapters.findIndex(chapter => chapter.id === id)).filter(index => index >= 0)
   const expanded = new Set<number>(ids)
@@ -48,6 +83,10 @@ export function routeStoryForensicRepair(
 ): StoryForensicRepairRoute {
   const fingerprint = storyForensicFingerprint(issues)
   const actionableIssues = issues.filter(issue => issue.code !== 'FORENSIC_EVALUATOR_ERROR')
+  const issueKeys = storyForensicIssueKeys(chapters, actionableIssues)
+  const targetLead = actionableIssues.some(issue =>
+    repairTitlesForIssue(issue).some(title => title.trim() === '导语')
+  )
   const feedback = issues.map(issue => [
     `${issue.code}（${issue.scope}）：${issue.message}`,
     issue.evidence.length > 0 ? `证据：${issue.evidence.join('；')}` : '',
@@ -56,7 +95,7 @@ export function routeStoryForensicRepair(
 
   if (actionableIssues.length === 0 && issues.some(issue => issue.code === 'FORENSIC_EVALUATOR_ERROR')) {
     return {
-      mode: 'retry_audit', action: 'scene', targetChapterIds: [], fingerprint,
+      mode: 'retry_audit', action: 'scene', targetChapterIds: [], targetLead: false, issueKeys, fingerprint,
       hint: `法医评估器返回无效，只重试审计，不修改或删除正文。\n${feedback}`
     }
   }
@@ -65,7 +104,7 @@ export function routeStoryForensicRepair(
   if (global) {
     return {
       mode: sameEvidenceCount >= 2 ? 'reset_engine' : 'retry_audit',
-      action: 'storyline', targetChapterIds: [], fingerprint,
+      action: 'storyline', targetChapterIds: [], targetLead, issueKeys, fingerprint,
       hint: `${sameEvidenceCount >= 2 ? '两次独立审计均确认故事发动机层硬伤' : '首次检出全局硬伤，先独立复核'}。\n${feedback}`
     }
   }
@@ -73,18 +112,16 @@ export function routeStoryForensicRepair(
   if (sameEvidenceCount >= 3) {
     return {
       mode: sameEvidenceCount >= 4 ? 'reset_engine' : 'reset_beats',
-      action: sameEvidenceCount >= 4 ? 'storyline' : 'beat',
-      targetChapterIds: [], fingerprint,
+      action: sameEvidenceCount >= 4 ? 'storyline' : 'beat', targetChapterIds: [],
+      targetLead, issueKeys, fingerprint,
       hint: `${sameEvidenceCount >= 4
         ? '同一证据在整组节拍重建后仍存在，才升级为故事发动机重建。'
         : '同一证据已经过两轮动态修复仍未消失，才升级为整组节拍重建。'}\n${feedback}`
     }
   }
 
-  let targetIds = resolveIds(chapters, actionableIssues.flatMap(issue =>
-    issue.repairChapterTitles.length > 0 ? issue.repairChapterTitles : issue.chapterTitles
-  ))
-  if (targetIds.length === 0 && chapters.length > 0) targetIds = [chapters.at(-1)!.id]
+  let targetIds = resolveIds(chapters, actionableIssues.flatMap(repairTitlesForIssue))
+  if (targetIds.length === 0 && !targetLead && chapters.length > 0) targetIds = [chapters.at(-1)!.id]
   if (sameEvidenceCount === 2) targetIds = expandNeighbors(chapters, targetIds)
 
   const scopes = new Set(actionableIssues.map(issue => issue.scope))
@@ -92,7 +129,7 @@ export function routeStoryForensicRepair(
     ? 'beat'
     : scopes.has('scene') ? 'scene' : 'paragraph'
   return {
-    mode: 'dynamic', action, targetChapterIds: targetIds, fingerprint,
+    mode: 'dynamic', action, targetChapterIds: targetIds, targetLead, issueKeys, fingerprint,
     hint: [
       `法医硬伤第 ${sameEvidenceCount} 轮动态修复。只修改指定节拍，保留其他已通过内容。`,
       sameEvidenceCount === 2 ? '上轮最小修复未消除证据，本轮扩大到相邻铺垫—兑现节拍簇。' : '',
