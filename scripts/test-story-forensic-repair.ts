@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import {
   filterStoryRepairLedgerIssues,
   routeStoryForensicRepair,
+  stalledStoryForensicEscalationCount,
   storyForensicFingerprint,
   storyForensicIssueKeys
 } from '../src/main/context/goal-routine/story-forensic-repair'
@@ -17,6 +18,7 @@ const chapters = [
 function issue(overrides: Partial<StoryForensicIssue> = {}): StoryForensicIssue {
   return {
     code: 'TIMELINE_CONTRADICTION',
+    claimKey: 'DEADLINE_CLOCK_MISMATCH',
     scope: 'sentence',
     chapterTitles: ['第四拍'],
     repairChapterTitles: ['第四拍'],
@@ -33,7 +35,7 @@ assert.equal(first.mode, 'dynamic')
 assert.equal(first.action, 'paragraph')
 assert.deepEqual(first.targetChapterIds, [14])
 assert.equal(first.targetLead, false)
-assert.deepEqual(first.issueKeys, ['TIMELINE_CONTRADICTION:14'])
+assert.deepEqual(first.issueKeys, ['TIMELINE_CONTRADICTION:14:DEADLINE_CLOCK_MISMATCH'])
 
 const second = routeStoryForensicRepair(chapters, [issue()], 2)
 assert.equal(second.mode, 'dynamic')
@@ -42,6 +44,8 @@ assert.deepEqual(second.targetChapterIds, [13, 14])
 
 assert.equal(routeStoryForensicRepair(chapters, [issue()], 3).mode, 'reset_beats')
 assert.equal(routeStoryForensicRepair(chapters, [issue()], 4).mode, 'reset_engine')
+assert.equal(stalledStoryForensicEscalationCount(1), 3)
+assert.equal(stalledStoryForensicEscalationCount(4), 4)
 
 const cluster = routeStoryForensicRepair(chapters, [issue({
   code: 'EVIDENCE_CHAIN_BREAK',
@@ -51,8 +55,20 @@ const cluster = routeStoryForensicRepair(chapters, [issue({
 assert.equal(cluster.action, 'beat')
 assert.deepEqual(cluster.targetChapterIds, [12, 14])
 
+const priorSeed = routeStoryForensicRepair(chapters, [issue({
+  code: 'DEUS_EX_MACHINA',
+  claimKey: 'OFFICIAL_UNSEEDED_INTERVENTION',
+  scope: 'scene',
+  chapterTitles: ['第四拍'],
+  repairChapterTitles: ['第四拍'],
+  recommendedAction: '在前文提前铺垫主角已提交举报，再保留第四拍处置结果'
+})], 1)
+assert.equal(priorSeed.action, 'beat')
+assert.deepEqual(priorSeed.targetChapterIds, [13, 14])
+
 const leadDuplicate = issue({
   code: 'DUPLICATED_EVENT',
+  claimKey: 'LEAD_FIRST_BEAT_DUPLICATION',
   scope: 'beat_cluster',
   chapterTitles: ['导语', '第一拍'],
   repairChapterTitles: ['导语', '第一拍'],
@@ -62,11 +78,11 @@ const leadDuplicate = issue({
 const leadRoute = routeStoryForensicRepair(chapters, [leadDuplicate], 1)
 assert.equal(leadRoute.targetLead, true)
 assert.deepEqual(leadRoute.targetChapterIds, [])
-assert.deepEqual(storyForensicIssueKeys(chapters, [leadDuplicate]), ['DUPLICATED_EVENT:11'])
+assert.deepEqual(storyForensicIssueKeys(chapters, [leadDuplicate]), ['DUPLICATED_EVENT:11:LEAD_FIRST_BEAT_DUPLICATION'])
 
 const ledgerRows = [
   { issue_key: 'EVIDENCE_STATE_REGRESSION:11,14', status: 'stalled' },
-  { issue_key: 'DUPLICATED_EVENT:11', status: 'open' }
+  { issue_key: 'DUPLICATED_EVENT:11:LEAD_FIRST_BEAT_DUPLICATION', status: 'open' }
 ]
 assert.deepEqual(
   filterStoryRepairLedgerIssues(ledgerRows, leadRoute.issueKeys),

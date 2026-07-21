@@ -8,6 +8,8 @@ import {
   derivedMemoryFailureDisposition,
   isStructuralStoryCandidateRejection,
   repairDeterministicStoryQuotes,
+  repairDeterministicStorySentences,
+  detectStoryDeadlineArithmeticIssues,
   resolveStoryModelCapability,
   shouldBlockStoryAntiAi,
   stableStoryHash,
@@ -42,6 +44,23 @@ assert.equal(repairDeterministicStoryQuotes('他说：\n“\n你来了。'), '�
 assert.equal(repairDeterministicStoryQuotes('“你来了。'), '“你来了。”')
 assert.equal(repairDeterministicStoryQuotes('“你来了。\n她转身离开。'), '“你来了。”\n她转身离开。')
 assert.equal(repairDeterministicStoryQuotes('”她转身离开。'), '她转身离开。')
+const deterministicSentenceRepair = repairDeterministicStorySentences(
+  '老师讲了四挺钟的课，我记了四颇为钟的笔记。其余事实不变。'
+)
+assert.equal(
+  deterministicSentenceRepair.content,
+  '老师讲了四十分钟的课，我记了四十分钟的笔记。其余事实不变。'
+)
+assert.deepEqual(deterministicSentenceRepair.repairs, [
+  { before: '四挺钟', after: '四十分钟' },
+  { before: '四颇为钟', after: '四十分钟' }
+])
+assert.equal(repairDeterministicStorySentences('会议持续四十分钟。').repairs.length, 0)
+assert.equal(
+  detectStoryDeadlineArithmeticIssues('现在是上午十点，十二个小时后就是下午四点。', 7)[0]?.code,
+  'DEADLINE_ARITHMETIC_CONTRADICTION'
+)
+assert.deepEqual(detectStoryDeadlineArithmeticIssues('现在是上午十点，十二个小时后就是晚上十点。', 7), [])
 
 assert.deepEqual(
   detectStoryTextIntegrityIssues('   ').map(issue => issue.code),
@@ -114,6 +133,10 @@ assert.notEqual(stableStoryHash('正文甲'), stableStoryHash('正文乙'))
 assert.equal(
   storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'engine', chapterIds: [2, 1], evidence: [], message: '时间冲突', expectedResult: '修复' }),
   storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'cluster', chapterIds: [1, 2], evidence: [], message: '同一时间冲突', expectedResult: '修复' })
+)
+assert.notEqual(
+  storyHarnessIssueKey({ code: 'DEUS_EX_MACHINA', severity: 'blocker', scope: 'scene', chapterIds: [7], evidence: [], message: '催债短信', expectedResult: '铺垫', identityHint: 'DEBT_MESSAGE_TRIGGER' }),
+  storyHarnessIssueKey({ code: 'DEUS_EX_MACHINA', severity: 'blocker', scope: 'scene', chapterIds: [7], evidence: [], message: '天降权威', expectedResult: '铺垫', identityHint: 'OFFICIAL_UNSEEDED_INTERVENTION' })
 )
 
 console.log('story harness deterministic tests passed')

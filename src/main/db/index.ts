@@ -33,6 +33,7 @@ export { emotionalStateDAO } from './dao/emotional-state-dao'
 export type { EmotionalStateLedgerRow, EmotionalStateLedgerInput } from './dao/emotional-state-dao'
 export { storyStateDAO } from './dao/story-state-dao'
 export { causalNovelDAO } from './dao/causal-novel-dao'
+export type { CausalPlanAttemptRecord, CausalStateRevisionRecord } from './dao/causal-novel-dao'
 export type { StoryStateFactRow, ChapterPatternFingerprintRow } from './dao/story-state-dao'
 export { storyHarnessDAO } from './dao/story-harness-dao'
 export type {

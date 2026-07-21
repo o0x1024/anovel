@@ -454,6 +454,17 @@ export interface BodyReactionClicheMatch {
   end: number
 }
 
+export interface BodyReactionReplacementPatch {
+  original?: unknown
+  replacement?: unknown
+}
+
+export interface BodyReactionPatchResult {
+  content: string
+  applied: number
+  rejected: Record<string, number>
+}
+
 const BODY_REACTION_CLICHE_PATTERN = /(?:指尖|指节|骨节)[^。！？!?。\n]{0,18}?(?:泛(?:着)?|发(?:着)?|呈(?:现|出)?|透(?:出)?|变(?:得|成)?|一片)?(?:青白|苍白|惨白|灰白|煞白|发白|泛白)|指甲(?:深深)?(?:陷|掐|嵌|刺)(?:进|入)?(?:了)?(?:掌心|手心)/g
 const PHYSIOLOGICAL_CONTEXT_PATTERN = /寒冷|寒风|冷风|冰冷|低温|冻(?:伤|僵|得)?|冰雪|失血|流血|出血|贫血|伤口|受伤|创伤|割伤|刺伤|骨折|疼痛|痛得|麻木|缺氧|窒息|中毒|休克|病变|病发|尸体|死者/
 
@@ -486,6 +497,80 @@ export function detectBodyReactionCliches(content: string): BodyReactionClicheMa
     }
   }
   return matches
+}
+
+/** 精确应用模型返回的定点补丁，并保留每种拒绝原因供运行日志审计。 */
+export function applyBodyReactionReplacementPatches(
+  initialContent: string,
+  targetSentences: string[],
+  patches: BodyReactionReplacementPatch[]
+): BodyReactionPatchResult {
+  let content = initialContent
+  let applied = 0
+  const rejected: Record<string, number> = {}
+  const reject = (reason: string): void => {
+    rejected[reason] = (rejected[reason] ?? 0) + 1
+  }
+
+  for (const raw of patches) {
+    if (typeof raw?.original !== 'string' || typeof raw.replacement !== 'string') {
+      reject('invalid_shape')
+      continue
+    }
+    const original = raw.original
+    const replacement = raw.replacement
+    if (!targetSentences.includes(original)) {
+      reject('original_not_requested')
+      continue
+    }
+    if (!content.includes(original)) {
+      reject('original_not_found')
+      continue
+    }
+    if (original === replacement) {
+      reject('unchanged')
+      continue
+    }
+    if (replacement && detectBodyReactionCliches(replacement).length > 0) {
+      reject('replacement_still_blocked')
+      continue
+    }
+    content = content.split(original).join(replacement)
+    applied++
+  }
+  return { content, applied, rejected }
+}
+
+/**
+ * 模型补丁连续失败时的确定性兜底：只删除包含命中短语的逗号分句，
+ * 其余动作、对话、结果和标点保持原顺序，不生成任何新描写。
+ */
+export function removeBodyReactionClichesDeterministically(initialContent: string): {
+  content: string
+  removedClauses: number
+  remaining: number
+} {
+  let content = initialContent
+  let removedClauses = 0
+  const sentences = [...new Set(detectBodyReactionCliches(content).map(item => item.sentence))]
+  for (const sentence of sentences) {
+    const matches = detectBodyReactionCliches(sentence)
+    if (matches.length === 0 || !content.includes(sentence)) continue
+    const punctuation = sentence.match(/[。！？!?]$/)?.[0] ?? ''
+    const body = punctuation ? sentence.slice(0, -punctuation.length) : sentence
+    const matchTexts = matches.map(item => item.matchText)
+    const clauses = body.split(/[，,]/)
+    const kept = clauses.filter(clause => !matchTexts.some(match => clause.includes(match)))
+    if (kept.length === clauses.length) continue
+    const replacement = `${kept.join('，').trim()}${kept.length > 0 ? punctuation : ''}`
+    content = content.split(sentence).join(replacement)
+    removedClauses += clauses.length - kept.length
+  }
+  return {
+    content,
+    removedClauses,
+    remaining: detectBodyReactionCliches(content).length
+  }
 }
 
 function calcSentenceLengthCV(text: string): number {

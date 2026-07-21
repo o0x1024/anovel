@@ -25,9 +25,18 @@ export interface ChapterExecutionContractInput {
   volumeName?: string | null
   volumeGoal?: string | null
   outline?: string | null
+  outlineDiagnosis?: string | null
   characterNames?: string[]
   characterSpeechStyles?: string[]
   wordTarget: number
+}
+
+export type ChapterExecutionRequirementKind = 'action' | 'turn' | 'state_change' | 'payoff_debt' | 'event'
+
+export interface ChapterExecutionRequirement {
+  id: string
+  kind: ChapterExecutionRequirementKind
+  description: string
 }
 
 export interface ChapterExecutionContract {
@@ -41,6 +50,7 @@ export interface ChapterExecutionContract {
   wordMax: number
   openingState: string
   requiredEvents: string[]
+  requirements: ChapterExecutionRequirement[]
   forbiddenEvents: string[]
   endingState: string
   abilityConstraints: string
@@ -56,16 +66,22 @@ export interface ChapterExecutionContract {
 }
 
 const TAGS = ['开场状态', '必须覆盖', '禁止越界', '结尾落点', '能力/状态约束', '连续性约束', '情节节点', '章末钩子', '戏剧契约'] as const
+export const CHAPTER_EXECUTION_CONTRACT_VERSION = 3
 
 function extractTaggedText(outline: string, tag: typeof TAGS[number]): string {
-  const startToken = `【${tag}】`
-  const start = outline.indexOf(startToken)
-  if (start < 0) return ''
-  const contentStart = start + startToken.length
+  const tokens = [`【${tag}】`, `${tag}：`, `${tag}:`]
+  const starts = tokens
+    .map(token => ({ token, index: outline.indexOf(token) }))
+    .filter(item => item.index >= 0)
+    .sort((left, right) => left.index - right.index)
+  const matched = starts[0]
+  if (!matched) return ''
+  const contentStart = matched.index + matched.token.length
   const next = TAGS
-    .map(nextTag => outline.indexOf(`【${nextTag}】`, contentStart))
-    .filter(pos => pos >= 0)
-    .sort((a, b) => a - b)[0]
+    .flatMap(nextTag => [`【${nextTag}】`, `${nextTag}：`, `${nextTag}:`])
+    .map(token => outline.indexOf(token, contentStart))
+    .filter(position => position >= 0)
+    .sort((left, right) => left - right)[0]
   return outline.slice(contentStart, next ?? outline.length).trim().slice(0, 1200)
 }
 
@@ -87,6 +103,29 @@ function splitContractItems(text: string): string[] {
     .slice(0, 12)
 }
 
+/**
+ * 旧版自由文本大纲经常把整章因果链塞进一个逗号长句。把这种长句直接作为
+ * 单个门禁事件，会迫使评估器用一段连续引文同时证明多个相距很远的事实。
+ * 这里只拆明显的复合长句；短事件保持原样，避免把正常动作拆得过碎。
+ */
+export function splitCompoundExecutionEvent(event: string): string[] {
+  const normalized = event.trim()
+  if (normalized.length < 96) return normalized ? [normalized] : []
+  const rawClauses = normalized.split(/[，,]+/).map(item => item.trim()).filter(Boolean)
+  if (rawClauses.length < 3) return [normalized]
+
+  const clauses: string[] = []
+  for (const clause of rawClauses) {
+    const shouldMergePrevious = clauses.length > 0 && (
+      clause.length < 6
+      || /^(?:不|未|没有|并且|而且|同时|随后|然后|和|从而|因此|进而|形成|证明|体现)/.test(clause)
+    )
+    if (shouldMergePrevious) clauses[clauses.length - 1] = `${clauses[clauses.length - 1]}，${clause}`
+    else clauses.push(clause)
+  }
+  return clauses.length >= 3 ? clauses.slice(0, 12) : [normalized]
+}
+
 function deriveOutlineEvents(outline: string): string[] {
   const plotNodes = splitContractItems(extractTaggedText(outline, '情节节点'))
   if (plotNodes.length > 0) return plotNodes
@@ -95,6 +134,54 @@ function deriveOutlineEvents(outline: string): string[] {
   return splitContractItems(untaggedNarrative)
     .filter(item => !/^(?:开场状态|必须覆盖|禁止越界|结尾落点|能力\/状态约束|连续性约束)/.test(item))
     .slice(0, 12)
+}
+
+function structuredExecutionRequirements(outlineDiagnosis?: string | null): Array<{
+  kind: ChapterExecutionRequirementKind
+  description: string
+}> {
+  if (!outlineDiagnosis?.trim()) return []
+  try {
+    const parsed = JSON.parse(outlineDiagnosis) as {
+      dramatic_contract?: Record<string, unknown>
+    }
+    const dramatic = parsed.dramatic_contract
+    if (!dramatic || typeof dramatic !== 'object' || Array.isArray(dramatic)) return []
+    const rows: Array<{ kind: ChapterExecutionRequirementKind; description: string }> = [
+      { kind: 'action', description: String(dramatic.protagonist_want ?? '').trim() },
+      { kind: 'turn', description: String(dramatic.turn ?? '').trim() },
+      { kind: 'state_change', description: String(dramatic.irreversible_change ?? '').trim() },
+      { kind: 'payoff_debt', description: String(dramatic.payoff_or_debt ?? '').trim() }
+    ].filter(row => Boolean(row.description))
+    // 只有结构化合同足够完整时才将其作为权威验收源，残缺旧数据仍走正文大纲兼容解析。
+    return rows.length >= 3 ? rows : []
+  } catch {
+    return []
+  }
+}
+
+function buildExecutionRequirements(
+  requiredEvents: string[],
+  outlineDiagnosis?: string | null
+): ChapterExecutionRequirement[] {
+  const structured = structuredExecutionRequirements(outlineDiagnosis)
+  const source = structured.length > 0
+    ? structured
+    : requiredEvents.map(description => ({ kind: 'event' as const, description }))
+  const seen = new Set<string>()
+  return source
+    .filter(item => {
+      const normalized = normalizeComparable(item.description)
+      if (!normalized || seen.has(normalized)) return false
+      seen.add(normalized)
+      return true
+    })
+    .slice(0, 8)
+    .map((item, index) => ({
+      id: `R${String(index + 1).padStart(3, '0')}`,
+      kind: item.kind,
+      description: item.description
+    }))
 }
 
 function allocateExecutionScenes(
@@ -161,12 +248,18 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
   const wordTarget = Math.max(0, Math.round(input.wordTarget))
   const explicitOpeningState = extractTaggedText(outline, '开场状态')
   const explicitRequiredEvents = splitContractItems(extractTaggedText(outline, '必须覆盖'))
-  const fallbackEvents = explicitRequiredEvents.length === 0 ? deriveOutlineEvents(outline) : []
+    .flatMap(splitCompoundExecutionEvent)
+  const fallbackEvents = explicitRequiredEvents.length === 0
+    ? deriveOutlineEvents(outline).flatMap(splitCompoundExecutionEvent)
+    : []
   const requiredEvents = explicitRequiredEvents.length > 0 ? explicitRequiredEvents : fallbackEvents
+  const requirements = buildExecutionRequirements(requiredEvents, input.outlineDiagnosis)
   const forbiddenEvents = splitContractItems(extractTaggedText(outline, '禁止越界'))
   const explicitEndingState = extractTaggedText(outline, '结尾落点')
-  const openingState = explicitOpeningState || (requiredEvents[0] ? `承接上一章最终状态，进入：${requiredEvents[0]}` : '')
-  const endingState = explicitEndingState || requiredEvents.at(-1) || ''
+  const openingState = explicitOpeningState
+    || (requiredEvents[0] ? '承接上一章最终正文状态，从本章第一个既定事件发生前继续行动' : '')
+  const endingState = explicitEndingState
+    || (requiredEvents.length > 0 ? '完成本章最后一个必写事件后立即收束，不提前进入下一章事件' : '')
   const abilityConstraints = extractTaggedText(outline, '能力/状态约束')
   const continuityConstraints = extractTaggedText(outline, '连续性约束')
   const characterNames = [...new Set((input.characterNames ?? []).map(name => name.trim()).filter(Boolean))]
@@ -187,10 +280,13 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
   const warnings: string[] = []
   if (wordTarget <= 0) errors.push('章节目标字数必须大于 0')
   if (!outline) errors.push('章节大纲为空，无法编译执行合同')
-  if (!explicitOpeningState) warnings.push('大纲没有显式【开场状态】，已从首个情节节点推导并以正文连续性状态为准')
+  if (!explicitOpeningState) warnings.push('大纲没有显式开场状态，已使用上一章最终正文状态作为连续性边界')
   if (requiredEvents.length === 0) warnings.push('大纲没有可拆分的【必须覆盖】节点')
-  else if (explicitRequiredEvents.length === 0) warnings.push('大纲没有显式【必须覆盖】，已将情节节点编译为可验收事件')
-  if (!explicitEndingState) warnings.push('大纲没有显式【结尾落点】，已使用最后一个情节节点作为停止边界')
+  else if (explicitRequiredEvents.length === 0) warnings.push('大纲没有显式必须覆盖节点，已将情节节点编译为可验收事件')
+  if (!explicitEndingState) warnings.push('大纲没有显式结尾落点，已在最后一个必写事件完成后立即停止')
+  if (structuredExecutionRequirements(input.outlineDiagnosis).length > 0) {
+    warnings.push('验收项已优先采用结构化戏剧合同，正文大纲仍用于场景生成与边界约束')
+  }
   if (muteInteraction) warnings.push('检测到无声互动章节：通用对话密度规则已由非语言互动质量替代')
 
   const forbiddenNormalized = forbiddenEvents.map(normalizeComparable).filter(Boolean)
@@ -212,11 +308,12 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
     wordMax: Math.round(wordTarget * 1.1),
     openingState,
     requiredEvents,
+    requirements,
     forbiddenEvents,
     endingState,
     abilityConstraints,
     continuityConstraints,
-    sourceOutlineHash: stableTextHash(outline),
+    sourceOutlineHash: stableTextHash(`${CHAPTER_EXECUTION_CONTRACT_VERSION}\n${outline}\n${JSON.stringify(requirements)}`),
     characterNames,
     dialogueMode,
     dialogueRange,

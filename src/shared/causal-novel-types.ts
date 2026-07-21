@@ -4,9 +4,22 @@ import {
   type EmotionContract
 } from './emotion-contract'
 
-export const CAUSAL_NOVEL_SCHEMA_VERSION = 1
+export const CAUSAL_NOVEL_SCHEMA_VERSION = 2
 
 export type CausalPromiseStatus = 'open' | 'advanced' | 'resolved'
+export type CausalCompletionStatus = 'writing' | 'proposed' | 'completed'
+
+export interface CausalMacroArc {
+  id: string
+  title: string
+  objective: string
+  entryConditions: string[]
+  exitConditions: string[]
+  mandatoryPayoffs: string[]
+  forbiddenDrift: string[]
+  status: 'pending' | 'active' | 'completed'
+  lastAdvancedChapter: number
+}
 
 export interface CausalActorState {
   name: string
@@ -44,7 +57,12 @@ export interface CausalNarrativeState {
   actors: CausalActorState[]
   activePressures: CausalPressure[]
   promises: CausalReaderPromise[]
+  macroArcs: CausalMacroArc[]
+  macroArchitectureReady: boolean
+  archivedPromiseIds: string[]
   recentEventSignatures: string[]
+  completionStatus: CausalCompletionStatus
+  completionAuditFeedback: string[]
   completed: boolean
   completionReason: string
 }
@@ -66,6 +84,14 @@ export interface CausalEventCandidate {
     pressureEscalation: number
     total: number
   }
+}
+
+export function causalCandidateTotal(candidate: CausalEventCandidate): number {
+  const scores = candidate.scores
+  return Math.round((
+    scores.causalNecessity + scores.promiseProgress + scores.irreversibleImpact +
+    scores.novelty + scores.pressureEscalation
+  ) / 5)
 }
 
 export interface CausalChapterDecision {
@@ -91,6 +117,61 @@ export interface CausalChapterPlan {
   selectedCandidateId: string
   decision: CausalChapterDecision
   emotionContract: CausalChapterEmotionContract
+  rollingHorizon: CausalHorizonBeat[]
+}
+
+export interface CausalHorizonBeat {
+  offset: number
+  objective: string
+  initiator: string
+  pressureIds: string[]
+  promiseIds: string[]
+  expectedIrreversibleChange: string
+  replanningTrigger: string
+}
+
+export interface CausalGroundedClaim {
+  field: 'attachment_anchor' | 'private_detail_anchor'
+  ref: string
+  evidence: string
+}
+
+export interface CausalEvidenceFact {
+  id: string
+  ref: string
+  text: string
+}
+
+export interface CausalEvidenceSelection {
+  attachmentEvidenceId: string
+  privateDetailEvidenceId: string
+}
+
+export interface CausalPlanFailureEvent {
+  revision: number
+  code: string
+}
+
+export function registerCausalPlanFailure(
+  history: CausalPlanFailureEvent[],
+  event: CausalPlanFailureEvent,
+  maxPerRevision = 3,
+  maxPerFamily = 2
+): {
+  history: CausalPlanFailureEvent[]
+  revisionCount: number
+  familyCount: number
+  shouldPause: boolean
+} {
+  const next = [...history, event].slice(-40)
+  const revisionCount = next.filter(item => item.revision === event.revision).length
+  const familyCount = next.filter(item => item.revision === event.revision && item.code === event.code).length
+  return {
+    history: next,
+    revisionCount,
+    familyCount,
+    shouldPause: revisionCount >= maxPerRevision || familyCount >= maxPerFamily
+  }
 }
 
 /**
@@ -99,6 +180,32 @@ export interface CausalChapterPlan {
  */
 export interface CausalChapterEmotionContract extends EmotionContract {
   grounding_refs: string[]
+  grounded_claims: CausalGroundedClaim[]
+}
+
+export type CausalChapterEmotionContractDraft = Omit<
+  CausalChapterEmotionContract,
+  'pov_character' | 'grounding_refs' | 'grounded_claims'
+> & {
+  groundingEvidence: CausalEvidenceSelection
+}
+
+export type CausalEventCandidateDraft = Omit<CausalEventCandidate, 'id' | 'scores'> & {
+  scores: Omit<CausalEventCandidate['scores'], 'total'>
+}
+
+export type CausalChapterDecisionDraft = Omit<
+  CausalChapterDecision,
+  'initiator' | 'chosenAction' | 'opposition' | 'cost' | 'advancedPromiseIds' | 'newQuestion'
+>
+
+export type CausalChapterPlanDraft = Omit<
+  CausalChapterPlan,
+  'candidates' | 'selectedCandidateId' | 'decision' | 'emotionContract'
+> & {
+  candidates: CausalEventCandidateDraft[]
+  decision: CausalChapterDecisionDraft
+  emotionContract: CausalChapterEmotionContractDraft
 }
 
 export interface CausalChapterEmotionalOutcome {
@@ -137,10 +244,14 @@ export interface CausalChapterOutcome {
   resolvedPromiseIds: string[]
   newPromises: Array<{ id: string; question: string }>
   actorUpdates: CausalActorUpdate[]
+  newActors: Array<{ actor: CausalActorState; evidence: string }>
   pressureUpdates: CausalPressureUpdate[]
   newPressures: Array<{ pressure: CausalPressure; evidence: string }>
+  arcUpdates: Array<{ id: string; status: 'active' | 'completed'; evidence: string }>
   emotionalOutcome: CausalChapterEmotionalOutcome
   terminalConditionMet: boolean
+  matchedTerminalCondition: string
+  terminalEvidence: string
   completionReason: string
 }
 
@@ -166,6 +277,60 @@ function assertEvidence(content: string, evidence: string, label: string): void 
   if (!quote || !content.includes(quote)) throw new Error(`${label}缺少正文逐字证据`)
 }
 
+export function normalizeCausalNarrativeState(input: CausalNarrativeState): CausalNarrativeState {
+  const legacy = input as CausalNarrativeState & {
+    macroArcs?: CausalMacroArc[]
+    macroArchitectureReady?: boolean
+    archivedPromiseIds?: string[]
+    completionStatus?: CausalCompletionStatus
+    completionAuditFeedback?: string[]
+  }
+  const fallbackArc: CausalMacroArc = {
+    id: 'arc_main',
+    title: '核心问题主线',
+    objective: legacy.centralQuestion,
+    entryConditions: ['故事已经开始'],
+    exitConditions: [...legacy.terminalConditions],
+    mandatoryPayoffs: legacy.promises.filter(item => item.status !== 'resolved').map(item => item.question),
+    forbiddenDrift: [...legacy.immutableRules],
+    status: legacy.completed ? 'completed' : 'active',
+    lastAdvancedChapter: legacy.revision
+  }
+  return {
+    ...legacy,
+    schemaVersion: CAUSAL_NOVEL_SCHEMA_VERSION,
+    macroArcs: legacy.macroArcs?.length ? legacy.macroArcs : [fallbackArc],
+    macroArchitectureReady: legacy.macroArchitectureReady === true,
+    archivedPromiseIds: unique(legacy.archivedPromiseIds ?? []).slice(-1000),
+    completionStatus: legacy.completionStatus ?? (legacy.completed ? 'completed' : 'writing'),
+    completionAuditFeedback: unique(legacy.completionAuditFeedback ?? []).slice(-12),
+    completed: legacy.completed || legacy.completionStatus === 'completed'
+  }
+}
+
+export function causalEmotionGroundingSources(
+  state: CausalNarrativeState,
+  recentChapters: Array<{ id: number; content: string }> = []
+): Record<string, string> {
+  return Object.fromEntries([
+    ...state.actors.map(actor => [
+      `actor:${actor.name}`,
+      [actor.currentGoal, actor.fear, actor.constraint, ...actor.knowledge, ...actor.resources].join('\n')
+    ] as const),
+    ...state.activePressures
+      .filter(item => item.status === 'active')
+      .map(item => [
+        `pressure:${item.id}`,
+        [item.source, item.target, item.condition, item.escalation].join('\n')
+      ] as const),
+    ...state.promises
+      .filter(item => item.status !== 'resolved')
+      .map(item => [`promise:${item.id}`, item.question] as const),
+    ...state.immutableRules.map((rule, index) => [`rule:${index + 1}`, rule] as const),
+    ...recentChapters.map(chapter => [`recent:${chapter.id}`, chapter.content] as const)
+  ])
+}
+
 export function causalEmotionGroundingRefs(
   state: CausalNarrativeState,
   recentChapterIds: number[] = []
@@ -179,10 +344,153 @@ export function causalEmotionGroundingRefs(
   ]
 }
 
+function evidenceText(value: string): string {
+  return value.trim()
+}
+
+/**
+ * 把权威状态拆成模型可选择的原子事实。模型只返回 fact id，服务端负责恢复来源和逐字证据，
+ * 避免要求弱模型从整段 JSON 中复制字段、转义符和标点。
+ */
+export function buildCausalEvidenceCatalog(
+  state: CausalNarrativeState,
+  recentChapters: Array<{ id: number; content: string }> = []
+): CausalEvidenceFact[] {
+  const facts: CausalEvidenceFact[] = []
+  const seen = new Set<string>()
+  const add = (id: string, ref: string, value: string): void => {
+    const text = evidenceText(value)
+    if (text.replace(/\s/g, '').length < 3) return
+    const key = `${ref}\u0000${text}`
+    if (seen.has(key)) return
+    seen.add(key)
+    facts.push({ id, ref, text })
+  }
+
+  state.actors.forEach((actor, actorIndex) => {
+    const ref = `actor:${actor.name}`
+    add(`actor_${actorIndex}_goal`, ref, actor.currentGoal)
+    add(`actor_${actorIndex}_fear`, ref, actor.fear)
+    add(`actor_${actorIndex}_constraint`, ref, actor.constraint)
+    actor.knowledge.forEach((item, index) => add(`actor_${actorIndex}_knowledge_${index}`, ref, item))
+    actor.resources.forEach((item, index) => add(`actor_${actorIndex}_resource_${index}`, ref, item))
+  })
+  state.activePressures.filter(item => item.status === 'active').forEach((pressure, index) => {
+    const ref = `pressure:${pressure.id}`
+    add(`pressure_${index}_condition`, ref, pressure.condition)
+    add(`pressure_${index}_escalation`, ref, pressure.escalation)
+    add(`pressure_${index}_source`, ref, pressure.source)
+    add(`pressure_${index}_target`, ref, pressure.target)
+  })
+  state.promises.filter(item => item.status !== 'resolved').forEach((promise, index) => {
+    add(`promise_${index}_question`, `promise:${promise.id}`, promise.question)
+  })
+  state.immutableRules.forEach((rule, index) => add(`rule_${index}`, `rule:${index + 1}`, rule))
+  recentChapters.forEach(chapter => {
+    const fragments = chapter.content
+      .slice(-1800)
+      .split(/(?<=[。！？!?])|\n+/)
+      .map(item => item.trim())
+      .filter(item => item.replace(/\s/g, '').length >= 6)
+      .slice(-12)
+    fragments.forEach((fragment, index) => add(`recent_${chapter.id}_${index}`, `recent:${chapter.id}`, fragment))
+  })
+  return facts.slice(0, 160)
+}
+
+function includeEvidence(field: string, evidence: string): string {
+  const current = field.trim()
+  if (!current) return evidence
+  return current.includes(evidence) ? current : `${evidence}；${current}`
+}
+
+/** 服务端固化所有跨字段等值关系和可计算字段，模型不再负责重复抄写。 */
+export function materializeCausalCandidates(drafts: CausalEventCandidateDraft[]): CausalEventCandidate[] {
+  return drafts.map((candidate, index) => {
+    const withTotal: CausalEventCandidate = {
+      ...candidate,
+      id: `candidate_${index + 1}`,
+      scores: { ...candidate.scores, total: 0 }
+    }
+    withTotal.scores.total = causalCandidateTotal(withTotal)
+    return withTotal
+  })
+}
+
+export function materializeCausalChapterPlan(
+  state: CausalNarrativeState,
+  draft: CausalChapterPlanDraft,
+  catalog: CausalEvidenceFact[]
+): CausalChapterPlan {
+  if (draft.candidates.length === 0) throw new Error('因果候选为空')
+  const candidates = materializeCausalCandidates(draft.candidates)
+  const bestScore = Math.max(...candidates.map(candidate => candidate.scores.total))
+  const selected = candidates.find(candidate => candidate.scores.total === bestScore)
+  if (!selected) throw new Error('无法确定最高分因果候选')
+  const actorNames = new Set(state.actors.map(actor => actor.name))
+  if (!actorNames.has(selected.initiator)) throw new Error(`候选发起人不在当前人物状态中：${selected.initiator}`)
+  if (!actorNames.has(draft.decision.pov)) throw new Error(`章节视角人物不在当前人物状态中：${draft.decision.pov}`)
+
+  const evidenceById = new Map(catalog.map(item => [item.id, item]))
+  const attachment = evidenceById.get(draft.emotionContract.groundingEvidence.attachmentEvidenceId)
+  const privateDetail = evidenceById.get(draft.emotionContract.groundingEvidence.privateDetailEvidenceId)
+  if (!attachment) throw new Error('依恋锚点引用了不存在的原子证据')
+  if (!privateDetail) throw new Error('私人细节引用了不存在的原子证据')
+
+  const promiseIds = new Set(state.promises.filter(item => item.status !== 'resolved').map(item => item.id))
+  const selectedPromiseId = promiseIds.has(selected.promiseAdvanced) ? selected.promiseAdvanced : undefined
+  if (!selectedPromiseId) throw new Error('最高分候选没有引用有效的未关闭读者承诺')
+  const nonActorRef = [attachment.ref, privateDetail.ref, `promise:${selectedPromiseId}`]
+    .find(ref => /^(pressure|promise|rule|recent):/.test(ref))
+  const groundingRefs = [...new Set([
+    `actor:${draft.decision.pov}`,
+    attachment.ref,
+    privateDetail.ref,
+    nonActorRef ?? `promise:${selectedPromiseId}`
+  ])]
+
+  const decision: CausalChapterDecision = {
+    ...draft.decision,
+    initiator: selected.initiator,
+    chosenAction: selected.action,
+    opposition: selected.opposition,
+    cost: selected.cost,
+    advancedPromiseIds: [selectedPromiseId],
+    newQuestion: selected.newQuestion
+  }
+  const rollingHorizon = draft.rollingHorizon.map((beat, index) => ({
+    ...beat,
+    offset: index,
+    initiator: index === 0 ? decision.initiator : beat.initiator,
+    pressureIds: unique(beat.pressureIds),
+    promiseIds: unique(beat.promiseIds)
+  }))
+  const { groundingEvidence: _groundingEvidence, ...emotionDraft } = draft.emotionContract
+  const emotionContract: CausalChapterEmotionContract = {
+    ...emotionDraft,
+    pov_character: decision.pov,
+    attachment_anchor: includeEvidence(emotionDraft.attachment_anchor, attachment.text),
+    private_detail_anchor: privateDetail.text,
+    grounding_refs: groundingRefs,
+    grounded_claims: [
+      { field: 'attachment_anchor', ref: attachment.ref, evidence: attachment.text },
+      { field: 'private_detail_anchor', ref: privateDetail.ref, evidence: privateDetail.text }
+    ]
+  }
+  return {
+    ...draft,
+    candidates,
+    selectedCandidateId: selected.id,
+    decision,
+    emotionContract,
+    rollingHorizon
+  }
+}
+
 export function validateCausalChapterEmotionContract(
   state: CausalNarrativeState,
   plan: CausalChapterPlan,
-  recentChapterIds: number[] = []
+  recentChapters: Array<number | { id: number; content: string }> = []
 ): void {
   const contract = plan.emotionContract
   const errors = validateEmotionContract(contract)
@@ -190,6 +498,7 @@ export function validateCausalChapterEmotionContract(
   if (contract.pov_character !== plan.decision.pov) {
     throw new Error('因果章节情绪事务的视角人物与章节决策不一致')
   }
+  const recentChapterIds = recentChapters.map(item => typeof item === 'number' ? item : item.id)
   const allowed = new Set(causalEmotionGroundingRefs(state, recentChapterIds))
   const refs = [...new Set(contract.grounding_refs.map(item => item.trim()).filter(Boolean))]
   if (refs.length < 2) throw new Error('因果章节情绪事务至少需要两个权威依据')
@@ -200,6 +509,32 @@ export function validateCausalChapterEmotionContract(
   }
   if (!refs.some(ref => /^(pressure|promise|rule|recent):/.test(ref))) {
     throw new Error('因果章节情绪事务缺少世界压力、读者承诺、硬规则或前章正文依据')
+  }
+  const sources = causalEmotionGroundingSources(
+    state,
+    recentChapters.filter((item): item is { id: number; content: string } => typeof item !== 'number')
+  )
+  const claims = contract.grounded_claims ?? []
+  for (const field of ['attachment_anchor', 'private_detail_anchor'] as const) {
+    const claim = claims.find(item => item.field === field)
+    if (!claim) throw new Error(`因果章节情绪事务缺少 ${field} 的逐字依据`)
+    if (!refs.includes(claim.ref) || !allowed.has(claim.ref)) {
+      throw new Error(`因果章节情绪事务的 ${field} 引用了非权威依据：${claim.ref}`)
+    }
+    const evidence = claim.evidence.trim()
+    if (evidence.length < 3 || !sources[claim.ref]?.includes(evidence)) {
+      throw new Error(`因果章节情绪事务的 ${field} 缺少权威来源逐字证据`)
+    }
+    if (!contract[field].includes(evidence)) {
+      throw new Error(`因果章节情绪事务的 ${field} 没有包含所声明的逐字证据`)
+    }
+    if (field === 'private_detail_anchor') {
+      const evidenceLength = evidence.replace(/\s/g, '').length
+      const fieldLength = contract[field].replace(/\s/g, '').length
+      if (fieldLength > 0 && evidenceLength / fieldLength < 0.45) {
+        throw new Error('因果章节情绪事务的 private_detail_anchor 包含过多无权威依据的补写')
+      }
+    }
   }
 }
 
@@ -223,17 +558,43 @@ export function applyCausalChapterOutcome(
     throw new Error('章节情绪结果缺少触发、选择、代价或余波的正文证据')
   }
   for (const quote of outcome.evidenceQuotes) assertEvidence(content, quote, '章节结果')
-  for (const update of outcome.actorUpdates) assertEvidence(content, update.evidence, `人物「${update.actor}」更新`)
+  for (const update of outcome.actorUpdates) {
+    assertEvidence(content, update.evidence, `人物「${update.actor}」更新`)
+    for (const fact of [
+      update.currentGoal,
+      update.constraint,
+      ...(update.knowledgeAdded ?? []),
+      ...(update.resourcesAdded ?? []),
+      ...(update.resourcesRemoved ?? [])
+    ]) {
+      if (fact?.trim()) assertEvidence(content, fact, `人物「${update.actor}」状态字段`)
+    }
+  }
+  for (const item of outcome.newActors ?? []) {
+    assertEvidence(content, item.evidence, `新增人物「${item.actor.name}」`)
+    for (const fact of [
+      item.actor.name,
+      item.actor.currentGoal,
+      item.actor.fear,
+      item.actor.constraint,
+      ...item.actor.knowledge,
+      ...item.actor.resources
+    ]) {
+      if (fact.trim()) assertEvidence(content, fact, `新增人物「${item.actor.name}」状态字段`)
+    }
+  }
   for (const update of outcome.pressureUpdates) assertEvidence(content, update.evidence, `压力「${update.id}」更新`)
   for (const item of outcome.newPressures) assertEvidence(content, item.evidence, `新增压力「${item.pressure.id}」`)
+  for (const update of outcome.arcUpdates ?? []) assertEvidence(content, update.evidence, `阶段「${update.id}」更新`)
   assertEvidence(content, emotional.triggerEvidence, '情绪触发')
   assertEvidence(content, emotional.choiceEvidence, '情绪选择')
   assertEvidence(content, emotional.costEvidence, '情绪代价')
   assertEvidence(content, emotional.residueEvidence, '情绪余波')
 
-  const promiseIds = new Set(state.promises.map(item => item.id))
+  const activePromiseIds = new Set(state.promises.map(item => item.id))
+  const knownPromiseIds = new Set([...activePromiseIds, ...state.archivedPromiseIds])
   for (const id of [...outcome.advancedPromiseIds, ...outcome.resolvedPromiseIds]) {
-    if (!promiseIds.has(id)) throw new Error(`章节结果引用不存在的读者承诺：${id}`)
+    if (!activePromiseIds.has(id)) throw new Error(`章节结果引用不存在或已归档的读者承诺：${id}`)
   }
   const nextPromises = state.promises.map(item => {
     if (outcome.resolvedPromiseIds.includes(item.id)) {
@@ -245,8 +606,8 @@ export function applyCausalChapterOutcome(
     return item
   })
   for (const item of outcome.newPromises) {
-    if (!item.id.trim() || promiseIds.has(item.id)) throw new Error(`新增读者承诺 ID 非法或重复：${item.id}`)
-    promiseIds.add(item.id)
+    if (!item.id.trim() || knownPromiseIds.has(item.id)) throw new Error(`新增读者承诺 ID 非法或重复：${item.id}`)
+    knownPromiseIds.add(item.id)
     nextPromises.push({
       id: item.id.trim(), question: item.question.trim(), status: 'open',
       openedChapter: chapterOrdinal, lastAdvancedChapter: chapterOrdinal
@@ -270,6 +631,19 @@ export function applyCausalChapterOutcome(
   const knownActorNames = new Set(actors.map(actor => actor.name))
   const unknownActor = outcome.actorUpdates.find(update => !knownActorNames.has(update.actor))
   if (unknownActor) throw new Error(`章节结果更新了不存在的人物：${unknownActor.actor}`)
+  for (const item of outcome.newActors ?? []) {
+    const actor = item.actor
+    if (!actor.name.trim() || knownActorNames.has(actor.name)) {
+      throw new Error(`新增人物名称为空或重复：${actor.name}`)
+    }
+    knownActorNames.add(actor.name)
+    actors.push({
+      ...actor,
+      name: actor.name.trim(),
+      knowledge: unique(actor.knowledge),
+      resources: unique(actor.resources)
+    })
+  }
 
   const pressureIds = new Set(state.activePressures.map(item => item.id))
   const activePressures = state.activePressures.map(pressure => {
@@ -291,14 +665,57 @@ export function applyCausalChapterOutcome(
     activePressures.push({ ...pressure, urgency: clampUrgency(pressure.urgency), status: 'active' })
   }
 
+  const arcIds = new Set(state.macroArcs.map(item => item.id))
+  const unknownArc = (outcome.arcUpdates ?? []).find(update => !arcIds.has(update.id))
+  if (unknownArc) throw new Error(`章节结果更新了不存在的阶段：${unknownArc.id}`)
+  let macroArcs = state.macroArcs.map(arc => {
+    const update = (outcome.arcUpdates ?? []).find(item => item.id === arc.id)
+    return update
+      ? { ...arc, status: update.status, lastAdvancedChapter: chapterOrdinal }
+      : arc
+  })
+  if (!macroArcs.some(item => item.status === 'active')) {
+    const nextPendingIndex = macroArcs.findIndex(item => item.status === 'pending')
+    if (nextPendingIndex >= 0) {
+      macroArcs = macroArcs.map((item, index) => index === nextPendingIndex
+        ? { ...item, status: 'active' as const, lastAdvancedChapter: chapterOrdinal }
+        : item)
+    }
+  }
+  if (macroArcs.filter(item => item.status === 'active').length > 1) {
+    throw new Error('章节结果导致多个阶段同时处于 active')
+  }
+
+  if (outcome.terminalConditionMet) {
+    if (!state.terminalConditions.includes(outcome.matchedTerminalCondition?.trim())) {
+      throw new Error('章节结果声明完结，但没有命中权威终止条件')
+    }
+    assertEvidence(content, outcome.terminalEvidence, '终止条件')
+    if (!outcome.completionReason?.trim()) throw new Error('章节结果声明完结，但缺少完结原因')
+  }
+
+  const archivedPromiseIds = unique([
+    ...state.archivedPromiseIds,
+    ...nextPromises
+      .filter(item => item.status === 'resolved' && chapterOrdinal - item.lastAdvancedChapter > 24)
+      .map(item => item.id)
+  ]).slice(-1000)
+  const retainedPromises = nextPromises.filter(item =>
+    item.status !== 'resolved' || chapterOrdinal - item.lastAdvancedChapter <= 24
+  )
+
   return {
     ...state,
     revision: state.revision + 1,
     actors,
-    activePressures,
-    promises: nextPromises,
+    activePressures: activePressures.filter(item => item.status === 'active'),
+    promises: retainedPromises,
+    macroArcs,
+    archivedPromiseIds,
     recentEventSignatures: unique([...state.recentEventSignatures, outcome.eventSignature]).slice(-12),
-    completed: outcome.terminalConditionMet,
+    completionStatus: outcome.terminalConditionMet ? 'proposed' : 'writing',
+    completionAuditFeedback: outcome.terminalConditionMet ? [] : state.completionAuditFeedback,
+    completed: false,
     completionReason: outcome.terminalConditionMet ? outcome.completionReason.trim() : ''
   }
 }
@@ -318,6 +735,8 @@ export function formatCausalDecisionCard(plan: CausalChapterPlan): string {
       `留下新问题：${decision.newQuestion}`
     ].join('；')}`,
     formatEmotionContractForPrompt(plan.emotionContract),
-    `【情绪事务权威依据】${plan.emotionContract.grounding_refs.join('；')}`
+    `【情绪事务权威依据】${plan.emotionContract.grounding_refs.join('；')}`,
+    `【情绪锚点逐字证据】${plan.emotionContract.grounded_claims.map(item => `${item.field}:${item.ref}="${item.evidence}"`).join('；')}`,
+    `【近期滚动窗口】${plan.rollingHorizon.map(item => `+${item.offset} ${item.objective}`).join('；')}`
   ].join('\n')
 }

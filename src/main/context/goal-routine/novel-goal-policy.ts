@@ -31,6 +31,9 @@ export function novelPhaseFailureSignature(phase: string, errorCode: string, mes
     stage = 'volume_contract_generation'
   } else if (phase === 'draft_body') {
     if (/章节执行合同|CONTRACT_INVALID|合同冲突/.test(message)) stage = 'chapter_contract'
+    else if (errorCode === 'EVALUATOR_PROTOCOL' || /评估器.*(?:证据协议|逐项验证|精确证据)|门禁证据协议/.test(message)) stage = 'execution_evaluator'
+    else if (/泛白类模板反应|泛白类身体反应/.test(message)) stage = 'anti_ai_repair'
+    else if (/章节情节点覆盖|章节执行门禁未通过|章际衔接/.test(message)) stage = 'execution_gate'
     else if (/模式指纹|chapter_pattern|MISSING_PATTERN_FINGERPRINT/.test(message)) stage = 'pattern_fingerprint'
     else if (/叙事记忆|state_facts|正文证据/.test(message)) stage = 'memory_extraction'
     else if (/质量与情绪|质量总分|AI句式|对话密度|句长波动|字数达标/.test(message)) stage = 'body_acceptance'
@@ -79,6 +82,17 @@ export function shouldPauseForReadOnlyNovelAudit(input: {
   return input.planComplete && input.contentComplete && !input.met
 }
 
+export function shouldRecoverNovelChapterExecutionProtocol(input: {
+  resume: boolean
+  phase: string
+  savedVersion: number | undefined
+  currentVersion: number
+}): boolean {
+  return input.resume
+    && input.phase === 'draft_body'
+    && input.savedVersion !== input.currentVersion
+}
+
 export function nextPhaseAfterNovelOutlineCheckpoint(input: {
   volumeReadyForDraft: boolean
   titleHookApplied: boolean
@@ -86,4 +100,109 @@ export function nextPhaseAfterNovelOutlineCheckpoint(input: {
 }): 'generate_beats' | 'generate_title_hook' | 'draft_body' {
   if (!input.volumeReadyForDraft && !input.allOutlinesComplete) return 'generate_beats'
   return input.titleHookApplied ? 'draft_body' : 'generate_title_hook'
+}
+
+export interface ReusableNovelExecutionCandidate {
+  version_number: number
+  outline: string | null
+  content: string | null
+  word_count: number
+  model_type: string | null
+  generation_round?: number
+  snapshot_json: string | null
+}
+
+function isLegacyEvidenceOnlyCandidate(candidate: ReusableNovelExecutionCandidate): boolean {
+  if (candidate.model_type !== 'novel_execution_candidate' || !candidate.snapshot_json) return false
+  try {
+    const snapshot = JSON.parse(candidate.snapshot_json) as {
+      gate?: { blockers?: unknown }
+    }
+    const blockers = snapshot.gate?.blockers
+    return Array.isArray(blockers)
+      && blockers.length > 0
+      && blockers.every(blocker =>
+        typeof blocker === 'string'
+        && blocker.includes('评估器给出的证据不是正文精确原句')
+      )
+  } catch {
+    return false
+  }
+}
+
+function novelCandidateProgress(candidate: ReusableNovelExecutionCandidate): {
+  coverage: number
+  violations: number
+} {
+  if (!candidate.snapshot_json) return { coverage: 0, violations: 0 }
+  try {
+    const snapshot = JSON.parse(candidate.snapshot_json) as {
+      gate?: { coverage?: unknown; forbiddenViolations?: unknown; blockers?: unknown }
+      evaluatorAttempts?: unknown
+    }
+    const gates = [snapshot.gate]
+    if (Array.isArray(snapshot.evaluatorAttempts)) {
+      for (const attempt of snapshot.evaluatorAttempts) {
+        if (attempt && typeof attempt === 'object') gates.push(attempt as typeof snapshot.gate)
+      }
+    }
+    let coverage = 0
+    let violations = 0
+    for (const gate of gates) {
+      if (!gate) continue
+      if (Array.isArray(gate.coverage)) {
+        const score = gate.coverage.reduce((sum, row) => {
+          if (!row || typeof row !== 'object') return sum
+          const verdict = String((row as { verdict?: unknown }).verdict ?? '')
+          return sum + (verdict === 'covered' ? 2 : verdict === 'partial' ? 1 : 0)
+        }, 0)
+        coverage = Math.max(coverage, score)
+      }
+      violations = Math.max(
+        violations,
+        Array.isArray(gate.forbiddenViolations) ? gate.forbiddenViolations.length : 0
+      )
+    }
+    return { coverage, violations }
+  } catch {
+    return { coverage: 0, violations: 0 }
+  }
+}
+
+/**
+ * 恢复时沿着章节修复前沿继续：修复轮次优先，其次是已覆盖验收项、越界风险、
+ * 字数范围和版本新旧。不能仅按字数距离退回更早、语义进度更低的候选。
+ */
+export function selectReusableNovelExecutionCandidate(
+  candidates: ReusableNovelExecutionCandidate[],
+  input: {
+    outline: string | null | undefined
+    wordTarget: number
+    wordMin: number
+    wordMax: number
+  }
+): ReusableNovelExecutionCandidate | undefined {
+  return candidates
+    .filter(candidate => Boolean(candidate.content?.trim()))
+    .filter(candidate => !candidate.outline || candidate.outline === input.outline)
+    .filter(candidate =>
+      candidate.model_type === 'novel_gate_evidence'
+      || candidate.model_type === 'novel_execution_candidate'
+      || candidate.model_type === 'novel_scene_complete'
+      || isLegacyEvidenceOnlyCandidate(candidate)
+    )
+    .sort((left, right) => {
+      const round = (right.generation_round ?? 0) - (left.generation_round ?? 0)
+      if (round) return round
+      const leftProgress = novelCandidateProgress(left)
+      const rightProgress = novelCandidateProgress(right)
+      if (leftProgress.coverage !== rightProgress.coverage) return rightProgress.coverage - leftProgress.coverage
+      if (leftProgress.violations !== rightProgress.violations) return leftProgress.violations - rightProgress.violations
+      const leftInRange = left.word_count >= input.wordMin && left.word_count <= input.wordMax
+      const rightInRange = right.word_count >= input.wordMin && right.word_count <= input.wordMax
+      if (leftInRange !== rightInRange) return leftInRange ? -1 : 1
+      const version = right.version_number - left.version_number
+      if (version) return version
+      return Math.abs(left.word_count - input.wordTarget) - Math.abs(right.word_count - input.wordTarget)
+    })[0]
 }

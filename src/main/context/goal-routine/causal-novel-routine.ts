@@ -12,14 +12,19 @@ import { bindGoalLoopModelOpts, clearGoalLoopModelOpts } from './story-goal-mode
 import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-goal-routine'
 import {
   extractCausalOutcome,
+  causalPlanFailureCode,
   initializeCausalNovelState,
-  planNextCausalChapter
+  planNextCausalChapter,
+  upgradeCausalNovelMacroArchitecture
 } from './causal-novel-engine'
 import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
+import { registerCausalPlanFailure, type CausalPlanFailureEvent } from '../../../shared/causal-novel-types'
 import type { GoalProgressEvent, Phase } from './novel-goal-routine'
 
 const activeCausalLoops = new Map<number, AbortController>()
 const MAX_IDENTICAL_FAILURES = 3
+const MAX_PLAN_FAILURES_PER_REVISION = 3
+const MAX_PLAN_FAILURES_PER_FAMILY = 2
 
 function broadcast(payload: GoalProgressEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -67,6 +72,7 @@ export async function runCausalNovelGoalLoop(
   let phase: Phase = causalNovelDAO.getState(workId) ? 'generate_beats' : 'materialize_settings'
   let lastFailure = ''
   let identicalFailures = 0
+  let planFailureHistory: CausalPlanFailureEvent[] = []
   const controller = new AbortController()
   activeCausalLoops.set(workId, controller)
   bindGoalLoopModelOpts(workId, fullConfig)
@@ -114,8 +120,28 @@ export async function runCausalNovelGoalLoop(
           continue
         }
 
-        const chapters = volumeChapterDAO.listChaptersByWork(workId)
-        const pending = causalNovelDAO.listDecisions(workId).find(item => item.status === 'planned')
+        const decisions = causalNovelDAO.listDecisions(workId)
+        const decisionIds = new Set(decisions.map(item => item.chapterId))
+        const unmanagedChapter = volumeChapterDAO.listChaptersByWork(workId).find(chapter => !decisionIds.has(chapter.id))
+        if (unmanagedChapter) {
+          throw new Error(`检测到非权威章节「${unmanagedChapter.title}」，为避免污染章节顺序与叙事记忆，删除该草稿后才能继续滚动`)
+        }
+        const pending = decisions.find(item => item.status === 'planned')
+        if (!pending && !state.macroArchitectureReady) {
+          phase = 'materialize_settings'
+          goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
+          const upgraded = await upgradeCausalNovelMacroArchitecture(
+            workId,
+            controller.signal,
+            progress => emit(progress, 'running')
+          )
+          goalRoutineDAO.appendTurn({
+            work_id: workId, turn_no: turn, phase, action: 'causal_macro_upgrade',
+            summary: `建立 ${upgraded.macroArcs.length} 个阶段锚点并写入状态修订版 ${upgraded.revision}`
+          })
+          emit(`阶段架构已升级为 ${upgraded.macroArcs.length} 个锚点`, 'running')
+          continue
+        }
         if (pending) {
           phase = 'draft_body'
           goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
@@ -128,7 +154,22 @@ export async function runCausalNovelGoalLoop(
               workType: 'causal_novel',
               deferNarrativeMemory: true
             })
-            if (!generated.success) throw new Error(generated.error || '因果章节正文生成失败')
+            if (!generated.success) {
+              if (generated.requiresEscalation && generated.error?.includes('章节执行门禁连续 3 次未返回完整精确证据')) {
+                goalRoutineDAO.appendTurn({
+                  work_id: workId,
+                  turn_no: turn,
+                  phase,
+                  action: 'causal_gate_evaluator_stalled',
+                  target_chapter_id: pending.chapterId,
+                  summary: generated.error
+                })
+                goalRoutineDAO.setStatus(workId, 'paused')
+                emit(generated.error, 'paused')
+                return
+              }
+              throw new Error(generated.error || '因果章节正文生成失败')
+            }
           }
           const acceptance = await runChapterAcceptanceGate(
             workId, pending.chapterId, fullConfig, controller.signal,
@@ -162,7 +203,8 @@ export async function runCausalNovelGoalLoop(
               chapterId: pending.chapterId,
               expectedStateRevision: extracted.state.revision - 1,
               nextState: extracted.state,
-              outcome: extracted.outcome
+              outcome: extracted.outcome,
+              expectedBodyHash: extracted.bodyHash
             })
             volumeChapterDAO.updateChapter(pending.chapterId, { status: 'completed' })
             return memory
@@ -175,13 +217,20 @@ export async function runCausalNovelGoalLoop(
           emit(`本章因果与情绪结果已提交：${extracted.outcome.summary}`, 'running')
           lastFailure = ''
           identicalFailures = 0
+          planFailureHistory = []
           continue
         }
 
-        if (state.completed) {
+        if (state.completionStatus === 'completed' || state.completed) {
+          goalRoutineDAO.update(workId, { status: 'goal_met', goal_met: true, current_phase: 'goal_check' })
+          emit(`因果小说已经完成：${state.completionReason}`, 'goal_met')
+          return
+        }
+
+        if (state.completionStatus === 'proposed') {
           phase = 'goal_check'
           goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
-          emit('核心戏剧问题已经得到不可逆回答，正在执行整书终审', 'running')
+          emit('正文提议核心问题已经收束，正在执行独立整书终审', 'running')
           const check = await checkStoryGoal(workId, fullConfig, controller.signal, message => emit(message, 'running'))
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: 'causal_final_check',
@@ -189,17 +238,20 @@ export async function runCausalNovelGoalLoop(
             summary: check.met ? `因果小说完成：${state.completionReason}` : check.reasons.join('；')
           })
           if (check.met) {
+            const completed = causalNovelDAO.confirmCompletion(workId, state.revision, state.completionReason)
             goalRoutineDAO.update(workId, { status: 'goal_met', goal_met: true })
-            emit(`因果小说完成：${state.completionReason}`, 'goal_met')
+            emit(`因果小说完成并写入状态修订版 ${completed.revision}：${completed.completionReason}`, 'goal_met')
           } else {
+            const reopened = causalNovelDAO.rejectProposedCompletion(workId, state.revision, check.reasons)
             goalRoutineDAO.update(workId, { status: 'paused', goal_met: false })
-            emit(`核心因果已收束，但整书终审未通过：${check.reasons.join('；')}`, 'paused')
+            emit(`完结提案未通过，已退回写作状态 r${reopened.revision}：${check.reasons.join('；')}`, 'paused')
           }
           return
         }
 
         const targetChapters = loadWritingPlan(workId).targetChapters
-        if (chapters.length >= targetChapters) {
+        const committedChapterCount = decisions.filter(item => item.status === 'committed').length
+        if (committedChapterCount >= targetChapters) {
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: 'goal_check' })
           emit(`已达到 ${targetChapters} 章，但核心终止条件尚未满足；已停止继续扩写`, 'paused')
           return
@@ -220,14 +272,42 @@ export async function runCausalNovelGoalLoop(
         emit(`已选择下一章「${planned.plan.decision.title}」并冻结本章情绪事务，未创建远期大纲`, 'running')
         lastFailure = ''
         identicalFailures = 0
+        planFailureHistory = []
       } catch (error) {
         if (controller.signal.aborted) continue
         const message = error instanceof Error ? error.message : String(error)
         identicalFailures = message === lastFailure ? identicalFailures + 1 : 1
         lastFailure = message
+        const stateRevision = causalNovelDAO.getState(workId)?.revision ?? -1
+        const planFailureCode = phase === 'generate_beats' ? causalPlanFailureCode(message) : null
+        const failureDecision = planFailureCode
+          ? registerCausalPlanFailure(
+              planFailureHistory,
+              { revision: stateRevision, code: planFailureCode },
+              MAX_PLAN_FAILURES_PER_REVISION,
+              MAX_PLAN_FAILURES_PER_FAMILY
+            )
+          : null
+        if (planFailureCode) {
+          planFailureHistory = failureDecision?.history ?? planFailureHistory
+        }
         goalRoutineDAO.appendTurn({
-          work_id: workId, turn_no: turn, phase, action: 'error', summary: message
+          work_id: workId,
+          turn_no: turn,
+          phase,
+          action: 'error',
+          summary: planFailureCode ? `[${planFailureCode}] ${message}` : message
         })
+        if (
+          planFailureCode && failureDecision?.shouldPause
+        ) {
+          goalRoutineDAO.update(workId, { status: 'paused', current_phase: phase })
+          emit(
+            `因果规划在状态 r${stateRevision} 未收敛，已按错误族 ${planFailureCode} 熔断：${message}`,
+            'paused'
+          )
+          return
+        }
         if (identicalFailures >= MAX_IDENTICAL_FAILURES) {
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: phase })
           emit(`相同失败连续 ${identicalFailures} 次，已熔断且未推进权威状态：${message}`, 'paused')

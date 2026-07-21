@@ -16,6 +16,18 @@ function matchStepPrefix(step: string | undefined, prefixes: string[]): boolean 
   return prefixes.some(p => step === p || step.startsWith(`${p}_`) || step.startsWith(p))
 }
 
+const FULL_PROSE_REWRITE_STEPS = new Set([
+  'novel_execution_repair',
+  'goal_diagnose_fix',
+  'story_continuity_repair'
+])
+
+/** 这些步骤都会输出可直接覆盖整章的正文，必须继承正文生成的完整文风层。 */
+export function isFullProseOutputStep(step: string | undefined): boolean {
+  if (!step) return false
+  return step === 'body_generation' || step.startsWith('body_') || FULL_PROSE_REWRITE_STEPS.has(step)
+}
+
 /** 核心设定 AI 生成（人设/世界观/冲突/人设卡片）：不注入文风、品味、锚点等 */
 export function isCoreSettingsAiGenerateStep(step: string | undefined): boolean {
   if (!step) return false
@@ -26,7 +38,7 @@ export function isCoreSettingsAiGenerateStep(step: string | undefined): boolean 
 export function resolveLayersForStep(step: string | undefined): StyleStepLayer[] {
   if (!step) return ['language']
 
-  if (matchStepPrefix(step, ['body'])) {
+  if (isFullProseOutputStep(step)) {
     return ['language', 'decision', 'pacing']
   }
   if (

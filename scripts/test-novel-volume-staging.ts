@@ -31,6 +31,8 @@ import {
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  selectReusableNovelExecutionCandidate,
+  shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from '../src/main/context/goal-routine/novel-goal-policy'
 import {
@@ -168,6 +170,116 @@ assert.equal(
   novelPhaseFailureSignature('draft_body', 'Error', '叙事记忆提取连续3轮失败：chapter_pattern 缺失'),
   novelPhaseFailureSignature('draft_body', 'Error', '章节模式指纹提取失败，禁止进入下一章')
 )
+assert.notEqual(
+  novelPhaseFailureSignature('draft_body', 'Error', '章节情节点覆盖/衔接经过 2 轮定向修复仍未通过'),
+  novelPhaseFailureSignature('draft_body', 'Error', '章节执行修复后仍有 1 处泛白类模板反应')
+)
+assert.notEqual(
+  novelPhaseFailureSignature('draft_body', 'EVALUATOR_PROTOCOL', '章节执行评估器连续 3 次未返回可逐项验证的精确证据'),
+  novelPhaseFailureSignature('draft_body', 'Error', '章节情节点覆盖/衔接经过 2 轮定向修复仍未通过')
+)
+const reusableCandidate = selectReusableNovelExecutionCandidate([
+  {
+    version_number: 33,
+    outline: '本章大纲',
+    content: '新版协议保留候选',
+    word_count: 1471,
+    model_type: 'novel_gate_evidence',
+    generation_round: 1,
+    snapshot_json: null
+  },
+  {
+    version_number: 27,
+    outline: '本章大纲',
+    content: '旧协议证据误判但字数合格的候选',
+    word_count: 1919,
+    model_type: 'novel_execution_candidate',
+    generation_round: 2,
+    snapshot_json: JSON.stringify({
+      gate: { blockers: ['情节缺失：必写事件；评估器给出的证据不是正文精确原句'] }
+    })
+  },
+  {
+    version_number: 31,
+    outline: '本章大纲',
+    content: '真实缺失事件的候选',
+    word_count: 1995,
+    model_type: 'novel_execution_candidate',
+    generation_round: 1,
+    snapshot_json: JSON.stringify({ gate: { blockers: ['情节缺失：主角没有进入垃圾场'] } })
+  }
+], {
+  outline: '本章大纲',
+  wordTarget: 2000,
+  wordMin: 1800,
+  wordMax: 2200
+})
+assert.equal(reusableCandidate?.version_number, 27)
+const repairedFrontier = selectReusableNovelExecutionCandidate([
+  {
+    version_number: 4,
+    outline: '本章大纲',
+    content: '第二轮语义候选',
+    word_count: 2440,
+    model_type: 'novel_execution_candidate',
+    generation_round: 2,
+    snapshot_json: JSON.stringify({ gate: { coverage: [{ verdict: 'partial' }], forbiddenViolations: [] } })
+  },
+  {
+    version_number: 5,
+    outline: '本章大纲',
+    content: '第三轮因证据协议暂停的最新候选',
+    word_count: 2506,
+    model_type: 'novel_gate_evidence',
+    generation_round: 3,
+    snapshot_json: JSON.stringify({ gate: { coverage: [], forbiddenViolations: [] }, evaluatorFailure: true })
+  }
+], {
+  outline: '本章大纲',
+  wordTarget: 2000,
+  wordMin: 1800,
+  wordMax: 2200
+})
+assert.equal(repairedFrontier?.version_number, 5)
+assert.equal(selectReusableNovelExecutionCandidate([
+  {
+    version_number: 1,
+    outline: '另一版大纲',
+    content: '不可跨大纲复用',
+    word_count: 2000,
+    model_type: 'novel_gate_evidence',
+    snapshot_json: null
+  }
+], {
+  outline: '当前大纲',
+  wordTarget: 2000,
+  wordMin: 1800,
+  wordMax: 2200
+}), undefined)
+assert.equal(shouldRecoverNovelChapterExecutionProtocol({
+  resume: true,
+  phase: 'draft_body',
+  savedVersion: undefined,
+  currentVersion: 3
+}), true)
+assert.equal(shouldRecoverNovelChapterExecutionProtocol({
+  resume: true,
+  phase: 'draft_body',
+  savedVersion: 3,
+  currentVersion: 3
+}), false)
+assert.equal(shouldRecoverNovelChapterExecutionProtocol({
+  resume: true,
+  phase: 'generate_beats',
+  savedVersion: 1,
+  currentVersion: 3
+}), false)
+assert.equal(shouldRecoverNovelChapterExecutionProtocol({
+  resume: false,
+  phase: 'draft_body',
+  savedVersion: 1,
+  currentVersion: 3
+}), false)
 assert.equal(shouldInjectWritingStyle('goal_novel_volume_chapter_gate'), false)
 assert.equal(shouldInjectTasteAndConditionRules('goal_novel_volume_chapter_gate'), false)
 assert.equal(shouldInjectWritingStyle('goal_novel_volume_chapter_repair'), false)

@@ -10,6 +10,8 @@ export interface StoryHarnessIssue {
   message: string
   expectedResult: string
   invariants?: string[]
+  /** 同码同章内具体因果故障的稳定标识，例如 LIU_PROFESSOR_UNSEEDED_INTERVENTION。 */
+  identityHint?: string
 }
 
 export interface StoryModelCapabilityProfile {
@@ -76,6 +78,87 @@ export function repairDeterministicStoryQuotes(text: string): string {
   return lineEnd >= 0
     ? `${repaired.slice(0, lineEnd)}”${repaired.slice(lineEnd)}`
     : `${repaired}”`
+}
+
+export interface DeterministicStorySentenceRepair {
+  content: string
+  repairs: Array<{ before: string; after: string }>
+}
+
+/**
+ * 原位修复已知、无歧义的坏词片段。只允许替换命中的短片段，不能借机重写句子。
+ *
+ * 生成模型偶尔会把“四十分钟”污染成“四挺钟”或“四颇为钟”。这两种形式
+ * 的缺失部分可以由字面结构唯一恢复，因此不应消耗一次整拍重写和盲评预算。
+ */
+export function repairDeterministicStorySentences(text: string): DeterministicStorySentenceRepair {
+  const repairs: Array<{ before: string; after: string }> = []
+  const content = text.replace(
+    /([一二三四五六七八九十\d]+)(挺|颇为)钟/g,
+    (before: string, amount: string) => {
+      const after = /^[一二三四五六七八九]$/.test(amount)
+        ? `${amount}十分钟`
+        : `${amount}分钟`
+      repairs.push({ before, after })
+      return after
+    }
+  )
+  return { content, repairs }
+}
+
+const STORY_HOUR_DIGITS: Record<string, number> = {
+  零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6,
+  七: 7, 八: 8, 九: 9, 十: 10, 十一: 11, 十二: 12
+}
+
+function parseStoryHour(value: string): number | null {
+  if (/^\d{1,2}$/.test(value)) {
+    const parsed = Number(value)
+    return parsed >= 0 && parsed <= 24 ? parsed : null
+  }
+  return STORY_HOUR_DIGITS[value] ?? null
+}
+
+function normalizeStoryClockHour(period: string, hour: number): number {
+  if (period === '下午' || period === '晚上') return hour < 12 ? hour + 12 : hour
+  if (period === '凌晨') return hour === 12 ? 0 : hour
+  if (period === '上午') return hour === 12 ? 0 : hour
+  return hour
+}
+
+/** 检出同一句中可以确定计算的“起始时刻 + N 小时 = 截止时刻”矛盾。 */
+export function detectStoryDeadlineArithmeticIssues(
+  text: string,
+  chapterId?: number
+): StoryHarnessIssue[] {
+  const issues: StoryHarnessIssue[] = []
+  const pattern = /(?:现在|当前)?(?:是)?(凌晨|上午|下午|晚上)([零一二两三四五六七八九十\d]{1,3})点[\s\S]{0,48}?([一二两三四五六七八九十\d]{1,3})个?小时后(?:就|将)?是?(凌晨|上午|下午|晚上)([零一二两三四五六七八九十\d]{1,3})点/g
+  for (const match of text.matchAll(pattern)) {
+    const start = parseStoryHour(match[2])
+    const duration = parseStoryHour(match[3])
+    const stated = parseStoryHour(match[5])
+    if (start == null || duration == null || stated == null) continue
+    const expected = (normalizeStoryClockHour(match[1], start) + duration) % 24
+    const actual = normalizeStoryClockHour(match[4], stated) % 24
+    if (expected === actual) continue
+    const expectedLabel = expected === 0
+      ? '凌晨十二点'
+      : expected < 12
+        ? `上午${expected}点`
+        : expected === 12
+          ? '中午十二点'
+          : `晚上${expected - 12}点`
+    issues.push({
+      code: 'DEADLINE_ARITHMETIC_CONTRADICTION',
+      severity: 'blocker',
+      scope: 'sentence',
+      chapterIds: chapterId == null ? undefined : [chapterId],
+      evidence: [match[0]],
+      message: `倒计时时间计算错误：所写截止时刻与起始时刻加 ${duration} 小时不一致`,
+      expectedResult: `只修正截止时刻或时长，使结果明确等于${expectedLabel}`
+    })
+  }
+  return issues
 }
 export const STORY_HARNESS_MAX_AUTOMATION_EPOCHS = 2
 
@@ -220,7 +303,8 @@ export function storyHarnessIssueKey(value: StoryHarnessIssue): string {
   // scope 是评估器给出的修复建议，不是问题身份。同一条时间线硬伤可能在
   // 两次独立审计中分别被标成 engine/cluster；把 scope 放进 key 会让旧问题
   // 被误判为已解决，同时创建一条“新”问题。
-  return `${value.code}:${chapters}`
+  const identity = value.identityHint?.trim().toUpperCase().replace(/[^A-Z0-9_\-\u4e00-\u9fff]+/g, '_')
+  return identity ? `${value.code}:${chapters}:${identity.slice(0, 120)}` : `${value.code}:${chapters}`
 }
 
 export function stableStoryHash(text: string): string {
@@ -254,6 +338,8 @@ export function detectStoryTextIntegrityIssues(
     push(issue('EMPTY_BODY', 'beat', ['正文为空'], '节拍正文为空，禁止提交正式章节', '生成非空且完整的正文'))
     return issues
   }
+
+  issues.push(...detectStoryDeadlineArithmeticIssues(trimmed, options.chapterId))
 
   const quoteCount = (trimmed.match(/[“”]/g) ?? []).length
   if (quoteCount % 2 !== 0) {

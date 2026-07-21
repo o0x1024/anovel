@@ -203,7 +203,6 @@ const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_pha
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
   const s = state.value?.status
-  if (terminalReason.value === 'needs_manual_editor') return false
   if (!s || s === 'goal_met' || s === 'timeout') return false
   if (running.value && s === 'running') return false
   return s === 'paused' || s === 'cancelled'
@@ -216,7 +215,7 @@ const resumeLabel = computed(() =>
 
 const canContinueRepair = computed(() => {
   const s = state.value
-  if (!s || running.value || s.goal_met || terminalReason.value === 'needs_manual_editor') return false
+  if (!s || running.value || s.goal_met) return false
   const repairPhases = ['goal_check', 'repair_plan', 'repair_execute']
   return (s.status === 'timeout' || s.status === 'paused')
     && repairPhases.includes(s.current_phase ?? '')
@@ -666,7 +665,7 @@ watch(config, saveConfig, { deep: true })
         </button>
         <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
-          {{ terminalReason === 'needs_manual_editor' ? '人工编辑后开启新周期' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环') }}
+          {{ terminalReason === 'needs_manual_editor' ? '重新验收当前正文' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环') }}
         </button>
         <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" @click="resume">
           <font-awesome-icon icon="forward" class="w-3.5 h-3.5" />

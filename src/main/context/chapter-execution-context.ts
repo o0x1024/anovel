@@ -104,6 +104,7 @@ export function compileChapterExecutionContract(
     volumeName: volume?.name,
     volumeGoal: volume?.description?.slice(0, 800),
     outline: chapter.outline,
+    outlineDiagnosis: chapter.outline_diagnosis,
     characterNames,
     characterSpeechStyles: cards.map(card => card.speechStyle ?? ''),
     wordTarget
@@ -129,13 +130,13 @@ export function persistChapterExecutionContract(
     }
   } catch { diagnosisReadable = false }
   if (!diagnosisReadable) return contract
-  const current = diagnosis.execution_contract_v2 as {
+  const current = diagnosis.execution_contract_v3 as {
     sourceOutlineHash?: unknown
     wordTarget?: unknown
   } | undefined
   if (current?.sourceOutlineHash !== contract.sourceOutlineHash || current?.wordTarget !== contract.wordTarget) {
     volumeChapterDAO.updateChapter(chapterId, {
-      outline_diagnosis: JSON.stringify({ ...diagnosis, execution_contract_v2: contract }),
+      outline_diagnosis: JSON.stringify({ ...diagnosis, execution_contract_v3: contract }),
       quality_assessment_json: null
     })
   }

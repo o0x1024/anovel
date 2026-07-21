@@ -42,6 +42,7 @@ import {
 } from './token-estimate'
 import { volumeChapterDAO } from '../db'
 import {
+  isBodyGenerationStep,
   shouldInjectAnchors,
   shouldInjectTasteAndConditionRules,
   shouldInjectWritingStyle
@@ -222,8 +223,7 @@ export function collectPromptSections(
   const sections: PromptSection[] = []
   const workId = request.workId
 
-  const isBodyStep =
-    request.step === 'body_generation' || !!request.step?.startsWith('body_')
+  const isBodyStep = isBodyGenerationStep(request.step)
 
   const shouldEnrichMemory = request.enrichNarrativeMemory !== false && (
     request.enrichNarrativeMemory === true ||
@@ -294,10 +294,10 @@ export function collectPromptSections(
 
   if (shouldInjectWritingStyle(request.step)) {
     let { languageText, stepRulesText } = resolveStyleTexts(request)
-    if (languageText && request.step?.startsWith('body_')) {
+    if (languageText && isBodyStep) {
       languageText = stripEmbeddedAntiAiSection(languageText)
     }
-    if (chapterExecutionContract && request.step?.startsWith('body_')) {
+    if (chapterExecutionContract && isBodyStep) {
       languageText = adaptBodyStyleTextForContract(languageText, chapterExecutionContract)
       stepRulesText = adaptBodyStyleTextForContract(stepRulesText, chapterExecutionContract)
     }
@@ -323,7 +323,7 @@ export function collectPromptSections(
     }
   }
 
-  if (workId && request.step?.startsWith('body_')) {
+  if (workId && isBodyStep) {
     const antiAiText = formatAntiAiRulesForPrompt(workId, request.step)
     if (antiAiText) {
       const isBodyGeneration = request.step === 'body_generation'
@@ -605,10 +605,7 @@ export function collectPromptSections(
     }))
   }
 
-  if (
-    workId &&
-    (request.step === 'body_generation' || request.step?.startsWith('body_'))
-  ) {
+  if (workId && isBodyStep) {
     const fewShotText = buildStyleFewShot(workId)
     if (fewShotText) {
       sections.push(systemRuleSection({

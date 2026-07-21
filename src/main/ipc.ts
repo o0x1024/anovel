@@ -52,6 +52,10 @@ import { getAntiAiRules, setAntiAiRules, appendAntiAiRules, suggestRulesFromAiTr
 import { humanizeText, measureAiSignature, type HumanizeOptions } from './context/humanize-text'
 import { autoRewriteBody } from './context/lab/body-auto-rewrite'
 import {
+  applyCausalStyleRewrite,
+  generateCausalStyleRewritePreview
+} from './context/causal-chapter-style-rewrite'
+import {
   runStoryGoalLoop,
   cancelGoalLoop,
   isGoalLoopRunning,
@@ -102,6 +106,30 @@ import {
  * 注册所有 IPC 处理器，桥接渲染进程与数据库层
  */
 export function registerIpcHandlers(): void {
+  const assertCausalChapterDirectMutationAllowed = (chapterId: number, action: string): void => {
+    const workId = volumeChapterDAO.getWorkIdForChapter(chapterId)
+    if (workId == null || workDAO.getById(workId)?.work_type !== 'causal_novel') return
+    if (isCausalNovelGoalLoopRunning(workId)) {
+      throw new Error(`滚动因果正在运行，请暂停后再${action}`)
+    }
+    const decision = causalNovelDAO.getDecision(chapterId)
+    if (decision?.status === 'committed') {
+      throw new Error('已提交章节已冻结；如只调整表达，请使用“AI 按当前文风重写”。涉及事实的修改必须通过因果重放流程')
+    }
+  }
+  const assertCausalVolumeDirectMutationAllowed = (volumeId: number, action: string): void => {
+    const volume = volumeChapterDAO.getVolume(volumeId)
+    if (!volume || workDAO.getById(volume.work_id)?.work_type !== 'causal_novel') return
+    if (isCausalNovelGoalLoopRunning(volume.work_id)) throw new Error(`滚动因果正在运行，请暂停后再${action}`)
+    throw new Error('因果小说的“滚动正文”由权威状态管理，不能通过通用分卷入口修改')
+  }
+  const assertCausalChapterStructuralMutationAllowed = (chapterId: number, action: string): void => {
+    const workId = volumeChapterDAO.getWorkIdForChapter(chapterId)
+    if (workId == null || workDAO.getById(workId)?.work_type !== 'causal_novel') return
+    if (isCausalNovelGoalLoopRunning(workId)) throw new Error(`滚动因果正在运行，请暂停后再${action}`)
+    throw new Error('因果小说的章节顺序由状态修订号决定，不能直接移动或重排')
+  }
+
   // ==================== 作品 ====================
   ipcMain.handle('work:list', (_e, workType?: string) => workDAO.list(workType))
   ipcMain.handle('work:get', (_e, id: number) => workDAO.getById(id))
@@ -165,9 +193,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('volume:list', (_e, workId: number) => volumeChapterDAO.listVolumes(workId))
   ipcMain.handle('volume:create', (_e, workId: number, name: string, desc?: string) =>
     volumeChapterDAO.createVolume(workId, name, desc))
-  ipcMain.handle('volume:update', (_e, id: number, fields: Record<string, unknown>) =>
-    volumeChapterDAO.updateVolume(id, fields))
+  ipcMain.handle('volume:update', (_e, id: number, fields: Record<string, unknown>) => {
+    assertCausalVolumeDirectMutationAllowed(id, '修改分卷')
+    return volumeChapterDAO.updateVolume(id, fields)
+  })
   ipcMain.handle('volume:delete', (_e, id: number) => {
+    assertCausalVolumeDirectMutationAllowed(id, '删除分卷')
     const volume = volumeChapterDAO.getVolume(id)
     const deleted = volumeChapterDAO.deleteVolume(id)
     if (deleted && volume && workDAO.getById(volume.work_id)?.work_type !== 'story') {
@@ -176,6 +207,9 @@ export function registerIpcHandlers(): void {
     return deleted
   })
   ipcMain.handle('volume:batchUpsert', (_e, workId: number, items: { name: string; description?: string }[], mode?: 'append' | 'replace') => {
+    if (workDAO.getById(workId)?.work_type === 'causal_novel') {
+      throw new Error('因果小说不支持通用分卷批量写入')
+    }
     const resolvedMode = mode ?? 'append'
     const ids = volumeChapterDAO.batchUpsertVolumes(workId, items, resolvedMode)
     if (resolvedMode === 'replace' && workDAO.getById(workId)?.work_type !== 'story') {
@@ -188,9 +222,22 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:list', (_e, volumeId: number) => volumeChapterDAO.listChapters(volumeId))
   ipcMain.handle('chapter:listByWork', (_e, workId: number) => volumeChapterDAO.listChaptersByWork(workId))
   ipcMain.handle('chapter:get', (_e, id: number) => volumeChapterDAO.getChapter(id))
-  ipcMain.handle('chapter:create', (_e, volumeId: number, title: string, outline?: string) =>
-    volumeChapterDAO.createChapter(volumeId, title, outline))
+  ipcMain.handle('chapter:create', (_e, volumeId: number, title: string, outline?: string) => {
+    const volume = volumeChapterDAO.getVolume(volumeId)
+    if (volume && workDAO.getById(volume.work_id)?.work_type === 'causal_novel') {
+      throw new Error('因果小说不能通过通用章节入口新增正文，请使用因果章节管理中的“新增非权威草稿”')
+    }
+    return volumeChapterDAO.createChapter(volumeId, title, outline)
+  })
   ipcMain.handle('chapter:update', (_e, id: number, fields: Record<string, unknown>) => {
+    assertCausalChapterDirectMutationAllowed(id, '修改章节')
+    const causalDecision = causalNovelDAO.getDecision(id)
+    if (causalDecision && typeof fields.title === 'string') {
+      const currentTitle = volumeChapterDAO.getChapter(id)?.title ?? ''
+      if (fields.title.trim() !== currentTitle) {
+        throw new Error('因果决策已冻结章节标题，不能通过通用章节入口修改')
+      }
+    }
     // 若修改了正文内容，自动创建历史快照
     if (fields.content !== undefined) {
       if (isEmptyChapterContent(fields.content)) {
@@ -203,20 +250,32 @@ export function registerIpcHandlers(): void {
     }
     return volumeChapterDAO.updateChapter(id, fields as Parameters<typeof volumeChapterDAO.updateChapter>[1])
   })
-  ipcMain.handle('chapter:delete', (_e, id: number) => volumeChapterDAO.deleteChapter(id))
+  ipcMain.handle('chapter:delete', (_e, id: number) => {
+    assertCausalChapterDirectMutationAllowed(id, '删除章节')
+    return volumeChapterDAO.deleteChapter(id)
+  })
   ipcMain.handle('chapter:listVersions', (_e, chapterId: number) =>
     volumeChapterDAO.listVersions(chapterId))
   ipcMain.handle('chapter:getVersion', (_e, versionId: number, chapterId: number) =>
     volumeChapterDAO.getVersion(versionId, chapterId))
-  ipcMain.handle('chapter:batchCreate', (_e, volumeId: number, items: { title: string; outline?: string }[], mode?: 'append' | 'replace') =>
-    volumeChapterDAO.batchCreateChapters(volumeId, items, mode ?? 'append'))
+  ipcMain.handle('chapter:batchCreate', (_e, volumeId: number, items: { title: string; outline?: string }[], mode?: 'append' | 'replace') => {
+    const volume = volumeChapterDAO.getVolume(volumeId)
+    if (volume && workDAO.getById(volume.work_id)?.work_type === 'causal_novel') {
+      throw new Error('因果小说不支持通用章节批量写入')
+    }
+    return volumeChapterDAO.batchCreateChapters(volumeId, items, mode ?? 'append')
+  })
   ipcMain.handle('chapter:parseSuggestions', (_e, content: string) => parseChapterSuggestions(content, false))
   ipcMain.handle('chapter:parseAbc', (_e, content: string) => parseChapterAbcFromAi(content))
   ipcMain.handle('chapter:stripOutline', (_e, content: string) => stripOutlineJsonFooter(content))
-  ipcMain.handle('chapter:reorder', (_e, orderedIds: number[]) =>
-    volumeChapterDAO.reorderChapters(orderedIds))
-  ipcMain.handle('chapter:move', (_e, chapterId: number, targetVolumeId: number, targetSort: number) =>
-    volumeChapterDAO.moveChapter(chapterId, targetVolumeId, targetSort))
+  ipcMain.handle('chapter:reorder', (_e, orderedIds: number[]) => {
+    for (const id of orderedIds) assertCausalChapterStructuralMutationAllowed(id, '调整章节顺序')
+    return volumeChapterDAO.reorderChapters(orderedIds)
+  })
+  ipcMain.handle('chapter:move', (_e, chapterId: number, targetVolumeId: number, targetSort: number) => {
+    assertCausalChapterStructuralMutationAllowed(chapterId, '移动章节')
+    return volumeChapterDAO.moveChapter(chapterId, targetVolumeId, targetSort)
+  })
 
   ipcMain.handle('volume:reorder', (_e, orderedIds: number[]) =>
     volumeChapterDAO.reorderVolumes(orderedIds))
@@ -616,6 +675,16 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('causal:getState', (_e, workId: number) => ({
     state: causalNovelDAO.getState(workId),
     decisions: causalNovelDAO.listDecisions(workId),
+    planAttempts: causalNovelDAO.listPlanAttempts(workId, 20).map(item => ({
+      id: item.id,
+      stateRevision: item.stateRevision,
+      stage: item.stage,
+      status: item.status,
+      errorCode: item.errorCode,
+      errorMessage: item.errorMessage,
+      responseHash: item.responseHash,
+      createTime: item.createTime
+    })),
     chapters: volumeChapterDAO.listChaptersByWork(workId).map(chapter => ({
       id: chapter.id,
       title: chapter.title,
@@ -624,6 +693,79 @@ export function registerIpcHandlers(): void {
       wordCount: chapter.word_count
     }))
   }))
+  ipcMain.handle('causal:listStateRevisions', (_e, workId: number, limit = 100) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    return causalNovelDAO.listStateRevisions(workId, limit).map(item => ({
+      revision: item.revision,
+      sourceChapterId: item.sourceChapterId,
+      transitionType: item.transitionType,
+      bodyHash: item.bodyHash,
+      createTime: item.createTime
+    }))
+  })
+  ipcMain.handle('causal:getStateRevision', (_e, workId: number, revision: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    return causalNovelDAO.getStateRevision(workId, revision)
+  })
+  ipcMain.handle('causal:createChapter', (_e, workId: number, rawTitle: string) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    void rawTitle
+    throw new Error('因果小说正文只能由“候选决策 → 正文门禁 → 状态提交”事务创建，不支持手动新增章节')
+  })
+  ipcMain.handle('causal:updateChapter', (_e, workId: number, chapterId: number, input: {
+    title?: string
+    content?: string
+    expectedUpdateTime?: string
+  }) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    assertCausalChapterDirectMutationAllowed(chapterId, '修改章节')
+    const current = volumeChapterDAO.getChapter(chapterId)
+    if (!current) throw new Error('章节不存在')
+    if (input.expectedUpdateTime && input.expectedUpdateTime !== current.update_time) {
+      throw new Error('章节已被其他操作修改，请刷新后重试')
+    }
+    const fields: Parameters<typeof volumeChapterDAO.updateChapterWithVersion>[1] = {}
+    if (input.title !== undefined) {
+      const title = input.title.trim()
+      if (!title) throw new Error('章节标题不能为空')
+      if (title !== current.title && causalNovelDAO.getDecision(chapterId)) {
+        throw new Error('因果决策已冻结章节标题；如需更换决策，请删除尚未提交的自动草稿后重新滚动')
+      }
+      if (title !== current.title) fields.title = title
+    }
+    if (input.content !== undefined && input.content !== (current.content ?? '')) {
+      fields.content = input.content
+      fields.word_count = input.content.replace(/\s/g, '').length
+    }
+    if (Object.keys(fields).length === 0) return true
+    fields.expectedUpdateTime = input.expectedUpdateTime
+    return fields.content !== undefined
+      ? volumeChapterDAO.updateChapterWithVersion(chapterId, fields, { model_type: 'manual' })
+      : volumeChapterDAO.updateChapter(chapterId, fields)
+  })
+  ipcMain.handle('causal:deleteChapter', (_e, workId: number, chapterId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    assertCausalChapterDirectMutationAllowed(chapterId, '删除章节')
+    return volumeChapterDAO.deleteChapter(chapterId)
+  })
+  ipcMain.handle('causal:rewriteChapterPreview', async (_e, workId: number, chapterId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请暂停后再重写章节')
+    return generateCausalStyleRewritePreview(workId, chapterId)
+  })
+  ipcMain.handle('causal:applyChapterRewrite', (_e, input: {
+    workId: number
+    chapterId: number
+    candidateContent: string
+    expectedUpdateTime: string
+    validationToken: string
+  }) => {
+    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再应用重写')
+    return applyCausalStyleRewrite(input)
+  })
   ipcMain.handle('causal:getChapterDetail', (_e, workId: number, chapterId: number) => {
     if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
     if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')

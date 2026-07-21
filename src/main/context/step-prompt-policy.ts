@@ -1,10 +1,9 @@
 import type { WorkContextOptions } from './work-context'
-import { isCoreSettingsAiGenerateStep } from './style-step-rules'
+import { isCoreSettingsAiGenerateStep, isFullProseOutputStep } from './style-step-rules'
 
 /** 正文生成 */
 export function isBodyGenerationStep(step: string | undefined): boolean {
-  if (!step) return false
-  return step === 'body_generation' || step.startsWith('body_')
+  return isFullProseOutputStep(step)
 }
 
 /** 分卷/章节情节大纲规划 */

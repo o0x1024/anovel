@@ -2,11 +2,17 @@ import assert from 'node:assert/strict'
 import {
   CAUSAL_NOVEL_SCHEMA_VERSION,
   applyCausalChapterOutcome,
+  buildCausalEvidenceCatalog,
+  causalCandidateTotal,
   causalEmotionGroundingRefs,
   formatCausalDecisionCard,
+  materializeCausalChapterPlan,
+  normalizeCausalNarrativeState,
+  registerCausalPlanFailure,
   validateCausalChapterEmotionContract,
   type CausalChapterOutcome,
   type CausalChapterPlan,
+  type CausalChapterPlanDraft,
   type CausalNarrativeState
 } from '../src/shared/causal-novel-types'
 
@@ -31,10 +37,41 @@ const state: CausalNarrativeState = {
     id: 'promise_ability', question: '林舟为什么能截取寿命？', status: 'open',
     openedChapter: 1, lastAdvancedChapter: 1
   }],
+  macroArcs: [{
+    id: 'arc_truth', title: '追查黑市', objective: '确认寿命交易真相',
+    entryConditions: ['黑市存在'], exitConditions: ['真相得到确认'],
+    mandatoryPayoffs: ['能力来源'], forbiddenDrift: ['寿命转移不能恢复'],
+    status: 'active', lastAdvancedChapter: 1
+  }],
+  macroArchitectureReady: true,
+  archivedPromiseIds: [],
   recentEventSignatures: ['林舟第一次进入黑市'],
+  completionStatus: 'writing', completionAuditFeedback: [],
   completed: false,
   completionReason: ''
 }
+
+const legacyNormalized = normalizeCausalNarrativeState({
+  ...state,
+  schemaVersion: 1,
+  macroArcs: undefined,
+  macroArchitectureReady: undefined,
+  archivedPromiseIds: undefined,
+  completionStatus: undefined,
+  completionAuditFeedback: undefined
+} as unknown as CausalNarrativeState)
+assert.equal(legacyNormalized.schemaVersion, CAUSAL_NOVEL_SCHEMA_VERSION)
+assert.equal(legacyNormalized.macroArchitectureReady, false)
+assert.equal(legacyNormalized.macroArcs.length, 1)
+
+let failureHistory: Array<{ revision: number; code: string }> = []
+for (const code of ['PLAN_IDENTITY', 'PLAN_EVIDENCE', 'PLAN_HORIZON']) {
+  const decision = registerCausalPlanFailure(failureHistory, { revision: 0, code })
+  failureHistory = decision.history
+  if (code === 'PLAN_HORIZON') assert.equal(decision.shouldPause, true)
+}
+const newRevisionFailure = registerCausalPlanFailure(failureHistory, { revision: 1, code: 'PLAN_IDENTITY' })
+assert.equal(newRevisionFailure.shouldPause, false)
 
 const content = '追踪者摘下兜帽，说出了林舟母亲的名字。林舟终于确认，父亲曾经替黑市工作。'
 const outcome: CausalChapterOutcome = {
@@ -45,13 +82,15 @@ const outcome: CausalChapterOutcome = {
   resolvedPromiseIds: [],
   newPromises: [{ id: 'promise_father', question: '父亲在黑市中做过什么？' }],
   actorUpdates: [{
-    actor: '林舟', knowledgeAdded: ['父亲曾替黑市工作'], evidence: '父亲曾经替黑市工作'
+    actor: '林舟', knowledgeAdded: ['父亲曾经替黑市工作'], evidence: '父亲曾经替黑市工作'
   }],
+  newActors: [],
   pressureUpdates: [{
     id: 'pressure_black_market', status: 'escalated', urgency: 9,
     condition: '追踪者掌握母亲身份并直接威胁林舟', evidence: '说出了林舟母亲的名字'
   }],
   newPressures: [],
+  arcUpdates: [],
   emotionalOutcome: {
     readerEffectSummary: '读者确认威胁已经触及林舟母亲，并开始追问父亲的隐瞒。',
     triggerEvidence: '说出了林舟母亲的名字',
@@ -62,6 +101,7 @@ const outcome: CausalChapterOutcome = {
     emotionalDebtPaid: ''
   },
   terminalConditionMet: false,
+  matchedTerminalCondition: '', terminalEvidence: '',
   completionReason: ''
 }
 
@@ -70,7 +110,7 @@ assert.equal(next.revision, 3)
 assert.equal(next.promises.find(item => item.id === 'promise_ability')?.status, 'advanced')
 assert.equal(next.promises.find(item => item.id === 'promise_father')?.openedChapter, 3)
 assert.equal(next.activePressures[0].urgency, 9)
-assert.ok(next.actors[0].knowledge.includes('父亲曾替黑市工作'))
+assert.ok(next.actors[0].knowledge.includes('父亲曾经替黑市工作'))
 
 assert.throws(
   () => applyCausalChapterOutcome(state, { ...outcome, evidenceQuotes: ['正文里不存在的句子'] }, 3, content),
@@ -78,12 +118,32 @@ assert.throws(
 )
 assert.throws(
   () => applyCausalChapterOutcome(state, { ...outcome, advancedPromiseIds: ['unknown'] }, 3, content),
-  /不存在的读者承诺/
+  /不存在或已归档的读者承诺/
 )
 assert.throws(
   () => applyCausalChapterOutcome(state, { ...outcome, emotionalOutcome: undefined as never }, 3, content),
   /缺少已经挣得的情绪结果摘要/
 )
+const newActorContent = `${content}陌生人自称顾淮。`
+const withNewActor = applyCausalChapterOutcome(state, {
+  ...outcome,
+  newActors: [{
+    actor: {
+      name: '顾淮', currentGoal: '', fear: '', knowledge: [], resources: [], constraint: ''
+    },
+    evidence: '陌生人自称顾淮'
+  }]
+}, 3, newActorContent)
+assert.ok(withNewActor.actors.some(actor => actor.name === '顾淮'))
+const proposedCompletion = applyCausalChapterOutcome(state, {
+  ...outcome,
+  terminalConditionMet: true,
+  matchedTerminalCondition: '林舟对是否公开真相作出不可逆选择',
+  terminalEvidence: '林舟终于确认',
+  completionReason: '林舟已经作出不可逆选择'
+}, 3, content)
+assert.equal(proposedCompletion.completionStatus, 'proposed')
+assert.equal(proposedCompletion.completed, false)
 
 const plan: CausalChapterPlan = {
   candidates: [{
@@ -119,13 +179,68 @@ const plan: CausalChapterPlan = {
       other_knows: '追踪者知道更多旧事', gap_type: 'reader_equal'
     },
     choice_and_cost: '林舟选择反向跟踪，并承担暴露异常能力的代价',
-    private_detail_anchor: '母亲的名字', subtext_or_omission: '林舟不立刻追问父亲，只继续套取敌人信息',
+    private_detail_anchor: '母亲死亡的威胁', subtext_or_omission: '林舟不立刻追问父亲，只继续套取敌人信息',
     reader_state_after: { label: '警觉', valence: -1, arousal: 3, agency: 0, certainty: 1 },
     arc_role: 'build', emotional_debt_opened: '父亲与黑市的旧账', emotional_debt_paid: '',
     residue_into_next: '林舟之后的选择会被对父亲的怀疑改变',
-    grounding_refs: ['actor:林舟', 'pressure:pressure_black_market', 'promise:promise_ability']
-  }
+    grounding_refs: ['actor:林舟', 'pressure:pressure_black_market', 'promise:promise_ability'],
+    grounded_claims: [
+      { field: 'attachment_anchor', ref: 'actor:林舟', evidence: '救母亲' },
+      { field: 'private_detail_anchor', ref: 'actor:林舟', evidence: '母亲死亡' }
+    ]
+  },
+  rollingHorizon: Array.from({ length: 5 }, (_, offset) => ({
+    offset,
+    objective: offset === 0 ? '反向跟踪追踪者' : `继续追查黑市线索${offset}`,
+    initiator: '林舟', pressureIds: ['pressure_black_market'], promiseIds: ['promise_ability'],
+    expectedIrreversibleChange: `确认第${offset + 1}层线索`, replanningTrigger: '黑市压力发生变化'
+  }))
 }
+assert.equal(causalCandidateTotal(plan.candidates[0]), 87)
+const evidenceCatalog = buildCausalEvidenceCatalog(state)
+const { total: _total, ...draftScores } = plan.candidates[0].scores
+const { id: _candidateId, scores: _candidateScores, ...draftCandidate } = plan.candidates[0]
+const {
+  initiator: _initiator,
+  chosenAction: _chosenAction,
+  opposition: _opposition,
+  cost: _cost,
+  advancedPromiseIds: _advancedPromiseIds,
+  newQuestion: _newQuestion,
+  ...draftDecision
+} = plan.decision
+const {
+  pov_character: _povCharacter,
+  grounding_refs: _groundingRefs,
+  grounded_claims: _groundedClaims,
+  ...draftEmotion
+} = plan.emotionContract
+const causalDraft: CausalChapterPlanDraft = {
+  candidates: [{ ...draftCandidate, scores: draftScores }],
+  decision: draftDecision,
+  emotionContract: {
+    ...draftEmotion,
+    groundingEvidence: {
+      attachmentEvidenceId: evidenceCatalog.find(item => item.text === '救母亲')!.id,
+      privateDetailEvidenceId: evidenceCatalog.find(item => item.text === '母亲死亡')!.id
+    }
+  },
+  rollingHorizon: plan.rollingHorizon.map((item, index) => ({
+    ...item,
+    offset: 9 - index,
+    initiator: index === 0 ? '周岚' : item.initiator
+  }))
+}
+const materialized = materializeCausalChapterPlan(state, causalDraft, evidenceCatalog)
+assert.equal(materialized.selectedCandidateId, 'candidate_1')
+assert.equal(materialized.candidates[0].scores.total, 87)
+assert.equal(materialized.decision.initiator, '林舟')
+assert.equal(materialized.decision.chosenAction, '反向跟踪追踪者')
+assert.equal(materialized.emotionContract.pov_character, '林舟')
+assert.equal(materialized.emotionContract.private_detail_anchor, '母亲死亡')
+assert.equal(materialized.rollingHorizon[0].offset, 0)
+assert.equal(materialized.rollingHorizon[0].initiator, '林舟')
+validateCausalChapterEmotionContract(state, materialized)
 validateCausalChapterEmotionContract(state, plan)
 assert.ok(causalEmotionGroundingRefs(state).includes('actor:林舟'))
 assert.throws(
@@ -133,6 +248,21 @@ assert.throws(
     ...plan, emotionContract: { ...plan.emotionContract, grounding_refs: ['actor:陆野', 'promise:promise_ability'] }
   }),
   /非权威依据/
+)
+assert.throws(
+  () => validateCausalChapterEmotionContract(state, {
+    ...plan,
+    emotionContract: {
+      ...plan.emotionContract,
+      private_detail_anchor: '母亲死亡之外，林舟童年还曾被陌生人救过一次',
+      grounded_claims: plan.emotionContract.grounded_claims.map(item =>
+        item.field === 'private_detail_anchor'
+          ? { ...item, evidence: '母亲死亡' }
+          : item
+      )
+    }
+  }),
+  /包含过多无权威依据的补写/
 )
 
 const card = formatCausalDecisionCard(plan)

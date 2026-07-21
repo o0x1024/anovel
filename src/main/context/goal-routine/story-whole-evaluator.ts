@@ -13,6 +13,7 @@ export type StoryForensicScope = 'sentence' | 'scene' | 'beat_cluster' | 'story_
 
 export interface StoryForensicIssue {
   code: string
+  claimKey: string
   scope: StoryForensicScope
   chapterTitles: string[]
   repairChapterTitles: string[]
@@ -100,6 +101,7 @@ const STORY_FORENSIC_JSON_SCHEMA = {
               'META_RESIDUE', 'BROKEN_CLIMAX_MECHANISM', 'OTHER_HARD_BLOCKER'
             ]
           },
+          claim_key: { type: 'string' },
           scope: { type: 'string', enum: ['sentence', 'scene', 'beat_cluster', 'story_engine'] },
           chapter_titles: { type: 'array', items: { type: 'string' } },
           repair_chapter_titles: { type: 'array', items: { type: 'string' } },
@@ -109,7 +111,7 @@ const STORY_FORENSIC_JSON_SCHEMA = {
           recommended_action: { type: 'string' }
         },
         required: [
-          'code', 'scope', 'chapter_titles', 'repair_chapter_titles',
+          'code', 'claim_key', 'scope', 'chapter_titles', 'repair_chapter_titles',
           'evidence', 'message', 'repairable', 'recommended_action'
         ]
       }
@@ -281,7 +283,7 @@ async function assessStoryForensics(
 ): Promise<StoryForensicIssue[]> {
   const deterministic: StoryForensicIssue[] = blocks.flatMap(block =>
     detectStoryMetaResidues(block.text).map(message => ({
-      code: 'META_RESIDUE',
+      code: 'META_RESIDUE', claimKey: 'DUPLICATED_OR_GENERATION_RESIDUE',
       scope: 'sentence' as const,
       chapterTitles: [block.title],
       repairChapterTitles: [block.title],
@@ -308,8 +310,9 @@ async function assessStoryForensics(
         '逐项核对 climax_evidence_chain：证据必须按约定来源和持有人提前出现，并由人物动作触发。自动弹文件、恰好群发短信、临时权威背书、主角此前不知道的新证据均属于 DEUS_EX_MACHINA。',
         'code 必须从以下固定集合选择：TIMELINE_CONTRADICTION、SPATIAL_JUMP、DUPLICATED_EVENT、EVIDENCE_STATE_REGRESSION、KNOWLEDGE_REGRESSION、OBSTACLE_BYPASS、DEUS_EX_MACHINA、UNPAYED_CORE_PROMISE、UNFORESHADOWED_NEW_ARC、META_RESIDUE、BROKEN_CLIMAX_MECHANISM、OTHER_HARD_BLOCKER。',
         'scope 只允许 sentence/scene/beat_cluster/story_engine。chapter_titles 是证据位置，repair_chapter_titles 是实际必须修改的最小节拍集。',
+        'claim_key 是同码同章内具体因果故障的稳定英文大写标识，格式为“对象_缺失链路”，两次独立审计遇到同一事实必须返回同一个值，例如 LIU_PROFESSOR_UNSEEDED_INTERVENTION；不同巧合不得共用 claim_key。',
         '单句时间/数字错误用sentence；单场证据或知情断裂用scene；需要“前面铺垫+后面兑现”联动用beat_cluster；合同或高潮机制本身不可行才用story_engine。',
-        '只输出 JSON：{"hard_blockers":[{"code":"TIMELINE_CONTRADICTION","scope":"sentence","chapter_titles":["原样标题"],"repair_chapter_titles":["原样标题"],"evidence":["证据A","证据B"],"message":"硬伤说明","repairable":true,"recommended_action":"最小修复动作"}]}。无硬伤输出空数组。'
+        '只输出 JSON：{"hard_blockers":[{"code":"TIMELINE_CONTRADICTION","claim_key":"DEADLINE_CLOCK_MISMATCH","scope":"sentence","chapter_titles":["原样标题"],"repair_chapter_titles":["原样标题"],"evidence":["证据A","证据B"],"message":"硬伤说明","repairable":true,"recommended_action":"最小修复动作"}]}。无硬伤输出空数组。'
       ].join('\n\n'),
       prompt: [
         formatStoryContractForPrompt(workId),
@@ -326,7 +329,7 @@ async function assessStoryForensics(
     { stream: false, signal }
   )
   const evaluatorError = (message: string): StoryForensicIssue => ({
-    code: 'FORENSIC_EVALUATOR_ERROR', scope: 'story_engine', chapterTitles: [], repairChapterTitles: [],
+    code: 'FORENSIC_EVALUATOR_ERROR', claimKey: 'FORENSIC_EVALUATOR_ERROR', scope: 'story_engine', chapterTitles: [], repairChapterTitles: [],
     evidence: [message], message: '整篇法医审计结果无法验证', repairable: false,
     recommendedAction: '重试审计，不得因评估器失败删除正文'
   })
@@ -353,7 +356,7 @@ async function assessStoryForensics(
       if (typeof item === 'string') {
         const titles = resolveTitles([item])
         return {
-          code: `FORENSIC_${index + 1}`, scope: 'beat_cluster', chapterTitles: titles,
+          code: `FORENSIC_${index + 1}`, claimKey: `LEGACY_FORENSIC_${index + 1}`, scope: 'beat_cluster', chapterTitles: titles,
           repairChapterTitles: titles, evidence: [item], message: item, repairable: true,
           recommendedAction: '修复定位节拍及必要铺垫，再做整篇复验'
         }
@@ -369,6 +372,8 @@ async function assessStoryForensics(
       if (!message) return null
       return {
         code: String(row.code ?? `FORENSIC_${index + 1}`).trim() || `FORENSIC_${index + 1}`,
+        claimKey: String(row.claim_key ?? '').trim()
+          || `${String(row.code ?? `FORENSIC_${index + 1}`).trim()}:${repairTitles.join('|') || chapterTitles.join('|')}`,
         scope,
         chapterTitles,
         repairChapterTitles: repairTitles.length > 0 ? repairTitles : chapterTitles,

@@ -518,7 +518,8 @@ export async function checkStoryGoal(
           evidence: issue.evidence,
           message: issue.message,
           expectedResult: issue.recommendedAction,
-          invariants: ['未被证据点名的正文与既有事实保持不变']
+          invariants: ['未被证据点名的正文与既有事实保持不变'],
+          identityHint: issue.claimKey
         })
       }
 

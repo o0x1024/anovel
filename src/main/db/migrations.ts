@@ -118,6 +118,21 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS causal_state_revisions (
+      work_id INTEGER NOT NULL,
+      revision INTEGER NOT NULL,
+      state_json TEXT NOT NULL,
+      source_chapter_id INTEGER,
+      transition_type VARCHAR(40) NOT NULL,
+      body_hash VARCHAR(64),
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (work_id, revision),
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_causal_state_revisions_chapter
+      ON causal_state_revisions(work_id, source_chapter_id, revision);
+
     CREATE TABLE IF NOT EXISTS causal_chapter_decisions (
       chapter_id INTEGER PRIMARY KEY,
       work_id INTEGER NOT NULL,
@@ -132,7 +147,35 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_causal_decisions_work_status
       ON causal_chapter_decisions(work_id, status, chapter_id);
+
+    CREATE TABLE IF NOT EXISTS causal_plan_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      state_revision INTEGER NOT NULL,
+      stage VARCHAR(30) NOT NULL,
+      status VARCHAR(20) NOT NULL,
+      error_code VARCHAR(50),
+      error_message TEXT,
+      response_hash VARCHAR(64),
+      response_json TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_plan_attempts_work
+      ON causal_plan_attempts(work_id, state_revision, id);
+
   `)
+
+  if (hasTable(db, 'works') && hasTable(db, 'causal_narrative_states')) {
+    db.exec(`
+      INSERT OR IGNORE INTO causal_state_revisions (
+        work_id, revision, state_json, transition_type
+      )
+      SELECT work_id, revision, state_json,
+        CASE WHEN revision = 0 THEN 'initial' ELSE 'legacy_snapshot' END
+      FROM causal_narrative_states;
+    `)
+  }
 
   // V4.6: 因果模式使用逐章情绪事务，禁止读取传统全书 emotion_engine。
   // 仅清理没有正文、且决策合同尚未包含 emotionContract 的未提交草稿；已提交作品不做兼容转换。

@@ -12,12 +12,26 @@ import { ensureIncrementalMigrations } from '../src/main/db/migrations'
 async function main(): Promise<void> {
   const { closeDatabase, getDatabase, injectDatabaseForTest } = await import('../src/main/db/connection')
   injectDatabaseForTest(new Database(':memory:'))
-  const { causalNovelDAO, coreSettingDAO, initSchema, volumeChapterDAO, workDAO } = await import('../src/main/db')
+  const {
+    causalNovelDAO,
+    coreSettingDAO,
+    initSchema,
+    volumeChapterDAO,
+    workDAO,
+    writingStyleDAO
+  } = await import('../src/main/db')
+  const { collectPromptSections } = await import('../src/main/context/context-budget')
   const {
     ensureChapterEmotionContract,
     loadChapterEmotionContract,
     loadEmotionEngine
   } = await import('../src/main/context/goal-routine/emotion-engine')
+  const {
+    applyCausalStyleRewrite,
+    buildCausalRewriteValidationToken,
+    collectCausalRewriteEvidenceAnchors,
+    validateCausalRewriteCandidate
+  } = await import('../src/main/context/causal-chapter-style-rewrite')
   initSchema()
 
   try {
@@ -42,9 +56,33 @@ async function main(): Promise<void> {
         id: 'p1', source: '黑市', target: '林舟', condition: '正在追查', escalation: '身份暴露', urgency: 7, status: 'active'
       }],
       promises: [{ id: 'q1', question: '能力从何而来？', status: 'open', openedChapter: 0, lastAdvancedChapter: 0 }],
-      recentEventSignatures: [], completed: false, completionReason: ''
+      macroArcs: [{
+        id: 'arc_truth', title: '追查黑市', objective: '确认寿命交易真相',
+        entryConditions: ['黑市存在'], exitConditions: ['真相确认'],
+        mandatoryPayoffs: ['能力来源'], forbiddenDrift: ['寿命不可恢复'],
+        status: 'active', lastAdvancedChapter: 0
+      }],
+      macroArchitectureReady: true,
+      archivedPromiseIds: [], recentEventSignatures: [],
+      completionStatus: 'writing', completionAuditFeedback: [],
+      completed: false, completionReason: ''
     }
     causalNovelDAO.createState(workId, state)
+    assert.equal(causalNovelDAO.listStateRevisions(workId).length, 1)
+    assert.equal(causalNovelDAO.getStateRevision(workId, 0)?.transitionType, 'initial')
+    causalNovelDAO.recordPlanAttempt({
+      workId,
+      stateRevision: 0,
+      stage: 'local_validation',
+      status: 'rejected',
+      errorCode: 'PLAN_IDENTITY',
+      errorMessage: '发起人必须是单一权威人物',
+      responseJson: '{"initiator":"林舟、周岚"}'
+    })
+    const rejectedAttempt = causalNovelDAO.listPlanAttempts(workId, 1)[0]
+    assert.equal(rejectedAttempt.errorCode, 'PLAN_IDENTITY')
+    assert.equal(rejectedAttempt.responseHash?.length, 64)
+    assert.match(rejectedAttempt.responseJson ?? '', /林舟、周岚/)
 
     const plan: CausalChapterPlan = {
       candidates: [{
@@ -95,12 +133,21 @@ async function main(): Promise<void> {
           gap_type: 'reader_equal'
         },
         choice_and_cost: '林舟选择接受盘查进入黑市，代价是身份进入追查名单',
-        private_detail_anchor: '母亲的住院腕带', subtext_or_omission: '林舟不解释救人的目的',
+        private_detail_anchor: '林舟救母亲', subtext_or_omission: '林舟不解释救人的目的',
         reader_state_after: { label: '担忧', valence: -1, arousal: 3, agency: 0, certainty: 1 },
         arc_role: 'build', emotional_debt_opened: '身份暴露可能牵连母亲', emotional_debt_paid: '',
         residue_into_next: '林舟之后每次使用能力都要考虑追查名单',
-        grounding_refs: ['actor:林舟', 'pressure:p1', 'promise:q1']
-      }
+        grounding_refs: ['actor:林舟', 'pressure:p1', 'promise:q1'],
+        grounded_claims: [
+          { field: 'attachment_anchor', ref: 'actor:林舟', evidence: '救母亲' },
+          { field: 'private_detail_anchor', ref: 'actor:林舟', evidence: '救母亲' }
+        ]
+      },
+      rollingHorizon: Array.from({ length: 5 }, (_, offset) => ({
+        offset, objective: offset === 0 ? '潜入黑市' : `继续追查线索${offset}`,
+        initiator: '林舟', pressureIds: ['p1'], promiseIds: ['q1'],
+        expectedIrreversibleChange: `确认线索${offset + 1}`, replanningTrigger: '黑市压力发生变化'
+      }))
     }
     const chapterId = causalNovelDAO.createPlannedChapter({
       workId, stateRevision: 0, plan, decisionCard: formatCausalDecisionCard(plan)
@@ -110,22 +157,56 @@ async function main(): Promise<void> {
     assert.match(volumeChapterDAO.getChapter(chapterId)?.emotion_contract_json ?? '', /grounding_refs/)
     assert.equal(loadChapterEmotionContract(chapterId)?.pov_character, '林舟')
 
+    const styleId = writingStyleDAO.create({
+      name: '因果正文测试文风',
+      prompt_template: '【文风要求】短句推进，保持第三人称限知。',
+      reference_text: '林舟停在门前。门后有人。那人正在等他。',
+      step_rules_json: JSON.stringify({
+        identity: { emotional_core: ['紧张'], target_reader: '悬疑读者', style_keywords: ['短句'] },
+        decision_rules: ['当危险逼近时 → 先写动作，再揭示判断'],
+        pacing_rules: {
+          conflict_interval: '每场至少一次阻力变化',
+          payoff_interval: '章内至少一次阶段回报',
+          chapter_end_must: ['未解威胁'],
+          emotion_loop: ['受压', '选择', '付代价']
+        },
+        quality_checklist: []
+      })
+    })
+    writingStyleDAO.setWorkStyle(workId, styleId)
+    const repairSectionKeys = collectPromptSections({
+      workId,
+      chapterId,
+      step: 'novel_execution_repair',
+      prompt: '修复完整正文',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false
+    }).map(section => section.key)
+    assert(repairSectionKeys.includes('style'))
+    assert(repairSectionKeys.includes('style_step_rules'))
+    assert(repairSectionKeys.includes('style_fewshot'))
+
     const outcome: CausalChapterOutcome = {
       summary: '林舟进入黑市。', eventSignature: '林舟潜入黑市', evidenceQuotes: ['林舟进入黑市'],
       advancedPromiseIds: ['q1'], resolvedPromiseIds: [], newPromises: [], actorUpdates: [],
-      pressureUpdates: [], newPressures: [],
+      newActors: [], pressureUpdates: [], newPressures: [], arcUpdates: [],
       emotionalOutcome: {
         readerEffectSummary: '林舟进入黑市但身份风险上升。', triggerEvidence: '林舟进入黑市',
         choiceEvidence: '林舟进入黑市', costEvidence: '林舟进入黑市', residueEvidence: '林舟进入黑市',
         emotionalDebtOpened: '身份进入追查名单', emotionalDebtPaid: ''
       },
-      terminalConditionMet: false, completionReason: ''
+      terminalConditionMet: false, matchedTerminalCondition: '', terminalEvidence: '', completionReason: ''
     }
     const nextState: CausalNarrativeState = {
       ...state, revision: 1,
       promises: [{ ...state.promises[0], status: 'advanced', lastAdvancedChapter: 1 }],
       recentEventSignatures: ['林舟潜入黑市']
     }
+    assert.throws(() => causalNovelDAO.commitDecision({
+      workId, chapterId, expectedStateRevision: 0, nextState, outcome,
+      expectedBodyHash: 'not-the-current-body-hash'
+    }), /正文已在因果提取后发生变化/)
+    assert.equal(causalNovelDAO.getState(workId)?.revision, 0)
     assert.throws(() => getDatabase().transaction(() => {
       causalNovelDAO.commitDecision({
         workId, chapterId, expectedStateRevision: 0, nextState, outcome
@@ -134,15 +215,83 @@ async function main(): Promise<void> {
     })(), /模拟同事务/)
     assert.equal(causalNovelDAO.getState(workId)?.revision, 0)
     assert.equal(causalNovelDAO.getDecision(chapterId)?.status, 'planned')
+    assert.equal(causalNovelDAO.listStateRevisions(workId).length, 1)
 
     causalNovelDAO.commitDecision({
       workId, chapterId, expectedStateRevision: 0, nextState, outcome
     })
     assert.equal(causalNovelDAO.getState(workId)?.revision, 1)
     assert.equal(causalNovelDAO.getDecision(chapterId)?.status, 'committed')
+    assert.equal(causalNovelDAO.getStateRevision(workId, 1)?.transitionType, 'chapter_commit')
+    assert.equal(causalNovelDAO.getStateRevision(workId, 1)?.sourceChapterId, chapterId)
+    assert.equal(causalNovelDAO.getStateRevision(workId, 1)?.bodyHash?.length, 64)
     assert.throws(() => causalNovelDAO.commitDecision({
       workId, chapterId, expectedStateRevision: 0, nextState, outcome
     }), /已经提交或拒绝/)
+
+    const originalBody = '林舟站在入口，随后推门。林舟进入黑市，守卫抬头记住了他的脸。'
+    const rewrittenBody = '入口没有灯。林舟进入黑市，守卫抬起眼，记住了他的脸；他径直往里走。'
+    volumeChapterDAO.updateChapter(chapterId, {
+      content: originalBody,
+      word_count: originalBody.replace(/\s/g, '').length
+    })
+    const committedDecision = causalNovelDAO.getDecision(chapterId)
+    const evidenceAnchors = collectCausalRewriteEvidenceAnchors({
+      decision: committedDecision,
+      stateFacts: [],
+      emotionalStates: []
+    })
+    assert.deepEqual(evidenceAnchors, ['林舟进入黑市'])
+    assert.equal(validateCausalRewriteCandidate(originalBody, rewrittenBody, evidenceAnchors).passed, true)
+    assert.equal(validateCausalRewriteCandidate(originalBody, '林舟去了别处。', evidenceAnchors).passed, false)
+    const chapterBeforeRewrite = volumeChapterDAO.getChapter(chapterId)!
+    const validationToken = buildCausalRewriteValidationToken({
+      workId,
+      chapterId,
+      updateTime: chapterBeforeRewrite.update_time,
+      stateRevision: committedDecision?.stateRevision ?? null,
+      candidateContent: rewrittenBody,
+      evidenceAnchors
+    })
+    assert.equal(applyCausalStyleRewrite({
+      workId,
+      chapterId,
+      candidateContent: rewrittenBody,
+      expectedUpdateTime: chapterBeforeRewrite.update_time,
+      validationToken
+    }), true)
+    assert.notEqual(volumeChapterDAO.getChapter(chapterId)?.content, originalBody)
+    assert.match(volumeChapterDAO.getChapter(chapterId)?.content ?? '', /林舟进入黑市/)
+    assert.match(volumeChapterDAO.listVersions(chapterId)[0].content ?? '', /随后推门/)
+    assert.notEqual(volumeChapterDAO.listVersions(chapterId)[0].content, volumeChapterDAO.getChapter(chapterId)?.content)
+    assert.equal(volumeChapterDAO.listVersions(chapterId)[0].model_type, 'causal_style_rewrite')
+    assert.equal(causalNovelDAO.getState(workId)?.revision, 1)
+    assert.equal(causalNovelDAO.getDecision(chapterId)?.status, 'committed')
+
+    const beforeProposal = causalNovelDAO.getState(workId)!
+    const proposedState: CausalNarrativeState = {
+      ...beforeProposal,
+      revision: 2,
+      completionStatus: 'proposed',
+      completed: false,
+      completionReason: '主角已经作出不可逆选择'
+    }
+    causalNovelDAO.replaceState(workId, 1, proposedState, { transitionType: 'test_completion_proposed' })
+    const reopened = causalNovelDAO.rejectProposedCompletion(workId, 2, ['整书终审仍缺少承诺兑现'])
+    assert.equal(reopened.revision, 3)
+    assert.equal(reopened.completionStatus, 'writing')
+    assert.deepEqual(reopened.completionAuditFeedback, ['整书终审仍缺少承诺兑现'])
+    causalNovelDAO.replaceState(workId, 3, {
+      ...reopened,
+      revision: 4,
+      completionStatus: 'proposed',
+      completionReason: '主角已经作出不可逆选择'
+    }, { transitionType: 'test_completion_proposed' })
+    const completed = causalNovelDAO.confirmCompletion(workId, 4, '独立终审确认完成')
+    assert.equal(completed.revision, 5)
+    assert.equal(completed.completionStatus, 'completed')
+    assert.equal(completed.completed, true)
+    assert.equal(causalNovelDAO.getStateRevision(workId, 5)?.transitionType, 'completion_confirmed')
 
     coreSettingDAO.upsert(workId, 'emotion_engine', '错误传统情绪发动机第一版')
     coreSettingDAO.upsert(workId, 'emotion_engine', '错误传统情绪发动机第二版')
@@ -164,7 +313,10 @@ async function main(): Promise<void> {
       /禁止回退到传统全书情绪发动机/
     )
 
+    getDatabase().exec('DROP TABLE causal_state_revisions')
     ensureIncrementalMigrations(getDatabase())
+    assert.equal(causalNovelDAO.listStateRevisions(workId).length, 1)
+    assert.equal(causalNovelDAO.getStateRevision(workId, 5)?.transitionType, 'legacy_snapshot')
     assert.equal(coreSettingDAO.getByType(workId, 'emotion_engine'), undefined)
     assert.equal(coreSettingDAO.listVersions(workId, 'emotion_engine').length, 0)
     assert.equal(volumeChapterDAO.getChapter(legacyChapterId), undefined)

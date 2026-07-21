@@ -24,6 +24,7 @@
     "test:novel-volume-staging": "jiti scripts/test-novel-volume-staging.ts",
     "test:novel-harness": "jiti scripts/test-novel-harness.ts",
     "test:causal-novel": "jiti scripts/test-causal-novel.ts && node scripts/run-electron-test.mjs scripts/test-causal-novel-db.ts",
+    "test:navigation-session": "jiti scripts/test-nav-session.ts",
     "test:novel-memory-commit": "node scripts/run-electron-test.mjs scripts/test-novel-memory-commit-db.ts",
     "test:novel-volume-state": "node scripts/run-electron-test.mjs scripts/test-novel-volume-state-db.ts",
     "test:structural-repair": "jiti scripts/test-story-structural-repair-policy.ts",

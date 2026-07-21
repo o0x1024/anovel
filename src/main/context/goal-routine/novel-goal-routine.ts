@@ -34,6 +34,7 @@ import { STORY_OVERALL_CHECK_SYSTEM_PROMPT } from '../story-settings-quality'
 import { loadWritingPlan } from '../writing-plan'
 import { bodyWordCountBounds } from '../../../shared/body-word-target'
 import {
+  CHAPTER_EXECUTION_CONTRACT_VERSION,
   evaluateNovelQualityAcceptance,
   formatChapterExecutionContract,
   isBetterNovelBodyCandidate,
@@ -97,6 +98,7 @@ import {
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from './novel-goal-policy'
 import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
@@ -157,7 +159,6 @@ const MAX_SETTING_GENERATION_ROUNDS = 4
 const MAX_CHAPTER_QUALITY_ROUNDS = 4
 const MAX_CHAPTER_CONVERGENCE_ROUNDS = 3
 const MAX_REPAIR_STALL_ROUNDS = 3
-
 function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean {
   const text = `${goal}\n${mainline}`.trim()
   if (!text) return false
@@ -1351,7 +1352,9 @@ export async function runNovelGoalLoop(
   if (!resume && explicitPhase === 'generate_volumes' && hasNoNovelStructure) {
     resetNovelGoalStateFromVolumePlan(workId)
   }
+  const savedExecutionProtocolVersion = readNovelGoalState(workId).chapterExecutionProtocolVersion
   updateNovelGoalState(workId, {
+    chapterExecutionProtocolVersion: CHAPTER_EXECUTION_CONTRACT_VERSION,
     ...(!resume && !explicitPhase
       ? {
           titleHookCandidates: undefined,
@@ -1365,6 +1368,24 @@ export async function runNovelGoalLoop(
       repairStall: undefined
     } : {})
   })
+  if (shouldRecoverNovelChapterExecutionProtocol({
+    resume,
+    phase,
+    savedVersion: savedExecutionProtocolVersion,
+    currentVersion: CHAPTER_EXECUTION_CONTRACT_VERSION
+  })) {
+    updateNovelGoalState(workId, {
+      chapterExecutionProtocolVersion: CHAPTER_EXECUTION_CONTRACT_VERSION,
+      failure: undefined
+    })
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase,
+      action: 'harness_recovery',
+      summary: `章节执行协议升级到 v${CHAPTER_EXECUTION_CONTRACT_VERSION}：保留正式正文与候选版本，清除旧版证据协议失败计数并按结构化验收项重新验收`
+    })
+  }
   if (!resume && !explicitPhase && volumeChapterDAO.listChaptersByWork(workId).length === 0) {
     updateNovelGoalState(workId, {
       novelOutline: undefined,
@@ -1691,7 +1712,15 @@ export async function runNovelGoalLoop(
                 workType: 'novel',
                 deferNarrativeMemory: true
               })
-              if (!gen.success) throw new Error(gen.error || '正文生成失败')
+              if (!gen.success) {
+                if (gen.failureKind === 'evaluator_protocol') {
+                  throw new NovelPipelineError(
+                    'EVALUATOR_PROTOCOL',
+                    gen.error || '章节执行评估器证据协议异常'
+                  )
+                }
+                throw new Error(gen.error || '正文生成失败')
+              }
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'draft',
                 target_chapter_id: chapter.id,
@@ -1971,6 +2000,18 @@ export async function runNovelGoalLoop(
         const pendingChapterGate = attemptedPhase === 'generate_beats'
           ? readNovelGoalState(workId).pendingChapterVolumeGate
           : undefined
+        if (errorCode === 'EVALUATOR_PROTOCOL') {
+          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'evaluator_protocol_pause',
+            summary: msg
+          })
+          emit(`章节候选已保留；评估器证据协议连续失败，已暂停且不会改写正文：${msg}`, 'paused')
+          return
+        }
         if (isTerminalNovelRepairError(errorCode)) {
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({

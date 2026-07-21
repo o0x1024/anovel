@@ -91,7 +91,7 @@ import { parseQualityConclusion, PASS_SCORE_THRESHOLD, type QualityConclusion } 
 import { selectPreferredTitleHook, compareRepairCandidate } from './story-pairwise-evaluator'
 import { clearChapterNarrativeMemory } from '../memory-cleanup'
 import { recordTasteChoice } from '../taste-profile'
-import { bodyWordCountBounds } from '../../../shared/body-word-target'
+import { bodyWordCountBounds, countWords } from '../../../shared/body-word-target'
 import { ensureStoryEngine } from './story-engine-gate'
 import { ensureStoryContract, formatStoryContractForPrompt, getStoryContract } from './story-contract'
 import { EMOTION_CONTRACT_JSON_SHAPE, ensureEmotionEngine } from './emotion-engine'
@@ -113,8 +113,11 @@ import {
   tensionCurveForBeat,
   validateTensionPlans
 } from './story-genre-policy'
-import { resetFailedStoryStructure } from './story-structure-reset'
-import { filterStoryRepairLedgerIssues, routeStoryForensicRepair } from './story-forensic-repair'
+import {
+  filterStoryRepairLedgerIssues,
+  routeStoryForensicRepair,
+  stalledStoryForensicEscalationCount
+} from './story-forensic-repair'
 import type { StoryForensicIssue } from './story-whole-evaluator'
 import {
   BEAT_CONTRACT_MAX_TOKENS,
@@ -152,6 +155,8 @@ import {
 } from './story-structural-repair-policy'
 import { GoalPhaseExhaustedError } from './goal-phase-error'
 import {
+  detectStoryTextIntegrityIssues,
+  repairDeterministicStorySentences,
   resolveStoryModelCapability,
   stableStoryHash,
   storyHarnessIssueKey,
@@ -185,6 +190,7 @@ interface RepairPlan {
 }
 
 interface RoutineRuntimeState {
+  repairProtocolVersion?: number
   lastCheck?: GoalCheckResult
   repairPlan?: RepairPlan
   overallRepairRounds?: number
@@ -255,6 +261,8 @@ interface RoutineRuntimeState {
     issues: string[]
   }>
 }
+
+const STORY_REPAIR_PROTOCOL_VERSION = 3
 
 interface SlotCandidate {
   title: string
@@ -1825,14 +1833,16 @@ function ensureFrozenStoryPovModes(workId: number): { mode: string; updated: num
   return { mode, updated }
 }
 
-/** 取正文最短的节拍（字数不足/信息最弱时优先扩写重写） */
-function shortestBeat(workId: number): { id: number; title: string } | null {
-  const chapters = volumeChapterDAO.listChaptersByWork(workId).filter(c => c.content?.trim())
-  if (chapters.length === 0) return null
-  const shortest = chapters.reduce((a, b) =>
-    (a.word_count || 0) < (b.word_count || 0) ? a : b
-  )
-  return { id: shortest.id, title: shortest.title }
+/** 字数缺口分摊到多个较短节拍，避免把单拍一次膨胀到全篇一半。 */
+function shortestBeatsWithWordCounts(
+  workId: number,
+  limit = 3
+): Array<{ id: number; title: string; wordCount: number }> {
+  return volumeChapterDAO.listChaptersByWork(workId)
+    .filter(chapter => chapter.content?.trim())
+    .sort((a, b) => (a.word_count || 0) - (b.word_count || 0))
+    .slice(0, Math.max(1, limit))
+    .map(chapter => ({ id: chapter.id, title: chapter.title, wordCount: chapter.word_count || 0 }))
 }
 
 /** 取正文最长的节拍（总字数超出时优先压缩重写） */
@@ -2196,16 +2206,19 @@ function buildRepairPlan(workId: number, check: GoalCheckResult | undefined): Re
   }
 
   if (/字数不足/.test(reasons)) {
-    const target = shortestBeat(workId)
-    const current = target ? volumeChapterDAO.getChapter(target.id) : null
     const minTotal = check ? bodyWordCountBounds(check.targetWords).min : 0
     const shortage = check && minTotal > 0 ? Math.max(0, minTotal - check.totalWords) : 0
-    const targetWords = (current?.word_count ?? 0) + shortage + 80
+    const targets = shortestBeatsWithWordCounts(workId, 3)
+    const perBeat = targets.length > 0 ? Math.ceil((shortage + 120) / targets.length) : 0
+    const targetWordCounts = Object.fromEntries(targets.map(target => [
+      target.id,
+      target.wordCount + perBeat
+    ]))
     return {
       action: 'resize',
-      targetChapterIds: target ? [target.id] : [],
-      targetWordCounts: target ? { [target.id]: targetWords } : {},
-      hint: `当前全篇低于目标下限。将本拍精确重写为约 ${targetWords} 字，只扩充人物选择、对手反制、代价和因果变化，禁止重复情绪或围观反应。`
+      targetChapterIds: targets.map(target => target.id),
+      targetWordCounts,
+      hint: `当前全篇低于目标下限。将字数缺口分摊到 ${targets.length} 个较短节拍，只扩充人物选择、对手反制、代价、铺垫和因果变化，禁止把缺口堆进单拍，也禁止重复情绪或围观反应。`
     }
   }
 
@@ -2540,11 +2553,13 @@ async function executeRepairPlan(
   onContinuityEvent?: (chapterId: number, event: StoryContinuityRepairEvent) => void
 ): Promise<{
   summary: string
+  changed: boolean
   continuityFailure?: { chapterId: number; blockers: string[]; attempts: number }
 }> {
-  if (plan.targetChapterIds.length === 0 && !plan.targetLead) return { summary: '无可修复节拍或导语' }
+  if (plan.targetChapterIds.length === 0 && !plan.targetLead) return { summary: '无可修复节拍或导语', changed: false }
   const summaries: string[] = []
   const originals = new Map(plan.targetChapterIds.map(id => [id, volumeChapterDAO.getChapter(id)]))
+  const originalLead = workDAO.getById(workId)?.description?.trim() ?? ''
   if (plan.targetLead) {
     summaries.push(await repairStoryLead(workId, plan, goal, signal))
   }
@@ -2566,6 +2581,7 @@ async function executeRepairPlan(
     if (!gen.success && gen.requiresEscalation) {
       return {
         summary: `${ch?.title ?? chapterId} 连续性候选修复未收敛，准备提升修复层级`,
+        changed: false,
         continuityFailure: {
           chapterId,
           blockers: gen.continuityBlockers ?? [gen.error || '连续性修复未通过'],
@@ -2644,7 +2660,64 @@ async function executeRepairPlan(
     summaries.push(`${ch?.title ?? chapterId} 已回滚（${comparison.preferCandidate ? '新版情绪门禁未通过' : comparison.reason}）`)
   }
   return {
-    summary: `${revisedBlueprints > 0 ? `修订 ${revisedBlueprints} 个节拍蓝图；` : ''}${summaries.join('；')}`
+    summary: `${revisedBlueprints > 0 ? `修订 ${revisedBlueprints} 个节拍蓝图；` : ''}${summaries.join('；')}`,
+    changed: plan.targetChapterIds.some(chapterId => {
+      const before = originals.get(chapterId)?.content?.trim() ?? ''
+      const after = volumeChapterDAO.getChapter(chapterId)?.content?.trim() ?? ''
+      return before !== after
+    }) || (plan.targetLead && (workDAO.getById(workId)?.description?.trim() ?? '') !== originalLead)
+  }
+}
+
+async function applyDeterministicSentenceRepair(
+  plan: RepairPlan,
+  signal?: AbortSignal
+): Promise<{ summary: string; changed: boolean }> {
+  const issueKeys = plan.issueKeys ?? []
+  if (issueKeys.length === 0 || !issueKeys.every(key => key.startsWith('CORRUPTED_SENTENCE:'))) {
+    return { summary: '', changed: false }
+  }
+
+  const updates: Array<{
+    chapterId: number
+    fields: Parameters<typeof volumeChapterDAO.updateChapterWithVersion>[1]
+    content: string
+    replacements: number
+  }> = []
+  for (const chapterId of plan.targetChapterIds) {
+    assertNotAborted(signal)
+    const chapter = volumeChapterDAO.getChapter(chapterId)
+    if (!chapter?.content) continue
+    const repaired = repairDeterministicStorySentences(chapter.content)
+    if (repaired.repairs.length === 0) continue
+    const residual = detectStoryTextIntegrityIssues(repaired.content, { chapterId })
+      .filter(issue => issue.code === 'CORRUPTED_SENTENCE')
+    if (residual.length > 0) continue
+    updates.push({
+      chapterId,
+      content: repaired.content,
+      replacements: repaired.repairs.length,
+      fields: {
+        content: repaired.content,
+        word_count: countWords(repaired.content),
+        quality_assessment_json: null,
+        emotion_assessment_json: null
+      }
+    })
+  }
+  if (updates.length === 0) return { summary: '', changed: false }
+
+  volumeChapterDAO.updateChaptersWithVersionsAtomic(updates.map(update => ({
+    chapterId: update.chapterId,
+    fields: update.fields,
+    versionMeta: { model_type: 'det_sentence_fix', generation_round: 99 }
+  })))
+  // 错词替换不改变事件、人物或证据状态，现有叙事记忆仍然有效；避免为了两个字
+  // 再发起一次模型提取，从而把瞬时修复重新变成可能卡住的长任务。
+  const replacementCount = updates.reduce((sum, update) => sum + update.replacements, 0)
+  return {
+    summary: `原位修复 ${updates.length} 个节拍中的 ${replacementCount} 处确定性坏词，并保存旧版本`,
+    changed: true
   }
 }
 
@@ -2729,6 +2802,16 @@ export async function runStoryGoalLoop(
   }
 
   fullConfig.maxTurns = requireGoalTurnLimit(fullConfig.maxTurns)
+  const startupRuntime = existing?.state_json
+    ? JSON.parse(existing.state_json) as RoutineRuntimeState
+    : {}
+  const upgradingRepairProtocol = resume
+    && startupRuntime.repairProtocolVersion !== STORY_REPAIR_PROTOCOL_VERSION
+  if (upgradingRepairProtocol && startupRuntime.terminalReason === 'needs_manual_editor') {
+    // 旧协议会在问题账本 stalled 时直接终止。升级后必须丢弃旧修复计划，
+    // 回到同稿终审重新路由；正文、候选与版本历史全部保留。
+    phase = 'goal_check'
+  }
 
   const controller = new AbortController()
   activeLoops.set(workId, controller)
@@ -2745,6 +2828,17 @@ export async function runStoryGoalLoop(
     goal_config_json: JSON.stringify(fullConfig),
     ...(!resume
       ? { state_json: JSON.stringify(retainedEvaluationHistory ? { evaluationHistory: retainedEvaluationHistory } : {}) }
+      : {})
+  })
+  patchRuntimeState(workId, {
+    repairProtocolVersion: STORY_REPAIR_PROTOCOL_VERSION,
+    ...(upgradingRepairProtocol
+      ? {
+          terminalReason: undefined,
+          repairPlan: undefined,
+          wholeAuditCount: 0,
+          forensicRepairStall: undefined
+        }
       : {})
   })
 
@@ -2958,11 +3052,11 @@ export async function runStoryGoalLoop(
           turn_no: turn,
           phase,
           action: 'budget_exhausted',
-          summary: `已使用 ${fullConfig.maxTurns} 轮硬预算，自动修复停止，等待人工编辑决策`
+          summary: `已使用 ${fullConfig.maxTurns} 轮硬预算，保存为可继续的验收检查点；尚未创建发布快照`
         })
-        patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
-        goalRoutineDAO.setStatus(workId, 'paused')
-        emit('目标循环已达到硬预算上限，正文和候选均已保留；需要人工编辑后从指定阶段继续', 'paused')
+        patchRuntimeState(workId, { terminalReason: undefined })
+        goalRoutineDAO.setStatus(workId, 'timeout')
+        emit('目标循环已达到本轮预算检查点；正文和候选均已保留，但尚未通过发布验收，可继续运行', 'timeout')
         return
       }
 
@@ -3402,7 +3496,7 @@ export async function runStoryGoalLoop(
             const issues: StoryForensicIssue[] = lastCheck.forensicIssues?.length
               ? lastCheck.forensicIssues
               : [{
-                  code: 'LEGACY_FORENSIC_BLOCKER', scope: 'beat_cluster',
+                  code: 'LEGACY_FORENSIC_BLOCKER', claimKey: 'LEGACY_FORENSIC_BLOCKER', scope: 'beat_cluster',
                   chapterTitles: [], repairChapterTitles: [], evidence: [feedback], message: feedback,
                   repairable: true, recommendedAction: '定位最小节拍簇并动态修复'
                 }]
@@ -3439,18 +3533,21 @@ export async function runStoryGoalLoop(
 
             if (route.mode === 'reset_beats' || route.mode === 'reset_engine') {
               const returnToEngine = route.mode === 'reset_engine'
-              const deleted = resetFailedStoryStructure(workId)
               if (returnToEngine) {
                 coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
               }
-              patchRuntimeState(workId, { structuralFeedback: route.hint })
-              patchRuntimeState(workId, { wholeAuditCount: 0 })
+              patchRuntimeState(workId, {
+                structuralFeedback: route.hint,
+                forceBeatRebuild: true,
+                repairPlan: undefined,
+                wholeAuditCount: 0
+              })
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase,
                 action: returnToEngine ? 'storyline' : 'beat',
-                summary: `同一法医证据连续 ${forensicCount} 轮未消除，才升级删除 ${deleted} 个节拍并回退到${returnToEngine ? '故事发动机' : '整组节拍'}`
+                summary: `同一法医证据连续 ${forensicCount} 轮未消除，已保留旧正文版本并回退到${returnToEngine ? '故事发动机' : '整组节拍'}重建`
               })
-              emit(`法医动态修复未收敛，已逐级升级到${returnToEngine ? '故事发动机' : '整组节拍'}重建`, 'running')
+              emit(`法医动态修复未收敛，旧正文已入版本历史，正在升级到${returnToEngine ? '故事发动机' : '整组节拍'}重建`, 'running')
               phase = returnToEngine ? 'story_engine_gate' : 'generate_beats'
               continue
             }
@@ -3486,16 +3583,16 @@ export async function runStoryGoalLoop(
           // 已确认的硬伤必须先进入定向修复。审计预算只限制没有硬伤路由可执行的
           // 重复评分，不能在“第二次复核确认硬伤”这一刻抢先暂停整个循环。
           if (wholeAuditCount >= capability.maxWholeAudits) {
-            patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
+            patchRuntimeState(workId, { terminalReason: undefined })
             goalRoutineDAO.appendTurn({
               work_id: workId,
               turn_no: turn,
               phase,
               action: 'audit_budget_exhausted',
-              summary: `整篇审计已达到 ${capability.maxWholeAudits} 次上限，停止自动改稿：${lastCheck.reasons.join('；')}`
+              summary: `整篇审计已达到 ${capability.maxWholeAudits} 次上限，保存为可继续的验收检查点：${lastCheck.reasons.join('；')}`
             })
-            goalRoutineDAO.setStatus(workId, 'paused')
-            emit(`整篇审计已达到 ${capability.maxWholeAudits} 次上限，已保留正文和问题账本，等待人工编辑`, 'paused')
+            goalRoutineDAO.setStatus(workId, 'timeout')
+            emit(`整篇审计已达到 ${capability.maxWholeAudits} 次上限，尚未生成发布快照；已保留正文和问题账本，可继续运行`, 'timeout')
             return
           }
 
@@ -3504,12 +3601,12 @@ export async function runStoryGoalLoop(
           if (stagnantChecks >= MAX_STAGNANT_CHECKS) {
             const resetCount = runtime.structuralResetCount ?? 0
             const feedback = [lastCheck.reasons.join('；'), ...lastCheck.storyIssues].filter(Boolean).join('；')
-            const deleted = resetFailedStoryStructure(workId)
             const returnToEngine = lastCheck.weakestLayer === 'storyline'
             if (returnToEngine) coreSettingDAO.deleteByWorkAndTypes(workId, ['story_engine', 'story_contract', 'emotion_engine'])
             patchRuntimeState(workId, {
               structuralResetCount: resetCount + 1,
               structuralFeedback: feedback,
+              forceBeatRebuild: true,
               stagnantChecks: 0,
               lastCheckComposite: undefined,
               lastCheckSignature: undefined
@@ -3519,7 +3616,7 @@ export async function runStoryGoalLoop(
               turn_no: turn,
               phase,
               action: returnToEngine ? 'storyline' : 'beat',
-              summary: `连续 ${stagnantChecks} 次无提升，第 ${resetCount + 1} 次删除 ${deleted} 个失败节拍并回退到${returnToEngine ? '故事发动机' : '整组节拍'}重生`
+              summary: `连续 ${stagnantChecks} 次无提升，第 ${resetCount + 1} 次保留旧正文版本并回退到${returnToEngine ? '故事发动机' : '整组节拍'}重生`
             })
             emit(`连续 ${stagnantChecks} 次无提升，已回退到${returnToEngine ? '故事发动机' : '整组节拍'}继续重生`, 'running')
             phase = returnToEngine ? 'story_engine_gate' : 'generate_beats'
@@ -3547,39 +3644,51 @@ export async function runStoryGoalLoop(
             storyHarnessDAO.listIssues(workId),
             plan.issueKeys ?? []
           )
-          const stalledIssue = relevantLedgerIssues.find(issue => issue.status === 'stalled')
-          if (stalledIssue) {
-            patchRuntimeState(workId, { terminalReason: 'needs_manual_editor' })
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase,
-              action: 'issue_stalled',
-              target_chapter_id: plan.targetChapterIds[0] ?? null,
-              summary: `${stalledIssue.code} 已达到 ${stalledIssue.attempts} 次定向修复上限，停止自动改稿`
-            })
-            goalRoutineDAO.setStatus(workId, 'paused')
-            emit(`问题 ${stalledIssue.code} 已达到自动修复上限；已保留全部正文，等待人工编辑`, 'paused')
-            return
-          }
-          for (const issue of relevantLedgerIssues.filter(issue => issue.status === 'open')) {
-            storyHarnessDAO.incrementIssueAttempt(
+          emit(`正在执行修复：${plan.action}`, 'running')
+          let execution = await applyDeterministicSentenceRepair(plan, controller.signal)
+          if (!execution.changed) {
+            const stalledIssue = relevantLedgerIssues.find(issue => issue.status === 'stalled')
+            if (stalledIssue) {
+              const currentRuntime = readRuntimeState(workId)
+              const fingerprint = plan.forensicFingerprint
+                ?? currentRuntime.forensicRepairStall?.fingerprint
+                ?? `${stalledIssue.issue_key}:stalled`
+              patchRuntimeState(workId, {
+                terminalReason: undefined,
+                repairPlan: undefined,
+                structuralFeedback: [
+                  `问题 ${stalledIssue.code} 的局部修复预算已耗尽，必须升级为整组节拍重建。`,
+                  plan.hint
+                ].filter(Boolean).join('\n'),
+                forceBeatRebuild: true,
+                forensicRepairStall: {
+                  fingerprint,
+                  count: stalledStoryForensicEscalationCount(currentRuntime.forensicRepairStall?.count)
+                }
+              })
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'issue_escalated',
+                target_chapter_id: plan.targetChapterIds[0] ?? null,
+                summary: `${stalledIssue.code} 已达到 ${stalledIssue.attempts} 次局部修复上限；保留旧正文版本并升级整组节拍重建`
+              })
+              emit(`问题 ${stalledIssue.code} 的局部修复未收敛，已保留旧正文并自动升级整组节拍重建`, 'running')
+              phase = 'generate_beats'
+              continue
+            }
+            execution = await executeRepairPlan(
               workId,
-              issue.issue_key,
-              capability.maxIssueRepairs
+              plan,
+              fullConfig.goalDescription,
+              controller.signal,
+              (chapterId, event) => {
+                const chapter = volumeChapterDAO.getChapter(chapterId)
+                recordContinuityEvent(chapterId, chapter?.title ?? String(chapterId), event)
+              }
             )
           }
-          emit(`正在执行修复：${plan.action}`, 'running')
-          const execution = await executeRepairPlan(
-            workId,
-            plan,
-            fullConfig.goalDescription,
-            controller.signal,
-            (chapterId, event) => {
-              const chapter = volumeChapterDAO.getChapter(chapterId)
-              recordContinuityEvent(chapterId, chapter?.title ?? String(chapterId), event)
-            }
-          )
           if (execution.continuityFailure) {
             await escalateContinuityFailure(
               execution.continuityFailure.chapterId,
@@ -3588,10 +3697,22 @@ export async function runStoryGoalLoop(
             )
             continue
           }
+          if (execution.changed) {
+            for (const issue of relevantLedgerIssues.filter(issue => issue.status === 'open')) {
+              storyHarnessDAO.incrementIssueAttempt(
+                workId,
+                issue.issue_key,
+                capability.maxIssueRepairs
+              )
+            }
+          }
           const summary = execution.summary
           // 新正文/新结构必须获得一套新的整篇审计预算；旧稿的两次复核不能
           // 把修复后的候选直接判成“预算耗尽”。总轮次与问题尝试上限仍负责熔断。
-          patchRuntimeState(workId, { wholeAuditCount: 0 })
+          patchRuntimeState(workId, {
+            wholeAuditCount: 0,
+            terminalReason: execution.changed ? undefined : readRuntimeState(workId).terminalReason
+          })
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: plan.action,
             target_chapter_id: plan.targetChapterIds[0] ?? null,

@@ -1,4 +1,5 @@
 import type { StoryForensicIssue } from './story-whole-evaluator'
+import { storyHarnessIssueKey } from '../../../shared/story-harness'
 
 export type StoryForensicRepairMode = 'dynamic' | 'retry_audit' | 'reset_beats' | 'reset_engine'
 
@@ -12,9 +13,15 @@ export interface StoryForensicRepairRoute {
   fingerprint: string
 }
 
+/** 局部问题达到尝试上限后必须进入整组节拍升级区间，而不是终止整部作品。 */
+export function stalledStoryForensicEscalationCount(previousCount = 0): number {
+  return Math.max(3, Number.isFinite(previousCount) ? Math.floor(previousCount) : 0)
+}
+
 export function storyForensicFingerprint(issues: StoryForensicIssue[]): string {
   return issues.map(issue => [
     issue.code,
+    issue.claimKey,
     issue.scope,
     [...issue.repairChapterTitles].sort().join(','),
     // 结构化审计以固定问题码+位置判定同一证据，避免模型改写证据措辞后计数归零。
@@ -55,7 +62,20 @@ export function storyForensicIssueKeys(
 ): string[] {
   return [...new Set(issues
     .filter(issue => issue.code !== 'FORENSIC_EVALUATOR_ERROR')
-    .map(issue => `${issue.code}:${issueChapterIds(chapters, issue).sort((a, b) => a - b).join(',')}`))]
+    .map(issue => storyHarnessIssueKey({
+      code: issue.code,
+      severity: 'blocker',
+      scope: issue.scope === 'beat_cluster'
+        ? 'cluster'
+        : issue.scope === 'story_engine'
+          ? 'engine'
+          : issue.scope,
+      chapterIds: issueChapterIds(chapters, issue),
+      evidence: issue.evidence,
+      message: issue.message,
+      expectedResult: issue.recommendedAction,
+      identityHint: issue.claimKey
+    })))]
 }
 
 export function filterStoryRepairLedgerIssues<T extends { issue_key: string }>(
@@ -72,6 +92,23 @@ function expandNeighbors(chapters: Array<{ id: number; title: string }>, ids: nu
   for (const index of indexes) {
     if (chapters[index - 1]) expanded.add(chapters[index - 1].id)
     if (chapters[index + 1]) expanded.add(chapters[index + 1].id)
+  }
+  return chapters.filter(chapter => expanded.has(chapter.id)).map(chapter => chapter.id)
+}
+
+function expandRequiredPriorSeeds(
+  chapters: Array<{ id: number; title: string }>,
+  issues: StoryForensicIssue[],
+  ids: number[]
+): number[] {
+  const needsPriorSeed = issues.some(issue =>
+    /提前|前文|此前|事先|预先|铺垫|伏笔|先行/.test(issue.recommendedAction)
+  )
+  if (!needsPriorSeed) return ids
+  const expanded = new Set(ids)
+  for (const id of ids) {
+    const index = chapters.findIndex(chapter => chapter.id === id)
+    if (index > 0) expanded.add(chapters[index - 1].id)
   }
   return chapters.filter(chapter => expanded.has(chapter.id)).map(chapter => chapter.id)
 }
@@ -122,10 +159,13 @@ export function routeStoryForensicRepair(
 
   let targetIds = resolveIds(chapters, actionableIssues.flatMap(repairTitlesForIssue))
   if (targetIds.length === 0 && !targetLead && chapters.length > 0) targetIds = [chapters.at(-1)!.id]
+  const beforePriorExpansion = targetIds.length
+  targetIds = expandRequiredPriorSeeds(chapters, actionableIssues, targetIds)
+  const expandedForPriorSeed = targetIds.length > beforePriorExpansion
   if (sameEvidenceCount === 2) targetIds = expandNeighbors(chapters, targetIds)
 
   const scopes = new Set(actionableIssues.map(issue => issue.scope))
-  const action: StoryForensicRepairRoute['action'] = sameEvidenceCount === 2 || scopes.has('beat_cluster')
+  const action: StoryForensicRepairRoute['action'] = sameEvidenceCount === 2 || expandedForPriorSeed || scopes.has('beat_cluster')
     ? 'beat'
     : scopes.has('scene') ? 'scene' : 'paragraph'
   return {

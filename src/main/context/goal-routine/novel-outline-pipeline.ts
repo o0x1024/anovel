@@ -286,6 +286,7 @@ export interface NovelGoalPersistentState {
     auditedAt: string
     reasons: string[]
   }
+  chapterExecutionProtocolVersion?: number
   failure?: {
     phase: string
     signature: string
@@ -432,7 +433,7 @@ export function planNovelVolumeGateWindows(
 
 export class NovelPipelineError extends Error {
     constructor(
-    public readonly code: 'OUTPUT_INVALID' | 'CONTRACT_INVALID' | 'PREREQUISITE_MISSING' | 'REPAIR_BOUNDARY' | 'REPAIR_STALL',
+    public readonly code: 'OUTPUT_INVALID' | 'CONTRACT_INVALID' | 'PREREQUISITE_MISSING' | 'REPAIR_BOUNDARY' | 'REPAIR_STALL' | 'EVALUATOR_PROTOCOL',
     message: string
   ) {
     super(message)
