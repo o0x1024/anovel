@@ -15,7 +15,8 @@ import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
-  generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO, storyHarnessDAO
+  generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO, storyHarnessDAO, causalNovelDAO,
+  storyStateDAO, emotionalStateDAO
 } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
@@ -58,6 +59,11 @@ import {
   type Phase
 } from './context/goal-routine/story-goal-routine'
 import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning } from './context/goal-routine/novel-goal-routine'
+import {
+  runCausalNovelGoalLoop,
+  cancelCausalNovelGoalLoop,
+  isCausalNovelGoalLoopRunning
+} from './context/goal-routine/causal-novel-routine'
 import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
 import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
@@ -99,7 +105,7 @@ export function registerIpcHandlers(): void {
   // ==================== 作品 ====================
   ipcMain.handle('work:list', (_e, workType?: string) => workDAO.list(workType))
   ipcMain.handle('work:get', (_e, id: number) => workDAO.getById(id))
-  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; workType?: string }) => {
+  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; workType?: string; genre?: string; tags?: string }) => {
     const id = workDAO.create(input)
     initWritingPlanForWork(id, {
       novelLength: input.novelLength ?? 'medium',
@@ -545,7 +551,12 @@ export function registerIpcHandlers(): void {
 
   // ==================== 目标循环（goal routine）====================
   function isNovelWork(workId: number): boolean {
-    return workDAO.getById(workId)?.work_type === 'novel'
+    const workType = workDAO.getById(workId)?.work_type
+    return workType === 'novel' || workType === 'causal_novel'
+  }
+
+  function isCausalNovelWork(workId: number): boolean {
+    return workDAO.getById(workId)?.work_type === 'causal_novel'
   }
 
   function resolveGoalForcePhase(config?: Record<string, unknown>): { forcePhase?: Phase; cfg: Record<string, unknown> } {
@@ -557,8 +568,9 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
     const { forcePhase, cfg } = resolveGoalForcePhase(config)
-    const isNovel = isNovelWork(workId)
-    const runner = isNovel
+    const runner = isCausalNovelWork(workId)
+      ? runCausalNovelGoalLoop(workId, cfg, e.sender, false)
+      : isNovelWork(workId)
       ? runNovelGoalLoop(workId, cfg, e.sender, false, forcePhase)
       : runStoryGoalLoop(workId, cfg, e.sender, false, forcePhase)
     void runner.catch((err) => {
@@ -576,8 +588,9 @@ export function registerIpcHandlers(): void {
       forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
       config = rest
     }
-    const isNovel = isNovelWork(workId)
-    const runner = isNovel
+    const runner = isCausalNovelWork(workId)
+      ? runCausalNovelGoalLoop(workId, config, e.sender, true)
+      : isNovelWork(workId)
       ? runNovelGoalLoop(workId, config, e.sender, true, forcePhase)
       : runStoryGoalLoop(workId, config, e.sender, true, forcePhase)
     void runner.catch((err) => {
@@ -586,7 +599,9 @@ export function registerIpcHandlers(): void {
     return true
   })
   ipcMain.handle('goal:cancel', (_e, workId: number) => {
-    return isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
+    return isCausalNovelWork(workId)
+      ? cancelCausalNovelGoalLoop(workId)
+      : isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
   })
   ipcMain.handle('goal:selectTitleHook', (_e, workId: number, candidateIndex: number) => {
     if (isNovelWork(workId)) throw new Error('小说目标循环暂不支持此书名导语确认流程')
@@ -597,6 +612,81 @@ export function registerIpcHandlers(): void {
     const turns = goalRoutineDAO.listTurns(workId, 30)
     const harnessIssues = isNovelWork(workId) ? [] : storyHarnessDAO.listIssues(workId)
     return { state: state ?? null, turns, harnessIssues }
+  })
+  ipcMain.handle('causal:getState', (_e, workId: number) => ({
+    state: causalNovelDAO.getState(workId),
+    decisions: causalNovelDAO.listDecisions(workId),
+    chapters: volumeChapterDAO.listChaptersByWork(workId).map(chapter => ({
+      id: chapter.id,
+      title: chapter.title,
+      status: chapter.status,
+      hasContent: Boolean(chapter.content?.trim()),
+      wordCount: chapter.word_count
+    }))
+  }))
+  ipcMain.handle('causal:getChapterDetail', (_e, workId: number, chapterId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    const chapter = volumeChapterDAO.getChapter(chapterId)
+    if (!chapter) throw new Error('章节不存在')
+    const parseJson = (value: string | null): unknown => {
+      if (!value?.trim()) return null
+      try { return JSON.parse(value) as unknown } catch { return null }
+    }
+    return {
+      chapter: {
+        id: chapter.id,
+        title: chapter.title,
+        content: chapter.content ?? '',
+        wordCount: chapter.word_count,
+        status: chapter.status,
+        updateTime: chapter.update_time,
+        decisionCard: chapter.outline ?? '',
+        qualityAssessment: parseJson(chapter.quality_assessment_json),
+        emotionAssessment: parseJson(chapter.emotion_assessment_json)
+      },
+      decision: causalNovelDAO.getDecision(chapterId),
+      stateFacts: storyStateDAO.listFactsByChapter(workId, chapterId).map(fact => ({
+        id: fact.id,
+        entity: fact.entity,
+        key: fact.state_key,
+        value: parseJson(fact.value_json),
+        transition: fact.transition,
+        irreversible: Boolean(fact.irreversible),
+        evidence: fact.evidence
+      })),
+      emotionalStates: emotionalStateDAO.listByChapter(chapterId).map(item => ({
+        characterName: item.character_name,
+        feltState: item.felt_state,
+        displayedState: item.displayed_state,
+        unresolvedEmotion: item.unresolved_emotion,
+        behavioralAftereffect: item.behavioral_aftereffect,
+        sourceEvent: item.source_event
+      })),
+      versions: volumeChapterDAO.listVersions(chapterId).map(version => ({
+        id: version.id,
+        versionNumber: version.version_number,
+        wordCount: version.word_count,
+        modelType: version.model_type,
+        generationRound: version.generation_round,
+        createTime: version.create_time,
+        hasContent: Boolean(version.content?.trim())
+      }))
+    }
+  })
+  ipcMain.handle('causal:getChapterVersion', (_e, workId: number, chapterId: number, versionId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    const version = volumeChapterDAO.getVersion(versionId, chapterId)
+    if (!version) throw new Error('章节版本不存在')
+    return {
+      id: version.id,
+      versionNumber: version.version_number,
+      content: version.content ?? '',
+      wordCount: version.word_count,
+      modelType: version.model_type,
+      createTime: version.create_time
+    }
   })
   ipcMain.handle('goal:getEvaluationData', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
@@ -622,7 +712,9 @@ export function registerIpcHandlers(): void {
     }
   })
   ipcMain.handle('goal:isRunning', (_e, workId: number) => {
-    return isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)
+    return isCausalNovelWork(workId)
+      ? isCausalNovelGoalLoopRunning(workId)
+      : isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)
   })
 
   ipcMain.handle('goal:listAllStates', () => {

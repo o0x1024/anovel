@@ -9,7 +9,8 @@ const route = useRoute()
 const { width: sidebarWidth, isResizing, startResize } = useSidebarWidth()
 
 const navItems = [
-  { path: '/', icon: 'book-open', label: '小说管理', section: 'workspace' },
+  { path: '/', icon: 'book-open', label: '小说管理（传统）', section: 'workspace' },
+  { path: '/causal-novels', icon: 'project-diagram', label: '小说管理（因果）', section: 'workspace' },
   { path: '/stories', icon: 'feather-alt', label: '短故事管理', section: 'workspace' },
   { path: '/style', icon: 'palette', label: '文风管理', section: 'workspace' },
   { path: '/assistant', icon: 'robot', label: 'AI 助手', section: 'intelligence' },
@@ -22,6 +23,9 @@ const navItems = [
 const activeRoute = computed(() => {
   if (route.path.startsWith('/novel/')) {
     return '/'
+  }
+  if (route.path.startsWith('/causal-novel/')) {
+    return '/causal-novels'
   }
   if (route.path.startsWith('/story/')) {
     return '/stories'

@@ -107,6 +107,66 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
       ON chapter_pattern_fingerprints(work_id, chapter_id);
   `)
 
+  // V4.5: 因果小说独立状态与逐章决策，不与传统大纲状态混写。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS causal_narrative_states (
+      work_id INTEGER PRIMARY KEY,
+      revision INTEGER NOT NULL DEFAULT 0,
+      state_json TEXT NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS causal_chapter_decisions (
+      chapter_id INTEGER PRIMARY KEY,
+      work_id INTEGER NOT NULL,
+      state_revision INTEGER NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'planned',
+      plan_json TEXT NOT NULL,
+      outcome_json TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_decisions_work_status
+      ON causal_chapter_decisions(work_id, status, chapter_id);
+  `)
+
+  // V4.6: 因果模式使用逐章情绪事务，禁止读取传统全书 emotion_engine。
+  // 仅清理没有正文、且决策合同尚未包含 emotionContract 的未提交草稿；已提交作品不做兼容转换。
+  if (hasTable(db, 'works') && hasTable(db, 'core_settings')) {
+    db.exec(`
+      DELETE FROM core_settings
+      WHERE type = 'emotion_engine'
+        AND work_id IN (SELECT id FROM works WHERE work_type = 'causal_novel');
+    `)
+  }
+  if (hasTable(db, 'works') && hasTable(db, 'core_setting_versions')) {
+    db.exec(`
+      DELETE FROM core_setting_versions
+      WHERE type = 'emotion_engine'
+        AND work_id IN (SELECT id FROM works WHERE work_type = 'causal_novel');
+    `)
+  }
+  if (hasTable(db, 'chapters') && hasTable(db, 'causal_chapter_decisions')) {
+    db.exec(`
+      DELETE FROM chapters
+      WHERE id IN (
+        SELECT d.chapter_id
+        FROM causal_chapter_decisions d
+        JOIN chapters c ON c.id = d.chapter_id
+        WHERE d.status = 'planned'
+          AND COALESCE(TRIM(c.content), '') = ''
+          AND CASE
+            WHEN json_valid(d.plan_json) THEN json_type(d.plan_json, '$.emotionContract') IS NULL
+            ELSE 1
+          END
+      );
+    `)
+  }
+
   if (hasTable(db, 'volumes') && !hasColumn(db, 'volumes', 'planned_start_chapter')) {
     db.exec(`ALTER TABLE volumes ADD COLUMN planned_start_chapter INTEGER`)
   }

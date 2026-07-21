@@ -723,7 +723,7 @@ function cleanupEmDashesAfterPassedGate(
   return { chapters, replaced }
 }
 
-async function runChapterAcceptanceGate(
+export async function runChapterAcceptanceGate(
   workId: number,
   chapterId: number,
   config: StoryGoalConfig,
@@ -790,7 +790,7 @@ async function runChapterAcceptanceGate(
   }
 }
 
-async function finalizeNovelChapterMemory(
+export async function finalizeNovelChapterMemory(
   workId: number,
   chapterId: number,
   signal?: AbortSignal,
@@ -810,23 +810,7 @@ async function finalizeNovelChapterMemory(
     )
     const committed = commitPreparedNarrativeMemory(workId, chapterId, prepared, {
       markChapterCompleted: true,
-      validate: () => {
-        const latest = volumeChapterDAO.getChapter(chapterId)
-        const consistency = runConsistencyGate(workId, chapterId, latest?.content ?? '')
-        const resource = runResourceConstraintGate(workId, chapterId)
-        const fingerprintReady = storyStateDAO.listFingerprintsByWork(workId)
-          .some(row => row.chapter_id === chapterId)
-        const systemic = assessNovelSystemics(workId, {
-          requireFingerprints: false,
-          includeProseScan: false
-        }).issues.filter(issue => issue.severity === 'blocker' && issue.chapterIds.includes(chapterId))
-        return [
-          ...consistency.blockers.map(item => `一致性：${item}`),
-          ...resource.blockers.map(item => `资源约束：${item}`),
-          ...(!fingerprintReady ? ['模式指纹：章节模式指纹缺失'] : []),
-          ...systemic.map(issue => `跨章状态/模式：${issue.message}`)
-        ]
-      }
+      validate: () => novelMemoryCommitBlockers(workId, chapterId)
     })
     onProgress?.(`「${chapter.title}」候选记忆及依赖门禁已原子提交`)
     return committed
@@ -840,6 +824,24 @@ async function finalizeNovelChapterMemory(
     })
     throw error
   }
+}
+
+export function novelMemoryCommitBlockers(workId: number, chapterId: number): string[] {
+  const latest = volumeChapterDAO.getChapter(chapterId)
+  const consistency = runConsistencyGate(workId, chapterId, latest?.content ?? '')
+  const resource = runResourceConstraintGate(workId, chapterId)
+  const fingerprintReady = storyStateDAO.listFingerprintsByWork(workId)
+    .some(row => row.chapter_id === chapterId)
+  const systemic = assessNovelSystemics(workId, {
+    requireFingerprints: false,
+    includeProseScan: false
+  }).issues.filter(issue => issue.severity === 'blocker' && issue.chapterIds.includes(chapterId))
+  return [
+    ...consistency.blockers.map(item => `一致性：${item}`),
+    ...resource.blockers.map(item => `资源约束：${item}`),
+    ...(!fingerprintReady ? ['模式指纹：章节模式指纹缺失'] : []),
+    ...systemic.map(issue => `跨章状态/模式：${issue.message}`)
+  ]
 }
 
 function buildNovelRepairPlan(workId: number, check: GoalCheckResult, config: StoryGoalConfig): RepairPlan {

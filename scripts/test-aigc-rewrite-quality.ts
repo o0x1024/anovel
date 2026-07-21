@@ -21,8 +21,8 @@ import {
   isAigcRewriteObjectiveImproved
 } from '../src/shared/aigc-rewrite-goal'
 
-const source = '沈彻只剩80天。\n“别碰那颗灵核。”\n他把三阶巨蝎的情报告诉了林晚。'
-const safeRewrite = '沈彻的寿数只剩80天。\n“别碰那颗灵核。”\n三阶巨蝎的情报，他先告诉了林晚。'
+const source = '沈彻只剩80天。\n“别碰那颗灵核。”\n他把三阶巨蝎的情报告诉了张三。'
+const safeRewrite = '沈彻的寿数只剩80天。\n“别碰那颗灵核。”\n三阶巨蝎的情报，他先告诉了张三。'
 const dialogueChanged = safeRewrite.replace('别碰那颗灵核', '不要碰灵核')
 
 assert.ok(computeChangeRatio(source, safeRewrite) > 0.01, '局部编辑必须能被改写幅度检测识别')

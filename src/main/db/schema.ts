@@ -388,6 +388,34 @@ export function initSchema(): void {
       ON chapter_pattern_fingerprints(work_id, chapter_id);
 
     -- ============================================
+    -- 滚动因果小说：权威状态与逐章决策事务
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS causal_narrative_states (
+      work_id INTEGER PRIMARY KEY,
+      revision INTEGER NOT NULL DEFAULT 0,
+      state_json TEXT NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS causal_chapter_decisions (
+      chapter_id INTEGER PRIMARY KEY,
+      work_id INTEGER NOT NULL,
+      state_revision INTEGER NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'planned',
+      plan_json TEXT NOT NULL,
+      outcome_json TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_causal_decisions_work_status
+      ON causal_chapter_decisions(work_id, status, chapter_id);
+
+    -- ============================================
     -- 资源约束账本（体力/法力/积分/等级/冷却等跨章节可变状态）
     -- ============================================
     CREATE TABLE IF NOT EXISTS resource_constraints (

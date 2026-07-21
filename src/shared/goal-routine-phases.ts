@@ -46,6 +46,14 @@ export const NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'repair_execute'
 ]
 
+/** 因果小说只保留状态初始化、下一章决策、正文事务和终局验收。 */
+export const CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
+  'materialize_settings',
+  'generate_beats',
+  'draft_body',
+  'goal_check'
+]
+
 /** 向后兼容：默认导出短故事顺序 */
 export const GOAL_ROUTINE_PHASE_ORDER = STORY_GOAL_ROUTINE_PHASE_ORDER
 
@@ -87,16 +95,26 @@ export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   repair_execute: '执行修复'
 }
 
+export const CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> = {
+  ...NOVEL_GOAL_ROUTINE_PHASE_LABELS,
+  materialize_settings: '权威状态初始化',
+  generate_beats: '下一章因果决策',
+  draft_body: '正文与状态事务',
+  goal_check: '终止条件与整书验收'
+}
+
 /** 向后兼容：默认导出短故事标签 */
 export const GOAL_ROUTINE_PHASE_LABELS = STORY_GOAL_ROUTINE_PHASE_LABELS
 
 /** 按作品类型获取阶段顺序 */
 export function getGoalRoutinePhaseOrder(workType?: string | null): GoalRoutinePhase[] {
+  if (workType === 'causal_novel') return CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_ORDER
   return workType === 'novel' ? NOVEL_GOAL_ROUTINE_PHASE_ORDER : STORY_GOAL_ROUTINE_PHASE_ORDER
 }
 
 /** 按作品类型获取阶段标签 */
 export function getGoalRoutinePhaseLabels(workType?: string | null): Record<GoalRoutinePhase, string> {
+  if (workType === 'causal_novel') return CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_LABELS
   return workType === 'novel' ? NOVEL_GOAL_ROUTINE_PHASE_LABELS : STORY_GOAL_ROUTINE_PHASE_LABELS
 }
 

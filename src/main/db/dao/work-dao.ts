@@ -88,10 +88,13 @@ export class WorkDAO extends BaseDAO {
   /** 创建新作品 */
   create(input: WorkCreateInput): number {
     return this.insert(
-      `INSERT INTO works (title, description, cover_image, novel_length, target_total_words, target_chapters, words_per_chapter, work_type)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO works (
+        title, description, cover_image, novel_length, target_total_words,
+        target_chapters, words_per_chapter, work_type, genre, tags
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [input.title, input.description ?? null, input.cover_image ?? null,
-        input.novelLength ?? 'medium', input.targetTotalWords ?? null, input.targetChapters ?? null, input.wordsPerChapter ?? null, input.workType ?? 'novel']
+        input.novelLength ?? 'medium', input.targetTotalWords ?? null, input.targetChapters ?? null,
+        input.wordsPerChapter ?? null, input.workType ?? 'novel', input.genre ?? null, input.tags ?? null]
     )
   }
 

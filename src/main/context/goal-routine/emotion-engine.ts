@@ -122,6 +122,7 @@ function sourceContext(workId: number): string {
 }
 
 export function loadEmotionEngine(workId: number): EmotionEngine | null {
+  if (workDAO.getById(workId)?.work_type === 'causal_novel') return null
   const setting = coreSettingDAO.getByType(workId, 'emotion_engine')
   const sources = [setting?.structured_content, setting?.content]
   for (const source of sources) {
@@ -142,6 +143,9 @@ export async function ensureEmotionEngine(
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<{ score: number; rounds: number }> {
+  if (workDAO.getById(workId)?.work_type === 'causal_novel') {
+    throw new Error('因果小说禁止调用传统全书情绪发动机；情绪事务必须由当前权威状态随章节决策生成')
+  }
   const existing = loadEmotionEngine(workId)
   if (existing) return { score: 100, rounds: 0 }
   const source = sourceContext(workId)
@@ -233,6 +237,9 @@ export async function ensureChapterEmotionContract(
   const existing = loadChapterEmotionContract(chapterId)
   if (existing) return existing
   const work = workDAO.getById(workId)
+  if (work?.work_type === 'causal_novel') {
+    throw new Error('因果章节缺少随决策生成的情绪事务，禁止回退到传统全书情绪发动机')
+  }
   let engine = loadEmotionEngine(workId)
   if (!engine) {
     await ensureEmotionEngine(workId, goal, work?.work_type === 'story' ? 'story' : 'novel', signal)

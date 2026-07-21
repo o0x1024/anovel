@@ -53,8 +53,8 @@ assert.ok(detectStoryTextIntegrityIssues('我本来想说，但是').some(issue 
 assert.ok(detectStoryTextIntegrityIssues('老师讲了四挺钟的课，我记了四颇为钟的笔记。').some(issue => issue.code === 'CORRUPTED_SENTENCE'))
 assert.ok(detectStoryTextIntegrityIssues('她以为我是真穷，只要当众揭穿').some(issue => issue.code === 'CORRUPTED_SENTENCE'))
 assert.ok(detectStoryTextIntegrityIssues(
-  '林晚走进教室。'.repeat(80),
-  { povMode: 'first', povCharacter: '林晚' }
+  '张三走进教室。'.repeat(80),
+  { povMode: 'first', povCharacter: '张三' }
 ).some(issue => issue.code === 'POV_DRIFT'))
 assert.ok(detectStoryTextIntegrityIssues(
   '旧事终于结束。'.repeat(30) + '下一个任务已经送到门口。',

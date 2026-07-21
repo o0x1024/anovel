@@ -9,6 +9,11 @@ const router = createRouter({
       component: () => import('../views/work/WorkList.vue')
     },
     {
+      path: '/causal-novels',
+      name: 'causal-novels',
+      component: () => import('../views/work/WorkList.vue')
+    },
+    {
       path: '/stories',
       name: 'stories',
       component: () => import('../views/work/WorkList.vue')
@@ -16,6 +21,11 @@ const router = createRouter({
     {
       path: '/novel/:id',
       name: 'novel-editor',
+      component: () => import('../views/editor/WorkEditor.vue')
+    },
+    {
+      path: '/causal-novel/:id',
+      name: 'causal-novel-editor',
       component: () => import('../views/editor/WorkEditor.vue')
     },
     {

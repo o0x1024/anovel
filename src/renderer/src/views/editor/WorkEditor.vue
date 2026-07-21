@@ -11,6 +11,8 @@ import AnchorsPanel from './AnchorsPanel.vue'
 import IdeasPanel from './IdeasPanel.vue'
 import FavoritesPanel from './FavoritesPanel.vue'
 import GoalRoutinePanel from './GoalRoutinePanel.vue'
+import CausalNovelPanel from './CausalNovelPanel.vue'
+import CausalChapterManagerPanel from './CausalChapterManagerPanel.vue'
 import WorkTemperaturePanel from './WorkTemperaturePanel.vue'
 import NarrativeMemoryPanel from './NarrativeMemoryPanel.vue'
 import TasteProfilePanel from './TasteProfilePanel.vue'
@@ -38,14 +40,16 @@ const route = useRoute()
 const router = useRouter()
 const workId = computed(() => Number(route.params.id))
 
-/** 由路由名区分小说 / 短故事，驱动步骤配置与返回路由 */
+/** 路由即产品边界：传统小说、因果小说和短故事互不混用运行链。 */
 const isStory = computed(() => route.name === 'story-editor')
-const backRoute = computed(() => (isStory.value ? '/stories' : '/'))
+const isCausalNovel = computed(() => route.name === 'causal-novel-editor')
+const backRoute = computed(() => isStory.value ? '/stories' : isCausalNovel.value ? '/causal-novels' : '/')
 
 interface WorkInfo {
   id: number
   title: string
   description: string | null
+  work_type: string | null
 }
 
 interface StyleOption {
@@ -60,7 +64,7 @@ interface StepDef {
 }
 
 type StepKey =
-  | 'incubator' | 'settings' | 'volumes' | 'chapters' | 'generate' | 'anchors' | 'ideas'
+  | 'incubator' | 'settings' | 'volumes' | 'chapters' | 'causal' | 'causal_chapters' | 'generate' | 'anchors' | 'ideas'
   | 'names' | 'temperature' | 'memory' | 'stats' | 'block' | 'materials' | 'stability'
   | 'taste' | 'images' | 'favorites' | 'goal'
 
@@ -76,7 +80,7 @@ const quickIdeaTrigger = ref(0)
 
 const showStepModelDialog = ref(false)
 
-const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : 'novel'))
+const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : isCausalNovel.value ? 'causal_novel' : 'novel'))
 const showExportModal = ref(false)
 const exportFormat = ref<'markdown' | 'txt' | 'html'>('markdown')
 const exportContentMode = ref<'full' | 'body'>('full')
@@ -97,6 +101,13 @@ const workflowSteps = computed<StepDef[]>(() => {
       { key: 'chapters', label: '节拍大纲', icon: 'list-ol' },
       { key: 'generate', label: '正文生成', icon: 'pen-nib' },
       { key: 'anchors', label: '锚点管理', icon: 'anchor' },
+      { key: 'ideas', label: '灵感收集', icon: 'brain' }
+    ]
+  }
+  if (isCausalNovel.value) {
+    return [
+      { key: 'causal', label: '滚动因果', icon: 'project-diagram' },
+      { key: 'causal_chapters', label: '章节管理', icon: 'book-open' },
       { key: 'ideas', label: '灵感收集', icon: 'brain' }
     ]
   }
@@ -125,12 +136,12 @@ const utilitySteps = computed<StepDef[]>(() => {
     { key: 'favorites', label: '收藏夹', icon: 'bookmark' },
     { key: 'goal', label: '目标循环', icon: 'rotate' }
   ]
-  return base
+  return isCausalNovel.value ? base.filter(step => step.key !== 'goal') : base
 })
 
 const steps = computed<StepDef[]>(() => [...workflowSteps.value, ...utilitySteps.value])
 
-const currentStep = ref<StepKey>('incubator')
+const currentStep = ref<StepKey>(isCausalNovel.value ? 'causal' : 'incubator')
 
 // 短故事不暴露分卷面板，但映射保留无害（短故事永远不会导航到 volumes）
 const panelComponents = {
@@ -138,6 +149,8 @@ const panelComponents = {
   settings: SettingsPanel,
   volumes: VolumesPanel,
   chapters: ChaptersPanel,
+  causal: CausalNovelPanel,
+  causal_chapters: CausalChapterManagerPanel,
   generate: GeneratePanel,
   anchors: AnchorsPanel,
   ideas: IdeasPanel,
@@ -161,11 +174,23 @@ const boundStyleName = computed(() =>
 )
 
 async function refreshProgress() {
+  if (isCausalNovel.value) {
+    stepProgress.value = null
+    return
+  }
   stepProgress.value = await window.anovel.invoke('work:getStepProgress', workId.value) as WorkStepProgress
 }
 
 async function refreshWork() {
   work.value = await window.anovel.invoke('work:get', workId.value) as WorkInfo
+  const actualType = work.value?.work_type
+  if (actualType === 'causal_novel' && !isCausalNovel.value) {
+    await router.replace(`/causal-novel/${workId.value}`)
+  } else if (actualType === 'story' && !isStory.value) {
+    await router.replace(`/story/${workId.value}`)
+  } else if (actualType === 'novel' && (isStory.value || isCausalNovel.value)) {
+    await router.replace(`/novel/${workId.value}`)
+  }
 }
 
 function goToStep(key: WorkflowStepKey) {
@@ -357,7 +382,7 @@ async function doExport() {
           {{ work?.title || '加载中...' }}
         </h3>
         <p class="text-xs font-bold text-base-content/30 uppercase tracking-wider mt-0.5">创作工作台</p>
-        <div v-if="stepProgress" class="mt-3">
+        <div v-if="stepProgress && !isCausalNovel" class="mt-3">
           <div class="flex items-center justify-between text-xs text-base-content/50 mb-1">
             <span>创作进度</span>
             <span>{{ stepProgress.completionPercent }}%</span>
@@ -483,7 +508,11 @@ async function doExport() {
       <div class="flex-1 overflow-auto px-3 py-3 sm:px-4 sm:py-4 scrollbar-thin">
         <div class="w-full min-w-0 animate-fade-in">
           <KeepAlive :key="workId" :max="Object.keys(panelComponents).length">
-            <component :is="activePanel" :work-id="workId" :work-type="isStory ? 'story' : 'novel'" />
+            <component
+              :is="activePanel"
+              :work-id="workId"
+              :work-type="isStory ? 'story' : isCausalNovel ? 'causal_novel' : 'novel'"
+            />
           </KeepAlive>
         </div>
       </div>
@@ -575,11 +604,11 @@ async function doExport() {
           <label class="text-xs text-base-content/50">导出范围</label>
           <select v-model="exportScope" class="select select-bordered select-sm w-full mt-1">
             <option value="work">{{ exportLabels.exportWhole }}</option>
-            <option v-if="!isStory" value="volume">单卷</option>
+            <option v-if="!isStory && !isCausalNovel" value="volume">单卷</option>
             <option value="chapter">{{ exportLabels.exportSingleUnit }}</option>
           </select>
         </div>
-        <div v-if="exportScope === 'volume' && !isStory">
+        <div v-if="exportScope === 'volume' && !isStory && !isCausalNovel">
           <label class="text-xs text-base-content/50">选择分卷</label>
           <select v-model="exportVolumeId" class="select select-bordered select-sm w-full mt-1">
             <option v-for="v in exportVolumes" :key="v.id" :value="v.id">{{ v.name }}</option>

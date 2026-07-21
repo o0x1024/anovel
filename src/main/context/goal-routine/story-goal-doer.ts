@@ -127,7 +127,7 @@ export interface GenerateBeatBodyOptions {
   onProgress?: (message: string) => void
   goalDescription?: string
   extraHint?: string
-  workType?: 'novel' | 'story'
+  workType?: 'novel' | 'story' | 'causal_novel'
   wordTargetOverride?: number
   onContinuityEvent?: (event: StoryContinuityRepairEvent) => void
   /** 小说目标循环先稳定正文，再由外层统一提交叙事记忆。 */
@@ -461,6 +461,7 @@ export async function generateBeatBody(
     signal, onProgress, goalDescription, extraHint, workType = 'story', wordTargetOverride,
     deferNarrativeMemory = false
   } = options
+  const proseWorkType: 'novel' | 'story' = workType === 'causal_novel' ? 'novel' : workType
   const existingChapter = volumeChapterDAO.getChapter(chapterId)
   const generationContext = storyCandidateContextSource(workId, existingChapter)
   if (workType === 'story') {
@@ -489,10 +490,10 @@ export async function generateBeatBody(
   await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
   const plan = loadWritingPlan(workId)
   const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
-  const executionContract = workType === 'novel'
+  const executionContract = proseWorkType === 'novel'
     ? persistChapterExecutionContract(workId, chapterId, wordTarget)
     : null
-  if (workType === 'novel' && !executionContract) {
+  if (proseWorkType === 'novel' && !executionContract) {
     return { success: false, content: '', wordCount: 0, failureKind: 'contract', error: '章节不存在，无法编译正文执行合同' }
   }
   if (executionContract?.errors.length) {
@@ -513,19 +514,19 @@ export async function generateBeatBody(
     wordTarget,
     goalDescription,
     extraHint,
-    workType,
+    proseWorkType,
     executionContract ?? undefined,
     compactContext.text
   )
-  if (!prompt) return { success: false, content: '', wordCount: 0, error: `${workType === 'story' ? '节拍' : '章节'}不存在` }
+  if (!prompt) return { success: false, content: '', wordCount: 0, error: `${proseWorkType === 'story' ? '节拍' : '章节'}不存在` }
 
   if (signal?.aborted) return { success: false, content: '', wordCount: 0, error: '已取消' }
 
   const ordinal = unitOrdinal(workId, chapterId)
-  const baseSystemPrompt = workType === 'story'
+  const baseSystemPrompt = proseWorkType === 'story'
     ? STORY_BODY_GENERATION_SYSTEM
     : NOVEL_GOAL_BODY_GENERATION_SYSTEM
-  const openingExtra = goldenOpeningSystemExtra(workType, ordinal)
+  const openingExtra = goldenOpeningSystemExtra(proseWorkType, ordinal)
   const systemPrompt = [baseSystemPrompt, openingExtra, BODY_REACTION_CLICHE_DIRECTIVE].filter(Boolean).join('\n\n')
 
   if (executionContract) {
@@ -543,7 +544,7 @@ export async function generateBeatBody(
   }
 
   let sceneResume: { startIndex: number; initialContent: string } | undefined
-  if (workType === 'novel' && executionContract?.scenes.length) {
+  if (proseWorkType === 'novel' && executionContract?.scenes.length) {
     const latestVersion = volumeChapterDAO.listVersions(chapterId)[0]
     const partial = latestVersion?.model_type === 'novel_scene_partial' && latestVersion.content?.trim()
       ? latestVersion
@@ -568,7 +569,7 @@ export async function generateBeatBody(
     }
   }
 
-  const response = workType === 'novel' && executionContract?.scenes.length
+  const response = proseWorkType === 'novel' && executionContract?.scenes.length
     ? await generateNovelBodyByScenes({
         workId,
         chapterId,
@@ -587,8 +588,8 @@ export async function generateBeatBody(
           step: 'body_generation',
           workId,
           maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
-          temperature: workType === 'novel' ? 0.75 : undefined,
-          enrichWorkContext: workType !== 'novel',
+          temperature: proseWorkType === 'novel' ? 0.75 : undefined,
+          enrichWorkContext: proseWorkType !== 'novel',
           chapterId,
           volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
           enrichNarrativeMemory: true
@@ -597,7 +598,7 @@ export async function generateBeatBody(
       )
 
   if (!response.success || !response.content?.trim()) {
-    if (workType === 'novel' && response.content?.trim() && executionContract) {
+    if (proseWorkType === 'novel' && response.content?.trim() && executionContract) {
       volumeChapterDAO.createVersion(chapterId, {
         outline: existingChapter?.outline ?? undefined,
         content: response.content,
@@ -614,7 +615,7 @@ export async function generateBeatBody(
     return { success: false, content: response.content ?? '', wordCount: 0, error: response.error || '生成失败' }
   }
 
-  if (workType === 'novel' && executionContract?.scenes.length && 'completedSceneCount' in response) {
+  if (proseWorkType === 'novel' && executionContract?.scenes.length && 'completedSceneCount' in response) {
     volumeChapterDAO.createVersion(chapterId, {
       outline: existingChapter?.outline ?? undefined,
       content: response.content,
@@ -631,7 +632,7 @@ export async function generateBeatBody(
     workId,
     chapterId,
     response.content,
-    workType,
+    proseWorkType,
     signal,
     onProgress,
     options.onContinuityEvent,
@@ -1294,7 +1295,7 @@ export function commitPreparedNarrativeMemory(
   prepared: PreparedNarrativeMemory,
   options: CommitPreparedNarrativeMemoryOptions = {}
 ): NonNullable<BeatGenResult['memoryExtracted']> {
-  const transaction = getDatabase().transaction(() => {
+  const commit = (): NonNullable<BeatGenResult['memoryExtracted']> => {
     const latest = volumeChapterDAO.getChapter(chapterId)
     if (!latest?.content?.trim() || latest.content !== prepared.sourceContent) {
       throw new Error('候选正文已变化，拒绝提交过期叙事记忆')
@@ -1324,8 +1325,9 @@ export function commitPreparedNarrativeMemory(
       foreshadowingResolved: appliedResolutions.resolved,
       foreshadowingPartial: appliedResolutions.partial
     }
-  })
-  const committed = transaction()
+  }
+  const database = getDatabase()
+  const committed = database.inTransaction ? commit() : database.transaction(commit)()
 
   if (process.env.ELECTRON_RUN_AS_NODE !== '1') {
     appLogger.info('goal_routine', '叙事记忆已更新', {

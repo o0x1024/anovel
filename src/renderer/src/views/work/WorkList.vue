@@ -22,13 +22,22 @@ import {
 } from '../../../../shared/goal-routine-phases'
 import { workUnitLabels } from '../../../../shared/work-terminology'
 import { tagsArrayToStoryCategoryTags, storyCategoryTagsToStorage } from '../../../../shared/story-category-tags'
+import { WORK_TYPES, type WorkType } from '../../../../shared/work-types'
 
 const route = useRoute()
 const router = useRouter()
 
-/** 由路由名区分小说 / 短故事，同一组件复用 */
-const workType: 'novel' | 'story' = route.name === 'stories' ? 'story' : 'novel'
-const editorPath = (id: number) => `/${workType}/${id}`
+/** 三个菜单使用互相隔离的 work_type，因果作品不会混入传统小说。 */
+const workType: WorkType = route.name === 'stories'
+  ? WORK_TYPES.story
+  : route.name === 'causal-novels'
+    ? WORK_TYPES.causalNovel
+    : WORK_TYPES.traditionalNovel
+const editorPath = (id: number) => workType === WORK_TYPES.story
+  ? `/story/${id}`
+  : workType === WORK_TYPES.causalNovel
+    ? `/causal-novel/${id}`
+    : `/novel/${id}`
 
 interface WorkTypeLabels {
   pageTitle: string
@@ -51,19 +60,19 @@ interface WorkTypeLabels {
   purgeHint: string
 }
 
-const LABELS: Record<'novel' | 'story', WorkTypeLabels> = {
+const LABELS: Record<WorkType, WorkTypeLabels> = {
   novel: {
-    pageTitle: '我的小说',
-    pageSubtitle: '管理并孵化你的小说创作项目，开启 AI 创作之旅',
-    createBtnText: '新建小说',
+    pageTitle: '我的传统小说',
+    pageSubtitle: '使用分卷、章节情节与结构合同管理规划式小说',
+    createBtnText: '新建传统小说',
     importBtnText: '导入备份',
     emptyTitleText: '还没有任何小说',
     emptySubtitleText: '点击上方按钮或下方快速开始，开启你的第一个精彩故事。',
     loadingText: '正在加载小说列表...',
     projectLabel: 'PROJECT',
     defaultDescText: '暂无简介，点击进入编辑，为你的小说添加一段精彩的大纲或背景设定。',
-    createDialogTitle: '新建小说',
-    createDialogSubtitle: '开始孵化一个新的小说灵感',
+    createDialogTitle: '新建传统小说',
+    createDialogSubtitle: '使用大纲与分卷规划开始小说创作',
     titleFieldLabel: '小说标题',
     descFieldLabel: '小说简介',
     editDialogTitle: '编辑小说',
@@ -71,6 +80,26 @@ const LABELS: Record<'novel' | 'story', WorkTypeLabels> = {
     unitLabel: '章',
     trashSubtitle: '已删除的作品可在此恢复，或彻底清除',
     purgeHint: '此操作不可撤销，作品及其所有章节、设定、记忆体将被永久清除。'
+  },
+  causal_novel: {
+    pageTitle: '我的因果小说',
+    pageSubtitle: '以世界状态、人物行动、读者承诺和不可逆后果滚动生成小说',
+    createBtnText: '新建因果小说',
+    importBtnText: '导入备份',
+    emptyTitleText: '还没有任何因果小说',
+    emptySubtitleText: '创建世界起点，让系统逐章选择最有价值的因果路径。',
+    loadingText: '正在加载因果小说列表...',
+    projectLabel: 'CAUSAL',
+    defaultDescText: '暂无世界起点，进入作品后设置世界规则与初始压力。',
+    createDialogTitle: '新建因果小说',
+    createDialogSubtitle: '不预写全书大纲，从世界状态开始滚动创作',
+    titleFieldLabel: '小说标题',
+    descFieldLabel: '世界起点',
+    editDialogTitle: '编辑因果小说',
+    editDialogSubtitle: '修改小说名称、世界起点与封面',
+    unitLabel: '章',
+    trashSubtitle: '已删除的因果作品可在此恢复，或彻底清除',
+    purgeHint: '此操作不可撤销，作品、因果状态、章节与记忆体将被永久清除。'
   },
   story: {
     pageTitle: '我的短故事',
@@ -307,7 +336,7 @@ async function fetchAllGoalStates() {
         turn: r.turnCount ?? 0,
         maxTurns: r.maxTurns ?? 0,
         phase: r.currentPhase ?? '',
-        message: r.goalMet ? '目标已达成' : (goalRoutinePhaseLabel(r.currentPhase) || ''),
+        message: r.goalMet ? '目标已达成' : (goalRoutinePhaseLabel(r.currentPhase, workType) || ''),
         updateTime: r.updateTime
       })
     }
@@ -808,7 +837,13 @@ function progressPct(work: Work): number {
           {{ t.importBtnText }}
           <input type="file" accept=".json,application/json" class="hidden" @change="importWorkFromFile" />
         </label>
-        <button type="button" class="btn btn-outline gap-2" @click="importManuscript" title="从 txt/docx 书稿导入并自动切分章节">
+        <button
+          v-if="workType !== 'causal_novel'"
+          type="button"
+          class="btn btn-outline gap-2"
+          @click="importManuscript"
+          title="从 txt/docx 书稿导入并自动切分章节"
+        >
           <font-awesome-icon icon="file-import" class="w-4 h-4" />
           导入文稿
         </button>

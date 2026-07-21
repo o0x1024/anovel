@@ -24,7 +24,7 @@ import { normalizeEmotionContract, validateEmotionContract } from '../src/shared
 
 function emotionContract(overrides: Record<string, unknown> = {}) {
   return normalizeEmotionContract({
-    pov_character: '林晚',
+    pov_character: '张三',
     attachment_anchor: '她不肯让母亲替自己低头',
     value_at_stake: '尊严与清白',
     reader_state_before: { label: '担忧', valence: -1, arousal: 2, agency: 0, certainty: 2 },
