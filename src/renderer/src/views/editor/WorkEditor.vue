@@ -115,7 +115,7 @@ const workflowSteps = computed<StepDef[]>(() => {
     { key: 'incubator', label: '大岗孵化', icon: 'lightbulb' },
     { key: 'settings', label: '核心设定', icon: 'sliders' },
     { key: 'volumes', label: '分卷大纲', icon: 'book' },
-    { key: 'chapters', label: '章节情节', icon: 'list-ol' },
+    { key: 'chapters', label: '章节大纲', icon: 'list-ol' },
     { key: 'generate', label: '正文生成', icon: 'pen-nib' },
     { key: 'anchors', label: '锚点管理', icon: 'anchor' },
     { key: 'ideas', label: '灵感收集', icon: 'brain' }

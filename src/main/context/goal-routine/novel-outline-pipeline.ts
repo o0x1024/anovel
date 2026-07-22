@@ -43,7 +43,9 @@ export const NOVEL_VOLUME_GATE_MAX_REPAIR_TARGETS_PER_ISSUE = 4
 export const NOVEL_VOLUME_GATE_MAX_REPAIRED_CHAPTERS = 6
 export const NOVEL_VOLUME_GATE_MAX_REWRITES_PER_CHAPTER = 1
 const NOVEL_VOLUME_GATE_ASSESS_MAX_TOKENS = 2400
-const NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION = 2
+// v5：所有分卷修复边界统一转入质量债务，不再终止整本生成。
+// 升级会让旧 stalled 检查点在续跑时只失效诊断缓存，不删除章节或版本。
+const NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION = 5
 
 const NOVEL_VOLUME_GATE_HARD_ISSUE_CODES = new Set([
   'STATE_CONTINUITY_BREAK',
@@ -265,6 +267,24 @@ export interface NovelGoalPersistentState {
   checkedChapterVolumes?: string[]
   pendingChapterVolumeGate?: string
   chapterVolumeGateCheckpoint?: NovelVolumeGateCheckpoint
+  volumeGateDeferredIssues?: Array<{
+    volume: string
+    score: number
+    rounds: number
+    reason: string
+    deferredAt: string
+    issues: Array<Pick<NovelVolumeGateIssue, 'source' | 'code' | 'problem' | 'repairChapterNumbers' | 'requiredFix'>>
+  }>
+  chapterVolumeGateResults?: Array<{
+    volume: string
+    status: 'passed' | 'deferred'
+    score: number
+    rounds: number
+    completedAt: string
+    snapshotFingerprint: string
+    reason?: string
+    issues: Array<Pick<NovelVolumeGateIssue, 'source' | 'code' | 'problem' | 'repairChapterNumbers' | 'requiredFix'>>
+  }>
   checkedBodyVolumes?: string[]
   pleasureVolumeFingerprint?: string
   pendingChapterSkeletonBatch?: {
@@ -287,6 +307,21 @@ export interface NovelGoalPersistentState {
     reasons: string[]
   }
   chapterExecutionProtocolVersion?: number
+  chapterExecutionDeferredIssues?: Array<{
+    chapterId: number
+    chapterTitle: string
+    sourceVersionNumber: number
+    blockers: string[]
+    deferredAt: string
+  }>
+  chapterAcceptanceDeferredIssues?: Array<{
+    chapterId: number
+    chapterTitle: string
+    qualityScore: number
+    emotionScore?: number
+    failedMetrics: string[]
+    deferredAt: string
+  }>
   failure?: {
     phase: string
     signature: string
@@ -301,7 +336,7 @@ export interface NovelOutlineBatchResult {
   remaining: number
   complete: boolean
   range?: { start: number; end: number }
-  volumeGate?: { volume: string; score: number; rounds: number }
+  volumeGate?: { volume: string; score: number; rounds: number; deferredIssues?: number }
   volumeReadyForDraft?: string
 }
 
@@ -357,7 +392,7 @@ export function resolveNovelVolumeWorkflowCheckpoint(
       if (laterChapter) {
         throw new NovelPipelineError(
           'CONTRACT_INVALID',
-          `分卷「${volume.name}」章节情节尚未完整，不能存在后续分卷「${laterChapter.volume_name}」的章节`
+          `分卷「${volume.name}」章节大纲尚未完整，不能存在后续分卷「${laterChapter.volume_name}」的章节`
         )
       }
       if (checkedOutlines.has(volume.name) || checkedBodies.has(volume.name)) {
@@ -457,6 +492,31 @@ export function updateNovelGoalState(workId: number, patch: Partial<NovelGoalPer
   goalRoutineDAO.update(workId, { state_json: JSON.stringify({ ...current, ...patch }) })
 }
 
+/**
+ * 用户显式续跑 stalled 分卷门禁时，只重开只读诊断；累计改写章节和单章次数仍保留，
+ * 因而不会通过反复点击绕过每卷 6 章、每章 1 次的安全边界。
+ */
+export function reopenStalledNovelVolumeGate(workId: number): boolean {
+  const state = readNovelGoalState(workId)
+  const checkpoint = state.chapterVolumeGateCheckpoint
+  if (!checkpoint?.stalled) return false
+  updateNovelGoalState(workId, {
+    failure: undefined,
+    chapterVolumeGateCheckpoint: {
+      ...checkpoint,
+      round: 1,
+      assessments: [],
+      aggregate: undefined,
+      repair: undefined,
+      stalled: undefined,
+      repairControl: checkpoint.repairControl
+        ? { ...checkpoint.repairControl, lastRoundVersions: [] }
+        : undefined
+    }
+  })
+  return true
+}
+
 /** 从分卷规划重新开始时，所有由分卷、章节和正文派生的运行检查点都必须失效。 */
 export function resetNovelGoalStateFromVolumePlan(workId: number): void {
   goalRoutineDAO.ensure(workId)
@@ -468,6 +528,8 @@ export function resetNovelGoalStateFromVolumePlan(workId: number): void {
     checkedChapterVolumes: undefined,
     pendingChapterVolumeGate: undefined,
     chapterVolumeGateCheckpoint: undefined,
+    volumeGateDeferredIssues: undefined,
+    chapterVolumeGateResults: undefined,
     checkedBodyVolumes: undefined,
     pleasureVolumeFingerprint: undefined,
     pendingChapterSkeletonBatch: undefined,
@@ -478,6 +540,8 @@ export function resetNovelGoalStateFromVolumePlan(workId: number): void {
     titleHookPreferredIndex: undefined,
     titleHookApplied: undefined,
     finalAudit: undefined,
+    chapterExecutionDeferredIssues: undefined,
+    chapterAcceptanceDeferredIssues: undefined,
     failure: undefined
   })
 }
@@ -506,6 +570,8 @@ export function invalidateNovelGoalStateAfterVolumeDeletion(
     chapterVolumeGateCheckpoint: state.chapterVolumeGateCheckpoint?.volume === deletedVolumeName
       ? undefined
       : state.chapterVolumeGateCheckpoint,
+    volumeGateDeferredIssues: (state.volumeGateDeferredIssues ?? []).filter(item => item.volume !== deletedVolumeName),
+    chapterVolumeGateResults: (state.chapterVolumeGateResults ?? []).filter(item => item.volume !== deletedVolumeName),
     repairPlan: undefined,
     repairStall: undefined,
     finalAudit: undefined,
@@ -563,6 +629,8 @@ export function reconcileNovelWorkflowState(workId: number): {
       lastCheck: undefined,
       checkedChapterVolumes: nextChapterVolumes,
       checkedBodyVolumes: nextBodyVolumes,
+      chapterVolumeGateResults: (state.chapterVolumeGateResults ?? [])
+        .filter(item => completeOutlineNames.has(item.volume)),
       pendingChapterVolumeGate: pendingInvalid ? undefined : state.pendingChapterVolumeGate,
       chapterVolumeGateCheckpoint: checkpointInvalid ? undefined : state.chapterVolumeGateCheckpoint,
       repairPlan: undefined,
@@ -1177,6 +1245,37 @@ function normalizeVolumeGateIssueCode(value: unknown): string {
   return normalized || 'SEMANTIC_CONTRACT_ISSUE'
 }
 
+/**
+ * 硬门禁只接受输入中可直接互斥的事实。单纯没有再次说明、没有显式关联，
+ * 或连续章节重复描述同一状态，都属于写作建议，不能触发自动改写。
+ */
+export function isActionableNovelVolumeGateIssue(input: {
+  code: string
+  problem: string
+  requiredFix: string
+  evidenceChapterNumbers: number[]
+}): boolean {
+  const evidenceChapters = new Set(input.evidenceChapterNumbers)
+  if (evidenceChapters.size < 2 && /CONTINUITY_BREAK|SETUP_PAYOFF_MISMATCH/.test(input.code)) return false
+  const text = `${input.problem}\n${input.requiredFix}`
+  return !(
+    /未提及|未交代|没有(?:提及|交代|明确说明)|未明确(?:说明|是同一|关联|来源)|未对.{0,40}(?:解释|衔接)/.test(text)
+    || /重复描述.{0,30}(?:状态断层|资源状态断层|连续性断层)/.test(text)
+    || /明确.{0,30}(?:是同一|延续|关联|来源).{0,20}(?:避免|防止)/.test(text)
+    || /角色与环境关联.{0,20}断层/.test(text)
+  )
+}
+
+export function shouldDeferNovelVolumeGateIssues(input: {
+  score: number
+  issues: NovelVolumeGateIssue[]
+  deterministicIssueCount: number
+}): boolean {
+  // 长篇生成的首要目标是完成整本正文。质量问题可以阻止继续自动改写，
+  // 但不能阻止后续分卷和正文生成；真实硬问题同样进入可审计债务，留待终审处理。
+  return input.issues.length > 0
+}
+
 function boundedRepairCandidates(candidates: number[]): number[] {
   const unique = [...new Set(candidates)].sort((a, b) => a - b)
   // 跨章问题过大时优先修改后出现的合同，保留较早章节作为只读事实锚点。
@@ -1271,6 +1370,14 @@ function parseModelVolumeGateIssues(input: {
     if (repairChapterNumbers.length === 0) {
       return []
     }
+    if (!isActionableNovelVolumeGateIssue({
+      code,
+      problem,
+      requiredFix,
+      evidenceChapterNumbers: evidence.map(item => item.chapterNumber)
+    })) {
+      return []
+    }
     return [{ source: 'model', severity, code, problem, repairChapterNumbers, evidence, requiredFix }]
   })
 }
@@ -1342,6 +1449,8 @@ async function assessVolumeChapterWindow(input: {
         '只检查当前窗口：因果链、冲突升级、阶段目标推进、角色选择与代价、伏笔、功能重复、节奏断层，以及与相邻章的接口。',
         '本卷合同用于判断方向，但不得因为个人文风偏好或没有证据的猜测压低分数。',
         'severity=hard 只用于两段输入中已经同时存在、可直接互斥的状态事实；“可能误解、执行时可能出错、节奏可优化、存在风险”一律是 advisory，只写入 summary，不得放入 issues。',
+        '没有再次提及尸体、毒伤、资源消耗或环境线索，不等于状态断裂；连续章节重复描述同一次受伤、净化或事件，是状态延续，不是互斥事实。',
+        '累计推进不能误判为数量矛盾：前章完成第一项、后章继续第二项/第三项属于正常递进。problem 中的每个事实必须与 evidence.quote 字面一致。',
         `hard code 仅允许：${[...NOVEL_VOLUME_GATE_HARD_ISSUE_CODES].join('、')}；功能重复、节奏、文风与信息密度不得触发自动修复。`,
         'evidence 可引用当前窗口或相邻只读上下文；每条 quote 只摘录一段 4-80 字的连续原文，必须逐字摘自输入中的 title、outline、next_hook 或结构合同。',
         '禁止在 quote 中改写、概括，或用“……”拼接两段原文；需要两段证据时必须输出两个 evidence 项。',
@@ -1766,7 +1875,7 @@ async function runVolumeChapterGate(
   contract: NovelVolumeContract,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ score: number; rounds: number }> {
+): Promise<{ score: number; rounds: number; deferredIssues?: number }> {
   const volume = volumeChapterDAO.listVolumes(workId).find(item => item.name === contract.name)
   if (!volume) throw new NovelPipelineError('PREREQUISITE_MISSING', `分卷「${contract.name}」尚未落库`)
   let savedCheckpoint = readNovelGoalState(workId).chapterVolumeGateCheckpoint
@@ -1778,21 +1887,28 @@ async function runVolumeChapterGate(
     onProgress?.(`检测到旧版自动修复检查点，已保留现有章节并从「${contract.name}」门禁重新诊断`)
   }
   if (savedCheckpoint?.version === 2 && savedCheckpoint.volume === contract.name && savedCheckpoint.stalled) {
-    throw new NovelPipelineError('REPAIR_STALL', savedCheckpoint.stalled.reason)
+    savedCheckpoint = {
+      ...savedCheckpoint,
+      round: 1,
+      assessments: [],
+      aggregate: undefined,
+      repair: undefined,
+      stalled: undefined,
+      repairControl: savedCheckpoint.repairControl
+        ? { ...savedCheckpoint.repairControl, lastRoundVersions: [] }
+        : undefined
+    }
+    updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: savedCheckpoint, failure: undefined })
+    onProgress?.(`检测到旧的分卷暂停检查点，已保留作品和改写预算并自动重开只读诊断`)
   }
   if (savedCheckpoint?.version === 2
     && savedCheckpoint.volume === contract.name
     && savedCheckpoint.round >= MAX_VOLUME_CHAPTER_GATE_REPAIR_ROUNDS
     && !savedCheckpoint.repair
     && !savedCheckpoint.repairControl) {
-    const reason = `分卷「${contract.name}」已进入旧版自动修复上限，禁止重新开启整卷重写`
-    updateNovelGoalState(workId, {
-      chapterVolumeGateCheckpoint: {
-        ...savedCheckpoint,
-        stalled: { reason, createTime: new Date().toISOString() }
-      }
-    })
-    throw new NovelPipelineError('REPAIR_STALL', reason)
+    updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: undefined, failure: undefined })
+    savedCheckpoint = undefined
+    onProgress?.(`检测到旧版分卷轮次上限，已保留作品并重新执行只读诊断`)
   }
   let rounds = savedCheckpoint?.version === 2
     && savedCheckpoint.volume === contract.name
@@ -1802,35 +1918,71 @@ async function runVolumeChapterGate(
     : 0
   let lastScore = -1
 
-  const stallAndRollback = (
+  const deferModelIssuesAndContinue = (
     checkpoint: NovelVolumeGateCheckpoint,
+    issues: NovelVolumeGateIssue[],
+    score: number,
     reason: string,
-    rollback = true
-  ): never => {
+    rollback = false
+  ): { score: number; rounds: number; deferredIssues: number } => {
     const versions = checkpoint.repairControl?.lastRoundVersions ?? []
-    if (rollback && versions.length > 0) {
-      volumeChapterDAO.restoreVersionsAtomic(versions)
+    if (rollback && versions.length > 0) volumeChapterDAO.restoreVersionsAtomic(versions)
+    const state = readNovelGoalState(workId)
+    const previous = state.volumeGateDeferredIssues ?? []
+    const entry = {
+      volume: contract.name,
+      score,
+      rounds,
+      reason,
+      deferredAt: new Date().toISOString(),
+      issues: issues.map(issue => ({
+        source: issue.source,
+        code: issue.code,
+        problem: issue.problem,
+        repairChapterNumbers: [...issue.repairChapterNumbers],
+        requiredFix: issue.requiredFix
+      }))
     }
-    const refreshed = volumeChapterDAO.listChapters(volume.id)
-    const terminal: NovelVolumeGateCheckpoint = {
-      ...checkpoint,
-      snapshotFingerprint: volumeGateSnapshotFingerprint(refreshed),
-      repair: undefined,
-      stalled: { reason, createTime: new Date().toISOString() }
-    }
-    updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: terminal })
-    throw new NovelPipelineError('REPAIR_STALL', reason)
+    updateNovelGoalState(workId, {
+      failure: undefined,
+      chapterVolumeGateCheckpoint: undefined,
+      volumeGateDeferredIssues: [...previous.filter(item => item.volume !== contract.name), entry]
+    })
+    onProgress?.(
+      `「${contract.name}」达到安全改写边界；${issues.length} 个模型残留问题已转入延后修复账本，分卷继续冻结（${score}分）`
+    )
+    return { score, rounds, deferredIssues: issues.length }
   }
 
-  const executePendingRepairs = async (checkpoint: NovelVolumeGateCheckpoint): Promise<void> => {
+  const checkpointScore = (checkpoint: NovelVolumeGateCheckpoint): number => {
+    const scores = [
+      ...checkpoint.assessments.map(item => item.score),
+      ...(checkpoint.aggregate ? [checkpoint.aggregate.score] : [])
+    ]
+    return scores.length > 0
+      ? Math.round(scores.reduce((sum, value) => sum + value, 0) / scores.length)
+      : 0
+  }
+
+  const executePendingRepairs = async (
+    checkpoint: NovelVolumeGateCheckpoint
+  ): Promise<{ score: number; rounds: number; deferredIssues: number } | undefined> => {
     const repair = checkpoint.repair
     if (!repair) return
+    const pendingIssues = repair.clusters.flatMap(cluster => cluster.issues)
     const allTargets = [...new Set(repair.clusters.flatMap(cluster => cluster.chapterNumbers))]
     const budget = checkNovelVolumeRepairBudget({
       chapterNumbers: allTargets,
       control: checkpoint.repairControl
     })
-    if (!budget.allowed) stallAndRollback(checkpoint, `分卷「${contract.name}」自动修复停滞：${budget.reason}`, false)
+    if (!budget.allowed) {
+      return deferModelIssuesAndContinue(
+        checkpoint,
+        pendingIssues,
+        checkpointScore(checkpoint),
+        budget.reason ?? '恢复修复队列时达到安全改写边界'
+      )
+    }
     let current: NovelVolumeGateCheckpoint = {
       ...checkpoint,
       repairControl: budget.control
@@ -1851,10 +2003,13 @@ async function runVolumeChapterGate(
           signal
         })
       } catch (error) {
-        if (error instanceof NovelPipelineError && error.code === 'OUTPUT_INVALID') {
-          stallAndRollback(
+        if (error instanceof NovelPipelineError && (error.code === 'OUTPUT_INVALID' || error.code === 'REPAIR_BOUNDARY')) {
+          return deferModelIssuesAndContinue(
             current,
-            `分卷「${contract.name}」第 ${cluster.chapterNumbers.join('、')} 章最小补丁验证失败，已拒绝落库并暂停：${error.message}`
+            pendingIssues,
+            checkpointScore(current),
+            `第 ${cluster.chapterNumbers.join('、')} 章最小补丁验证失败，已拒绝落库：${error.message}`,
+            true
           )
         }
         throw error
@@ -1911,7 +2066,7 @@ async function runVolumeChapterGate(
     rounds++
     const chapters = volumeChapterDAO.listChapters(volume.id)
     if (chapters.length !== contract.endChapter - contract.startChapter + 1) {
-      throw new NovelPipelineError('CONTRACT_INVALID', `分卷「${contract.name}」章节情节尚未完整，不能执行整卷门禁`)
+      throw new NovelPipelineError('CONTRACT_INVALID', `分卷「${contract.name}」章节大纲尚未完整，不能执行整卷门禁`)
     }
     const windows = planNovelVolumeGateWindows(contract.startChapter, contract.endChapter)
     const snapshotFingerprint = volumeGateSnapshotFingerprint(chapters)
@@ -1934,10 +2089,11 @@ async function runVolumeChapterGate(
     updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: checkpoint })
     if (checkpoint.repair) {
       onProgress?.(`正在从断点恢复「${contract.name}」定点修复（已完成 ${checkpoint.repair.nextClusterIndex}/${checkpoint.repair.clusters.length} 个小簇）`)
-      await executePendingRepairs(checkpoint)
+      const deferred = await executePendingRepairs(checkpoint)
+      if (deferred) return deferred
       continue
     }
-    onProgress?.(`正在诊断「${contract.name}」章节情节第 ${rounds} 轮：共 ${windows.length} 个连续窗口`)
+    onProgress?.(`正在诊断「${contract.name}」章节大纲第 ${rounds} 轮：共 ${windows.length} 个连续窗口`)
     const assessments: NovelVolumeGateAssessment[] = []
     for (let windowIndex = 0; windowIndex < windows.length; windowIndex++) {
       if (signal?.aborted) throw new Error('已取消')
@@ -1993,22 +2149,32 @@ async function runVolumeChapterGate(
     }
     const control = checkpoint.repairControl
     if (control?.previousIssueCount != null && issues.length >= control.previousIssueCount) {
-      stallAndRollback(
+      return deferModelIssuesAndContinue(
         checkpoint,
-        `分卷「${contract.name}」自动修复后硬问题未减少（${control.previousIssueCount} → ${issues.length}），已回滚上一修复轮并暂停`
+        issues,
+        lastScore,
+        `自动修复后质量问题未继续减少（${control.previousIssueCount} → ${issues.length}）`,
+        true
       )
     }
     if (rounds >= MAX_VOLUME_CHAPTER_GATE_REPAIR_ROUNDS) {
-      stallAndRollback(
+      return deferModelIssuesAndContinue(
         checkpoint,
-        `分卷「${contract.name}」章节情节连续 ${MAX_VOLUME_CHAPTER_GATE_REPAIR_ROUNDS} 轮未通过硬门禁（最终 ${lastScore} 分），已停止自动重写`
+        issues,
+        lastScore,
+        `连续 ${MAX_VOLUME_CHAPTER_GATE_REPAIR_ROUNDS} 轮后仍有质量问题`
       )
     }
     const clusters = planVolumeGateRepairClusters(issues)
     const targets = [...new Set(clusters.flatMap(cluster => cluster.chapterNumbers))]
     const budget = checkNovelVolumeRepairBudget({ chapterNumbers: targets, control })
     if (!budget.allowed) {
-      stallAndRollback(checkpoint, `分卷「${contract.name}」自动修复停滞：${budget.reason}`)
+      return deferModelIssuesAndContinue(
+        checkpoint,
+        issues,
+        lastScore,
+        budget.reason ?? '达到安全改写预算'
+      )
     }
     checkpoint = {
       ...checkpoint,
@@ -2022,13 +2188,34 @@ async function runVolumeChapterGate(
     }
     updateNovelGoalState(workId, { chapterVolumeGateCheckpoint: checkpoint })
     onProgress?.(`「${contract.name}」发现 ${issues.length} 个证据问题，将定点修复 ${clusters.length} 个小簇`)
-    await executePendingRepairs(checkpoint)
+    const deferred = await executePendingRepairs(checkpoint)
+    if (deferred) return deferred
   }
   const checkpoint = readNovelGoalState(workId).chapterVolumeGateCheckpoint
-  throw new NovelPipelineError(
-    'REPAIR_STALL',
-    checkpoint?.stalled?.reason
-      ?? `分卷「${contract.name}」自动修复未收敛，已保留检查点并暂停`
+  const unresolved = [
+    ...(checkpoint?.assessments.flatMap(item => item.issues) ?? []),
+    ...(checkpoint?.aggregate?.issues ?? []),
+    ...(checkpoint?.repair?.clusters.flatMap(cluster => cluster.issues) ?? [])
+  ]
+  return deferModelIssuesAndContinue(
+    checkpoint ?? {
+      version: 2,
+      repairProtocolVersion: NOVEL_VOLUME_REPAIR_PROTOCOL_VERSION,
+      volume: contract.name,
+      round: Math.max(1, rounds),
+      snapshotFingerprint: volumeGateSnapshotFingerprint(volumeChapterDAO.listChapters(volume.id)),
+      assessments: []
+    },
+    unresolved.length > 0 ? unresolved : [{
+      source: 'deterministic',
+      code: 'VOLUME_GATE_UNRESOLVED',
+      problem: '分卷自动修复未收敛，已停止改写但继续整本生成',
+      repairChapterNumbers: [],
+      evidence: [],
+      requiredFix: '在整书终审阶段重新检查该分卷'
+    }],
+    Math.max(0, lastScore),
+    '分卷自动修复循环结束但质量问题尚未清零'
   )
 }
 
@@ -2856,6 +3043,7 @@ export async function prepareNovelVolumePlan(
         volumePlanChecked: false,
         volumeQualityReport: undefined,
         checkedChapterVolumes: undefined,
+        chapterVolumeGateResults: undefined,
         pendingChapterVolumeGate: undefined,
         chapterVolumeGateCheckpoint: undefined,
         checkedBodyVolumes: undefined
@@ -2868,6 +3056,7 @@ export async function prepareNovelVolumePlan(
       volumePlanChecked: false,
       volumeQualityReport: undefined,
       checkedChapterVolumes: undefined,
+      chapterVolumeGateResults: undefined,
       pendingChapterVolumeGate: undefined,
       chapterVolumeGateCheckpoint: undefined,
       checkedBodyVolumes: undefined,
@@ -2906,6 +3095,7 @@ export async function prepareNovelVolumePlan(
       volumePlanChecked: true,
       volumeQualityReport: gate.report,
       checkedChapterVolumes: revised ? undefined : latestState.checkedChapterVolumes,
+      chapterVolumeGateResults: revised ? undefined : latestState.chapterVolumeGateResults,
       pendingChapterVolumeGate: undefined,
       chapterVolumeGateCheckpoint: undefined
     })
@@ -2942,7 +3132,7 @@ export async function generateNextNovelOutlineBatch(
     )
   }
   if (!state.novelOutline || state.novelOutline.targetChapters !== targetChapters || !state.volumePlanChecked) {
-    throw new NovelPipelineError('PREREQUISITE_MISSING', '分卷大纲尚未通过质量门禁，不能生成章节情节')
+    throw new NovelPipelineError('PREREQUISITE_MISSING', '分卷大纲尚未通过质量门禁，不能生成章节大纲')
   }
   const volumePlan = validateVolumePlan(state.novelOutline.volumePlan, targetChapters)
   await ensurePleasureEngineMatchesVolumePlan(workId, goal, volumePlan, signal, onProgress)
@@ -2960,14 +3150,42 @@ export async function generateNextNovelOutlineBatch(
     alignedState.checkedBodyVolumes
   )
 
-  const checkCompletedVolume = async (contract: NovelVolumeContract): Promise<{ volume: string; score: number; rounds: number }> => {
+  const checkCompletedVolume = async (contract: NovelVolumeContract): Promise<{
+    volume: string
+    score: number
+    rounds: number
+    deferredIssues?: number
+  }> => {
     updateNovelGoalState(workId, { pendingChapterVolumeGate: contract.name })
     const result = await runVolumeChapterGate(workId, goal, contract, signal, onProgress)
     const latest = readNovelGoalState(workId)
+    const deferred = latest.volumeGateDeferredIssues?.find(item => item.volume === contract.name)
+    const volumeRows = volumeChapterDAO.listVolumes(workId)
+    const completedVolume = volumeRows.find(item => item.name === contract.name)
+    const snapshotFingerprint = completedVolume
+      ? volumeGateSnapshotFingerprint(volumeChapterDAO.listChapters(completedVolume.id))
+      : ''
+    const gateResult = {
+      volume: contract.name,
+      status: result.deferredIssues ? 'deferred' as const : 'passed' as const,
+      score: result.score,
+      rounds: result.rounds,
+      completedAt: new Date().toISOString(),
+      snapshotFingerprint,
+      reason: deferred?.reason,
+      issues: deferred?.issues ?? []
+    }
     updateNovelGoalState(workId, {
       pendingChapterVolumeGate: undefined,
       chapterVolumeGateCheckpoint: undefined,
-      checkedChapterVolumes: [...new Set([...(latest.checkedChapterVolumes ?? []), contract.name])]
+      checkedChapterVolumes: [...new Set([...(latest.checkedChapterVolumes ?? []), contract.name])],
+      volumeGateDeferredIssues: result.deferredIssues
+        ? latest.volumeGateDeferredIssues
+        : (latest.volumeGateDeferredIssues ?? []).filter(item => item.volume !== contract.name),
+      chapterVolumeGateResults: [
+        ...(latest.chapterVolumeGateResults ?? []).filter(item => item.volume !== contract.name),
+        gateResult
+      ]
     })
     return { volume: contract.name, ...result }
   }
@@ -3013,7 +3231,7 @@ export async function generateNextNovelOutlineBatch(
   )
   const end = batchProfile.end
   const volumeFingerprint = createHash('sha256').update(JSON.stringify(volume)).digest('hex')
-  onProgress?.(`正在生成章节情节第 ${start}-${end} 章（剩余 ${targetChapters - existing.length} 章）`)
+  onProgress?.(`正在生成章节大纲第 ${start}-${end} 章（剩余 ${targetChapters - existing.length} 章）`)
   let correction = state.failure?.phase === 'generate_beats' ? state.failure.message : undefined
   const pendingSkeletons = state.pendingChapterSkeletonBatch
   const canResumeSkeletons = pendingSkeletons?.volumeName === volume.name

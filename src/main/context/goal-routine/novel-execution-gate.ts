@@ -450,7 +450,9 @@ export async function assessNovelExecutionCandidate(
         'covered/partial 的 evidence_ids 只能选择候选正文中实际列出的 C 编号；不要复制原文，不要使用上一章的 P 编号。',
         'missing 的 evidence_ids 返回空数组。一个验收项可引用多个不连续的 C 编号。',
         'forbidden_violations 每项必须返回 description 和当前正文 C evidence_ids；continuity_blockers 每项必须返回 description 和相关 C/P evidence_ids。没有问题就返回空数组。',
-        'partial 表示事件出现但关键动作、阻力、选择或结果只被一句概括。missing 或 partial 都会阻止提交。',
+        'partial 只表示合同要求的关键动作、选择或结果确实缺少；动作链分散在多个句段、使用同义表达或与下一验收项连续衔接，不得因此判 partial。',
+        '若正文通过可定位动作表现出目标结果（例如藏匿、遮盖、压住物资已经实现“保住物资”），即使没有复述合同原句也应判 covered。',
+        '相邻验收项存在先后转折时分别按各自阶段判断，例如先避战保护物资、后被迫交战；不得因为后续行为不同而否定前一阶段已经完成的动作。missing 或 partial 都会阻止提交。',
         '以下情况必须 continuity_blockers：开头复述上一章；时间地点无过渡跳变；人物位置、伤势、资源或知情状态无来源变化；上一章未完成动作被跳过；结尾越过合同落点。',
         '不要按关键词机械匹配，要判断语义事件是否真实发生。只输出 JSON。'
       ].join('\n'),

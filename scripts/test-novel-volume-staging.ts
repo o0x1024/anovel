@@ -12,6 +12,7 @@ import {
   chapterSkeletonBatchSchema,
   chapterStructureContractSchema,
   checkNovelVolumeRepairBudget,
+  isActionableNovelVolumeGateIssue,
   locateNovelVolumeGateEvidenceFragments,
   missingChapterStructureFields,
   planNovelChapterBatch,
@@ -19,6 +20,7 @@ import {
   planNovelVolumeRanges,
   replaceUniqueRepairText,
   resolveNovelVolumeWorkflowCheckpoint,
+  shouldDeferNovelVolumeGateIssues,
   selectDeterministicNovelRepairChapterNumbers,
   selectNovelVolumeGateRepairTargets,
   validatePartialVolumePlan,
@@ -31,7 +33,13 @@ import {
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  resolveNovelPreparationPhase,
+  selectDeferredNovelExecutionCandidate,
   selectReusableNovelExecutionCandidate,
+  shouldContinueNovelAfterVolumeRepairBoundary,
+  shouldDeferNovelChapterAcceptance,
+  shouldDeferNovelQualityCandidate,
+  shouldExtendNovelConstructionBudget,
   shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from '../src/main/context/goal-routine/novel-goal-policy'
@@ -41,6 +49,96 @@ import {
 } from '../src/main/context/step-prompt-policy'
 
 const targetChapters = 260
+
+assert.equal(isActionableNovelVolumeGateIssue({
+  code: 'STATE_CONTINUITY_BREAK',
+  problem: '下一章未明确说明是同一枚孢尘弹，重复描述造成状态断层',
+  requiredFix: '明确这是上一章状态的延续，避免重复描述',
+  evidenceChapterNumbers: [11, 12, 13]
+}), false)
+assert.equal(isActionableNovelVolumeGateIssue({
+  code: 'CAST_CONTINUITY_BREAK',
+  problem: '没有交代尸体是否被发现',
+  requiredFix: '补充尸体处理说明',
+  evidenceChapterNumbers: [7, 8]
+}), false)
+assert.equal(isActionableNovelVolumeGateIssue({
+  code: 'STATE_CONTINUITY_BREAK',
+  problem: '前章明确角色死亡，后章明确角色存活，状态事实互斥',
+  requiredFix: '修正后章状态以服从已冻结事实',
+  evidenceChapterNumbers: [3, 8]
+}), true)
+assert.equal(isActionableNovelVolumeGateIssue({
+  code: 'STATE_CONTINUITY_BREAK',
+  problem: '单章状态描述可能存在问题',
+  requiredFix: '优化描述',
+  evidenceChapterNumbers: [8]
+}), false)
+const modelResidualIssue = {
+  source: 'model' as const,
+  severity: 'hard' as const,
+  code: 'STATE_CONTINUITY_BREAK',
+  problem: '模型残留问题',
+  repairChapterNumbers: [26],
+  evidence: [{ chapterNumber: 26, quote: '证据文本' }],
+  requiredFix: '后续定点复核'
+}
+assert.equal(shouldDeferNovelVolumeGateIssues({
+  score: 92,
+  issues: [modelResidualIssue],
+  deterministicIssueCount: 0
+}), true)
+assert.equal(shouldDeferNovelVolumeGateIssues({
+  score: 89,
+  issues: [modelResidualIssue],
+  deterministicIssueCount: 0
+}), true)
+assert.equal(shouldDeferNovelVolumeGateIssues({
+  score: 92,
+  issues: [{ ...modelResidualIssue, source: 'deterministic' }],
+  deterministicIssueCount: 1
+}), true)
+assert.equal(shouldDeferNovelVolumeGateIssues({
+  score: 0,
+  issues: [],
+  deterministicIssueCount: 0
+}), false)
+
+const completePreparation = {
+  settingsReady: true,
+  characterCardsReady: true,
+  emotionEngineReady: true,
+  settingsGateReady: true,
+  volumePlanReady: true,
+  hasChapters: false
+}
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'goal_check',
+  settingsReady: false
+}), 'materialize_settings')
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'generate_beats',
+  characterCardsReady: false
+}), 'generate_character_cards')
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'generate_beats',
+  volumePlanReady: false
+}), 'generate_volumes')
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'generate_beats'
+}), 'generate_beats')
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'goal_check',
+  hasChapters: true,
+  settingsReady: false,
+  volumePlanReady: false
+}), 'goal_check')
+
 const ranges = planNovelVolumeRanges(targetChapters)
 assert.equal(ranges.length, 6)
 assert.deepEqual(ranges[0], { startChapter: 1, endChapter: 44 })
@@ -215,6 +313,90 @@ const reusableCandidate = selectReusableNovelExecutionCandidate([
   wordMax: 2200
 })
 assert.equal(reusableCandidate?.version_number, 27)
+const deferredCandidate = selectDeferredNovelExecutionCandidate([
+  {
+    version_number: 49,
+    outline: '本章大纲',
+    content: '隐藏物资后避战，随后被迫迎战。',
+    word_count: 2048,
+    model_type: 'novel_execution_candidate',
+    generation_round: 3,
+    snapshot_json: JSON.stringify({
+      contractHash: 'contract-v1',
+      gate: {
+        blockers: ['情节仅部分落地：R001 保护物资'],
+        coverage: [
+          { verdict: 'partial', evidenceIds: ['C003', 'C004'] },
+          { verdict: 'covered', evidenceIds: ['C010'] }
+        ],
+        forbiddenViolations: []
+      }
+    })
+  },
+  {
+    version_number: 50,
+    outline: '本章大纲',
+    content: '缺少关键情节。',
+    word_count: 2000,
+    model_type: 'novel_execution_candidate',
+    generation_round: 3,
+    snapshot_json: JSON.stringify({
+      contractHash: 'contract-v1',
+      gate: {
+        blockers: ['情节缺失：R001 保护物资'],
+        coverage: [{ verdict: 'missing', evidenceIds: [] }],
+        forbiddenViolations: []
+      }
+    })
+  }
+], {
+  outline: '本章大纲',
+  contractHash: 'contract-v1',
+  wordMin: 1800,
+  wordMax: 2200
+})
+assert.equal(deferredCandidate?.candidate.version_number, 49)
+assert.deepEqual(deferredCandidate?.blockers, ['情节仅部分落地：R001 保护物资'])
+assert.equal(selectDeferredNovelExecutionCandidate([
+  {
+    version_number: 51,
+    outline: '本章大纲',
+    content: '虽覆盖情节但发生跨章事实冲突。',
+    word_count: 2000,
+    model_type: 'novel_execution_candidate',
+    snapshot_json: JSON.stringify({
+      contractHash: 'contract-v1',
+      gate: {
+        blockers: ['人物位置与上一章冲突'],
+        coverage: [{ verdict: 'partial', evidenceIds: ['C001'] }],
+        forbiddenViolations: []
+      }
+    })
+  }
+], {
+  outline: '本章大纲',
+  contractHash: 'contract-v1',
+  wordMin: 1800,
+  wordMax: 2200
+}), undefined)
+assert.equal(shouldDeferNovelChapterAcceptance({
+  score: 85,
+  failureLayer: 'scene',
+  hardDimensionScores: [81, 79, 88, 80, 84, 86]
+}), true)
+assert.equal(shouldDeferNovelChapterAcceptance({
+  score: 85,
+  failureLayer: 'continuity',
+  hardDimensionScores: [81, 79, 88, 80, 84, 86]
+}), false)
+assert.equal(shouldDeferNovelChapterAcceptance({
+  score: 85,
+  failureLayer: 'scene',
+  hardDimensionScores: [81, 64, 88, 80, 84, 86]
+}), false)
+assert.equal(shouldDeferNovelQualityCandidate({ score: 93, hardFail: false }), true)
+assert.equal(shouldDeferNovelQualityCandidate({ score: 64, hardFail: false }), false)
+assert.equal(shouldDeferNovelQualityCandidate({ score: 93, hardFail: true }), false)
 const repairedFrontier = selectReusableNovelExecutionCandidate([
   {
     version_number: 4,
@@ -382,6 +564,27 @@ assert.equal(MAX_AUTO_NOVEL_REPAIR_CHAPTERS, 8)
 assert.equal(isTerminalNovelRepairError('REPAIR_STALL'), true)
 assert.equal(isTerminalNovelRepairError('REPAIR_BOUNDARY'), true)
 assert.equal(isTerminalNovelRepairError('OUTPUT_INVALID'), false)
+assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
+  phase: 'generate_beats', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: true
+}), true)
+assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
+  phase: 'generate_beats', errorCode: 'REPAIR_BOUNDARY', hasVolumeCheckpoint: true
+}), true)
+assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
+  phase: 'draft_body', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: true
+}), false)
+assert.equal(shouldExtendNovelConstructionBudget({
+  turn: 1000, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 800, completedBodies: 400
+}), true)
+assert.equal(shouldExtendNovelConstructionBudget({
+  turn: 1000, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 800, completedBodies: 800
+}), false)
+assert.equal(shouldExtendNovelConstructionBudget({
+  turn: 999, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 400, completedBodies: 0
+}), false)
+assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
+  phase: 'generate_beats', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: false
+}), false)
 assert.equal(isNovelChapterReadyForTransition({
   qualityReady: true,
   emotionReady: true,

@@ -3,7 +3,7 @@
  *
  * 与短故事差异：
  * 1. 跳过短故事孵化器阶段（incubate_outline / incubator_gate / freeze_storyline），
- *    小说直接复用作品已有的分卷/章节结构或生成分卷大纲与章节情节。
+ *    小说直接复用作品已有的分卷/章节结构或生成分卷大纲与章节大纲。
  * 2. 正文生成按「章」而非「拍」走 novel 正文 prompt。
  * 3. 验收逻辑复用 story-goal-checker（维度通用）。
  *
@@ -11,8 +11,8 @@
  *   materialize_settings → 沉淀核心设定
  *   generate_character_cards → 生成主角人设卡片
  *   generate_volumes → 生成、诊断并冻结全书分卷大纲
- *   generate_beats ⇄ draft_body → 按卷交错生成章节情节与正文，卷末冻结后再开下一卷
- *   generate_title_hook → 首卷章节情节冻结后生成爆款书名与导语
+ *   generate_beats ⇄ draft_body → 按卷交错生成章节大纲与正文，卷末冻结后再开下一卷
+ *   generate_title_hook → 首卷章节大纲冻结后生成爆款书名与导语
  *   overall_self_check → 核心设定整体自检
  *   goal_check → 全书只读终审；未通过时冻结正文并暂停
  *   repair_plan / repair_execute → 仅在用户显式继续时修复全书尾部安全窗口
@@ -24,6 +24,7 @@ import { modelService } from '../../model'
 import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
 import { buildWorkContext } from '../work-context'
 import {
+  loadCharacterCards,
   parseCharacterCardsFromAi,
   sanitizeCharacterCards,
   saveCharacterCards,
@@ -77,6 +78,7 @@ import {
   prepareNovelVolumePlan,
   NovelPipelineError,
   readNovelGoalState,
+  reopenStalledNovelVolumeGate,
   resetNovelGoalStateFromVolumePlan,
   resolveNovelVolumeWorkflowCheckpoint,
   updateNovelGoalState,
@@ -98,6 +100,11 @@ import {
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  resolveNovelPreparationPhase,
+  shouldContinueNovelAfterVolumeRepairBoundary,
+  shouldExtendNovelConstructionBudget,
+  shouldDeferNovelChapterAcceptance,
+  shouldDeferNovelQualityCandidate,
   shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from './novel-goal-policy'
@@ -159,6 +166,38 @@ const MAX_SETTING_GENERATION_ROUNDS = 4
 const MAX_CHAPTER_QUALITY_ROUNDS = 4
 const MAX_CHAPTER_CONVERGENCE_ROUNDS = 3
 const MAX_REPAIR_STALL_ROUNDS = 3
+
+function safeNovelPreparationPhase(workId: number, requestedPhase: Phase, goal: string): Phase {
+  const mainline = coreSettingDAO.getByType(workId, 'main_plotline')?.content?.trim()
+    || coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
+    || ''
+  const requiredSettingTypes = shouldSkipGoldenFingerForNovel(goal, mainline)
+    ? NOVEL_SETTING_TYPES.filter(type => type !== 'golden_finger')
+    : [...NOVEL_SETTING_TYPES]
+  const settingsReady = requiredSettingTypes.every(type => Boolean(coreSettingDAO.getByType(workId, type)?.content?.trim()))
+  const cards = loadCharacterCards(workId)
+  const characterCardsReady = cards.length > 0 && validateCharacterCards(cards).valid
+  const emotionEngineReady = Boolean(coreSettingDAO.getByType(workId, 'emotion_engine')?.content?.trim())
+  const settingsGateReady = getSettingsQualityStatus(workId).canProceed
+  const targetChapters = loadWritingPlan(workId).targetChapters
+  const runtime = readNovelGoalState(workId)
+  const volumePlanReady = Boolean(
+    runtime.novelOutline
+    && runtime.novelOutline.targetChapters === targetChapters
+    && runtime.volumePlanChecked
+  )
+  const hasChapters = volumeChapterDAO.listChaptersByWork(workId).length > 0
+  return resolveNovelPreparationPhase({
+    requestedPhase,
+    settingsReady,
+    characterCardsReady,
+    emotionEngineReady,
+    settingsGateReady,
+    volumePlanReady,
+    hasChapters
+  }) as Phase
+}
+
 function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean {
   const text = `${goal}\n${mainline}`.trim()
   if (!text) return false
@@ -518,7 +557,7 @@ async function diagnoseAndFixUntilPass(
   qualityMetricMins: Record<QualityAiMetricKey, number>,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ passed: boolean; finalScore: number; rounds: number; failedMetrics: string[] }> {
+): Promise<{ passed: boolean; deferred?: boolean; finalScore: number; rounds: number; failedMetrics: string[] }> {
   let rounds = 0
   let bestScore = -1
   const failedMetrics: string[] = []
@@ -690,6 +729,21 @@ async function diagnoseAndFixUntilPass(
     }
     failedMetrics.splice(0, failedMetrics.length, ...bestCandidate.blockingFailures)
     bestScore = bestCandidate.scoreTotal
+    if (shouldDeferNovelQualityCandidate({
+      score: bestCandidate.scoreTotal,
+      hardFail: bestCandidate.hardFail
+    })) {
+      onProgress?.(
+        `「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」无识别硬伤，采用本轮最佳候选 ${bestCandidate.scoreTotal} 分并将软指标转入质量债务`
+      )
+      return {
+        passed: true,
+        deferred: true,
+        finalScore: bestScore,
+        rounds,
+        failedMetrics: [...new Set(failedMetrics)]
+      }
+    }
   }
   onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」连续 ${MAX_CHAPTER_QUALITY_ROUNDS} 轮未通过质量门禁`)
   return { passed: false, finalScore: bestScore, rounds, failedMetrics: [...new Set(failedMetrics)] }
@@ -730,9 +784,17 @@ export async function runChapterAcceptanceGate(
   config: StoryGoalConfig,
   signal?: AbortSignal,
   onProgress?: (message: string) => void
-): Promise<{ passed: boolean; qualityScore: number; rounds: number; failedMetrics: string[] }> {
+): Promise<{
+  passed: boolean
+  deferred?: boolean
+  qualityScore: number
+  emotionScore?: number
+  rounds: number
+  failedMetrics: string[]
+}> {
   let totalQualityRounds = 0
   let qualityScore = -1
+  let qualityDeferred = false
   const failures: string[] = []
 
   for (let convergenceRound = 1; convergenceRound <= MAX_CHAPTER_CONVERGENCE_ROUNDS; convergenceRound++) {
@@ -751,6 +813,7 @@ export async function runChapterAcceptanceGate(
       if (!quality.passed) {
         return { passed: false, qualityScore, rounds: totalQualityRounds, failedMetrics: [...new Set(failures)] }
       }
+      qualityDeferred = Boolean(quality.deferred)
     }
 
     const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma', [chapterId])
@@ -763,10 +826,43 @@ export async function runChapterAcceptanceGate(
     const assessment = await assessChapterEmotion(workId, chapterId, chapter?.content ?? '', signal, true)
     if (assessment.passed) {
       onProgress?.(`「${chapter?.title ?? chapterId}」质量与情绪门禁均已通过`)
-      return { passed: true, qualityScore, rounds: totalQualityRounds, failedMetrics: [] }
+      return {
+        passed: true,
+        deferred: qualityDeferred,
+        qualityScore,
+        emotionScore: assessment.score,
+        rounds: totalQualityRounds,
+        failedMetrics: qualityDeferred ? [...new Set(failures)] : []
+      }
     }
 
     failures.push(`情绪门禁 ${assessment.score}分/${assessment.failure_layer}层`)
+    const hardEmotionScores = [
+      assessment.attachment_score,
+      assessment.causal_earnedness_score,
+      assessment.inferability_score,
+      assessment.modulation_score,
+      assessment.residue_score,
+      assessment.target_alignment_score
+    ]
+    const safeSoftEmotionDebt = shouldDeferNovelChapterAcceptance({
+      score: assessment.score,
+      failureLayer: assessment.failure_layer,
+      hardDimensionScores: hardEmotionScores
+    })
+    if (safeSoftEmotionDebt) {
+      onProgress?.(
+        `「${chapter?.title ?? chapterId}」情绪承重维度均高于硬伤线，剩余 ${assessment.failure_layer} 层问题转入质量债务并继续`
+      )
+      return {
+        passed: true,
+        deferred: true,
+        qualityScore,
+        emotionScore: assessment.score,
+        rounds: totalQualityRounds,
+        failedMetrics: [...new Set(failures)]
+      }
+    }
     if (convergenceRound === MAX_CHAPTER_CONVERGENCE_ROUNDS) break
     onProgress?.(
       `「${chapter?.title ?? chapterId}」情绪门禁未通过（${assessment.score}分），正在修订并重新执行质量门禁`
@@ -786,6 +882,7 @@ export async function runChapterAcceptanceGate(
   return {
     passed: false,
     qualityScore,
+    emotionScore: undefined,
     rounds: totalQualityRounds,
     failedMetrics: [...new Set(failures)]
   }
@@ -1347,6 +1444,15 @@ export async function runNovelGoalLoop(
   bindGoalLoopModelOpts(workId, fullConfig)
 
   goalRoutineDAO.ensure(workId)
+  if (resume && phase === 'generate_beats' && reopenStalledNovelVolumeGate(workId)) {
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase,
+      action: 'repair_stall_resume',
+      summary: '用户显式断点续跑：保留章节、候选版本和累计改写预算，重新执行只读分卷诊断'
+    })
+  }
   const hasNoNovelStructure = volumeChapterDAO.listVolumes(workId).length === 0
     && volumeChapterDAO.listChaptersByWork(workId).length === 0
   if (!resume && explicitPhase === 'generate_volumes' && hasNoNovelStructure) {
@@ -1429,6 +1535,50 @@ export async function runNovelGoalLoop(
         goalRoutineDAO.setStatus(workId, 'cancelled')
         emit('已取消', 'cancelled')
         return
+      }
+
+      const requestedPhase = phase
+      const prerequisitePhase = safeNovelPreparationPhase(workId, requestedPhase, fullConfig.goalDescription)
+      if (prerequisitePhase !== requestedPhase) {
+        phase = prerequisitePhase
+        updateNovelGoalState(workId, { failure: undefined })
+        goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+        goalRoutineDAO.appendTurn({
+          work_id: workId,
+          turn_no: turn,
+          phase,
+          action: 'prerequisite_redirect',
+          summary: `「${requestedPhase}」前置条件未完成，自动回退到「${prerequisitePhase}」；保留已有正文、章节与版本`
+        })
+        emit(`检测到「${requestedPhase}」前置条件未完成，已无损回退到「${prerequisitePhase}」`, 'running')
+        continue
+      }
+
+      const expectedChapters = loadWritingPlan(workId).targetChapters
+      const constructionChapters = volumeChapterDAO.listChaptersByWork(workId)
+      const completedBodies = constructionChapters.filter(chapter => Boolean(chapter.content?.trim())).length
+      if (shouldExtendNovelConstructionBudget({
+        turn,
+        maxTurns: fullConfig.maxTurns,
+        expectedChapters,
+        outlinedChapters: constructionChapters.length,
+        completedBodies
+      })) {
+        const previousLimit = fullConfig.maxTurns
+        fullConfig.maxTurns += Math.max(100, expectedChapters)
+        goalRoutineDAO.update(workId, {
+          max_turns: fullConfig.maxTurns,
+          goal_config_json: JSON.stringify(fullConfig)
+        })
+        goalRoutineDAO.appendTurn({
+          work_id: workId,
+          turn_no: turn,
+          phase,
+          action: 'construction_budget_extended',
+          summary: `整本尚未生成完成，施工预算从 ${previousLimit} 自动续展到 ${fullConfig.maxTurns} 轮（大纲 ${constructionChapters.length}/${expectedChapters}，正文 ${completedBodies}/${expectedChapters}）`
+        })
+        emit(`整本尚未完成，已自动续展施工预算至 ${fullConfig.maxTurns} 轮`, 'running')
+        continue
       }
 
       if (turn >= fullConfig.maxTurns) {
@@ -1576,7 +1726,7 @@ export async function runNovelGoalLoop(
             action: 'volumes',
             summary: `分卷大纲已冻结：${result.volumes} 卷${result.revised ? '，经门禁整体修订' : ''}`
           })
-          emit(`分卷大纲完成：${result.volumes} 卷，进入章节情节`, 'running')
+          emit(`分卷大纲完成：${result.volumes} 卷，进入章节大纲`, 'running')
           phase = 'generate_beats'
         } else if (phase === 'generate_beats') {
           const reconciled = reconcileNovelWorkflowState(workId)
@@ -1621,31 +1771,36 @@ export async function runNovelGoalLoop(
             phase = outlineState.titleHookApplied ? 'draft_body' : 'generate_title_hook'
             emit(
               outlineState.titleHookApplied
-                ? '当前分卷章节情节已冻结，转入该卷正文生成'
-                : '首卷章节情节已冻结，先生成书名导语再写正文',
+                ? '当前分卷章节大纲已冻结，转入该卷正文生成'
+                : '首卷章节大纲已冻结，先生成书名导语再写正文',
               'running'
             )
             continue
           }
           if (workflow?.kind === 'complete') {
             phase = 'goal_check'
-            emit('全部分卷章节情节、正文及卷末检查点均已冻结，进入整书目标验收', 'running')
+            emit('全部分卷章节大纲、正文及卷末检查点均已冻结，进入整书目标验收', 'running')
             continue
           }
           const res = await generateNextNovelOutlineBatch(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           goalRoutineDAO.appendTurn({
             work_id: workId, turn_no: turn, phase, action: 'beats',
             summary: res.created > 0
-              ? `生成章节情节 ${res.range?.start}-${res.range?.end}，剩余 ${res.remaining} 章${res.volumeGate ? `；「${res.volumeGate.volume}」整卷门禁通过（${res.volumeGate.score}分，${res.volumeGate.rounds}轮）` : ''}`
-              : `章节情节完整，复用 ${res.reused} 章`
+              ? `生成章节大纲 ${res.range?.start}-${res.range?.end}，剩余 ${res.remaining} 章${res.volumeGate ? `；「${res.volumeGate.volume}」整卷门禁${res.volumeGate.deferredIssues ? `安全冻结并延后 ${res.volumeGate.deferredIssues} 项模型问题` : '通过'}（${res.volumeGate.score}分，${res.volumeGate.rounds}轮）` : ''}`
+              : `章节大纲完整，复用 ${res.reused} 章`
           })
           if (res.volumeGate) {
-            emit(`「${res.volumeGate.volume}」章节情节门禁通过：${res.volumeGate.score}分`, 'running')
+            emit(
+              res.volumeGate.deferredIssues
+                ? `「${res.volumeGate.volume}」已安全冻结：${res.volumeGate.score}分，${res.volumeGate.deferredIssues} 项模型问题转入延后修复账本`
+                : `「${res.volumeGate.volume}」章节大纲门禁通过：${res.volumeGate.score}分`,
+              'running'
+            )
           }
           emit(res.volumeReadyForDraft
-            ? `「${res.volumeReadyForDraft}」章节情节已冻结，转入该卷正文；全书剩余 ${res.remaining} 章待滚动规划`
+            ? `「${res.volumeReadyForDraft}」章节大纲已冻结，转入该卷正文；全书剩余 ${res.remaining} 章待滚动规划`
             : res.complete
-              ? `章节情节已完整生成，共 ${res.created + res.reused} 章`
+              ? `章节大纲已完整生成，共 ${res.created + res.reused} 章`
               : `本批生成 ${res.created} 章，剩余 ${res.remaining} 章`, 'running')
           const state = readNovelGoalState(workId)
           phase = nextPhaseAfterNovelOutlineCheckpoint({
@@ -1677,7 +1832,7 @@ export async function runNovelGoalLoop(
               workflow.kind === 'outline_gate'
                 ? `「${workflow.volume.name}」章节门禁尚未通过，禁止生成正文`
                 : workflow.kind === 'generate_outline'
-                  ? `「${workflow.volume.name}」章节情节尚未完整，禁止生成正文`
+                  ? `「${workflow.volume.name}」章节大纲尚未完整，禁止生成正文`
                   : workflow.kind === 'body_gate'
                     ? `「${workflow.volume.name}」正文完整，先执行卷末检查点`
                     : '全部分卷已冻结，进入整书目标验收',
@@ -1690,7 +1845,7 @@ export async function runNovelGoalLoop(
             phase = phaseAfterCurrentDraftWindow(workId)
             emit(
               phase === 'generate_beats'
-                ? '当前分卷正文已冻结，开始滚动规划下一卷章节情节'
+                ? '当前分卷正文已冻结，开始滚动规划下一卷章节大纲'
                 : '正文已全部生成，进入只读整书目标验收',
               'running'
             )
@@ -1726,6 +1881,30 @@ export async function runNovelGoalLoop(
                 target_chapter_id: chapter.id,
                 summary: `生成候选正文「${chapter.title}」${gen.wordCount}字，叙事记忆尚未提交`
               })
+              if (gen.deferredExecution) {
+                const currentState = readNovelGoalState(workId)
+                const previous = currentState.chapterExecutionDeferredIssues ?? []
+                updateNovelGoalState(workId, {
+                  chapterExecutionDeferredIssues: [
+                    ...previous.filter(item => item.chapterId !== chapter.id),
+                    {
+                      chapterId: chapter.id,
+                      chapterTitle: chapter.title,
+                      sourceVersionNumber: gen.deferredExecution.sourceVersionNumber,
+                      blockers: gen.deferredExecution.blockers,
+                      deferredAt: new Date().toISOString()
+                    }
+                  ]
+                })
+                goalRoutineDAO.appendTurn({
+                  work_id: workId,
+                  turn_no: turn,
+                  phase,
+                  action: 'chapter_execution_deferred_continue',
+                  target_chapter_id: chapter.id,
+                  summary: `「${chapter.title}」采用候选 v${gen.deferredExecution.sourceVersionNumber}：全部情节点已有证据，仅剩软验收债务，停止重复改写并继续整本生成`
+                })
+              }
               emit(`生成候选正文「${chapter.title}」${gen.wordCount}字，开始执行质量与情绪门禁`, 'running')
             } else {
               goalRoutineDAO.appendTurn({
@@ -1760,6 +1939,33 @@ export async function runNovelGoalLoop(
                 `「${chapter.title}」累计诊断 ${acceptance.rounds} 轮仍未通过质量与情绪联合门禁，已保留最佳正文并禁止进入下一章`
                 + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
               )
+            }
+
+            if (acceptance.deferred) {
+              const currentState = readNovelGoalState(workId)
+              const previous = currentState.chapterAcceptanceDeferredIssues ?? []
+              updateNovelGoalState(workId, {
+                chapterAcceptanceDeferredIssues: [
+                  ...previous.filter(item => item.chapterId !== chapter.id),
+                  {
+                    chapterId: chapter.id,
+                    chapterTitle: chapter.title,
+                    qualityScore: acceptance.qualityScore,
+                    emotionScore: acceptance.emotionScore,
+                    failedMetrics: acceptance.failedMetrics,
+                    deferredAt: new Date().toISOString()
+                  }
+                ]
+              })
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'chapter_acceptance_deferred_continue',
+                target_chapter_id: chapter.id,
+                score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
+                summary: `「${chapter.title}」无硬伤，软质量/情绪问题转入延后账本，继续生成下一章：${acceptance.failedMetrics.join('、')}`
+              })
             }
 
             const finalMemory = await finalizeNovelChapterMemory(
@@ -1814,6 +2020,19 @@ export async function runNovelGoalLoop(
             controller.signal,
             msg => emit(msg, 'running')
           )
+          const deferredVolumeIssues = readNovelGoalState(workId).volumeGateDeferredIssues ?? []
+          const deferredIssueCount = deferredVolumeIssues.reduce((sum, item) => sum + item.issues.length, 0)
+          if (deferredIssueCount > 0) {
+            lastCheck = {
+              ...lastCheck,
+              met: false,
+              gateBlockers: lastCheck.gateBlockers + deferredIssueCount,
+              reasons: [
+                ...lastCheck.reasons,
+                `分卷质量债务待终审：${deferredVolumeIssues.length} 卷 / ${deferredIssueCount} 项`
+              ]
+            }
+          }
           updateNovelGoalState(workId, { lastCheck })
           goalRoutineDAO.update(workId, {
             last_quality_score: lastCheck.qualityScore >= 0 ? lastCheck.qualityScore : null,
@@ -1827,7 +2046,7 @@ export async function runNovelGoalLoop(
 
           const expectedChapters = loadWritingPlan(workId).targetChapters
           if (expectedChapters > 0 && lastCheck.totalBeats < expectedChapters) {
-            emit(`章节数量不完整：${lastCheck.totalBeats}/${expectedChapters}，返回章节情节生成`, 'running')
+            emit(`章节数量不完整：${lastCheck.totalBeats}/${expectedChapters}，返回章节大纲生成`, 'running')
             phase = 'generate_beats'
             continue
           }
@@ -1990,6 +2209,12 @@ export async function runNovelGoalLoop(
           : e instanceof NovelPipelineError
             ? e.code
             : e instanceof Error ? e.name : 'unknown'
+        const expectedConstructionChapters = loadWritingPlan(workId).targetChapters
+        const constructionRows = volumeChapterDAO.listChaptersByWork(workId)
+        const completedConstructionBodies = constructionRows.filter(chapter => Boolean(chapter.content?.trim())).length
+        const keepConstructionRunning = expectedConstructionChapters > 0
+          && (constructionRows.length < expectedConstructionChapters || completedConstructionBodies < expectedConstructionChapters)
+          && !['goal_check', 'repair_plan', 'repair_execute'].includes(attemptedPhase)
         const signature = novelPhaseFailureSignature(attemptedPhase, errorCode, msg)
         const failureCount = currentFailure?.phase === attemptedPhase && currentFailure.signature === signature
           ? currentFailure.count + 1
@@ -2000,7 +2225,47 @@ export async function runNovelGoalLoop(
         const pendingChapterGate = attemptedPhase === 'generate_beats'
           ? readNovelGoalState(workId).pendingChapterVolumeGate
           : undefined
+        if (errorCode === 'PREREQUISITE_MISSING') {
+          const prerequisitePhase = safeNovelPreparationPhase(workId, attemptedPhase, fullConfig.goalDescription)
+          if (prerequisitePhase !== attemptedPhase) {
+            phase = prerequisitePhase
+            updateNovelGoalState(workId, { failure: undefined })
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'prerequisite_redirect',
+              summary: `前置条件缺失，已从「${attemptedPhase}」无损回退到「${phase}」：${msg}`
+            })
+            emit(`前置条件缺失，已回退到「${phase}」继续：${msg}`, 'running')
+            continue
+          }
+          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'prerequisite_pause',
+            summary: `前置条件缺失，已暂停且不重复空转：${msg}`
+          })
+          emit(`前置条件缺失，已保存断点并暂停：${msg}`, 'paused')
+          return
+        }
         if (errorCode === 'EVALUATOR_PROTOCOL') {
+          if (keepConstructionRunning) {
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase: attemptedPhase,
+              action: 'construction_evaluator_retry',
+              summary: `整本施工尚未完成，保留章节候选并继续重试评估协议：${msg}`
+            })
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+            emit(`评估协议异常，已保留候选并继续整本施工：${msg}`, 'running')
+            await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 2_000 * failureCount)))
+            continue
+          }
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({
             work_id: workId,
@@ -2012,7 +2277,80 @@ export async function runNovelGoalLoop(
           emit(`章节候选已保留；评估器证据协议连续失败，已暂停且不会改写正文：${msg}`, 'paused')
           return
         }
+        const boundaryState = readNovelGoalState(workId)
+        const boundaryVolumeName = boundaryState.pendingChapterVolumeGate ?? boundaryState.chapterVolumeGateCheckpoint?.volume
+        if (shouldContinueNovelAfterVolumeRepairBoundary({
+          phase: attemptedPhase,
+          errorCode,
+          hasVolumeCheckpoint: Boolean(boundaryVolumeName)
+        })) {
+          const runtime = boundaryState
+          const checkpoint = runtime.chapterVolumeGateCheckpoint
+          const volumeName = boundaryVolumeName
+          if (volumeName) {
+            const issues = [
+              ...(checkpoint?.assessments.flatMap(item => item.issues) ?? []),
+              ...(checkpoint?.aggregate?.issues ?? []),
+              ...(checkpoint?.repair?.clusters.flatMap(cluster => cluster.issues) ?? [])
+            ]
+            const scores = [
+              ...(checkpoint?.assessments.map(item => item.score) ?? []),
+              ...(checkpoint?.aggregate ? [checkpoint.aggregate.score] : [])
+            ]
+            const score = scores.length > 0
+              ? Math.round(scores.reduce((sum, value) => sum + value, 0) / scores.length)
+              : 0
+            const previousDebt = runtime.volumeGateDeferredIssues ?? []
+            updateNovelGoalState(workId, {
+              failure: undefined,
+              pendingChapterVolumeGate: undefined,
+              chapterVolumeGateCheckpoint: undefined,
+              checkedChapterVolumes: [...new Set([...(runtime.checkedChapterVolumes ?? []), volumeName])],
+              volumeGateDeferredIssues: [
+                ...previousDebt.filter(item => item.volume !== volumeName),
+                {
+                  volume: volumeName,
+                  score,
+                  rounds: checkpoint?.round ?? 0,
+                  reason: msg,
+                  deferredAt: new Date().toISOString(),
+                  issues: issues.map(issue => ({
+                    source: issue.source,
+                    code: issue.code,
+                    problem: issue.problem,
+                    repairChapterNumbers: [...issue.repairChapterNumbers],
+                    requiredFix: issue.requiredFix
+                  }))
+                }
+              ]
+            })
+            phase = 'generate_beats'
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'volume_gate_deferred_continue',
+              summary: `分卷「${volumeName}」停止自动改写，质量问题转入延后账本，整本生成继续：${msg}`
+            })
+            emit(`分卷「${volumeName}」已停止自动改写并记录质量债务，继续生成下一阶段`, 'running')
+            continue
+          }
+        }
         if (isTerminalNovelRepairError(errorCode)) {
+          if (keepConstructionRunning) {
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase: attemptedPhase,
+              action: 'construction_boundary_retry',
+              summary: `自动改写已停止但整本施工未完成，保留正文与版本并继续：${msg}`
+            })
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+            emit(`已停止本次越界改写并保留版本，整本施工继续`, 'running')
+            await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 2_000 * failureCount)))
+            continue
+          }
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({
             work_id: workId,
@@ -2030,6 +2368,20 @@ export async function runNovelGoalLoop(
           return
         }
         if (failureCount >= MAX_NOVEL_PHASE_FAILURES) {
+          if (keepConstructionRunning) {
+            updateNovelGoalState(workId, { failure: undefined })
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase: attemptedPhase,
+              action: 'construction_failure_retry',
+              summary: `施工阶段连续 ${failureCount} 次失败，已保留检查点、重置重试窗口并继续：${msg}`
+            })
+            emit(`施工阶段连续失败，已保留检查点并退避后继续，不终止整本生成`, 'running')
+            await new Promise(resolve => setTimeout(resolve, 30_000))
+            continue
+          }
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({
             work_id: workId,
@@ -2052,7 +2404,7 @@ export async function runNovelGoalLoop(
             summary: attemptedPhase === 'generate_beats'
               ? pendingChapterGate
                 ? `分卷「${pendingChapterGate}」章节窗口门禁连续 ${failureCount} 次失败，已保留卷内窗口检查点；下一轮仅重试未完成窗口：${msg}`
-                : `章节情节生成连续 ${failureCount} 次失败，已切换为单章检查点、关闭思考并压缩上下文后继续：${msg}`
+                : `章节大纲生成连续 ${failureCount} 次失败，已切换为单章检查点、关闭思考并压缩上下文后继续：${msg}`
               : attemptedPhase === 'generate_volumes'
               ? /VOLUME_OUTPUT_TRUNCATED|Unterminated string|Unexpected end of JSON/i.test(msg)
                 ? `分卷生成连续 ${failureCount} 次发生输出截断，下一轮将从已保存分卷继续，提高输出预算并强制精简字段：${msg}`
@@ -2063,7 +2415,7 @@ export async function runNovelGoalLoop(
             attemptedPhase === 'generate_beats'
               ? pendingChapterGate
                 ? `分卷「${pendingChapterGate}」窗口门禁失败，已保存卷内检查点并仅重试未完成窗口`
-                : '章节情节连续失败，已切换单章检查点策略并从断点继续'
+                : '章节大纲连续失败，已切换单章检查点策略并从断点继续'
               : attemptedPhase === 'generate_volumes'
               ? /VOLUME_OUTPUT_TRUNCATED|Unterminated string|Unexpected end of JSON/i.test(msg)
                 ? '分卷输出被截断，已提高输出预算并从当前卷继续'

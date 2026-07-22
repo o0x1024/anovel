@@ -21,6 +21,7 @@ import {
   type CausalNarrativeState
 } from '../../../shared/causal-novel-types'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { runCausalOutcomePipeline } from './causal-outcome-pipeline'
 
 const INITIAL_STATE_SCHEMA: Record<string, unknown> = {
   type: 'object', additionalProperties: false,
@@ -280,98 +281,6 @@ function buildDecisionDraftSchema(state: CausalNarrativeState, catalog: CausalEv
       emotionContract: full.properties.emotionContract,
       rollingHorizon: full.properties.rollingHorizon
     }
-  }
-}
-
-const OUTCOME_SCHEMA: Record<string, unknown> = {
-  type: 'object', additionalProperties: false,
-  required: [
-    'summary', 'eventSignature', 'evidenceQuotes', 'advancedPromiseIds', 'resolvedPromiseIds',
-    'newPromises', 'actorUpdates', 'newActors', 'pressureUpdates', 'newPressures', 'arcUpdates',
-    'emotionalOutcome', 'terminalConditionMet', 'matchedTerminalCondition', 'terminalEvidence',
-    'completionReason'
-  ],
-  properties: {
-    summary: { type: 'string' }, eventSignature: { type: 'string' },
-    evidenceQuotes: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string' } },
-    advancedPromiseIds: { type: 'array', items: { type: 'string' } },
-    resolvedPromiseIds: { type: 'array', items: { type: 'string' } },
-    newPromises: {
-      type: 'array', maxItems: 4, items: {
-        type: 'object', additionalProperties: false, required: ['id', 'question'],
-        properties: { id: { type: 'string' }, question: { type: 'string' } }
-      }
-    },
-    actorUpdates: {
-      type: 'array', maxItems: 12, items: {
-        type: 'object', additionalProperties: false, required: ['actor', 'evidence'],
-        properties: {
-          actor: { type: 'string' }, currentGoal: { type: 'string' },
-          knowledgeAdded: { type: 'array', items: { type: 'string' } },
-          resourcesAdded: { type: 'array', items: { type: 'string' } },
-          resourcesRemoved: { type: 'array', items: { type: 'string' } },
-          constraint: { type: 'string' }, evidence: { type: 'string' }
-        }
-      }
-    },
-    newActors: {
-      type: 'array', maxItems: 4, items: {
-        type: 'object', additionalProperties: false, required: ['actor', 'evidence'],
-        properties: {
-          actor: {
-            type: 'object', additionalProperties: false,
-            required: ['name', 'currentGoal', 'fear', 'knowledge', 'resources', 'constraint'],
-            properties: {
-              name: { type: 'string' }, currentGoal: { type: 'string' }, fear: { type: 'string' },
-              knowledge: { type: 'array', items: { type: 'string' } },
-              resources: { type: 'array', items: { type: 'string' } }, constraint: { type: 'string' }
-            }
-          },
-          evidence: { type: 'string' }
-        }
-      }
-    },
-    pressureUpdates: {
-      type: 'array', maxItems: 12, items: {
-        type: 'object', additionalProperties: false, required: ['id', 'status', 'evidence'],
-        properties: {
-          id: { type: 'string' }, status: { type: 'string', enum: ['unchanged', 'escalated', 'resolved'] },
-          condition: { type: 'string' }, urgency: { type: 'integer', minimum: 1, maximum: 10 },
-          evidence: { type: 'string' }
-        }
-      }
-    },
-    newPressures: {
-      type: 'array', maxItems: 6, items: {
-        type: 'object', additionalProperties: false, required: ['pressure', 'evidence'],
-        properties: { pressure: PRESSURE_ITEM_SCHEMA, evidence: { type: 'string' } }
-      }
-    },
-    arcUpdates: {
-      type: 'array', maxItems: 4, items: {
-        type: 'object', additionalProperties: false, required: ['id', 'status', 'evidence'],
-        properties: {
-          id: { type: 'string' }, status: { type: 'string', enum: ['active', 'completed'] },
-          evidence: { type: 'string' }
-        }
-      }
-    },
-    emotionalOutcome: {
-      type: 'object', additionalProperties: false,
-      required: [
-        'readerEffectSummary', 'triggerEvidence', 'choiceEvidence', 'costEvidence',
-        'residueEvidence', 'emotionalDebtOpened', 'emotionalDebtPaid'
-      ],
-      properties: {
-        readerEffectSummary: { type: 'string' }, triggerEvidence: { type: 'string' },
-        choiceEvidence: { type: 'string' }, costEvidence: { type: 'string' },
-        residueEvidence: { type: 'string' }, emotionalDebtOpened: { type: 'string' },
-        emotionalDebtPaid: { type: 'string' }
-      }
-    },
-    terminalConditionMet: { type: 'boolean' },
-    matchedTerminalCondition: { type: 'string' }, terminalEvidence: { type: 'string' },
-    completionReason: { type: 'string' }
   }
 }
 
@@ -845,53 +754,46 @@ export async function extractCausalOutcome(
   workId: number,
   chapterId: number,
   signal?: AbortSignal,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  options: {
+    baseState?: CausalNarrativeState
+    allowCommittedDecision?: boolean
+    ordinal?: number
+  } = {}
 ): Promise<{ state: CausalNarrativeState; outcome: CausalChapterOutcome; bodyHash: string }> {
-  onProgress?.('状态提取 1/3：正在读取最终正文与提交前状态')
-  const state = causalNovelDAO.getState(workId)
+  onProgress?.('章后结果 · 正在读取最终正文与提交前状态')
+  const state = options.baseState ?? causalNovelDAO.getState(workId)
   const record = causalNovelDAO.getDecision(chapterId)
   const chapter = volumeChapterDAO.getChapter(chapterId)
   if (!state || !record || !chapter?.content?.trim()) throw new Error('因果结果提交缺少状态、决策或正文')
-  if (record.stateRevision !== state.revision) throw new Error('因果结果基于过期状态，拒绝提交')
-  onProgress?.('状态提取 2/3：正在从正文提取因果变化与情绪结果证据')
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, chapterId, step: 'goal_novel_causal_outcome', enrichWorkContext: false, enrichNarrativeMemory: false,
-      temperature: 0, maxTokens: 5000,
-      responseSchema: { name: 'causal_novel_chapter_outcome', schema: OUTCOME_SCHEMA, strict: false },
-      systemPrompt: [
-        '你是因果小说的章后事实提交器。只提交正文实际发生且可逐字举证的变化。',
-        '禁止把原决策卡中的计划当成已发生事实；正文没有发生就不能提交。',
-        '禁止输出关系评分、关系阶段或把情绪变化伪装成世界事实。',
-        'evidenceQuotes、actorUpdates.evidence、pressureUpdates.evidence 必须逐字摘自正文。',
-        '正文首次出现且会继续影响剧情的重要人物必须放入 newActors，并提供逐字证据；禁止把新人物塞进 actorUpdates。newActors 与 actorUpdates 中所有非空目标、恐惧、认知、资源、约束字段都必须直接使用正文中的逐字短语；正文没有明确给出的字段留空。',
-        'arcUpdates 只在正文实际满足阶段推进或退出条件时提交，并提供逐字证据。',
-        'emotionalOutcome 只记录本章已经挣得的情绪结果；trigger/choice/cost/residue 四项 evidence 都必须逐字摘自正文。',
-        '情绪债只记录本章正文真正开启或兑现的内容，不能预告未来关系路线。',
-        'terminalConditionMet=true 时，matchedTerminalCondition 必须逐字等于权威状态中的一项终止条件，terminalEvidence 必须逐字来自正文；否则三项完结字段留空。'
-      ].join('\n'),
-      prompt: [
-        `【提交前权威状态】\n${JSON.stringify(state, null, 2)}`,
-        `【本章决策】\n${JSON.stringify(record.plan.decision, null, 2)}`,
-        `【本章情绪事务】\n${JSON.stringify(record.plan.emotionContract, null, 2)}`,
-        `【本章正文】\n${chapter.content}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
+  if (!options.allowCommittedDecision && record.stateRevision !== state.revision) {
+    throw new Error('因果结果基于过期状态，拒绝提交')
+  }
+  if (!options.allowCommittedDecision && record.status !== 'planned') {
+    throw new Error('因果结果只允许从待提交决策提取')
+  }
+  const contentVersion = causalNovelDAO.ensureCurrentContentVersion(
+    workId, chapterId, options.allowCommittedDecision ? 'replay_outcome' : 'outcome', 'generated'
   )
-  if (!response.success || !response.content?.trim()) throw new Error(response.error || '因果结果提取失败')
-  onProgress?.('状态提取 3/3：正在校验证据、承诺、人物、压力与情绪结果')
-  const outcome = parseStructured<CausalChapterOutcome>(response.content)
+  const pipeline = await runCausalOutcomePipeline({
+    workId,
+    chapterId,
+    contentVersionId: contentVersion.id,
+    state,
+    record,
+    content: chapter.content,
+    signal,
+    onProgress
+  })
+  const outcome = pipeline.outcome
   const progressedPromises = new Set([...outcome.advancedPromiseIds, ...outcome.resolvedPromiseIds])
   if (!record.plan.decision.advancedPromiseIds.some(id => progressedPromises.has(id))) {
     throw new Error('章节结果没有推进决策中冻结的任何读者承诺')
   }
-  const committedIds = new Set(
-    causalNovelDAO.listDecisions(workId)
-      .filter(item => item.status === 'committed' || item.chapterId === chapterId)
-      .map(item => item.chapterId)
-  )
-  const ordinal = volumeChapterDAO.listChaptersByWork(workId)
+  const committedIds = new Set(causalNovelDAO.listDecisions(workId)
+    .filter(item => item.status === 'committed' || item.chapterId === chapterId)
+    .map(item => item.chapterId))
+  const ordinal = options.ordinal ?? volumeChapterDAO.listChaptersByWork(workId)
     .filter(item => committedIds.has(item.id))
     .findIndex(item => item.id === chapterId) + 1
   const nextState = applyCausalChapterOutcome(state, outcome, ordinal, chapter.content)

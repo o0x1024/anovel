@@ -56,6 +56,12 @@ import {
   generateCausalStyleRewritePreview
 } from './context/causal-chapter-style-rewrite'
 import {
+  applyCausalChapterEdit,
+  cancelCausalChapterReplay,
+  previewCausalChapterEdit,
+  type CausalManualEditKind
+} from './context/causal-chapter-edit'
+import {
   runStoryGoalLoop,
   cancelGoalLoop,
   isGoalLoopRunning,
@@ -101,6 +107,7 @@ import {
   invalidateNovelGoalStateAfterVolumeDeletion,
   resetNovelGoalStateFromVolumePlan
 } from './context/goal-routine/novel-outline-pipeline'
+import { getChapterPlanningDetails } from './context/chapter-planning-details'
 
 /**
  * 注册所有 IPC 处理器，桥接渲染进程与数据库层
@@ -222,6 +229,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:list', (_e, volumeId: number) => volumeChapterDAO.listChapters(volumeId))
   ipcMain.handle('chapter:listByWork', (_e, workId: number) => volumeChapterDAO.listChaptersByWork(workId))
   ipcMain.handle('chapter:get', (_e, id: number) => volumeChapterDAO.getChapter(id))
+  ipcMain.handle('chapter:getPlanningDetails', (_e, workId: number, chapterId: number) =>
+    getChapterPlanningDetails(workId, chapterId))
   ipcMain.handle('chapter:create', (_e, volumeId: number, title: string, outline?: string) => {
     const volume = volumeChapterDAO.getVolume(volumeId)
     if (volume && workDAO.getById(volume.work_id)?.work_type === 'causal_novel') {
@@ -744,6 +753,47 @@ export function registerIpcHandlers(): void {
       ? volumeChapterDAO.updateChapterWithVersion(chapterId, fields, { model_type: 'manual' })
       : volumeChapterDAO.updateChapter(chapterId, fields)
   })
+  ipcMain.handle('causal:previewChapterEdit', async (_e, input: {
+    workId: number
+    chapterId: number
+    candidateContent: string
+    editKind: CausalManualEditKind
+  }) => {
+    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再编辑章节')
+    return previewCausalChapterEdit(input)
+  })
+  ipcMain.handle('causal:applyChapterEdit', (_e, input: {
+    workId: number
+    chapterId: number
+    candidateContent: string
+    editKind: CausalManualEditKind
+    currentVersionId: number
+    expectedUpdateTime: string
+    validationToken: string
+  }) => {
+    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再编辑章节')
+    return applyCausalChapterEdit(input)
+  })
+  ipcMain.handle('causal:listReplayJobs', (_e, workId: number, limit = 50) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    return causalNovelDAO.listReplayJobs(workId, limit)
+  })
+  ipcMain.handle('causal:retryReplay', (_e, workId: number, replayJobId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请先暂停')
+    const job = causalNovelDAO.getReplayJob(replayJobId)
+    if (!job || job.workId !== workId) throw new Error('因果重放任务不存在')
+    if (job.status !== 'blocked') throw new Error('只有冲突停止的重放任务可以重试')
+    causalNovelDAO.retryReplay(replayJobId)
+    return true
+  })
+  ipcMain.handle('causal:cancelReplay', (_e, workId: number, replayJobId: number) => {
+    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请先暂停')
+    return cancelCausalChapterReplay(workId, replayJobId)
+  })
   ipcMain.handle('causal:deleteChapter', (_e, workId: number, chapterId: number) => {
     if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
     if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
@@ -788,6 +838,18 @@ export function registerIpcHandlers(): void {
         emotionAssessment: parseJson(chapter.emotion_assessment_json)
       },
       decision: causalNovelDAO.getDecision(chapterId),
+      contentBinding: causalNovelDAO.getChapterBinding(chapterId),
+      contentVersions: causalNovelDAO.listContentVersions(chapterId).map(version => ({
+        id: version.id,
+        parentVersionId: version.parentVersionId,
+        bodyHash: version.bodyHash,
+        wordCount: version.wordCount,
+        source: version.source,
+        editKind: version.editKind,
+        status: version.status,
+        createTime: version.createTime
+      })),
+      replayJobs: causalNovelDAO.listReplayJobs(workId, 50).filter(job => job.chapterId === chapterId),
       stateFacts: storyStateDAO.listFactsByChapter(workId, chapterId).map(fact => ({
         id: fact.id,
         entity: fact.entity,

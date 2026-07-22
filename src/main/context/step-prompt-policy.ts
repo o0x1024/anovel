@@ -6,7 +6,7 @@ export function isBodyGenerationStep(step: string | undefined): boolean {
   return isFullProseOutputStep(step)
 }
 
-/** 分卷/章节情节大纲规划 */
+/** 分卷/章节大纲规划 */
 export function isOutlinePlanningStep(step: string | undefined): boolean {
   if (!step) return false
   if (step === 'volumes_outline' || step.startsWith('volumes_outline_')) return true
@@ -38,6 +38,7 @@ export function isFocusedAnalysisStep(step: string | undefined): boolean {
   if (!step) return false
   if (step === 'story_title_hook_gen') return true
   if (step === 'goal_novel_volume_chapter_gate' || step === 'goal_novel_volume_chapter_repair') return true
+  if (step.startsWith('goal_novel_causal_outcome') || step === 'goal_novel_causal_edit_audit') return true
   if (step.endsWith('_self_check')) return true
   const prefixes = [
     'critique_',

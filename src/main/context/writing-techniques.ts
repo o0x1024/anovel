@@ -110,7 +110,7 @@ export const CHAPTER_ABC_OUTLINE_PROMPT = [
 
 /** 批量生成分卷章节：仅 JSON */
 export const VOLUME_CHAPTERS_BATCH_JSON_PROMPT = [
-  '根据分卷信息与作品上下文，生成本卷章节情节大纲。',
+  '根据分卷信息与作品上下文，生成本卷章节大纲。',
   '【输出格式 - 必须严格遵守】',
   '只输出一个 JSON 对象；禁止 Markdown 章节标题、前置说明、分析过程，以及 ``` 代码块围栏。',
   'chapters 数组每一项代表一章；不要把「卷X章节大纲」「分章情节」「章节结尾钩子」等文档标题当作 title。',
@@ -136,11 +136,11 @@ export const CHAPTER_OUTLINE_JSON_PROMPT = [
   '格式：{"entry_state":"承接状态","must_cover":["必须事件1","必须事件2"],"must_not":["不得提前写后续反转"],"ending_state":"停在未解决危机","continuity_constraints":"紧接上一章结尾","beat_role":"B","foreshadow_target":"...","next_hook":"...","state_constraints":"回收后主角明显乏力，污染刺痒感短暂加重，但仍能勉强行动"}'
 ].join('\n')
 
-/** 章节情节大纲长度与体裁约束（规划层，非正文） */
+/** 章节大纲长度与体裁约束（规划层，非正文） */
 export function chapterOutlineLengthRules(wordsPerChapter = 4000): string {
   const c = outlineConstraintsForWordTarget(wordsPerChapter)
   return [
-    '【章节情节大纲体裁 - 必须遵守】',
+    '【章节大纲体裁 - 必须遵守】',
     '1. 大纲是写作指令，不是正文：只写事件链、冲突、转折，禁止写完整对话/场景描写/心理独白',
     `2. 每章 must_cover / plot_points 合计约 ${c.charsMin}-${c.charsMax} 字；超过 ${c.charsWarn} 字视为不合格`,
     `3. ${c.pointsMin}-${c.pointsMax} 个 must_cover，每点 1-3 句梗概，作为正文生成验收清单`,

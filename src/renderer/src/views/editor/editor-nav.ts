@@ -76,7 +76,7 @@ export const editorNavKey: InjectionKey<EditorNav> = Symbol('editorNav')
 export const NEXT_STEP_LABELS: Record<WorkflowStepKey, string> = {
   incubator: '进入核心设定',
   settings: '进入分卷大纲',
-  volumes: '进入章节情节',
+  volumes: '进入章节大纲',
   chapters: '进入正文生成',
   generate: ''
 }
@@ -108,7 +108,7 @@ export const STEP_MENU_LABELS: Record<WorkflowStepKey, string> = {
   incubator: '大岗孵化',
   settings: '核心设定',
   volumes: '分卷大纲',
-  chapters: '章节情节',
+  chapters: '章节大纲',
   generate: '正文生成'
 }
 

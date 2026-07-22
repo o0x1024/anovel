@@ -90,6 +90,33 @@ const state = computed(() => snapshot.value.state)
 const activePressures = computed(() => state.value?.activePressures.filter(item => item.status === 'active') ?? [])
 const openPromises = computed(() => state.value?.promises.filter(item => item.status !== 'resolved') ?? [])
 const currentArc = computed(() => state.value?.macroArcs?.find(item => item.status === 'active') ?? null)
+const pressureSources = computed(() => {
+  const actors = new Map((state.value?.actors ?? []).map(actor => [actor.name, actor]))
+  const grouped = new Map<string, {
+    source: string
+    targets: string[]
+    pressureCount: number
+    maxUrgency: number
+    actor: CausalNarrativeState['actors'][number] | null
+  }>()
+  for (const pressure of activePressures.value) {
+    const existing = grouped.get(pressure.source)
+    if (existing) {
+      if (!existing.targets.includes(pressure.target)) existing.targets.push(pressure.target)
+      existing.pressureCount++
+      existing.maxUrgency = Math.max(existing.maxUrgency, pressure.urgency)
+      continue
+    }
+    grouped.set(pressure.source, {
+      source: pressure.source,
+      targets: [pressure.target],
+      pressureCount: 1,
+      maxUrgency: pressure.urgency,
+      actor: actors.get(pressure.source) ?? null
+    })
+  }
+  return [...grouped.values()].sort((a, b) => b.maxUrgency - a.maxUrgency)
+})
 const latestDecision = computed(() => snapshot.value.decisions.at(-1) ?? null)
 const canonicalChapters = computed(() => {
   const ids = new Set(snapshot.value.decisions.map(item => item.chapterId))
@@ -107,10 +134,18 @@ const elapsedLabel = computed(() => {
   const seconds = total % 60
   return minutes > 0 ? `${minutes}分${String(seconds).padStart(2, '0')}秒` : `${seconds}秒`
 })
-const currentPhaseLabel = computed(() => goalRoutinePhaseLabel(
-  currentProgress.value?.phase,
-  'causal_novel'
-))
+function activityPhaseLabel(phase: string | undefined, detail: string): string {
+  if (/^章后结果|核心事件提取|人物变化提取|世界压力提取|情绪结果提取|因果结果/.test(detail)) {
+    return '章后结果提取'
+  }
+  if (/原子提交|已提交/.test(detail)) return '状态事务提交'
+  if (/叙事记忆/.test(detail)) return '叙事记忆候选'
+  if (/质量验收|质量门禁/.test(detail)) return '正文质量验收'
+  if (/滚动决策/.test(detail)) return '正文生成'
+  return goalRoutinePhaseLabel(phase, 'causal_novel') || phase || '运行'
+}
+
+const currentPhaseLabel = computed(() => activityPhaseLabel(currentProgress.value?.phase, message.value))
 
 function parseDbTime(value: string): Date {
   return new Date(value.includes('T') ? value : `${value.replace(' ', 'T')}Z`)
@@ -121,6 +156,18 @@ function formatLogTime(value: string): string {
   return Number.isNaN(date.getTime())
     ? value
     : date.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function arcStatusLabel(status: CausalNarrativeState['macroArcs'][number]['status']): string {
+  if (status === 'active') return '当前阶段'
+  if (status === 'completed') return '已完成'
+  return '待进入'
+}
+
+function arcStatusClass(status: CausalNarrativeState['macroArcs'][number]['status']): string {
+  if (status === 'active') return 'badge-primary'
+  if (status === 'completed') return 'badge-success'
+  return 'badge-ghost'
 }
 
 function actionLabel(action: string | null): string {
@@ -439,7 +486,7 @@ onUnmounted(() => {
               <span class="text-base-100/35">{{ formatLogTime(entry.time) }}</span>
               <span class="text-base-100/45">#{{ entry.turn }}</span>
               <span :class="entry.status === 'error' ? 'text-error' : entry.persisted ? 'text-info' : 'text-primary'">
-                {{ goalRoutinePhaseLabel(entry.phase, 'causal_novel') || entry.phase || '运行' }}
+                {{ activityPhaseLabel(entry.phase, entry.message) }}
               </span>
               <span :class="entry.status === 'error' ? 'text-error' : 'text-base-100/80'">{{ entry.message }}</span>
             </div>
@@ -482,24 +529,102 @@ onUnmounted(() => {
 
         <section class="card bg-base-200 border border-base-300 p-5 space-y-3">
           <div class="flex items-center justify-between gap-2">
-            <h4 class="font-semibold text-sm">当前阶段锚点</h4>
-            <span v-if="currentArc" class="badge badge-primary badge-sm">{{ currentArc.title }}</span>
+            <div>
+              <h4 class="font-semibold text-sm">世界硬规则</h4>
+              <p class="text-xs text-base-content/40 mt-1">后续章节不得违背；只能通过正文事实推进世界状态。</p>
+            </div>
+            <span class="badge badge-ghost badge-sm">{{ state.immutableRules.length }}</span>
           </div>
-          <template v-if="currentArc">
-            <p v-if="!state?.macroArchitectureReady" class="rounded-lg bg-warning/10 border border-warning/30 px-3 py-2 text-xs">
-              这是旧状态的兼容主线；当前章节事务完成后，系统会生成正式的阶段锚点修订。
-            </p>
-            <p class="text-sm leading-relaxed">{{ currentArc.objective }}</p>
+          <ol class="space-y-2">
+            <li v-for="(rule, index) in state.immutableRules" :key="`${index}-${rule}`" class="flex gap-2 rounded-lg bg-base-100 border border-base-300 p-3 text-xs leading-relaxed">
+              <span class="badge badge-outline badge-xs shrink-0">R{{ index + 1 }}</span>
+              <span>{{ rule }}</span>
+            </li>
+          </ol>
+        </section>
+
+        <section class="card bg-base-200 border border-base-300 p-5 space-y-4 xl:col-span-2">
+          <div class="flex items-center justify-between gap-2">
             <div>
-              <p class="text-xs font-bold text-base-content/50 mb-2">退出条件</p>
-              <p v-for="item in currentArc.exitConditions" :key="item" class="text-xs text-base-content/70">• {{ item }}</p>
+              <h4 class="font-semibold text-sm">权威人物</h4>
+              <p class="text-xs text-base-content/40 mt-1">显示人物当前目标、恐惧、约束、认知与资源；内容会随已提交章节更新。</p>
             </div>
+            <span class="badge badge-ghost badge-sm">{{ state.actors.length }}</span>
+          </div>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <article v-for="actor in state.actors" :key="actor.name" class="rounded-xl bg-base-100 border border-base-300 p-4 space-y-3">
+              <div class="flex items-center gap-2">
+                <strong class="text-sm">{{ actor.name }}</strong>
+                <span v-if="pressureSources.some(item => item.source === actor.name)" class="badge badge-error badge-outline badge-xs ml-auto">当前施压方</span>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div><p class="text-base-content/40">当前目标</p><p class="mt-1 leading-relaxed">{{ actor.currentGoal || '未记录' }}</p></div>
+                <div><p class="text-base-content/40">恐惧</p><p class="mt-1 leading-relaxed">{{ actor.fear || '未记录' }}</p></div>
+                <div class="sm:col-span-2"><p class="text-base-content/40">当前约束</p><p class="mt-1 leading-relaxed">{{ actor.constraint || '未记录' }}</p></div>
+              </div>
+              <details class="rounded-lg border border-base-300 bg-base-200/50 px-3 py-2 text-xs">
+                <summary class="cursor-pointer font-semibold">认知 {{ actor.knowledge.length }} 条 · 资源 {{ actor.resources.length }} 项</summary>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-3">
+                  <div><p class="font-bold text-base-content/50 mb-1">已知信息</p><p v-for="item in actor.knowledge" :key="item" class="leading-relaxed">• {{ item }}</p><p v-if="!actor.knowledge.length" class="text-base-content/40">暂无</p></div>
+                  <div><p class="font-bold text-base-content/50 mb-1">可用资源</p><p v-for="item in actor.resources" :key="item" class="leading-relaxed">• {{ item }}</p><p v-if="!actor.resources.length" class="text-base-content/40">暂无</p></div>
+                </div>
+              </details>
+            </article>
+          </div>
+        </section>
+
+        <section class="card bg-base-200 border border-base-300 p-5 space-y-4 xl:col-span-2">
+          <div class="flex items-center justify-between gap-2">
             <div>
-              <p class="text-xs font-bold text-base-content/50 mb-2">本阶段必须兑现</p>
-              <p v-for="item in currentArc.mandatoryPayoffs" :key="item" class="text-xs text-base-content/70">• {{ item }}</p>
+              <h4 class="font-semibold text-sm">全部阶段锚点</h4>
+              <p class="text-xs text-base-content/40 mt-1">阶段锚点约束长线方向，不是逐章大纲。</p>
             </div>
-          </template>
-          <p v-else class="text-xs text-base-content/40">旧状态尚未建立独立阶段锚点，将使用核心问题主线兼容运行。</p>
+            <span v-if="currentArc" class="badge badge-primary badge-sm">当前：{{ currentArc.title }}</span>
+          </div>
+          <p v-if="!state.macroArchitectureReady" class="rounded-lg bg-warning/10 border border-warning/30 px-3 py-2 text-xs">
+            这是旧状态的兼容主线；当前章节事务完成后，系统会生成正式的阶段锚点修订。
+          </p>
+          <div v-if="state.macroArcs.length" class="space-y-3">
+            <article v-for="(arc, index) in state.macroArcs" :key="arc.id" class="rounded-xl border p-4" :class="arc.status === 'active' ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-100'">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-xs text-base-content/40">{{ index + 1 }}</span>
+                <strong class="text-sm">{{ arc.title }}</strong>
+                <span class="badge badge-xs ml-auto" :class="arcStatusClass(arc.status)">{{ arcStatusLabel(arc.status) }}</span>
+              </div>
+              <p class="text-sm leading-relaxed mt-2">{{ arc.objective }}</p>
+              <details class="mt-3 text-xs">
+                <summary class="cursor-pointer text-base-content/55 font-semibold">查看进入/退出条件、必须兑现与禁止漂移</summary>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3 rounded-lg bg-base-200/60 p-3">
+                  <div><p class="font-bold text-base-content/50 mb-1">进入条件</p><p v-for="item in arc.entryConditions" :key="item" class="leading-relaxed">• {{ item }}</p></div>
+                  <div><p class="font-bold text-base-content/50 mb-1">退出条件</p><p v-for="item in arc.exitConditions" :key="item" class="leading-relaxed">• {{ item }}</p></div>
+                  <div><p class="font-bold text-base-content/50 mb-1">必须兑现</p><p v-for="item in arc.mandatoryPayoffs" :key="item" class="leading-relaxed">• {{ item }}</p></div>
+                  <div><p class="font-bold text-base-content/50 mb-1">禁止漂移</p><p v-for="item in arc.forbiddenDrift" :key="item" class="leading-relaxed">• {{ item }}</p></div>
+                </div>
+              </details>
+            </article>
+          </div>
+          <p v-else class="text-xs text-base-content/40">尚未建立阶段锚点。</p>
+        </section>
+
+        <section class="card bg-base-200 border border-base-300 p-5 space-y-3">
+          <div class="flex items-center justify-between">
+            <div>
+              <h4 class="font-semibold text-sm">敌对与施压来源</h4>
+              <p class="text-[11px] text-base-content/40 mt-1">按当前压力整理，不等同于系统判定的反派。</p>
+            </div>
+            <span class="badge badge-ghost badge-sm">{{ pressureSources.length }}</span>
+          </div>
+          <div v-for="item in pressureSources" :key="item.source" class="rounded-lg bg-base-100 border border-base-300 p-3">
+            <div class="flex items-center gap-2 text-xs">
+              <strong>{{ item.source }}</strong>
+              <span v-if="item.actor" class="badge badge-outline badge-xs">权威人物</span>
+              <span class="badge badge-xs ml-auto" :class="item.maxUrgency >= 8 ? 'badge-error' : 'badge-warning'">最高 {{ item.maxUrgency }}/10</span>
+            </div>
+            <p class="text-xs text-base-content/60 mt-1">施压对象：{{ item.targets.join('、') }}</p>
+            <p class="text-[11px] text-base-content/40 mt-1">关联 {{ item.pressureCount }} 个当前压力</p>
+            <p v-if="item.actor" class="text-[11px] text-base-content/40 mt-1">当前目标：{{ item.actor.currentGoal }}</p>
+          </div>
+          <p v-if="!pressureSources.length" class="text-xs text-base-content/40">当前没有活跃的施压来源。</p>
         </section>
 
         <section class="card bg-base-200 border border-base-300 p-5 space-y-3">

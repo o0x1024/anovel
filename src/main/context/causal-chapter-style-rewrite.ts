@@ -88,7 +88,8 @@ export function validateCausalRewriteCandidate(
   if (originalCount > 0 && candidateCount > Math.ceil(originalCount * 1.25)) {
     reasons.push(`候选过长：${candidateCount} 字，原文 ${originalCount} 字`)
   }
-  const missing = evidenceAnchors.filter(anchor => !candidateContent.includes(anchor))
+  const compactCandidate = candidateContent.replace(/\s+/g, '')
+  const missing = evidenceAnchors.filter(anchor => !compactCandidate.includes(anchor.replace(/\s+/g, '')))
   if (missing.length) reasons.push(`缺少 ${missing.length} 条权威逐字证据：${missing.slice(0, 3).join('；')}`)
   return { passed: reasons.length === 0, reasons }
 }
@@ -141,6 +142,83 @@ function loadLocks(workId: number, chapterId: number) {
   return { chapter, decision, stateFacts, emotionalStates, evidenceAnchors }
 }
 
+function lockedContextFor(
+  workId: number,
+  chapterId: number,
+  locks: ReturnType<typeof loadLocks>
+): Record<string, unknown> {
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const chapterIndex = chapters.findIndex(item => item.id === chapterId)
+  const nextChapter = chapterIndex >= 0 ? chapters[chapterIndex + 1] : undefined
+  return {
+    decisionStatus: locks.decision?.status ?? null,
+    stateRevision: locks.decision?.stateRevision ?? null,
+    decision: locks.decision?.plan.decision ?? null,
+    committedOutcome: locks.decision?.outcome ?? null,
+    stateFacts: locks.stateFacts.map(item => ({
+      entity: item.entity,
+      key: item.state_key,
+      value: item.value_json,
+      transition: item.transition,
+      irreversible: Boolean(item.irreversible)
+    })),
+    emotionalAftereffects: locks.emotionalStates.map(item => ({
+      character: item.character_name,
+      unresolvedEmotion: item.unresolved_emotion,
+      behavioralAftereffect: item.behavioral_aftereffect
+    })),
+    nextChapterOpening: nextChapter?.content?.trim().slice(0, 1200) ?? ''
+  }
+}
+
+export async function auditCausalManualExpressionEdit(
+  workId: number,
+  chapterId: number,
+  candidateContent: string
+): Promise<{ evidenceAnchors: string[]; auditReasons: string[] }> {
+  const locks = loadLocks(workId, chapterId)
+  if (locks.decision?.status !== 'committed') {
+    throw new Error('只有已提交章节需要执行表达等价审计')
+  }
+  const deterministic = validateCausalRewriteCandidate(
+    locks.chapter.content, candidateContent, locks.evidenceAnchors
+  )
+  if (!deterministic.passed) throw new Error(deterministic.reasons.join('；'))
+  const lockedContext = lockedContextFor(workId, chapterId, locks)
+  const auditResponse = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      chapterId,
+      step: 'goal_novel_causal_edit_audit',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: false,
+      temperature: 0,
+      maxTokens: 1600,
+      forceThinkingDisabled: true,
+      responseSchema: { name: 'causal_manual_edit_audit', schema: REWRITE_AUDIT_SCHEMA, strict: true },
+      systemPrompt: [
+        '你是因果小说人工编辑一致性审计器，只判断新正文是否与已提交事实完全等价。',
+        '人物行动、事件顺序、选择、代价、资源、伤势、认知、压力、承诺、情绪余波、章末状态或下一章衔接有任何变化，必须 passed=false。',
+        '只允许措辞、句式、节奏、段落与错别字变化。不要因为用户声明“只改文字”而放宽审计。只返回 JSON。'
+      ].join('\n'),
+      prompt: [
+        `【冻结事实】\n${JSON.stringify(lockedContext, null, 2)}`,
+        `【原正文】\n${locks.chapter.content}`,
+        `【人工编辑候选】\n${candidateContent}`
+      ].join('\n\n')
+    }),
+    { stream: false }
+  )
+  if (!auditResponse.success || !auditResponse.content?.trim()) {
+    throw new Error(auditResponse.error || '人工编辑一致性审计失败')
+  }
+  const audit = parseAudit(auditResponse.content)
+  if (!audit.passed) {
+    throw new Error(`人工编辑改变了已提交事实：${audit.reasons.join('；') || '存在未说明的事实漂移'}`)
+  }
+  return { evidenceAnchors: locks.evidenceAnchors, auditReasons: audit.reasons }
+}
+
 export async function generateCausalStyleRewritePreview(
   workId: number,
   chapterId: number
@@ -148,30 +226,10 @@ export async function generateCausalStyleRewritePreview(
   const styleId = writingStyleDAO.getWorkStyleId(workId)
   const style = styleId ? writingStyleDAO.getById(styleId) : undefined
   if (!styleId || !style) throw new Error('当前作品尚未绑定文风，请先选择文风')
-  const { chapter, decision, stateFacts, emotionalStates, evidenceAnchors } = loadLocks(workId, chapterId)
+  const locks = loadLocks(workId, chapterId)
+  const { chapter, decision, evidenceAnchors } = locks
   if (!decision) throw new Error('手动章节没有因果决策，不能执行因果锁定重写')
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const chapterIndex = chapters.findIndex(item => item.id === chapterId)
-  const nextChapter = chapterIndex >= 0 ? chapters[chapterIndex + 1] : undefined
-  const lockedContext = {
-    decisionStatus: decision.status,
-    stateRevision: decision.stateRevision,
-    decision: decision.plan.decision,
-    committedOutcome: decision.outcome,
-    stateFacts: stateFacts.map(item => ({
-      entity: item.entity,
-      key: item.state_key,
-      value: item.value_json,
-      transition: item.transition,
-      irreversible: Boolean(item.irreversible)
-    })),
-    emotionalAftereffects: emotionalStates.map(item => ({
-      character: item.character_name,
-      unresolvedEmotion: item.unresolved_emotion,
-      behavioralAftereffect: item.behavioral_aftereffect
-    })),
-    nextChapterOpening: nextChapter?.content?.trim().slice(0, 1200) ?? ''
-  }
+  const lockedContext = lockedContextFor(workId, chapterId, locks)
   const targetWords = wordCount(chapter.content)
   const rewriteResponse = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -280,6 +338,9 @@ export function applyCausalStyleRewrite(input: {
   if (expectedToken !== input.validationToken) throw new Error('重写候选已变化，请重新生成并审计')
   const styleId = writingStyleDAO.getWorkStyleId(input.workId)
   return getDatabase().transaction(() => {
+    const sourceVersion = causalNovelDAO.ensureCurrentContentVersion(
+      input.workId, input.chapterId, 'style_rewrite_source', 'expression'
+    )
     const updated = volumeChapterDAO.updateChapterWithVersion(input.chapterId, {
       content: input.candidateContent,
       word_count: wordCount(input.candidateContent),
@@ -287,6 +348,24 @@ export function applyCausalStyleRewrite(input: {
       emotion_assessment_json: chapter.emotion_assessment_json
     }, { model_type: 'causal_style_rewrite', style_id: styleId ?? undefined })
     if (!updated) throw new Error('章节已被其他操作修改，请重新生成重写候选')
+    const targetVersion = causalNovelDAO.createContentVersion({
+      workId: input.workId,
+      chapterId: input.chapterId,
+      parentVersionId: sourceVersion.id,
+      content: input.candidateContent,
+      source: 'ai_style_rewrite',
+      editKind: 'expression',
+      status: 'candidate'
+    })
+    causalNovelDAO.activateContentVersion({
+      workId: input.workId,
+      chapterId: input.chapterId,
+      contentVersionId: targetVersion.id,
+      stateBeforeRevision: decision.stateRevision,
+      stateAfterRevision: decision.status === 'committed' ? decision.stateRevision + 1 : null,
+      decisionStatus: decision.status
+    })
+    causalNovelDAO.invalidateCheckpoints(input.workId, input.chapterId)
     if (emotionalStates.length) {
       emotionalStateDAO.replaceChapter(input.chapterId, emotionalStates.map(item => ({
         work_id: item.work_id,

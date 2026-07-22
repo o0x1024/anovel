@@ -98,7 +98,7 @@ async function runChecklist() {
         <p class="font-medium mb-1">{{ blockTypes[selectedBlockType].label }}</p>
         <p>{{ blockTypes[selectedBlockType].hint }}</p>
       </div>
-      <p class="text-xs text-base-content/50">建议将应对方案写回「章节情节」大纲或「灵感收集」，而非直接插入已写正文。</p>
+      <p class="text-xs text-base-content/50">建议将应对方案写回「章节大纲」或「灵感收集」，而非直接插入已写正文。</p>
     </div>
 
     <div v-else-if="tab === 'inspiration'" class="space-y-3">

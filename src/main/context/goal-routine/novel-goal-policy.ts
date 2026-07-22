@@ -2,8 +2,74 @@ export const MAX_AUTO_NOVEL_REPAIR_CHAPTERS = 8
 export const MAX_NOVEL_PHASE_FAILURES = 6
 export const MAX_NOVEL_REPAIR_STALLS = 5
 
+export type NovelPreparationPhase =
+  | 'materialize_settings'
+  | 'generate_character_cards'
+  | 'emotion_engine_gate'
+  | 'overall_self_check'
+  | 'generate_volumes'
+
+/**
+ * 用户可以从界面选择任意阶段，但长篇生成阶段不能越过尚未完成的前置门禁。
+ * 该函数只决定“最早安全阶段”，不修改任何作品数据。
+ */
+export function resolveNovelPreparationPhase(input: {
+  requestedPhase: string
+  settingsReady: boolean
+  characterCardsReady: boolean
+  emotionEngineReady: boolean
+  settingsGateReady: boolean
+  volumePlanReady: boolean
+  hasChapters: boolean
+}): string {
+  const guardedPhases = new Set([
+    'generate_volumes',
+    'generate_beats',
+    'generate_title_hook',
+    'draft_body',
+    'goal_check',
+    'repair_plan',
+    'repair_execute'
+  ])
+  if (!guardedPhases.has(input.requestedPhase)) return input.requestedPhase
+
+  // “重新验收已有正文”必须保持只读，不能因旧作缺少新协议状态而回头重写设定。
+  if (input.requestedPhase === 'goal_check' && input.hasChapters) return input.requestedPhase
+
+  if (!input.settingsReady) return 'materialize_settings'
+  if (!input.characterCardsReady) return 'generate_character_cards'
+  if (!input.emotionEngineReady) return 'emotion_engine_gate'
+  if (!input.settingsGateReady) return 'overall_self_check'
+  if (!input.volumePlanReady) return 'generate_volumes'
+  return input.requestedPhase
+}
+
 export function isTerminalNovelRepairError(errorCode: string): boolean {
   return errorCode === 'REPAIR_BOUNDARY' || errorCode === 'REPAIR_STALL'
+}
+
+/** 分卷生成中的修复边界只能停止改写，不能停止整本生成。 */
+export function shouldContinueNovelAfterVolumeRepairBoundary(input: {
+  phase: string
+  errorCode: string
+  hasVolumeCheckpoint: boolean
+}): boolean {
+  return input.phase === 'generate_beats'
+    && input.hasVolumeCheckpoint
+    && (input.errorCode === 'REPAIR_STALL' || input.errorCode === 'REPAIR_BOUNDARY')
+}
+
+/** 用户要求整本连续生成时，施工阶段不能因为阶段轮次数量大于章节数而提前停机。 */
+export function shouldExtendNovelConstructionBudget(input: {
+  turn: number
+  maxTurns: number
+  expectedChapters: number
+  outlinedChapters: number
+  completedBodies: number
+}): boolean {
+  return input.turn >= input.maxTurns
+    && input.expectedChapters > 0
+    && (input.outlinedChapters < input.expectedChapters || input.completedBodies < input.expectedChapters)
 }
 
 function normalizedNovelFailureKind(message: string): string {
@@ -112,6 +178,14 @@ export interface ReusableNovelExecutionCandidate {
   snapshot_json: string | null
 }
 
+export interface DeferredNovelExecutionCandidate {
+  candidate: ReusableNovelExecutionCandidate
+  blockers: string[]
+  coveredCount: number
+  partialCount: number
+  evidenceCount: number
+}
+
 function isLegacyEvidenceOnlyCandidate(candidate: ReusableNovelExecutionCandidate): boolean {
   if (candidate.model_type !== 'novel_execution_candidate' || !candidate.snapshot_json) return false
   try {
@@ -205,4 +279,91 @@ export function selectReusableNovelExecutionCandidate(
       if (version) return version
       return Math.abs(left.word_count - input.wordTarget) - Math.abs(right.word_count - input.wordTarget)
     })[0]
+}
+
+/**
+ * 章节执行门禁长期不收敛时，只允许降级提交“已有完整可定位证据”的软缺口：
+ * 每项至少 partial、没有缺失项、没有禁写越界或跨章连续性问题，且字数合规。
+ * 这条路径用于终止评估器活锁，不能掩盖真正的正文缺失或事实冲突。
+ */
+export function selectDeferredNovelExecutionCandidate(
+  candidates: ReusableNovelExecutionCandidate[],
+  input: {
+    outline: string | null | undefined
+    contractHash: string
+    wordMin: number
+    wordMax: number
+  }
+): DeferredNovelExecutionCandidate | undefined {
+  const eligible = candidates.flatMap(candidate => {
+    if (
+      candidate.model_type !== 'novel_execution_candidate'
+      || !candidate.content?.trim()
+      || !candidate.snapshot_json
+      || (candidate.outline && candidate.outline !== input.outline)
+      || candidate.word_count < input.wordMin
+      || candidate.word_count > input.wordMax
+    ) return []
+    try {
+      const snapshot = JSON.parse(candidate.snapshot_json) as {
+        contractHash?: unknown
+        gate?: {
+          blockers?: unknown
+          coverage?: unknown
+          forbiddenViolations?: unknown
+          evaluatorProtocolErrors?: unknown
+        }
+      }
+      if (snapshot.contractHash !== input.contractHash) return []
+      const gate = snapshot.gate
+      if (!gate || !Array.isArray(gate.coverage) || gate.coverage.length === 0) return []
+      if (Array.isArray(gate.evaluatorProtocolErrors) && gate.evaluatorProtocolErrors.length > 0) return []
+      if (Array.isArray(gate.forbiddenViolations) && gate.forbiddenViolations.length > 0) return []
+      const verdicts = gate.coverage.map(row =>
+        row && typeof row === 'object' ? String((row as { verdict?: unknown }).verdict ?? '') : ''
+      )
+      if (verdicts.some(verdict => verdict !== 'covered' && verdict !== 'partial')) return []
+      const blockers = Array.isArray(gate.blockers)
+        ? gate.blockers.map(String).filter(Boolean)
+        : []
+      if (blockers.length === 0 || blockers.some(blocker => !blocker.startsWith('情节仅部分落地：'))) return []
+      const evidenceCount = gate.coverage.reduce((sum, row) => {
+        if (!row || typeof row !== 'object') return sum
+        const evidenceIds = (row as { evidenceIds?: unknown }).evidenceIds
+        return sum + (Array.isArray(evidenceIds) ? evidenceIds.length : 0)
+      }, 0)
+      return [{
+        candidate,
+        blockers,
+        coveredCount: verdicts.filter(verdict => verdict === 'covered').length,
+        partialCount: verdicts.filter(verdict => verdict === 'partial').length,
+        evidenceCount
+      }]
+    } catch {
+      return []
+    }
+  })
+  return eligible.sort((left, right) => {
+    if (left.coveredCount !== right.coveredCount) return right.coveredCount - left.coveredCount
+    if (left.evidenceCount !== right.evidenceCount) return right.evidenceCount - left.evidenceCount
+    return right.candidate.version_number - left.candidate.version_number
+  })[0]
+}
+
+export function shouldDeferNovelChapterAcceptance(input: {
+  score: number
+  failureLayer: string
+  hardDimensionScores: number[]
+}): boolean {
+  return input.score >= 80
+    && input.hardDimensionScores.length > 0
+    && input.hardDimensionScores.every(score => score >= 65)
+    && ['scene', 'prose', 'none'].includes(input.failureLayer)
+}
+
+export function shouldDeferNovelQualityCandidate(input: {
+  score: number
+  hardFail: boolean
+}): boolean {
+  return !input.hardFail && input.score >= 65
 }

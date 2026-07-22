@@ -216,6 +216,10 @@ export interface CausalChapterEmotionalOutcome {
   residueEvidence: string
   emotionalDebtOpened: string
   emotionalDebtPaid: string
+  triggerEvidenceIds?: string[]
+  choiceEvidenceIds?: string[]
+  costEvidenceIds?: string[]
+  residueEvidenceIds?: string[]
 }
 
 export interface CausalActorUpdate {
@@ -226,32 +230,36 @@ export interface CausalActorUpdate {
   resourcesRemoved?: string[]
   constraint?: string
   evidence: string
+  evidenceIds?: string[]
 }
 
 export interface CausalPressureUpdate {
   id: string
-  status: 'unchanged' | 'escalated' | 'resolved'
+  status: 'unchanged' | 'stable' | 'escalated' | 'relieved' | 'resolved'
   condition?: string
   urgency?: number
   evidence: string
+  evidenceIds?: string[]
 }
 
 export interface CausalChapterOutcome {
   summary: string
   eventSignature: string
   evidenceQuotes: string[]
+  evidenceRefs?: Array<{ id: string; text: string }>
   advancedPromiseIds: string[]
   resolvedPromiseIds: string[]
   newPromises: Array<{ id: string; question: string }>
   actorUpdates: CausalActorUpdate[]
-  newActors: Array<{ actor: CausalActorState; evidence: string }>
+  newActors: Array<{ actor: CausalActorState; evidence: string; evidenceIds?: string[] }>
   pressureUpdates: CausalPressureUpdate[]
-  newPressures: Array<{ pressure: CausalPressure; evidence: string }>
-  arcUpdates: Array<{ id: string; status: 'active' | 'completed'; evidence: string }>
+  newPressures: Array<{ pressure: CausalPressure; evidence: string; evidenceIds?: string[] }>
+  arcUpdates: Array<{ id: string; status: 'active' | 'completed'; evidence: string; evidenceIds?: string[] }>
   emotionalOutcome: CausalChapterEmotionalOutcome
   terminalConditionMet: boolean
   matchedTerminalCondition: string
   terminalEvidence: string
+  terminalEvidenceIds?: string[]
   completionReason: string
 }
 
@@ -274,7 +282,11 @@ function clampUrgency(value: number): number {
 
 function assertEvidence(content: string, evidence: string, label: string): void {
   const quote = evidence.trim()
-  if (!quote || !content.includes(quote)) throw new Error(`${label}缺少正文逐字证据`)
+  const compact = (value: string): string => value.replace(/\s+/g, '')
+  if (!quote || !compact(content).includes(compact(quote))) {
+    const preview = quote ? `：“${quote.slice(0, 80)}”` : ''
+    throw new Error(`${label}缺少正文逐字证据${preview}`)
+  }
 }
 
 export function normalizeCausalNarrativeState(input: CausalNarrativeState): CausalNarrativeState {
@@ -544,6 +556,16 @@ export function applyCausalChapterOutcome(
   chapterOrdinal: number,
   content: string
 ): CausalNarrativeState {
+  const evidenceRefMap = new Map((outcome.evidenceRefs ?? []).map(item => [item.id, item.text]))
+  for (const ref of outcome.evidenceRefs ?? []) assertEvidence(content, ref.text, `证据单元「${ref.id}」`)
+  const assertBoundEvidence = (evidence: string, evidenceIds: string[] | undefined, label: string): void => {
+    if (evidenceIds?.length) {
+      const missing = evidenceIds.filter(id => !evidenceRefMap.has(id))
+      if (missing.length) throw new Error(`${label}引用不存在的证据单元：${missing.join('、')}`)
+      return
+    }
+    assertEvidence(content, evidence, label)
+  }
   const emotional = outcome.emotionalOutcome
   if (!emotional || !emotional.readerEffectSummary?.trim()) {
     throw new Error('章节结果缺少已经挣得的情绪结果摘要')
@@ -559,37 +581,41 @@ export function applyCausalChapterOutcome(
   }
   for (const quote of outcome.evidenceQuotes) assertEvidence(content, quote, '章节结果')
   for (const update of outcome.actorUpdates) {
-    assertEvidence(content, update.evidence, `人物「${update.actor}」更新`)
-    for (const fact of [
-      update.currentGoal,
-      update.constraint,
-      ...(update.knowledgeAdded ?? []),
-      ...(update.resourcesAdded ?? []),
-      ...(update.resourcesRemoved ?? [])
-    ]) {
-      if (fact?.trim()) assertEvidence(content, fact, `人物「${update.actor}」状态字段`)
+    assertBoundEvidence(update.evidence, update.evidenceIds, `人物「${update.actor}」更新`)
+    if (!update.evidenceIds?.length) {
+      for (const fact of [
+        update.currentGoal,
+        update.constraint,
+        ...(update.knowledgeAdded ?? []),
+        ...(update.resourcesAdded ?? []),
+        ...(update.resourcesRemoved ?? [])
+      ]) {
+        if (fact?.trim()) assertEvidence(content, fact, `人物「${update.actor}」状态字段`)
+      }
     }
   }
   for (const item of outcome.newActors ?? []) {
-    assertEvidence(content, item.evidence, `新增人物「${item.actor.name}」`)
-    for (const fact of [
-      item.actor.name,
-      item.actor.currentGoal,
-      item.actor.fear,
-      item.actor.constraint,
-      ...item.actor.knowledge,
-      ...item.actor.resources
-    ]) {
-      if (fact.trim()) assertEvidence(content, fact, `新增人物「${item.actor.name}」状态字段`)
+    assertBoundEvidence(item.evidence, item.evidenceIds, `新增人物「${item.actor.name}」`)
+    if (!item.evidenceIds?.length) {
+      for (const fact of [
+        item.actor.name,
+        item.actor.currentGoal,
+        item.actor.fear,
+        item.actor.constraint,
+        ...item.actor.knowledge,
+        ...item.actor.resources
+      ]) {
+        if (fact.trim()) assertEvidence(content, fact, `新增人物「${item.actor.name}」状态字段`)
+      }
     }
   }
-  for (const update of outcome.pressureUpdates) assertEvidence(content, update.evidence, `压力「${update.id}」更新`)
-  for (const item of outcome.newPressures) assertEvidence(content, item.evidence, `新增压力「${item.pressure.id}」`)
-  for (const update of outcome.arcUpdates ?? []) assertEvidence(content, update.evidence, `阶段「${update.id}」更新`)
-  assertEvidence(content, emotional.triggerEvidence, '情绪触发')
-  assertEvidence(content, emotional.choiceEvidence, '情绪选择')
-  assertEvidence(content, emotional.costEvidence, '情绪代价')
-  assertEvidence(content, emotional.residueEvidence, '情绪余波')
+  for (const update of outcome.pressureUpdates) assertBoundEvidence(update.evidence, update.evidenceIds, `压力「${update.id}」更新`)
+  for (const item of outcome.newPressures) assertBoundEvidence(item.evidence, item.evidenceIds, `新增压力「${item.pressure.id}」`)
+  for (const update of outcome.arcUpdates ?? []) assertBoundEvidence(update.evidence, update.evidenceIds, `阶段「${update.id}」更新`)
+  assertBoundEvidence(emotional.triggerEvidence, emotional.triggerEvidenceIds, '情绪触发')
+  assertBoundEvidence(emotional.choiceEvidence, emotional.choiceEvidenceIds, '情绪选择')
+  assertBoundEvidence(emotional.costEvidence, emotional.costEvidenceIds, '情绪代价')
+  assertBoundEvidence(emotional.residueEvidence, emotional.residueEvidenceIds, '情绪余波')
 
   const activePromiseIds = new Set(state.promises.map(item => item.id))
   const knownPromiseIds = new Set([...activePromiseIds, ...state.archivedPromiseIds])
@@ -690,7 +716,7 @@ export function applyCausalChapterOutcome(
     if (!state.terminalConditions.includes(outcome.matchedTerminalCondition?.trim())) {
       throw new Error('章节结果声明完结，但没有命中权威终止条件')
     }
-    assertEvidence(content, outcome.terminalEvidence, '终止条件')
+    assertBoundEvidence(outcome.terminalEvidence, outcome.terminalEvidenceIds, '终止条件')
     if (!outcome.completionReason?.trim()) throw new Error('章节结果声明完结，但缺少完结原因')
   }
 

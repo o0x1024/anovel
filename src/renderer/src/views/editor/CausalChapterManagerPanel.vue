@@ -32,6 +32,19 @@ interface ChapterDetail {
     emotionAssessment: unknown
   }
   decision: CausalChapterDecisionRecord | null
+  contentBinding: {
+    contentVersionId: number
+    stateBeforeRevision: number | null
+    stateAfterRevision: number | null
+    bindingStatus: string
+  } | null
+  replayJobs: Array<{
+    id: number
+    status: string
+    affectedChapterIds: number[]
+    errorMessage: string | null
+    createTime: string
+  }>
   stateFacts: Array<{
     id: number
     entity: string
@@ -58,6 +71,22 @@ interface ChapterDetail {
     createTime: string
     hasContent: boolean
   }>
+}
+
+type ManualEditKind = 'expression' | 'factual'
+
+interface CausalChapterEditPreview {
+  chapterId: number
+  editKind: ManualEditKind
+  decisionStatus: 'planned' | 'committed'
+  currentVersionId: number
+  affectedChapterIds: number[]
+  affectedChapterTitles: string[]
+  requiresReplay: boolean
+  warnings: string[]
+  auditReasons: string[]
+  expectedUpdateTime: string
+  validationToken: string
 }
 
 interface VersionPreview {
@@ -103,6 +132,10 @@ const copied = ref(false)
 const rewriteGenerating = ref(false)
 const rewriteApplying = ref(false)
 const rewritePreview = ref<CausalStyleRewritePreview | null>(null)
+const manualEditKind = ref<ManualEditKind>('expression')
+const editPreview = ref<CausalChapterEditPreview | null>(null)
+const editApplying = ref(false)
+const replayActionLoading = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(10)
 const listWidth = ref(240)
@@ -126,7 +159,8 @@ const paginatedChapters = computed(() => {
 const selectedListItem = computed(() => chapters.value.find(chapter => chapter.id === selectedId.value) ?? null)
 const decisionPlan = computed<CausalChapterPlan | null>(() => detail.value?.decision?.plan ?? null)
 const outcome = computed<CausalChapterOutcome | null>(() => detail.value?.decision?.outcome ?? null)
-const directEditLocked = computed(() => detail.value?.decision?.status === 'committed')
+const committedChapter = computed(() => detail.value?.decision?.status === 'committed')
+const pendingReplay = computed(() => detail.value?.replayJobs.find(job => ['pending', 'running', 'blocked'].includes(job.status)) ?? null)
 const titleEditLocked = computed(() => Boolean(detail.value?.decision))
 const editWordCount = computed(() => editContent.value.replace(/\s/g, '').length)
 const hasUnsavedChanges = computed(() => Boolean(
@@ -263,10 +297,6 @@ function switchTab(tab: DetailTab): void {
 
 async function saveChapter(): Promise<void> {
   if (!detail.value || saving.value) return
-  if (directEditLocked.value) {
-    errorMessage.value = '已提交章节已冻结；只调整表达请使用“AI 按当前文风重写”'
-    return
-  }
   const title = editTitle.value.trim()
   if (!title) {
     errorMessage.value = '章节标题不能为空'
@@ -275,6 +305,15 @@ async function saveChapter(): Promise<void> {
   saving.value = true
   errorMessage.value = ''
   try {
+    if (editContent.value !== detail.value.chapter.content) {
+      editPreview.value = await window.anovel.invoke('causal:previewChapterEdit', {
+        workId: props.workId,
+        chapterId: detail.value.chapter.id,
+        candidateContent: editContent.value,
+        editKind: committedChapter.value ? manualEditKind.value : 'expression'
+      }) as CausalChapterEditPreview
+      return
+    }
     const updated = await window.anovel.invoke(
       'causal:updateChapter', props.workId, detail.value.chapter.id,
       { title, content: editContent.value, expectedUpdateTime: detail.value.chapter.updateTime }
@@ -287,6 +326,62 @@ async function saveChapter(): Promise<void> {
     errorMessage.value = String(error)
   } finally {
     saving.value = false
+  }
+}
+
+async function applyManualEdit(): Promise<void> {
+  const preview = editPreview.value
+  if (!preview || !detail.value || editApplying.value) return
+  editApplying.value = true
+  errorMessage.value = ''
+  try {
+    await window.anovel.invoke('causal:applyChapterEdit', {
+      workId: props.workId,
+      chapterId: preview.chapterId,
+      candidateContent: editContent.value,
+      editKind: preview.editKind,
+      currentVersionId: preview.currentVersionId,
+      expectedUpdateTime: preview.expectedUpdateTime,
+      validationToken: preview.validationToken
+    })
+    editPreview.value = null
+    await loadChapters(false)
+    await loadDetail(preview.chapterId)
+  } catch (error) {
+    errorMessage.value = String(error)
+  } finally {
+    editApplying.value = false
+  }
+}
+
+async function retryReplay(): Promise<void> {
+  if (!pendingReplay.value || replayActionLoading.value) return
+  replayActionLoading.value = true
+  errorMessage.value = ''
+  try {
+    await window.anovel.invoke('causal:retryReplay', props.workId, pendingReplay.value.id)
+    await loadChapters(false)
+    if (selectedId.value) await loadDetail(selectedId.value)
+  } catch (error) {
+    errorMessage.value = String(error)
+  } finally {
+    replayActionLoading.value = false
+  }
+}
+
+async function cancelReplay(): Promise<void> {
+  if (!pendingReplay.value || replayActionLoading.value) return
+  if (!confirm('撤销本次事实修改并恢复修改前正文？新正文版本仍会保留在历史中。')) return
+  replayActionLoading.value = true
+  errorMessage.value = ''
+  try {
+    await window.anovel.invoke('causal:cancelReplay', props.workId, pendingReplay.value.id)
+    await loadChapters(false)
+    if (selectedId.value) await loadDetail(selectedId.value)
+  } catch (error) {
+    errorMessage.value = String(error)
+  } finally {
+    replayActionLoading.value = false
   }
 }
 
@@ -533,24 +628,59 @@ onUnmounted(() => {
               </button>
               <button v-for="tab in tabLabels" :key="tab.key" type="button" class="btn btn-ghost btn-xs" @click="openDrawer(tab.key)">{{ tab.label }}</button>
               <span class="w-px h-4 bg-base-300 mx-1" />
-              <button type="button" class="btn btn-ghost btn-xs text-error gap-1" :disabled="!selectedListItem || directEditLocked" :title="directEditLocked ? '已提交章节属于权威历史，不能直接删除' : '删除草稿章节'" @click="selectedListItem && deleteChapter(selectedListItem)"><font-awesome-icon icon="trash" class="w-3 h-3" />删除</button>
+              <button type="button" class="btn btn-ghost btn-xs text-error gap-1" :disabled="!selectedListItem || committedChapter" :title="committedChapter ? '删除已提交章节需要结构重放' : '删除草稿章节'" @click="selectedListItem && deleteChapter(selectedListItem)"><font-awesome-icon icon="trash" class="w-3 h-3" />删除</button>
             </div>
           </div>
 
           <div class="flex flex-wrap items-center gap-2 mb-3 shrink-0">
             <input v-model="editTitle" class="input input-bordered input-sm min-w-0 flex-1" placeholder="章节标题" :disabled="titleEditLocked" />
+            <select v-if="committedChapter" v-model="manualEditKind" class="select select-bordered select-sm" :disabled="Boolean(pendingReplay)">
+              <option value="expression">只改文字</option>
+              <option value="factual">修改事实或情节</option>
+            </select>
             <span class="text-xs text-base-content/45">{{ editWordCount }} 字</span>
-            <button type="button" class="btn btn-ghost btn-sm" :disabled="directEditLocked || saving || !hasUnsavedChanges" @click="cancelEditing">还原修改</button>
-            <button type="button" class="btn btn-primary btn-sm" :disabled="directEditLocked || saving || !editTitle.trim()" @click="saveChapter">{{ saving ? '保存中…' : '保存修改' }}</button>
+            <button type="button" class="btn btn-ghost btn-sm" :disabled="saving || !hasUnsavedChanges" @click="cancelEditing">还原修改</button>
+            <button type="button" class="btn btn-primary btn-sm" :disabled="saving || Boolean(pendingReplay) || !editTitle.trim()" @click="saveChapter">{{ saving ? '审计中…' : '预览并保存' }}</button>
           </div>
-          <p v-if="detail.decision?.status === 'committed'" class="rounded-lg bg-warning/10 border border-warning/30 px-3 py-2 text-xs text-warning-content mb-3 shrink-0">
-            这是已提交的权威章节，正文和标题已冻结。只调整表达请使用上方“AI 按当前文风重写”；事实修改需要后续因果重放流程。
+          <div v-if="pendingReplay" class="rounded-lg bg-error/10 border border-error/30 px-3 py-2 text-xs mb-3 shrink-0 flex items-center gap-2 flex-wrap">
+            <span class="flex-1 min-w-60">因果重放任务 #{{ pendingReplay.id }}：{{ pendingReplay.status }}。重放完成前本作品不会继续生成；原正文与原因果状态均已保留。</span>
+            <button v-if="pendingReplay.status === 'blocked'" type="button" class="btn btn-outline btn-xs" :disabled="replayActionLoading" @click="retryReplay">修正后重试</button>
+            <button type="button" class="btn btn-ghost btn-xs" :disabled="replayActionLoading" @click="cancelReplay">撤销事实修改</button>
+          </div>
+          <p v-else-if="detail.decision?.status === 'committed'" class="rounded-lg bg-warning/10 border border-warning/30 px-3 py-2 text-xs text-warning-content mb-3 shrink-0">
+            已提交正文可以编辑，但不会覆盖历史。“只改文字”需通过事实等价审计；“修改事实或情节”会创建新版本、暂停生成并重放后续因果。
           </p>
-          <textarea v-model="editContent" :disabled="directEditLocked" class="textarea textarea-bordered w-full flex-1 min-h-[460px] resize-none rounded-b-none border-b-0 font-serif text-[16px] leading-8 bg-base-100 disabled:bg-base-100 disabled:text-base-content/90" placeholder="输入章节正文" />
+          <textarea v-model="editContent" :disabled="Boolean(pendingReplay)" class="textarea textarea-bordered w-full flex-1 min-h-[460px] resize-none rounded-b-none border-b-0 font-serif text-[16px] leading-8 bg-base-100 disabled:bg-base-100 disabled:text-base-content/90" placeholder="输入章节正文" />
         </template>
         <p v-else class="flex-1 grid place-items-center text-sm text-base-content/40">请从左侧选择章节</p>
       </main>
     </div>
+
+    <Teleport to="body">
+      <div v-if="editPreview" class="fixed inset-0 z-[115] flex items-center justify-center bg-black/40 p-4">
+        <div class="card bg-base-100 border border-base-300 shadow-2xl w-full max-w-2xl p-5 space-y-4">
+          <div>
+            <h2 class="font-bold text-lg">确认正文版本与因果影响</h2>
+            <p class="text-xs text-base-content/50 mt-1">本次保存不会覆盖旧正文；当前内容将成为新的不可变版本。</p>
+          </div>
+          <div class="rounded-lg border p-4" :class="editPreview.requiresReplay ? 'border-warning bg-warning/5' : 'border-success bg-success/5'">
+            <p class="font-semibold text-sm">{{ editPreview.editKind === 'expression' ? '只修改表达' : '修改事实或情节' }}</p>
+            <p v-for="warning in editPreview.warnings" :key="warning" class="text-sm mt-2">• {{ warning }}</p>
+          </div>
+          <div v-if="editPreview.affectedChapterTitles.length" class="space-y-2">
+            <p class="text-sm font-semibold">受影响的后续章节（{{ editPreview.affectedChapterTitles.length }}）</p>
+            <div class="max-h-36 overflow-auto rounded-lg bg-base-200 p-3 text-xs leading-6">{{ editPreview.affectedChapterTitles.join('、') }}</div>
+          </div>
+          <div class="flex justify-end gap-2">
+            <button type="button" class="btn btn-ghost btn-sm" :disabled="editApplying" @click="editPreview = null">返回修改</button>
+            <button type="button" class="btn btn-primary btn-sm" :disabled="editApplying" @click="applyManualEdit">
+              <font-awesome-icon v-if="editApplying" icon="spinner" spin class="w-3.5 h-3.5" />
+              {{ editApplying ? '正在保存…' : editPreview.requiresReplay ? '保存并创建重放任务' : '保存新版本' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div v-if="rewritePreview" class="fixed inset-0 z-[110] flex items-center justify-center bg-black/40 p-4">

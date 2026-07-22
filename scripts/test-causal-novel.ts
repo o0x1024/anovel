@@ -15,6 +15,14 @@ import {
   type CausalChapterPlanDraft,
   type CausalNarrativeState
 } from '../src/shared/causal-novel-types'
+import {
+  CausalOutcomeProtocolError,
+  buildCausalBodyEvidenceUnits,
+  causalOutcomeFailureCode,
+  materializeCausalOutcomeDraft,
+  validateCausalEvidenceIds,
+  type CausalOutcomeDraftBundle
+} from '../src/shared/causal-outcome-protocol'
 
 const state: CausalNarrativeState = {
   schemaVersion: CAUSAL_NOVEL_SCHEMA_VERSION,
@@ -116,6 +124,12 @@ assert.throws(
   () => applyCausalChapterOutcome(state, { ...outcome, evidenceQuotes: ['正文里不存在的句子'] }, 3, content),
   /缺少正文逐字证据/
 )
+assert.doesNotThrow(() => applyCausalChapterOutcome(
+  state,
+  { ...outcome, evidenceQuotes: ['追踪者摘下兜帽，说出了林舟母亲的名字。\n林舟终于确认'] },
+  3,
+  '追踪者摘下兜帽，说出了林舟母亲的名字。林舟终于确认，父亲曾经替黑市工作。'
+))
 assert.throws(
   () => applyCausalChapterOutcome(state, { ...outcome, advancedPromiseIds: ['unknown'] }, 3, content),
   /不存在或已归档的读者承诺/
@@ -144,6 +158,69 @@ const proposedCompletion = applyCausalChapterOutcome(state, {
 }, 3, content)
 assert.equal(proposedCompletion.completionStatus, 'proposed')
 assert.equal(proposedCompletion.completed, false)
+
+const indexedContent = [
+  '追踪者摘下兜帽，说出了林舟母亲的名字。林舟没有后退。',
+  '他终于确认，父亲曾经替黑市工作。'
+].join('\n')
+const evidenceUnits = buildCausalBodyEvidenceUnits(indexedContent)
+assert.deepEqual(evidenceUnits.map(item => item.id), ['e0001', 'e0002', 'e0003'])
+assert.equal(evidenceUnits[0].text, '追踪者摘下兜帽，说出了林舟母亲的名字。')
+assert.equal(evidenceUnits[2].paragraph, 2)
+assert.throws(
+  () => validateCausalEvidenceIds(evidenceUnits, ['e9999'], 'core.evidenceIds'),
+  (error: unknown) => error instanceof CausalOutcomeProtocolError && error.code === 'OUTCOME_EVIDENCE_ID'
+)
+
+const stagedOutcomeDraft: CausalOutcomeDraftBundle = {
+  core: {
+    summary: '追踪者以母亲施压，林舟确认父亲与黑市有关',
+    eventSignature: '母亲威胁揭开父亲黑市联系',
+    evidenceIds: ['e0001', 'e0003'],
+    advancedPromiseIds: ['promise_ability'], resolvedPromiseIds: [],
+    newPromiseQuestions: ['父亲曾为黑市做过什么？'],
+    terminalConditionMet: false, matchedTerminalCondition: '', terminalEvidenceIds: [], completionReason: ''
+  },
+  actors: {
+    actorUpdates: [{
+      actor: '林舟', currentGoal: '查清父亲与黑市的关系',
+      knowledgeAdded: ['父亲曾替黑市工作'], resourcesAdded: [], resourcesRemoved: [],
+      constraint: '母亲身份已被追踪者掌握', evidenceIds: ['e0001', 'e0003']
+    }],
+    newActors: []
+  },
+  world: { pressureUpdates: [], newPressures: [], arcUpdates: [] },
+  emotion: {
+    readerEffectSummary: '威胁触及母亲，同时打开父亲旧事的悬念',
+    triggerEvidenceIds: ['e0001'], choiceEvidenceIds: ['e0002'],
+    costEvidenceIds: ['e0001'], residueEvidenceIds: ['e0003'],
+    emotionalDebtOpened: '父亲与黑市的旧账', emotionalDebtPaid: ''
+  }
+}
+const stagedOutcome = materializeCausalOutcomeDraft({ state, units: evidenceUnits, draft: stagedOutcomeDraft })
+assert.equal(stagedOutcome.newPromises[0].id, 'p1')
+assert.deepEqual(stagedOutcome.actorUpdates[0].evidenceIds, ['e0001', 'e0003'])
+assert.doesNotThrow(() => applyCausalChapterOutcome(state, stagedOutcome, 3, indexedContent))
+assert.equal(causalOutcomeFailureCode(new Error('情绪结果提取连续 2 次结构化输出无效：Unexpected token')), 'OUTCOME_SCHEMA')
+assert.equal(causalOutcomeFailureCode(new Error('核心事件提取连续 2 次结构化输出无效：核心事件没有推进冻结决策中的任何读者承诺')), 'OUTCOME_PROMISE_PROGRESS')
+assert.equal(causalOutcomeFailureCode(new CausalOutcomeProtocolError('OUTCOME_ENTAILMENT', '审计失败')), 'OUTCOME_ENTAILMENT')
+assert.throws(
+  () => materializeCausalOutcomeDraft({
+    state,
+    units: evidenceUnits,
+    draft: {
+      ...stagedOutcomeDraft,
+      world: {
+        ...stagedOutcomeDraft.world,
+        pressureUpdates: [{
+          id: 'pressure_black_market', direction: 'escalated', condition: '追踪仍在继续',
+          urgency: 4, evidenceIds: ['e0001']
+        }]
+      }
+    }
+  }),
+  (error: unknown) => error instanceof CausalOutcomeProtocolError && error.code === 'OUTCOME_OPERATION'
+)
 
 const plan: CausalChapterPlan = {
   candidates: [{

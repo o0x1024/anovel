@@ -31,7 +31,7 @@ export const STORY_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'repair_execute'
 ]
 
-/** 小说阶段顺序；运行器会在章节情节与正文之间按卷往返，数组仅用于界面排序。 */
+/** 小说阶段顺序；运行器会在章节大纲与正文之间按卷往返，数组仅用于界面排序。 */
 export const NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'materialize_settings',
   'generate_character_cards',
@@ -88,7 +88,7 @@ export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   generate_title_hook: '书名导语',
   overall_self_check: '整体自检',
   generate_volumes: '分卷大纲',
-  generate_beats: '章节情节',
+  generate_beats: '章节大纲',
   draft_body: '正文生成',
   goal_check: '目标验收',
   repair_plan: '修复计划',

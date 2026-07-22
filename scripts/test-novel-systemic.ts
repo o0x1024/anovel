@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { detectChapterPatternIssues, detectStoryStateIssues } from '../src/main/context/goal-routine/novel-systemic-gate'
+import { reconcileChapterPatternWithOutlineDiagnosis } from '../src/main/context/memory-extract'
 import type { ChapterPatternFingerprintRow, StoryStateFactRow } from '../src/main/db'
 
 function fact(input: Partial<StoryStateFactRow> & Pick<StoryStateFactRow, 'chapter_id' | 'entity' | 'state_key' | 'value_json' | 'transition'>): StoryStateFactRow {
@@ -96,6 +97,45 @@ const stagnant = chapters.map((_, index) => fingerprint(index + 1, {
 }))
 const stagnantIssues = detectChapterPatternIssues(chapters as never[], stagnant)
 assert(stagnantIssues.some(issue => issue.code === 'VOLUME_OBJECTIVE_STAGNATION'))
+
+const contractBackedChapters = chapters.map((chapter, index) => ({
+  ...chapter,
+  outline_diagnosis: JSON.stringify({
+    pattern_contract: {
+      conflict_type: `合同冲突${index}`,
+      protagonist_method: `合同解法${index}`,
+      antagonist_tactic: `合同对手策略${index}`,
+      anticipated_opponent_adjustment: index === 1 ? '对手改变搜捕路线' : '无变化',
+      location_type: `合同地点${index}`,
+      hook_type: `合同钩子${index}`,
+      cost_type: `合同代价${index}`,
+      relationship_delta: index === 1 ? '建立临时同盟' : '无变化',
+      volume_objective_delta: index < 3 ? `合同目标推进${index}` : '无变化'
+    },
+    dramatic_contract: { irreversible_change: `不可逆变化${index}` },
+    tension_plan: { payoff_type: index === 2 ? 'partial' : 'debt' }
+  })
+}))
+const staleModelFingerprints = chapters.map((_, index) => fingerprint(index + 1, {
+  opponent_adjustment: '无变化',
+  relationship_delta: '无变化',
+  volume_objective_delta: '无变化',
+  payoff_type: 'debt'
+}))
+const reconciledIssues = detectChapterPatternIssues(contractBackedChapters as never[], staleModelFingerprints)
+assert(!reconciledIssues.some(issue => issue.code === 'VOLUME_OBJECTIVE_STAGNATION'))
+assert(!reconciledIssues.some(issue => issue.code === 'PAYOFF_DEBT_STREAK'))
+const reconciledCandidate = reconcileChapterPatternWithOutlineDiagnosis(
+  {
+    conflictType: '候选冲突', protagonistMethod: '候选解法', antagonistTactic: '候选策略',
+    antagonistOutcome: '候选结果', opponentAdjustment: '无变化', locationType: '候选地点',
+    hookType: '候选钩子', costType: '候选代价', relationshipDelta: '无变化',
+    volumeObjectiveDelta: '无变化', payoffType: 'debt'
+  },
+  contractBackedChapters[2].outline_diagnosis
+)
+assert.equal(reconciledCandidate.volumeObjectiveDelta, '合同目标推进2')
+assert.equal(reconciledCandidate.payoffType, 'partial')
 
 const varied = chapters.map((_, index) => fingerprint(index + 1))
 const cleanIssues = detectChapterPatternIssues(chapters as never[], varied, { requireFingerprints: true })

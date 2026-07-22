@@ -1,6 +1,7 @@
 import { storyStateDAO, volumeChapterDAO } from '../../db'
 import type { ChapterPatternFingerprintRow, StoryStateFactRow } from '../../db'
 import type { ChapterRow } from '../../db/dao/chapter-dao'
+import { reconcileChapterPatternWithOutlineDiagnosis } from '../memory-extract'
 import {
   issueEvidenceFingerprint,
   type NovelSystemicAssessment,
@@ -171,13 +172,44 @@ function repeatedProseIssues(chapters: WorkChapter[]): NovelSystemIssue[] {
   })]
 }
 
+function reconcileCompletedFingerprint(
+  row: ChapterPatternFingerprintRow,
+  chapter: WorkChapter | undefined
+): ChapterPatternFingerprintRow {
+  if (chapter?.status !== 'completed') return row
+  const reconciled = reconcileChapterPatternWithOutlineDiagnosis({
+    conflictType: row.conflict_type,
+    protagonistMethod: row.protagonist_method,
+    antagonistTactic: row.antagonist_tactic,
+    antagonistOutcome: row.antagonist_outcome,
+    opponentAdjustment: row.opponent_adjustment,
+    locationType: row.location_type,
+    hookType: row.hook_type,
+    costType: row.cost_type,
+    relationshipDelta: row.relationship_delta,
+    volumeObjectiveDelta: row.volume_objective_delta,
+    payoffType: row.payoff_type
+  }, chapter.outline_diagnosis)
+  return {
+    ...row,
+    opponent_adjustment: reconciled.opponentAdjustment,
+    relationship_delta: reconciled.relationshipDelta,
+    volume_objective_delta: reconciled.volumeObjectiveDelta,
+    payoff_type: reconciled.payoffType
+  }
+}
+
 export function detectChapterPatternIssues(
   chapters: WorkChapter[],
   fingerprints: ChapterPatternFingerprintRow[],
   options: { requireFingerprints?: boolean; includeProseScan?: boolean } = {}
 ): NovelSystemIssue[] {
   const issues: NovelSystemIssue[] = []
-  const fingerprintByChapter = new Map(fingerprints.map(row => [row.chapter_id, row]))
+  const chapterById = new Map(chapters.map(chapter => [chapter.id, chapter]))
+  const fingerprintByChapter = new Map(fingerprints.map(row => [
+    row.chapter_id,
+    reconcileCompletedFingerprint(row, chapterById.get(row.chapter_id))
+  ]))
   if (options.requireFingerprints) {
     const missing = chapters.filter(chapter => chapter.content?.trim() && !fingerprintByChapter.has(chapter.id))
     if (missing.length > 0) {

@@ -130,7 +130,7 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'story_repair_blueprint', label: '结构层修复' },
       { step: 'resource_constraints_extract', label: '资源约束抽取' },
       { step: 'goal_generate_volumes', label: '目标分卷大纲' },
-      { step: 'goal_generate_beats', label: '目标章节情节' },
+      { step: 'goal_generate_beats', label: '目标章节大纲' },
       { step: 'goal_novel_volume_plan', label: '长篇分卷合同' },
       { step: 'goal_novel_chapter_batch', label: '长篇章节批次' },
       { step: 'goal_novel_chapter_contract', label: '长篇单章结构合同' },

@@ -67,6 +67,61 @@ interface OutlineDiagnosisPatch {
   characters?: string | null
 }
 
+interface ContractRow {
+  label: string
+  value: string
+}
+
+interface ChapterPlanningDetails {
+  chapterNumber: number
+  volumeName: string
+  executionContract: {
+    openingState: string
+    requiredEvents: string[]
+    forbiddenEvents: string[]
+    endingState: string
+    abilityConstraints: string
+    continuityConstraints: string
+    warnings: string[]
+    errors: string[]
+  } | null
+  structureContract: Record<string, unknown> | null
+  emotionContract: Record<string, unknown> | null
+  emotionAssessment: Record<string, unknown> | null
+  qualityAssessment: Record<string, unknown> | null
+  resourceBudgets: Array<{
+    id: number
+    owner?: string | null
+    resource: string
+    unit?: string | null
+    start_min?: number | null
+    start_max?: number | null
+    end_min?: number | null
+    end_max?: number | null
+    allowed_events?: string | null
+    forbidden_events?: string | null
+    reason?: string | null
+  }>
+  gate: {
+    status: 'not_run' | 'queued' | 'running' | 'repairing' | 'passed' | 'deferred' | 'stalled'
+    volume: string
+    score?: number
+    rounds?: number
+    reason?: string
+    completedAt?: string
+    summary?: string
+    historicalScoreMissing?: boolean
+    issues: Array<{
+      code: string
+      problem: string
+      requiredFix: string
+      repairChapterNumbers: number[]
+      appliesToChapter: boolean
+    }>
+  }
+  warnings: string[]
+}
+
 const volumes = ref<{ id: number; name: string; description?: string | null }[]>([])
 const chapters = ref<Chapter[]>([])
 const selectedVolume = ref<number | null>(null)
@@ -85,6 +140,9 @@ const aiChapterId = ref<number | null>(null)
 const batchSelectMode = ref(false)
 const batchSelectedIds = ref<Set<number>>(new Set())
 const lastAiContext = ref('')
+const planningDetails = ref<ChapterPlanningDetails | null>(null)
+const planningDetailsLoading = ref(false)
+let planningDetailsRequest = 0
 
 const batchChapterCount = ref(5)
 const chapterBaseOffset = ref(0)
@@ -135,8 +193,10 @@ watch(selectedChapterId, () => {
       currentPage.value = Math.floor(idx / pageSize) + 1
     }
     void loadChapterVersions(selectedChapterId.value)
+    void loadPlanningDetails(selectedChapterId.value)
   } else {
     chapterVersions.value = []
+    planningDetails.value = null
   }
 }, { immediate: true })
 
@@ -171,7 +231,7 @@ const batchSystemPrompt = computed(() => {
   }
 
   return [
-    '根据当前分卷信息与作品创作上下文，生成该卷下的章节情节大纲。',
+    '根据当前分卷信息与作品创作上下文，生成该卷下的章节大纲。',
     goldenOutlineContract('novel', startNum, startNum + batchChapterCount.value - 1),
     '【输出格式 - 必须严格遵守】',
     '只输出一个 JSON 对象；禁止 Markdown 章节标题、前置说明、思考过程，以及 ``` 代码块围栏。',
@@ -432,6 +492,8 @@ async function loadChapters(vid: number) {
   }
   if (!chapters.value.some(c => c.id === selectedChapterId.value)) {
     selectedChapterId.value = chapters.value[0].id
+  } else {
+    await loadPlanningDetails(selectedChapterId.value)
   }
 }
 
@@ -461,6 +523,145 @@ const selectedChapterOutlineDisplay = computed(() =>
 const selectedChapterCharacters = computed(() =>
   parseCharacterNames(selectedChapter.value?.characters)
 )
+
+const CONTRACT_LABELS: Record<string, string> = {
+  dramatic_contract: '戏剧合同',
+  pattern_contract: '模式合同',
+  tension_plan: '张力计划',
+  scene_promise: '本章承诺',
+  protagonist_want: '主角目标',
+  obstacle: '具体阻力',
+  stakes: '失败代价',
+  info_gap: '信息差',
+  pressure_escalation: '压力升级',
+  turn: '关键转折',
+  irreversible_change: '不可逆变化',
+  payoff_or_debt: '兑现或欠债',
+  next_question: '章末追问',
+  conflict_type: '冲突类型',
+  protagonist_method: '主角方法',
+  antagonist_tactic: '对手策略',
+  anticipated_opponent_adjustment: '对手后续调整',
+  location_type: '场景类型',
+  hook_type: '钩子类型',
+  cost_type: '代价类型',
+  relationship_delta: '关系变化',
+  volume_objective_delta: '分卷目标推进',
+  level: '张力等级',
+  payoff_type: '兑现类型',
+  attachment_basis: '读者依恋依据',
+  trigger: '情绪触发',
+  event_meaning: '事件意义',
+  character_appraisal: '人物评价',
+  surface_behavior: '表层行为',
+  inner_conflict: '内在冲突',
+  choice: '关键选择',
+  cost: '选择代价',
+  reader_inference: '读者推断',
+  aftermath: '情绪余波',
+  information_position: '信息位置',
+  score: '分数',
+  passed: '是否通过',
+  summary: '结论',
+  blockers: '阻塞项',
+  warnings: '提醒'
+}
+
+function contractLabel(key: string): string {
+  return CONTRACT_LABELS[key] ?? key.replaceAll('_', ' ')
+}
+
+function scalarContractValue(value: unknown): string {
+  if (value == null || value === '') return ''
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  return String(value).trim()
+}
+
+function flattenContractRows(value: unknown, prefix = ''): ContractRow[] {
+  if (Array.isArray(value)) {
+    const simple = value.map(scalarContractValue).filter(Boolean)
+    if (simple.length === value.length) return prefix ? [{ label: prefix, value: simple.join('；') }] : []
+    return value.flatMap((item, index) => flattenContractRows(item, `${prefix}${index + 1}`))
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).flatMap(([key, child]) => {
+      if (key === 'execution_contract_v3') return []
+      const label = prefix ? `${prefix} · ${contractLabel(key)}` : contractLabel(key)
+      return flattenContractRows(child, label)
+    })
+  }
+  const text = scalarContractValue(value)
+  return text && prefix ? [{ label: prefix, value: text }] : []
+}
+
+const structureContractSections = computed(() => {
+  const source = planningDetails.value?.structureContract
+  if (!source) return []
+  return ['dramatic_contract', 'pattern_contract', 'tension_plan'].flatMap(key => {
+    const value = source[key]
+    const rows = flattenContractRows(value)
+    return rows.length ? [{ key, title: contractLabel(key), rows }] : []
+  })
+})
+
+const emotionContractRows = computed(() =>
+  flattenContractRows(planningDetails.value?.emotionContract)
+)
+
+const assessmentSections = computed(() => [
+  { key: 'emotion', title: '情绪验收', rows: flattenContractRows(planningDetails.value?.emotionAssessment) },
+  { key: 'quality', title: '正文质量验收', rows: flattenContractRows(planningDetails.value?.qualityAssessment) }
+].filter(section => section.rows.length))
+
+function gateStatusLabel(status: ChapterPlanningDetails['gate']['status']): string {
+  return {
+    not_run: '未检查',
+    queued: '等待检查',
+    running: '检查中',
+    repairing: '定点修复中',
+    passed: '已通过',
+    deferred: '延期放行',
+    stalled: '已阻塞'
+  }[status]
+}
+
+function gateBadgeClass(status: ChapterPlanningDetails['gate']['status']): string {
+  if (status === 'passed') return 'badge-success'
+  if (status === 'deferred' || status === 'repairing' || status === 'queued') return 'badge-warning'
+  if (status === 'stalled') return 'badge-error'
+  if (status === 'running') return 'badge-info'
+  return 'badge-ghost'
+}
+
+function formatGateTime(value?: string): string {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function budgetRange(min?: number | null, max?: number | null, unit?: string | null): string {
+  if (min == null && max == null) return '未限定'
+  const range = min === max ? String(min) : `${min ?? '不限'}～${max ?? '不限'}`
+  return `${range}${unit ? ` ${unit}` : ''}`
+}
+
+async function loadPlanningDetails(chapterId: number | null) {
+  const request = ++planningDetailsRequest
+  if (!chapterId || workType.value === 'story') {
+    planningDetails.value = null
+    planningDetailsLoading.value = false
+    return
+  }
+  planningDetailsLoading.value = true
+  try {
+    const result = await window.anovel.invoke(
+      'chapter:getPlanningDetails', props.workId, chapterId
+    ) as ChapterPlanningDetails
+    if (request === planningDetailsRequest) planningDetails.value = result
+  } finally {
+    if (request === planningDetailsRequest) planningDetailsLoading.value = false
+  }
+}
 
 function selectChapter(ch: Chapter) {
   selectedChapterId.value = ch.id
@@ -1387,9 +1588,9 @@ async function clearDiagnosisResult() {
       </div>
 
       <div :class="['grid grid-cols-1 gap-4 mb-6', workType === 'story' ? 'lg:grid-cols-1' : 'lg:grid-cols-2']">
-        <!-- AI 批量生成本卷章节 -->
+        <!-- AI 批量生成本卷章节大纲 -->
         <div v-if="workType !== 'story'" class="card bg-base-200 border border-base-300 shadow-sm p-4">
-          <h4 class="font-semibold text-sm mb-3">AI 批量生成本卷章节</h4>
+          <h4 class="font-semibold text-sm mb-3">AI 批量生成本卷章节大纲</h4>
           <div class="flex flex-wrap gap-2 mb-3 items-center">
             <label class="text-xs text-base-content/50">章节数</label>
             <input
@@ -1406,7 +1607,7 @@ async function clearDiagnosisResult() {
               @click="aiBatchChapters"
             >
               <font-awesome-icon :icon="batchLoading ? 'spinner' : 'robot'" :spin="batchLoading" class="w-3 h-3" />
-              {{ batchLoading ? '生成中...' : 'AI 批量生成章节' }}
+              {{ batchLoading ? '生成大纲中...' : 'AI 批量生成大纲' }}
             </button>
             <template v-if="parsedChapters.length">
               <span class="text-xs font-medium text-success">已解析 {{ parsedChapters.length }} 章</span>
@@ -1484,9 +1685,13 @@ async function clearDiagnosisResult() {
           </div>
         </div>
 
-        <!-- AI 大纲诊断 -->
+        <!-- 手动大纲诊断（区别于目标循环正式门禁） -->
         <div class="card bg-base-200 border border-base-300 shadow-sm p-4 min-w-0 flex flex-col">
-          <h4 class="font-semibold text-sm mb-3">AI {{ unitLabels.outline }}诊断</h4>
+          <div class="flex flex-wrap items-center gap-2 mb-1">
+            <h4 class="font-semibold text-sm">手动{{ unitLabels.outline }}诊断</h4>
+            <span class="badge badge-ghost badge-xs">辅助检查</span>
+          </div>
+          <p class="text-[11px] text-base-content/45 mb-3">用于人工发起的诊断与修订，不代表目标循环的正式章节大纲门禁结果。</p>
           <div class="flex flex-wrap gap-2 mb-3 items-center">
             <label v-if="workType !== 'story'" class="text-xs text-base-content/50">诊断范围</label>
             <select v-if="workType !== 'story'" v-model="diagnosisScope" class="select select-bordered select-sm w-36">
@@ -1500,7 +1705,7 @@ async function clearDiagnosisResult() {
               @click="runOutlineDiagnosis"
             >
               <font-awesome-icon :icon="diagnosisLoading ? 'spinner' : 'clipboard-check'" :spin="diagnosisLoading" class="w-3 h-3" />
-              {{ diagnosisLoading ? '诊断中...' : '运行大纲诊断' }}
+              {{ diagnosisLoading ? '诊断中...' : '运行手动诊断' }}
             </button>
             <button
               class="btn btn-secondary btn-sm gap-1"
@@ -1678,6 +1883,60 @@ async function clearDiagnosisResult() {
               </div>
             </div>
 
+            <div
+              v-if="workType !== 'story'"
+              class="mb-3 rounded-lg border border-base-300 bg-base-100/80 px-3 py-2.5 shrink-0"
+            >
+              <div v-if="planningDetailsLoading" class="text-xs text-base-content/40 flex items-center gap-2">
+                <font-awesome-icon icon="spinner" spin class="w-3 h-3" />
+                正在读取正式门禁与章节合同…
+              </div>
+              <template v-else-if="planningDetails">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-xs font-semibold">正式章节大纲门禁</span>
+                  <span class="badge badge-sm" :class="gateBadgeClass(planningDetails.gate.status)">
+                    {{ gateStatusLabel(planningDetails.gate.status) }}
+                  </span>
+                  <span v-if="planningDetails.gate.score != null" class="text-xs text-base-content/60">
+                    {{ planningDetails.gate.score }} 分
+                  </span>
+                  <span v-if="planningDetails.gate.rounds != null" class="text-xs text-base-content/50">
+                    第 {{ planningDetails.gate.rounds }} 轮
+                  </span>
+                  <span v-if="planningDetails.gate.completedAt" class="text-[11px] text-base-content/40">
+                    {{ formatGateTime(planningDetails.gate.completedAt) }}
+                  </span>
+                </div>
+                <p v-if="planningDetails.gate.historicalScoreMissing" class="text-[11px] text-base-content/45 mt-1.5">
+                  这是旧版冻结记录，当时未保存分数与大纲快照；重新运行正式门禁后会补齐可追溯结果。
+                </p>
+                <p v-if="planningDetails.gate.reason" class="text-xs mt-1.5" :class="planningDetails.gate.status === 'stalled' ? 'text-error' : 'text-warning'">
+                  {{ planningDetails.gate.reason }}
+                </p>
+                <p v-if="planningDetails.gate.summary" class="text-xs text-base-content/60 mt-1.5">
+                  {{ planningDetails.gate.summary }}
+                </p>
+                <div v-if="planningDetails.gate.issues.length" class="mt-2 space-y-1.5">
+                  <div
+                    v-for="(issue, index) in planningDetails.gate.issues"
+                    :key="`${issue.code}-${index}`"
+                    class="rounded border px-2.5 py-2 text-xs"
+                    :class="issue.appliesToChapter ? 'border-warning/40 bg-warning/5' : 'border-base-300/70 bg-base-200/40 opacity-70'"
+                  >
+                    <div class="flex flex-wrap items-center gap-1.5 font-medium">
+                      <span>{{ issue.code }}</span>
+                      <span v-if="issue.appliesToChapter" class="badge badge-warning badge-xs">涉及本章</span>
+                      <span v-if="issue.repairChapterNumbers.length" class="text-[11px] font-normal text-base-content/45">
+                        涉及第 {{ issue.repairChapterNumbers.join('、') }} 章
+                      </span>
+                    </div>
+                    <p v-if="issue.problem" class="mt-1 text-base-content/70">{{ issue.problem }}</p>
+                    <p v-if="issue.requiredFix" class="mt-1 text-base-content/50">处理要求：{{ issue.requiredFix }}</p>
+                  </div>
+                </div>
+              </template>
+            </div>
+
             <div v-if="editingChapterId !== selectedChapter.id" class="flex-1 min-h-0 overflow-y-auto">
               <div class="mb-3 pb-3 border-b border-base-300/60">
                 <div class="text-xs font-medium text-base-content/60 mb-2">出场角色</div>
@@ -1706,6 +1965,115 @@ async function clearDiagnosisResult() {
                 {{ selectedChapterOutlineDisplay }}
               </p>
               <p v-else class="text-sm text-base-content/40 italic">{{ workType === 'story' ? '暂无大纲，可点击「AI 生成大纲」或「编辑」' : '暂无章节大纲，可点击「AI 生成章节大纲」或「编辑」' }}</p>
+
+              <div v-if="workType !== 'story' && planningDetails" class="mt-4 space-y-2">
+                <details v-if="planningDetails.executionContract" class="collapse collapse-arrow bg-base-100 border border-base-300/70">
+                  <summary class="collapse-title min-h-0 py-3 text-sm font-semibold">章节执行合同</summary>
+                  <div class="collapse-content text-xs space-y-3">
+                    <div v-if="planningDetails.executionContract.openingState">
+                      <div class="font-medium text-base-content/55 mb-1">开场状态</div>
+                      <p class="whitespace-pre-wrap leading-relaxed">{{ planningDetails.executionContract.openingState }}</p>
+                    </div>
+                    <div v-if="planningDetails.executionContract.requiredEvents.length">
+                      <div class="font-medium text-base-content/55 mb-1">必须覆盖</div>
+                      <ol class="list-decimal pl-5 space-y-1">
+                        <li v-for="(event, index) in planningDetails.executionContract.requiredEvents" :key="`required-${index}`">{{ event }}</li>
+                      </ol>
+                    </div>
+                    <div v-if="planningDetails.executionContract.forbiddenEvents.length">
+                      <div class="font-medium text-base-content/55 mb-1">禁止越界</div>
+                      <ul class="list-disc pl-5 space-y-1">
+                        <li v-for="(event, index) in planningDetails.executionContract.forbiddenEvents" :key="`forbidden-${index}`">{{ event }}</li>
+                      </ul>
+                    </div>
+                    <div v-if="planningDetails.executionContract.endingState">
+                      <div class="font-medium text-base-content/55 mb-1">结尾落点</div>
+                      <p class="whitespace-pre-wrap leading-relaxed">{{ planningDetails.executionContract.endingState }}</p>
+                    </div>
+                    <div v-if="planningDetails.executionContract.continuityConstraints">
+                      <div class="font-medium text-base-content/55 mb-1">连续性约束</div>
+                      <p class="whitespace-pre-wrap leading-relaxed">{{ planningDetails.executionContract.continuityConstraints }}</p>
+                    </div>
+                    <div v-if="planningDetails.executionContract.abilityConstraints">
+                      <div class="font-medium text-base-content/55 mb-1">能力/状态约束</div>
+                      <p class="whitespace-pre-wrap leading-relaxed">{{ planningDetails.executionContract.abilityConstraints }}</p>
+                    </div>
+                    <div v-if="planningDetails.executionContract.errors.length" class="alert alert-error py-2 text-xs">
+                      {{ planningDetails.executionContract.errors.join('；') }}
+                    </div>
+                    <div v-if="planningDetails.executionContract.warnings.length" class="alert alert-warning py-2 text-xs">
+                      {{ planningDetails.executionContract.warnings.join('；') }}
+                    </div>
+                  </div>
+                </details>
+
+                <details
+                  v-for="section in structureContractSections"
+                  :key="section.key"
+                  class="collapse collapse-arrow bg-base-100 border border-base-300/70"
+                >
+                  <summary class="collapse-title min-h-0 py-3 text-sm font-semibold">{{ section.title }}</summary>
+                  <div class="collapse-content text-xs">
+                    <dl class="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-x-3 gap-y-2">
+                      <template v-for="row in section.rows" :key="`${section.key}-${row.label}`">
+                        <dt class="font-medium text-base-content/50">{{ row.label }}</dt>
+                        <dd class="whitespace-pre-wrap leading-relaxed">{{ row.value }}</dd>
+                      </template>
+                    </dl>
+                  </div>
+                </details>
+
+                <div v-if="!structureContractSections.length" class="rounded-lg border border-base-300/70 bg-base-100 px-3 py-2.5 text-xs text-base-content/45">
+                  尚未生成戏剧合同、模式合同与张力计划；正式章节大纲门禁运行前需要补齐。
+                </div>
+
+                <details class="collapse collapse-arrow bg-base-100 border border-base-300/70">
+                  <summary class="collapse-title min-h-0 py-3 text-sm font-semibold">情绪合同</summary>
+                  <div class="collapse-content text-xs">
+                    <dl v-if="emotionContractRows.length" class="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-x-3 gap-y-2">
+                      <template v-for="row in emotionContractRows" :key="`emotion-${row.label}`">
+                        <dt class="font-medium text-base-content/50">{{ row.label }}</dt>
+                        <dd class="whitespace-pre-wrap leading-relaxed">{{ row.value }}</dd>
+                      </template>
+                    </dl>
+                    <p v-else class="text-base-content/45">尚未生成；正文生成前由独立情绪引擎补齐。</p>
+                  </div>
+                </details>
+
+                <details class="collapse collapse-arrow bg-base-100 border border-base-300/70">
+                  <summary class="collapse-title min-h-0 py-3 text-sm font-semibold">资源预算</summary>
+                  <div class="collapse-content space-y-2">
+                    <div v-for="budget in planningDetails.resourceBudgets" :key="budget.id" class="rounded border border-base-300/70 p-2.5 text-xs">
+                      <div class="font-semibold">{{ budget.owner ? `${budget.owner} · ` : '' }}{{ budget.resource }}</div>
+                      <div class="mt-1 text-base-content/60">起始 {{ budgetRange(budget.start_min, budget.start_max, budget.unit) }} → 结束 {{ budgetRange(budget.end_min, budget.end_max, budget.unit) }}</div>
+                      <p v-if="budget.allowed_events" class="mt-1">允许变化：{{ budget.allowed_events }}</p>
+                      <p v-if="budget.forbidden_events" class="mt-1 text-warning">禁止变化：{{ budget.forbidden_events }}</p>
+                      <p v-if="budget.reason" class="mt-1 text-base-content/50">依据：{{ budget.reason }}</p>
+                    </div>
+                    <p v-if="!planningDetails.resourceBudgets.length" class="text-xs text-base-content/45">当前章节没有需要数值追踪的资源预算。</p>
+                  </div>
+                </details>
+
+                <details
+                  v-for="section in assessmentSections"
+                  :key="section.key"
+                  class="collapse collapse-arrow bg-base-100 border border-base-300/70"
+                >
+                  <summary class="collapse-title min-h-0 py-3 text-sm font-semibold">{{ section.title }}</summary>
+                  <div class="collapse-content text-xs">
+                    <dl class="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-x-3 gap-y-2">
+                      <template v-for="row in section.rows" :key="`${section.key}-${row.label}`">
+                        <dt class="font-medium text-base-content/50">{{ row.label }}</dt>
+                        <dd class="whitespace-pre-wrap leading-relaxed">{{ row.value }}</dd>
+                      </template>
+                    </dl>
+                  </div>
+                </details>
+
+                <div v-if="planningDetails.warnings.length" class="alert alert-warning py-2 text-xs">
+                  {{ planningDetails.warnings.join('；') }}
+                </div>
+              </div>
             </div>
 
             <div v-else class="flex-1 min-h-0 overflow-y-auto space-y-3">

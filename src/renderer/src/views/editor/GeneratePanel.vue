@@ -1368,49 +1368,22 @@ async function saveToChapter() {
   if (!ch || savingChapter.value) return
 
   const isClearing = !result.value.trim()
+  const wordCount = countWords(result.value)
+  const updateFields: Record<string, unknown> = {
+    content: result.value,
+    word_count: wordCount,
+    status: !isClearing && workType.value === 'novel' ? 'memory_pending' : 'draft'
+  }
+  let bodyPersisted = false
   savingChapter.value = true
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   try {
-    if (!isClearing) {
-      await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
-      const emotion = await window.anovel.invoke(
-        'emotion:assessChapter', props.workId, ch.id, result.value, false, false
-      ) as EmotionBlindAssessment
-      emotionAssessment.value = emotion
-      if (!emotion.passed) {
-        alert(`情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}`)
-        return
-      }
-      const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
-      gateResult.value = gate
-      if (!gate.passed) {
-        const msg = ['保存被 consistency 门禁拦截：', ...gate.blockers].join('\n')
-        if (gate.execution) {
-          alert(`${msg}\n\n长篇章节的情节点覆盖与章际衔接属于硬门禁，不能强制跳过。请先修复正文。`)
-          return
-        }
-        if (!confirm(`${msg}\n\n仍要强制保存吗？`)) return
-      } else if (gate.warnings.length > 0) {
-        const msg = gate.warnings.slice(0, 5).join('\n')
-        if (!confirm(`保存前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续保存？`)) return
-      }
-    }
+    // 正文与旧版本快照必须先落库；后续门禁只决定是否允许提交记忆并标记完成。
+    const updated = await window.anovel.invoke('chapter:update', ch.id, updateFields)
+    if (updated !== true) throw new Error('章节正文未写入数据库')
+    bodyPersisted = true
 
-    const wordCount = countWords(result.value)
-    const updateFields: Record<string, unknown> = {
-      content: result.value,
-      word_count: wordCount,
-      status: !isClearing && workType.value === 'novel' ? 'memory_pending' : 'draft'
-    }
-    await window.anovel.invoke('chapter:update', ch.id, updateFields)
-    if (!isClearing) {
-      emotionAssessment.value = await window.anovel.invoke(
-        'emotion:assessChapter', props.workId, ch.id, result.value, true, true
-      ) as EmotionBlindAssessment
-    } else {
-      emotionAssessment.value = null
-    }
     const idx = chapters.value.findIndex(c => c.id === ch.id)
     if (idx >= 0) {
       chapters.value[idx] = {
@@ -1424,10 +1397,38 @@ async function saveToChapter() {
     await nav?.refreshProgress()
 
     if (isClearing) {
+      emotionAssessment.value = null
       await loadNarrativeMemory(ch.id)
       showToast('success', '已清空本章正文及关联叙事记忆')
       return
     }
+
+    await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
+    const emotion = await window.anovel.invoke(
+      'emotion:assessChapter', props.workId, ch.id, result.value, false, false
+    ) as EmotionBlindAssessment
+    emotionAssessment.value = emotion
+    if (!emotion.passed) {
+      alert(`正文已落库并保留旧版本，但情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}\n\n章节保持待同步状态，请修订后再次保存。`)
+      return
+    }
+    const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
+    gateResult.value = gate
+    if (!gate.passed) {
+      const msg = ['正文已落库并保留旧版本，但 consistency 门禁未通过：', ...gate.blockers].join('\n')
+      if (gate.execution) {
+        alert(`${msg}\n\n长篇章节的情节点覆盖与章际衔接属于硬门禁；章节保持待同步状态，请先修复正文。`)
+        return
+      }
+      if (!confirm(`${msg}\n\n是否仍要继续提交叙事记忆？`)) return
+    } else if (gate.warnings.length > 0) {
+      const msg = gate.warnings.slice(0, 5).join('\n')
+      if (!confirm(`正文已保存，后续提交前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续提交叙事记忆？`)) return
+    }
+
+    emotionAssessment.value = await window.anovel.invoke(
+      'emotion:assessChapter', props.workId, ch.id, result.value, true, true
+    ) as EmotionBlindAssessment
 
     const fp = await window.anovel.invoke('fingerprint:checkDeviation', props.workId, ch.id, result.value) as {
       success?: boolean
@@ -1440,7 +1441,9 @@ async function saveToChapter() {
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    showToast('error', `保存失败：${message}`)
+    showToast('error', bodyPersisted
+      ? `正文已保存，但后续处理失败：${message}`
+      : `保存失败：${message}`)
     return
   } finally {
     savingChapter.value = false
@@ -1669,7 +1672,7 @@ function generatePreviewReport() {
         v-if="chapters.length === 0"
         class="text-center py-12 text-base-content/40"
       >
-        <p>{{ workType === 'story' ? '还没有节拍，请先在「节拍大纲」中拆解' : '本卷还没有章节，请先在「章节情节」中添加' }}</p>
+        <p>{{ workType === 'story' ? '还没有节拍，请先在「节拍大纲」中拆解' : '本卷还没有章节，请先在「章节大纲」中添加' }}</p>
       </div>
 
       <div

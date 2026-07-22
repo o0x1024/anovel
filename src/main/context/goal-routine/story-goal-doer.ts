@@ -37,6 +37,7 @@ import {
   parseMemoryExtract,
   partitionStateFactsByEvidence,
   deriveChapterPatternFromOutlineDiagnosis,
+  reconcileChapterPatternWithOutlineDiagnosis,
   applyMemoryExtract,
   parseForeshadowingResolutions,
   applyForeshadowingResolutions
@@ -90,7 +91,10 @@ import {
   repairNovelExecutionCandidate,
   type NovelExecutionGateResult
 } from './novel-execution-gate'
-import { selectReusableNovelExecutionCandidate } from './novel-goal-policy'
+import {
+  selectDeferredNovelExecutionCandidate,
+  selectReusableNovelExecutionCandidate
+} from './novel-goal-policy'
 
 function storyCandidateContextSource(
   workId: number,
@@ -124,6 +128,7 @@ export interface BeatGenResult {
   requiresEscalation?: boolean
   failureKind?: 'contract' | 'body_integrity' | 'continuity' | 'evaluator_protocol' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
   memoryPending?: boolean
+  deferredExecution?: { sourceVersionNumber: number; blockers: string[] }
   memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; stateFacts?: number; patternFingerprint?: boolean; warnings?: string[]; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
@@ -829,6 +834,7 @@ async function persistGeneratedBody(
   let antiAiRepairRounds = antiAiRepair.rounds
   let wordCount = countWords(content)
   let continuityRepairRounds = 0
+  let deferredExecution: BeatGenResult['deferredExecution']
 
   if (workType === 'novel') {
     const contract = persistChapterExecutionContract(workId, chapterId)
@@ -893,16 +899,57 @@ async function persistGeneratedBody(
         })
       })
       if (round >= 2) {
-        return {
-          success: false,
-          content,
-          wordCount,
-          continuityRepairRounds: round,
-          continuityBlockers: gate.blockers,
-          requiresEscalation: true,
-          failureKind: 'continuity',
-          error: `章节情节点覆盖/衔接经过 2 轮定向修复仍未通过：${gate.blockers.join('；')}`
+        const deferred = selectDeferredNovelExecutionCandidate(
+          volumeChapterDAO.listVersions(chapterId),
+          {
+            outline: currentChapter?.outline,
+            contractHash: contract.sourceOutlineHash,
+            wordMin: contract.wordMin,
+            wordMax: contract.wordMax
+          }
+        )
+        if (!deferred?.candidate.content?.trim()) {
+          return {
+            success: false,
+            content,
+            wordCount,
+            continuityRepairRounds: round,
+            continuityBlockers: gate.blockers,
+            requiresEscalation: true,
+            failureKind: 'continuity',
+            error: `章节情节点覆盖/衔接经过 2 轮定向修复仍未通过：${gate.blockers.join('；')}`
+          }
         }
+        content = deferred.candidate.content.trim()
+        wordCount = deferred.candidate.word_count
+        deferredExecution = {
+          sourceVersionNumber: deferred.candidate.version_number,
+          blockers: deferred.blockers
+        }
+        volumeChapterDAO.createVersion(chapterId, {
+          outline: currentChapter?.outline ?? undefined,
+          content,
+          word_count: wordCount,
+          model_type: 'novel_execution_deferred',
+          generation_round: round + 1,
+          snapshot_json: JSON.stringify({
+            contractHash: contract.sourceOutlineHash,
+            sourceVersionNumber: deferred.candidate.version_number,
+            deferredAt: new Date().toISOString(),
+            blockers: deferred.blockers,
+            reason: '全部验收项至少部分落地且有正文证据；无越界、连续性或字数硬伤，停止重复改写并转入质量债务'
+          })
+        })
+        appLogger.warn('goal_routine', '章节执行软门禁未收敛，提交最佳证据候选并继续整本施工', {
+          workId,
+          chapterId,
+          sourceVersionNumber: deferred.candidate.version_number,
+          coveredCount: deferred.coveredCount,
+          partialCount: deferred.partialCount,
+          blockers: deferred.blockers
+        })
+        onProgress?.(`章节执行软门禁未收敛，已采用最佳候选 v${deferred.candidate.version_number} 并记录质量债务`)
+        break
       }
       onProgress?.(`章节执行门禁未通过，正在定向修复（${round + 1}/2）`)
       const repaired = await repairNovelExecutionCandidate(
@@ -1210,7 +1257,8 @@ async function persistGeneratedBody(
     memoryPending: memoryDeferred || Boolean(memoryError),
     antiAiRepairs,
     antiAiRepairRounds,
-    continuityRepairRounds
+    continuityRepairRounds,
+    deferredExecution
   }
 }
 
@@ -1283,6 +1331,12 @@ export async function prepareNarrativeMemoryAfterGeneration(
   if (signal?.aborted) throw new Error('已取消')
 
   const resourceBudgetPrompt = formatChapterResourceBudgetsForPrompt(workId, chapterId)
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  const volume = chapter ? volumeChapterDAO.getVolume(chapter.volume_id) : undefined
+  const isTraditionalNovel = workDAO.getById(workId)?.work_type === 'novel'
+  const frozenPattern = isTraditionalNovel
+    ? deriveChapterPatternFromOutlineDiagnosis(chapter?.outline_diagnosis)
+    : undefined
   const memorySystemPrompt = resourceBudgetPrompt
     ? [
         MEMORY_EXTRACT_SYSTEM_PROMPT,
@@ -1294,6 +1348,17 @@ export async function prepareNarrativeMemoryAfterGeneration(
         '章末数值必须落在预算的章末区间内，并以正文实际发生的消耗、恢复、冷却或状态变化为依据。'
       ].join('\n\n')
     : MEMORY_EXTRACT_SYSTEM_PROMPT
+  const extractionPrompt = [
+    isTraditionalNovel && volume?.description?.trim() ? `【本卷核心目标】\n${volume.description.trim()}` : '',
+    frozenPattern
+      ? [
+          '【冻结章节模式合同】',
+          JSON.stringify(frozenPattern),
+          '请根据正文判断合同是否实际兑现。正文已经明确执行合同中的推进、关系变化或阶段兑现时，不得填写“无变化”；不得虚构正文未发生的推进。'
+        ].join('\n')
+      : '',
+    `【正文】\n${content}`
+  ].filter(Boolean).join('\n\n')
 
   // 只生成候选记忆，不修改任何正式账本。结构或证据不合格时只重试提取器。
   let extracted: ReturnType<typeof parseMemoryExtract> | undefined
@@ -1303,7 +1368,7 @@ export async function prepareNarrativeMemoryAfterGeneration(
     if (signal?.aborted) throw new Error('canceled')
     const memRes = await modelService.chat(
       withGoalLoopModelOptions(workId, {
-        prompt: content,
+        prompt: extractionPrompt,
         systemPrompt: [
           memorySystemPrompt,
           extractError
@@ -1341,11 +1406,20 @@ export async function prepareNarrativeMemoryAfterGeneration(
         warnings.push(`已丢弃 ${evidence.errors.length} 条无原文证据的状态事实：${evidence.errors.join('；')}`)
       }
       if (options.requirePatternFingerprint && !candidate.chapter_pattern) {
-        const chapter = volumeChapterDAO.getChapter(chapterId)
         const fallback = deriveChapterPatternFromOutlineDiagnosis(chapter?.outline_diagnosis)
         if (!fallback) throw new Error('chapter_pattern 连续3轮无效，且章节合同无法生成确定性回退指纹')
         candidate.chapter_pattern = fallback
         warnings.push('模型未返回有效 chapter_pattern，已使用冻结章节合同生成确定性回退指纹')
+      }
+      if (candidate.chapter_pattern && frozenPattern) {
+        const extractedPattern = candidate.chapter_pattern
+        candidate.chapter_pattern = reconcileChapterPatternWithOutlineDiagnosis(
+          extractedPattern,
+          chapter?.outline_diagnosis
+        )
+        if (JSON.stringify(candidate.chapter_pattern) !== JSON.stringify(extractedPattern)) {
+          warnings.push('模式指纹的分卷推进/关系/对手调整/兑现类型已按冻结章节合同校准')
+        }
       }
       extracted = candidate
       break

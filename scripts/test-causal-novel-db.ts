@@ -267,6 +267,43 @@ async function main(): Promise<void> {
     assert.equal(volumeChapterDAO.listVersions(chapterId)[0].model_type, 'causal_style_rewrite')
     assert.equal(causalNovelDAO.getState(workId)?.revision, 1)
     assert.equal(causalNovelDAO.getDecision(chapterId)?.status, 'committed')
+    const rewriteBinding = causalNovelDAO.getChapterBinding(chapterId)
+    assert.equal(rewriteBinding?.bindingStatus, 'active')
+    assert.equal(rewriteBinding?.stateBeforeRevision, 0)
+    assert.equal(rewriteBinding?.stateAfterRevision, 1)
+    const immutableVersions = causalNovelDAO.listContentVersions(chapterId)
+    assert.ok(immutableVersions.length >= 2)
+    assert.equal(immutableVersions[0].source, 'ai_style_rewrite')
+    assert.equal(immutableVersions[0].status, 'active')
+    assert.equal(immutableVersions[0].bodyHash.length, 64)
+
+    const factualCandidate = causalNovelDAO.createContentVersion({
+      workId,
+      chapterId,
+      parentVersionId: immutableVersions[0].id,
+      content: `${rewrittenBody}林舟决定不再进入黑市。`,
+      source: 'manual',
+      editKind: 'factual',
+      status: 'candidate'
+    })
+    const replay = causalNovelDAO.queueReplay({
+      workId,
+      chapterId,
+      baseStateRevision: 0,
+      sourceVersionId: immutableVersions[0].id,
+      targetVersionId: factualCandidate.id,
+      editKind: 'factual',
+      affectedChapterIds: []
+    })
+    assert.equal(replay.status, 'pending')
+    assert.equal(causalNovelDAO.getPendingReplay(workId)?.targetVersionId, factualCandidate.id)
+    assert.equal(causalNovelDAO.getChapterBinding(chapterId)?.bindingStatus, 'pending_replay')
+    causalNovelDAO.blockReplay(replay.id, chapterId, '后续章节证据冲突')
+    assert.equal(causalNovelDAO.getPendingReplay(workId)?.status, 'blocked')
+    causalNovelDAO.retryReplay(replay.id)
+    assert.equal(causalNovelDAO.getPendingReplay(workId)?.status, 'pending')
+    causalNovelDAO.cancelReplay(replay.id)
+    assert.equal(causalNovelDAO.getReplayJob(replay.id)?.status, 'cancelled')
 
     const beforeProposal = causalNovelDAO.getState(workId)!
     const proposedState: CausalNarrativeState = {

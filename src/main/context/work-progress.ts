@@ -108,7 +108,7 @@ export function getNextWorkflowStep(current: WorkflowStepKey): WorkflowStepKey |
 export const NEXT_STEP_LABELS: Record<WorkflowStepKey, string> = {
   incubator: '进入核心设定',
   settings: '进入分卷大纲',
-  volumes: '进入章节情节',
+  volumes: '进入章节大纲',
   chapters: '进入正文生成',
   generate: ''
 }

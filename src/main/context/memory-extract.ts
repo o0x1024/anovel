@@ -268,6 +268,33 @@ export function deriveChapterPatternFromOutlineDiagnosis(
   }
 }
 
+const EMPTY_PATTERN_SEMANTIC = /^(?:|无|没有|未变化|无变化|保持|无推进|未推进|不变|none|unchanged)$/i
+
+/**
+ * 正文已经通过冻结章节合同的执行门禁后，模式指纹中的结构语义应以合同为校准基准。
+ * 弱模型常能返回合法 JSON，却会在只读正文时把分卷推进、关系变化或阶段兑现误判为“无变化”。
+ * 这里只校正会驱动跨章系统门禁的字段，其余正文观察字段仍保留模型提取结果。
+ */
+export function reconcileChapterPatternWithOutlineDiagnosis(
+  extracted: ChapterPatternFingerprintInput,
+  outlineDiagnosis: string | null | undefined
+): ChapterPatternFingerprintInput {
+  const contract = deriveChapterPatternFromOutlineDiagnosis(outlineDiagnosis)
+  if (!contract) return extracted
+  const contractValueWhenModelMissed = (actual: string, expected: string): string =>
+    EMPTY_PATTERN_SEMANTIC.test(actual.trim()) && !EMPTY_PATTERN_SEMANTIC.test(expected.trim())
+      ? expected
+      : actual
+  return {
+    ...extracted,
+    opponentAdjustment: contractValueWhenModelMissed(extracted.opponentAdjustment, contract.opponentAdjustment),
+    relationshipDelta: contractValueWhenModelMissed(extracted.relationshipDelta, contract.relationshipDelta),
+    volumeObjectiveDelta: contractValueWhenModelMissed(extracted.volumeObjectiveDelta, contract.volumeObjectiveDelta),
+    // 阶段兑现类型属于冻结张力合同，不允许记忆提取器用无上下文猜测覆盖。
+    payoffType: contract.payoffType
+  }
+}
+
 export function applyMemoryExtract(
   workId: number,
   chapterId: number,

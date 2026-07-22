@@ -63,7 +63,7 @@ interface WorkTypeLabels {
 const LABELS: Record<WorkType, WorkTypeLabels> = {
   novel: {
     pageTitle: '我的传统小说',
-    pageSubtitle: '使用分卷、章节情节与结构合同管理规划式小说',
+    pageSubtitle: '使用分卷大纲、章节大纲与结构合同管理规划式小说',
     createBtnText: '新建传统小说',
     importBtnText: '导入备份',
     emptyTitleText: '还没有任何小说',

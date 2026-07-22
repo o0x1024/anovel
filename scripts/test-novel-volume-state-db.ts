@@ -26,6 +26,7 @@ async function main(): Promise<void> {
     invalidateNovelGoalStateAfterVolumeDeletion,
     readNovelGoalState,
     reconcileNovelWorkflowState,
+    reopenStalledNovelVolumeGate,
     resetNovelGoalStateFromVolumePlan,
     updateNovelGoalState
   } = await import('../src/main/context/goal-routine/novel-outline-pipeline')
@@ -97,8 +98,46 @@ async function main(): Promise<void> {
     assert.deepEqual(readNovelGoalState(staleWorkId).checkedBodyVolumes, [])
     assert.equal(readNovelGoalState(staleWorkId).failure, undefined)
 
+    updateNovelGoalState(staleWorkId, {
+      failure: { phase: 'generate_beats', signature: 'stall', count: 4, message: '超过安全上限' },
+      chapterVolumeGateCheckpoint: {
+        version: 2,
+        repairProtocolVersion: 3,
+        volume: '第一卷',
+        round: 3,
+        snapshotFingerprint: 'snapshot',
+        assessments: [{
+          key: '1-2', startChapter: 1, endChapter: 2, passed: false, score: 90,
+          summary: '旧诊断', issues: []
+        }],
+        repairControl: {
+          changedChapterNumbers: [2],
+          rewriteCounts: { '2': 1 },
+          lastRoundVersions: [{ chapterId: 2, versionId: 9 }]
+        },
+        stalled: { reason: '超过安全上限', createTime: '2026-07-22T00:00:00.000Z' }
+      }
+    })
+    assert.equal(reopenStalledNovelVolumeGate(staleWorkId), true)
+    const reopened = readNovelGoalState(staleWorkId)
+    assert.equal(reopened.failure, undefined)
+    assert.equal(reopened.chapterVolumeGateCheckpoint?.stalled, undefined)
+    assert.equal(reopened.chapterVolumeGateCheckpoint?.round, 1)
+    assert.deepEqual(reopened.chapterVolumeGateCheckpoint?.assessments, [])
+    assert.deepEqual(reopened.chapterVolumeGateCheckpoint?.repairControl?.changedChapterNumbers, [2])
+    assert.deepEqual(reopened.chapterVolumeGateCheckpoint?.repairControl?.rewriteCounts, { '2': 1 })
+    assert.deepEqual(reopened.chapterVolumeGateCheckpoint?.repairControl?.lastRoundVersions, [])
+
+    updateNovelGoalState(staleWorkId, {
+      volumeGateDeferredIssues: [{
+        volume: '第一卷', score: 92, rounds: 2, reason: '达到安全边界',
+        deferredAt: '2026-07-22T00:00:00.000Z', issues: []
+      }]
+    })
+
     resetNovelGoalStateFromVolumePlan(staleWorkId)
     assert.equal(readNovelGoalState(staleWorkId).novelOutline, undefined)
+    assert.equal(readNovelGoalState(staleWorkId).volumeGateDeferredIssues, undefined)
   } finally {
     closeDatabase()
   }

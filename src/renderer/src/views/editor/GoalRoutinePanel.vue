@@ -371,13 +371,6 @@ function resumeInvokePayload() {
   return payload
 }
 
-function resumeStartMessage(): string {
-  const label = goalRoutinePhaseLabel(resumeFromPhase.value)
-  if (state.value?.status === 'timeout') return `从「${label}」继续运行…`
-  if (canResume.value) return `从「${label}」断点续跑…`
-  return '目标循环启动…'
-}
-
 async function start() {
   if (running.value) return
   const useResumePayload = showResumePhasePicker.value
@@ -385,6 +378,7 @@ async function start() {
   const message = useResumePayload
     ? `从「${goalRoutinePhaseLabel(resumeFromPhase.value, props.workType)}」启动新一轮…`
     : '目标循环启动新一轮…'
+  phasePickerTouched.value = false
   running.value = true
   lastStatus.value = 'running'
   lastMessage.value = message
@@ -400,8 +394,12 @@ async function cancel() {
 
 async function resume() {
   if (running.value) return
-  const payload = resumeInvokePayload()
-  const message = resumeStartMessage()
+  const payload = goalInvokePayload()
+  const savedPhase = normalizePhase(state.value?.current_phase)
+  const message = state.value?.status === 'timeout'
+    ? `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」继续运行…`
+    : `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」续跑…`
+  phasePickerTouched.value = false
   running.value = true
   lastStatus.value = 'running'
   lastMessage.value = message
@@ -410,12 +408,25 @@ async function resume() {
   await refreshState()
 }
 
+async function resumeAtPhase(phase: GoalRoutinePhase, message: string) {
+  if (running.value) return
+  running.value = true
+  lastStatus.value = 'running'
+  lastMessage.value = message
+  liveTurn.value = null
+  await window.anovel.invoke('goal:resume', props.workId, {
+    ...goalInvokePayload(),
+    forcePhase: phase
+  })
+  await refreshState()
+}
+
 async function continueRepair() {
   if (running.value) return
   // 小说整书终审默认只读；只有用户显式点击继续修复时才进入受限修复计划。
   resumeFromPhase.value = 'repair_plan'
   phasePickerTouched.value = true
-  await resume()
+  await resumeAtPhase('repair_plan', '正在从修复计划继续…')
 }
 
 async function recheckExistingNovel() {
@@ -492,7 +503,7 @@ watch(config, saveConfig, { deep: true })
           : '描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」'"
         class="textarea textarea-bordered w-full text-sm rounded-lg resize-none leading-relaxed"
       ></textarea>
-      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 整体自检 → 分卷大纲 → 章节情节 → 书名导语 → 正文生成' : '核心设定 → 主角人设卡 → 故事发动机 → 节拍大纲 → 书名导语 → 整体自检 → 正文生成' }}；进度区会显示当前子步骤。</p>
+      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 整体自检 → 分卷大纲 → 章节大纲 → 书名导语 → 正文生成' : '核心设定 → 主角人设卡 → 故事发动机 → 节拍大纲 → 书名导语 → 整体自检 → 正文生成' }}；进度区会显示当前子步骤。</p>
       <label v-if="workType === 'novel'" class="flex items-center gap-2 text-xs cursor-pointer pt-1 border-t border-base-300/40">
         <input v-model="config.incubatorEnabled" type="checkbox" :disabled="running"
           class="checkbox checkbox-xs checkbox-primary" />
@@ -629,7 +640,7 @@ watch(config, saveConfig, { deep: true })
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
           <p class="text-[11px] text-base-content/40 leading-relaxed">达到用户设置的轮次上限后保留正文与候选并暂停，不会自动修改运行预算。</p>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节情节、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节大纲、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
 
@@ -646,7 +657,7 @@ watch(config, saveConfig, { deep: true })
           </option>
         </select>
         <p class="text-[11px] text-base-content/40 leading-relaxed">
-          “启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”保留原轮次。已有作品内容不会被自动清除。
+          “启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”严格恢复已保存步骤并保留原轮次。已有作品内容不会被自动清除。
         </p>
         <p v-if="workType === 'novel'" class="text-[11px] text-warning/80 leading-relaxed">
           长篇会按“本卷大纲 → 本卷正文 → 冻结”滚动运行；整书终审只读。终审未过时，只有手动点击“继续修复”才会改写，且自动范围限于尾部 8 章。
@@ -821,7 +832,7 @@ watch(config, saveConfig, { deep: true })
     <!-- 安全提示 -->
     <div class="alert alert-info text-xs py-2">
       <font-awesome-icon icon="info-circle" class="w-4 h-4 shrink-0" />
-      <span>每次写正文自动存版本快照；进入「{{ workType === 'novel' ? '章节情节' : '节拍大纲' }}」步骤可逐{{ workType === 'novel' ? '章' : '拍' }}查看版本历史并回滚。</span>
+      <span>每次写正文自动存版本快照；进入「{{ workType === 'novel' ? '章节大纲' : '节拍大纲' }}」步骤可逐{{ workType === 'novel' ? '章' : '拍' }}查看版本历史并回滚。</span>
     </div>
   </div>
 </template>

@@ -164,6 +164,112 @@ export function ensureIncrementalMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_causal_plan_attempts_work
       ON causal_plan_attempts(work_id, state_revision, id);
 
+    CREATE TABLE IF NOT EXISTS causal_content_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      parent_version_id INTEGER,
+      body_hash VARCHAR(64) NOT NULL,
+      content TEXT NOT NULL,
+      word_count INTEGER NOT NULL DEFAULT 0,
+      source VARCHAR(30) NOT NULL DEFAULT 'system',
+      edit_kind VARCHAR(20) NOT NULL DEFAULT 'generated',
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (parent_version_id) REFERENCES causal_content_versions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_content_versions_chapter
+      ON causal_content_versions(work_id, chapter_id, id DESC);
+
+    CREATE TABLE IF NOT EXISTS causal_chapter_bindings (
+      chapter_id INTEGER PRIMARY KEY,
+      work_id INTEGER NOT NULL,
+      content_version_id INTEGER NOT NULL,
+      state_before_revision INTEGER,
+      state_after_revision INTEGER,
+      decision_status VARCHAR(20) NOT NULL,
+      binding_status VARCHAR(24) NOT NULL DEFAULT 'active',
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (content_version_id) REFERENCES causal_content_versions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_chapter_bindings_work
+      ON causal_chapter_bindings(work_id, binding_status, chapter_id);
+
+    CREATE TABLE IF NOT EXISTS causal_stage_checkpoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      content_version_id INTEGER NOT NULL,
+      body_hash VARCHAR(64) NOT NULL,
+      protocol_version INTEGER NOT NULL DEFAULT 1,
+      stage VARCHAR(40) NOT NULL,
+      status VARCHAR(20) NOT NULL,
+      payload_json TEXT,
+      error_message TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(chapter_id, content_version_id, protocol_version, stage),
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (content_version_id) REFERENCES causal_content_versions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS causal_replay_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      base_state_revision INTEGER NOT NULL,
+      source_version_id INTEGER NOT NULL,
+      target_version_id INTEGER NOT NULL,
+      edit_kind VARCHAR(20) NOT NULL,
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      affected_chapters_json TEXT NOT NULL DEFAULT '[]',
+      error_message TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_version_id) REFERENCES causal_content_versions(id),
+      FOREIGN KEY (target_version_id) REFERENCES causal_content_versions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_replay_jobs_work_status
+      ON causal_replay_jobs(work_id, status, id);
+
+    CREATE TABLE IF NOT EXISTS causal_outcome_versions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      content_version_id INTEGER NOT NULL,
+      replay_job_id INTEGER,
+      state_before_revision INTEGER NOT NULL,
+      state_after_revision INTEGER NOT NULL,
+      outcome_json TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (content_version_id) REFERENCES causal_content_versions(id),
+      FOREIGN KEY (replay_job_id) REFERENCES causal_replay_jobs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_causal_outcome_versions_chapter
+      ON causal_outcome_versions(work_id, chapter_id, id DESC);
+
+    CREATE TABLE IF NOT EXISTS causal_replay_conflicts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      replay_job_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      conflict_type VARCHAR(40) NOT NULL,
+      message TEXT NOT NULL,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (replay_job_id) REFERENCES causal_replay_jobs(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
   `)
 
   if (hasTable(db, 'works') && hasTable(db, 'causal_narrative_states')) {

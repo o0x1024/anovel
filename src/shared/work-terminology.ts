@@ -32,7 +32,7 @@ const NOVEL_LABELS: WorkUnitLabels = {
   perUnit: '每章',
   perUnitWords: '每章字数',
   outline: '章节大纲',
-  outlineStep: '章节情节',
+  outlineStep: '章节大纲',
   planTitle: '章节规划',
   plannedVerb: '已规划',
   planVerb: '规划',

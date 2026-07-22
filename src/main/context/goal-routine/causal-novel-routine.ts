@@ -6,7 +6,8 @@ import { checkStoryGoal, DEFAULT_STORY_GOAL_CONFIG, type StoryGoalConfig } from 
 import {
   commitPreparedNarrativeMemory,
   generateBeatBody,
-  prepareNarrativeMemoryAfterGeneration
+  prepareNarrativeMemoryAfterGeneration,
+  type PreparedNarrativeMemory
 } from './story-goal-doer'
 import { bindGoalLoopModelOpts, clearGoalLoopModelOpts } from './story-goal-model'
 import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-goal-routine'
@@ -20,11 +21,18 @@ import {
 import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
 import { registerCausalPlanFailure, type CausalPlanFailureEvent } from '../../../shared/causal-novel-types'
 import type { GoalProgressEvent, Phase } from './novel-goal-routine'
+import { processPendingCausalReplay } from './causal-replay'
+import {
+  CausalOutcomeProtocolError,
+  causalOutcomeFailureCode,
+  type CausalOutcomeFailureCode
+} from '../../../shared/causal-outcome-protocol'
 
 const activeCausalLoops = new Map<number, AbortController>()
 const MAX_IDENTICAL_FAILURES = 3
 const MAX_PLAN_FAILURES_PER_REVISION = 3
 const MAX_PLAN_FAILURES_PER_FAMILY = 2
+const MAX_OUTCOME_FAILURES_PER_FAMILY = 3
 
 function broadcast(payload: GoalProgressEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -67,12 +75,14 @@ export async function runCausalNovelGoalLoop(
     : {}
   const fullConfig: StoryGoalConfig = { ...DEFAULT_STORY_GOAL_CONFIG, ...saved, ...config }
   fullConfig.maxTurns = requireGoalTurnLimit(fullConfig.maxTurns)
-  let turn = resume ? existing?.turn_count ?? 0 : 0
-  if (turn >= fullConfig.maxTurns) turn = 0
+  // maxTurns 是单次“开始/继续”的调用预算，不是作品生命周期累计额度。
+  // 历史 turn_count 只用于审计；沿用它会让长期作品在 59/60 恢复后立刻再次超时。
+  let turn = 0
   let phase: Phase = causalNovelDAO.getState(workId) ? 'generate_beats' : 'materialize_settings'
   let lastFailure = ''
   let identicalFailures = 0
   let planFailureHistory: CausalPlanFailureEvent[] = []
+  const outcomeFailureCounts = new Map<string, number>()
   const controller = new AbortController()
   activeCausalLoops.set(workId, controller)
   bindGoalLoopModelOpts(workId, fullConfig)
@@ -117,6 +127,29 @@ export async function runCausalNovelGoalLoop(
             summary: `建立 ${initialized.actors.length} 个人物、${initialized.activePressures.length} 个压力、${initialized.promises.length} 个读者承诺`
           })
           emit('权威因果状态已建立，不生成全书大纲；关系只记录已发生事实', 'running')
+          continue
+        }
+
+        const pendingReplay = causalNovelDAO.getPendingReplay(workId)
+        if (pendingReplay) {
+          if (pendingReplay.status === 'blocked') {
+            goalRoutineDAO.update(workId, { status: 'paused', current_phase: 'goal_check' })
+            emit(`人工事实修改的因果重放存在冲突：${pendingReplay.errorMessage || '请在章节管理中处理冲突'}`, 'paused')
+            return
+          }
+          phase = 'goal_check'
+          goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
+          const replayed = await processPendingCausalReplay(
+            workId, fullConfig, controller.signal, message => emit(message, 'running')
+          )
+          if (replayed) {
+            goalRoutineDAO.appendTurn({
+              work_id: workId, turn_no: turn, phase, action: 'causal_manual_replay',
+              target_chapter_id: pendingReplay.chapterId,
+              summary: `重放任务 #${replayed.replayJobId} 已完成，重放 ${replayed.replayedChapters} 章，权威状态推进到 r${replayed.finalRevision}`
+            })
+            emit(`人工修改的因果重放已完成，权威状态更新到 r${replayed.finalRevision}`, 'running')
+          }
           continue
         }
 
@@ -171,27 +204,97 @@ export async function runCausalNovelGoalLoop(
               throw new Error(generated.error || '因果章节正文生成失败')
             }
           }
-          const acceptance = await runChapterAcceptanceGate(
-            workId, pending.chapterId, fullConfig, controller.signal,
-            message => emit(message, 'running')
+          let contentVersion = causalNovelDAO.ensureCurrentContentVersion(
+            workId, pending.chapterId, 'generation', 'generated'
           )
-          if (!acceptance.passed) {
-            throw new Error(`因果章节质量门禁未通过：${acceptance.failedMetrics.join('；')}`)
+          const acceptedCheckpoint = causalNovelDAO.getCheckpoint(
+            pending.chapterId, contentVersion.id, 'acceptance'
+          )
+          if (acceptedCheckpoint?.status !== 'completed') {
+            const acceptance = await runChapterAcceptanceGate(
+              workId, pending.chapterId, fullConfig, controller.signal,
+              message => emit(message, 'running')
+            )
+            if (!acceptance.passed) {
+              causalNovelDAO.saveCheckpoint({
+                workId, chapterId: pending.chapterId, contentVersionId: contentVersion.id,
+                bodyHash: contentVersion.bodyHash, stage: 'acceptance', status: 'failed',
+                errorMessage: acceptance.failedMetrics.join('；')
+              })
+              throw new Error(`因果章节质量门禁未通过：${acceptance.failedMetrics.join('；')}`)
+            }
+            contentVersion = causalNovelDAO.ensureCurrentContentVersion(
+              workId, pending.chapterId, 'acceptance', 'generated'
+            )
+            causalNovelDAO.saveCheckpoint({
+              workId, chapterId: pending.chapterId, contentVersionId: contentVersion.id,
+              bodyHash: contentVersion.bodyHash, stage: 'acceptance', status: 'completed',
+              payload: { passed: true }
+            })
+          } else {
+            emit('已复用当前正文版本的质量验收检查点', 'running')
           }
           const finalChapter = volumeChapterDAO.getChapter(pending.chapterId)
           if (!finalChapter?.content?.trim()) throw new Error('因果章节最终正文不存在')
-          emit(`正在从「${finalChapter.title}」准备候选叙事记忆`, 'running')
-          const preparedMemory = await prepareNarrativeMemoryAfterGeneration(
-            workId,
-            pending.chapterId,
-            finalChapter.content,
-            controller.signal,
-            { requirePatternFingerprint: true, dropInvalidStateFactsAfterRetries: true }
+          contentVersion = causalNovelDAO.ensureCurrentContentVersion(
+            workId, pending.chapterId, 'accepted_body', 'generated'
           )
-          const extracted = await extractCausalOutcome(
-            workId, pending.chapterId, controller.signal,
-            progress => emit(progress, 'running')
+          const memoryCheckpoint = causalNovelDAO.getCheckpoint(
+            pending.chapterId, contentVersion.id, 'narrative_memory'
           )
+          let preparedMemory: PreparedNarrativeMemory
+          if (memoryCheckpoint?.status === 'completed' && memoryCheckpoint.payload) {
+            preparedMemory = memoryCheckpoint.payload as PreparedNarrativeMemory
+            emit('已复用当前正文版本的候选叙事记忆检查点', 'running')
+          } else {
+            emit(`正在从「${finalChapter.title}」准备候选叙事记忆`, 'running')
+            preparedMemory = await prepareNarrativeMemoryAfterGeneration(
+              workId,
+              pending.chapterId,
+              finalChapter.content,
+              controller.signal,
+              { requirePatternFingerprint: true, dropInvalidStateFactsAfterRetries: true }
+            )
+            causalNovelDAO.saveCheckpoint({
+              workId, chapterId: pending.chapterId, contentVersionId: contentVersion.id,
+              bodyHash: contentVersion.bodyHash, stage: 'narrative_memory', status: 'completed',
+              payload: preparedMemory
+            })
+          }
+          let extracted: Awaited<ReturnType<typeof extractCausalOutcome>>
+          const outcomeCheckpoint = causalNovelDAO.getCheckpoint(
+            pending.chapterId, contentVersion.id, 'causal_outcome'
+          )
+          const cachedOutcome = outcomeCheckpoint?.status === 'completed'
+            ? outcomeCheckpoint.payload as Awaited<ReturnType<typeof extractCausalOutcome>> | null
+            : null
+          const currentStateRevision = causalNovelDAO.getState(workId)?.revision
+          if (
+            cachedOutcome?.bodyHash === contentVersion.bodyHash &&
+            cachedOutcome.state?.revision === (currentStateRevision ?? -2) + 1
+          ) {
+            extracted = cachedOutcome
+            emit('已复用当前正文版本的因果结果检查点', 'running')
+          } else {
+            try {
+              extracted = await extractCausalOutcome(
+                workId, pending.chapterId, controller.signal,
+                progress => emit(progress, 'running')
+              )
+              causalNovelDAO.saveCheckpoint({
+                workId, chapterId: pending.chapterId, contentVersionId: contentVersion.id,
+                bodyHash: contentVersion.bodyHash, stage: 'causal_outcome', status: 'completed',
+                payload: extracted
+              })
+            } catch (error) {
+              causalNovelDAO.saveCheckpoint({
+                workId, chapterId: pending.chapterId, contentVersionId: contentVersion.id,
+                bodyHash: contentVersion.bodyHash, stage: 'causal_outcome', status: 'failed',
+                errorMessage: error instanceof Error ? error.message : String(error)
+              })
+              throw error
+            }
+          }
           emit('正在原子提交正文完成状态、叙事记忆、情绪结果与因果状态修订', 'running')
           const committedMemory = getDatabase().transaction(() => {
             const memory = commitPreparedNarrativeMemory(workId, pending.chapterId, preparedMemory, {
@@ -218,6 +321,7 @@ export async function runCausalNovelGoalLoop(
           lastFailure = ''
           identicalFailures = 0
           planFailureHistory = []
+          outcomeFailureCounts.clear()
           continue
         }
 
@@ -273,6 +377,7 @@ export async function runCausalNovelGoalLoop(
         lastFailure = ''
         identicalFailures = 0
         planFailureHistory = []
+        outcomeFailureCounts.clear()
       } catch (error) {
         if (controller.signal.aborted) continue
         const message = error instanceof Error ? error.message : String(error)
@@ -280,6 +385,23 @@ export async function runCausalNovelGoalLoop(
         lastFailure = message
         const stateRevision = causalNovelDAO.getState(workId)?.revision ?? -1
         const planFailureCode = phase === 'generate_beats' ? causalPlanFailureCode(message) : null
+        const pendingDecision = phase === 'draft_body'
+          ? causalNovelDAO.listDecisions(workId).find(item => item.status === 'planned')
+          : undefined
+        const isOutcomeFailure = phase === 'draft_body' && (
+          error instanceof CausalOutcomeProtocolError ||
+          /章后结果|核心事件提取|人物变化提取|世界压力提取|情绪结果提取|因果结果|冻结决策中的.*承诺/.test(message)
+        )
+        const outcomeFailureCode: CausalOutcomeFailureCode | null = isOutcomeFailure
+          ? causalOutcomeFailureCode(error)
+          : null
+        const outcomeFailureKey = outcomeFailureCode && pendingDecision
+          ? `${stateRevision}:${pendingDecision.chapterId}:${outcomeFailureCode}`
+          : null
+        const outcomeFailureCount = outcomeFailureKey
+          ? (outcomeFailureCounts.get(outcomeFailureKey) ?? 0) + 1
+          : 0
+        if (outcomeFailureKey) outcomeFailureCounts.set(outcomeFailureKey, outcomeFailureCount)
         const failureDecision = planFailureCode
           ? registerCausalPlanFailure(
               planFailureHistory,
@@ -296,7 +418,11 @@ export async function runCausalNovelGoalLoop(
           turn_no: turn,
           phase,
           action: 'error',
-          summary: planFailureCode ? `[${planFailureCode}] ${message}` : message
+          summary: planFailureCode
+            ? `[${planFailureCode}] ${message}`
+            : outcomeFailureCode
+              ? `[${outcomeFailureCode}] ${message}`
+              : message
         })
         if (
           planFailureCode && failureDecision?.shouldPause
@@ -308,12 +434,25 @@ export async function runCausalNovelGoalLoop(
           )
           return
         }
+        if (outcomeFailureCode && outcomeFailureCount >= MAX_OUTCOME_FAILURES_PER_FAMILY) {
+          goalRoutineDAO.update(workId, { status: 'paused', current_phase: phase })
+          emit(
+            `章后结果在状态 r${stateRevision} 连续 ${outcomeFailureCount} 次触发错误族 ${outcomeFailureCode}，已暂停且未提交权威状态：${message}`,
+            'paused'
+          )
+          return
+        }
         if (identicalFailures >= MAX_IDENTICAL_FAILURES) {
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: phase })
           emit(`相同失败连续 ${identicalFailures} 次，已熔断且未推进权威状态：${message}`, 'paused')
           return
         }
-        emit(`本轮未提交因果状态：${message}`, 'running')
+        emit(
+          outcomeFailureCode
+            ? `章后结果 ${outcomeFailureCode} 重试 ${outcomeFailureCount}/${MAX_OUTCOME_FAILURES_PER_FAMILY}；本轮未提交权威状态：${message}`
+            : `本轮未提交因果状态：${message}`,
+          'running'
+        )
       }
     }
   } finally {

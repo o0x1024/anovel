@@ -90,6 +90,8 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
     normalized === 'emotion_blind_read' ||
     normalized === 'emotion_target_compare' ||
     normalized === 'emotion_state_extract' ||
+    normalized.startsWith('goal_novel_causal_outcome') ||
+    normalized === 'goal_novel_causal_edit_audit' ||
     normalized === 'memory_extract' ||
     normalized.startsWith('quality_diagnosis') ||
     normalized === 'settings_overall_check' ||
