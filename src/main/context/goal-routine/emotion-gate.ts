@@ -69,17 +69,63 @@ export function parseStoredEmotionAssessment(raw: string | null | undefined): Em
   } catch { return null }
 }
 
+export function isEmotionAssessmentAcceptedForTransition(
+  assessment: EmotionBlindAssessment | null | undefined
+): boolean {
+  return Boolean(assessment?.passed || assessment?.outcome_meta?.accepted_deferred === true)
+}
+
 export function isEmotionOutcomeComplete(
   chapterId: number,
   content: string,
   raw: string | null | undefined
 ): boolean {
   const assessment = parseStoredEmotionAssessment(raw)
-  if (!assessment?.passed) return false
+  if (!isEmotionAssessmentAcceptedForTransition(assessment)) return false
   if (assessment.outcome_meta?.ledger_complete === false) return false
   if (assessment.outcome_meta?.content_hash
     && assessment.outcome_meta.content_hash !== emotionContentHash(content)) return false
   return emotionalStateDAO.listByChapter(chapterId).length > 0
+}
+
+/**
+ * 持久化“原始评估未完全通过、但无硬伤并允许延后验收”的最终决策。
+ * 原始 passed 保持不变；accepted_deferred 只代表工作流可以带债务推进。
+ */
+export async function persistDeferredEmotionOutcome(
+  workId: number,
+  chapterId: number,
+  content: string,
+  assessment: EmotionBlindAssessment,
+  signal?: AbortSignal
+): Promise<EmotionBlindAssessment> {
+  const latest = volumeChapterDAO.getChapter(chapterId)
+  if (!latest?.content?.trim() || latest.content !== content) {
+    throw new Error('候选正文已变化，拒绝提交过期的延后情绪验收')
+  }
+  const contract = loadChapterEmotionContract(chapterId)
+  if (!contract) throw new Error('章节缺少 emotion_contract，禁止提交延后情绪验收')
+  const ledgerRows = await extractEmotionalLedgerRows(workId, chapterId, content, contract, signal)
+  const accepted: EmotionBlindAssessment = {
+    ...assessment,
+    outcome_meta: {
+      content_hash: emotionContentHash(content),
+      ledger_complete: true,
+      ledger_schema_version: EMOTION_LEDGER_SCHEMA_VERSION,
+      accepted_deferred: true
+    }
+  }
+  const readerCurve = Array.isArray(accepted.actual_reader_curve) ? accepted.actual_reader_curve : []
+  const averageArousal = readerCurve.length > 0
+    ? readerCurve.reduce((sum, point) => sum + point.arousal, 0) / readerCurve.length
+    : 0
+  emotionalStateDAO.replaceChapterOutcome(
+    chapterId,
+    ledgerRows,
+    JSON.stringify(accepted),
+    Math.max(1, Math.min(10, Math.round(1 + averageArousal * 2.25)))
+  )
+  return accepted
 }
 
 function clamp(value: unknown, min = 0, max = 100): number {
@@ -371,7 +417,7 @@ export async function ensureChapterEmotionOutcome(
   const hashMatches = !stored?.outcome_meta?.content_hash
     || stored.outcome_meta.content_hash === emotionContentHash(content)
   if (stored && hashMatches) {
-    if (!stored.passed) return stored
+    if (!isEmotionAssessmentAcceptedForTransition(stored)) return stored
     if (existingLedgerRows.length > 0 && stored.outcome_meta?.ledger_complete !== false) return stored
     const contract = loadChapterEmotionContract(chapterId)
     if (!contract) throw new Error('章节缺少 emotion_contract，禁止补抽取情绪账本')

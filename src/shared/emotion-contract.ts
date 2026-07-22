@@ -115,6 +115,8 @@ export interface EmotionBlindAssessment {
     content_hash: string
     ledger_complete: boolean
     ledger_schema_version: number
+    /** 原始评估未完全通过，但所有承重维度均高于硬伤线，允许带审计债务推进。 */
+    accepted_deferred?: boolean
   }
 }
 

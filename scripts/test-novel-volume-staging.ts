@@ -33,6 +33,7 @@ import {
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  resolveNovelChapterRecoveryAction,
   resolveNovelPreparationPhase,
   selectDeferredNovelExecutionCandidate,
   selectReusableNovelExecutionCandidate,
@@ -47,6 +48,11 @@ import {
   shouldInjectTasteAndConditionRules,
   shouldInjectWritingStyle
 } from '../src/main/context/step-prompt-policy'
+import { isEmotionAssessmentAcceptedForTransition } from '../src/main/context/goal-routine/emotion-gate'
+import {
+  parseCachedQualityAssessment,
+  serializeQualityAssessment
+} from '../src/main/context/goal-routine/chapter-assessment-cache'
 
 const targetChapters = 260
 
@@ -595,6 +601,50 @@ assert.equal(isNovelChapterReadyForTransition({
   emotionReady: true,
   patternFingerprintReady: true
 }), true)
+assert.equal(resolveNovelChapterRecoveryAction({
+  hasContent: false, qualityReady: false, emotionReady: false, patternFingerprintReady: false
+}), 'generate')
+assert.equal(resolveNovelChapterRecoveryAction({
+  hasContent: true, qualityReady: true, emotionReady: false, patternFingerprintReady: false
+}), 'acceptance')
+assert.equal(resolveNovelChapterRecoveryAction({
+  hasContent: true, qualityReady: true, emotionReady: true, patternFingerprintReady: false
+}), 'memory')
+assert.equal(resolveNovelChapterRecoveryAction({
+  hasContent: true, qualityReady: true, emotionReady: true, patternFingerprintReady: true
+}), 'complete')
+assert.equal(isEmotionAssessmentAcceptedForTransition({
+  passed: false,
+  outcome_meta: {
+    content_hash: 'hash',
+    ledger_complete: true,
+    ledger_schema_version: 2,
+    accepted_deferred: true
+  }
+} as never), true)
+assert.equal(isEmotionAssessmentAcceptedForTransition({
+  passed: false,
+  outcome_meta: {
+    content_hash: 'hash',
+    ledger_complete: true,
+    ledger_schema_version: 2
+  }
+} as never), false)
+const deferredQualityContent = '延后验收正文'
+const deferredQuality = parseCachedQualityAssessment(serializeQualityAssessment({
+  content: deferredQualityContent,
+  scoreTotal: 92,
+  hardFail: false,
+  report: '无硬伤',
+  acceptedDeferred: true
+}), deferredQualityContent)
+assert.equal(deferredQuality?.acceptedDeferred, true)
+assert.equal(parseCachedQualityAssessment(serializeQualityAssessment({
+  content: deferredQualityContent,
+  scoreTotal: 92,
+  hardFail: false,
+  acceptedDeferred: true
+}), '正文已变化'), null)
 assert.deepEqual(capNovelAutomaticRepairTargets([2, 3], policyChapters), [])
 assert.equal(shouldPauseForReadOnlyNovelAudit({ planComplete: true, contentComplete: true, met: false }), true)
 assert.equal(shouldPauseForReadOnlyNovelAudit({ planComplete: false, contentComplete: true, met: false }), false)

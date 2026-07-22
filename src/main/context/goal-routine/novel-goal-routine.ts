@@ -85,7 +85,13 @@ import {
 } from './novel-outline-pipeline'
 import { formatNovelScaleContract, validatePleasureEngineScale } from './novel-scale-contract'
 import { ensureEmotionEngine } from './emotion-engine'
-import { assessChapterEmotion, emotionRepairHint, isEmotionOutcomeComplete } from './emotion-gate'
+import {
+  assessChapterEmotion,
+  emotionRepairHint,
+  isEmotionOutcomeComplete,
+  parseStoredEmotionAssessment,
+  persistDeferredEmotionOutcome
+} from './emotion-gate'
 import { parseCachedQualityAssessment, serializeQualityAssessment } from './chapter-assessment-cache'
 import { retentionPackagingRules } from './reader-retention'
 import { assessNovelVolume } from './novel-whole-evaluator'
@@ -96,10 +102,10 @@ import {
   MAX_NOVEL_PHASE_FAILURES,
   MAX_NOVEL_REPAIR_STALLS,
   capNovelAutomaticRepairTargets,
-  isNovelChapterReadyForTransition,
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
+  resolveNovelChapterRecoveryAction,
   resolveNovelPreparationPhase,
   shouldContinueNovelAfterVolumeRepairBoundary,
   shouldExtendNovelConstructionBudget,
@@ -519,6 +525,7 @@ interface PendingDraftChapter {
   id: number
   title: string
   needsGeneration: boolean
+  needsAcceptance: boolean
 }
 
 function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): PendingDraftChapter | null {
@@ -526,18 +533,22 @@ function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): Pendi
   const fingerprintChapterIds = new Set(storyStateDAO.listFingerprintsByWork(workId).map(row => row.chapter_id))
   for (const ch of chapters) {
     const content = ch.content?.trim() ?? ''
-    if (!content) return { id: ch.id, title: ch.title, needsGeneration: true }
-
     const cachedQuality = parseCachedQualityAssessment(ch.quality_assessment_json, content)
     const qualityReady = !config.diagnoseBodyAfterGeneration || config.qualityMin <= 0 || !!cachedQuality
     const emotionReady = isEmotionOutcomeComplete(ch.id, content, ch.emotion_assessment_json)
     const memoryReady = fingerprintChapterIds.has(ch.id)
-    if (!isNovelChapterReadyForTransition({
+    const action = resolveNovelChapterRecoveryAction({
+      hasContent: Boolean(content),
       qualityReady,
       emotionReady,
       patternFingerprintReady: memoryReady
-    })) {
-      return { id: ch.id, title: ch.title, needsGeneration: false }
+    })
+    if (action === 'complete') continue
+    return {
+      id: ch.id,
+      title: ch.title,
+      needsGeneration: action === 'generate',
+      needsAcceptance: action === 'generate' || action === 'acceptance'
     }
   }
   return null
@@ -733,6 +744,19 @@ async function diagnoseAndFixUntilPass(
       score: bestCandidate.scoreTotal,
       hardFail: bestCandidate.hardFail
     })) {
+      const deferredChapter = volumeChapterDAO.getChapter(chapterId)
+      if (!deferredChapter?.content?.trim()) {
+        throw new Error('最佳质量候选不存在，拒绝提交延后质量验收')
+      }
+      volumeChapterDAO.updateChapter(chapterId, {
+        quality_assessment_json: serializeQualityAssessment({
+          content: deferredChapter.content,
+          scoreTotal: bestCandidate.scoreTotal,
+          hardFail: false,
+          report: bestCandidate.report,
+          acceptedDeferred: true
+        })
+      })
       onProgress?.(
         `「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」无识别硬伤，采用本轮最佳候选 ${bestCandidate.scoreTotal} 分并将软指标转入质量债务`
       )
@@ -799,21 +823,32 @@ export async function runChapterAcceptanceGate(
 
   for (let convergenceRound = 1; convergenceRound <= MAX_CHAPTER_CONVERGENCE_ROUNDS; convergenceRound++) {
     if (config.diagnoseBodyAfterGeneration && config.qualityMin > 0) {
-      const quality = await diagnoseAndFixUntilPass(
-        workId,
-        chapterId,
-        config.qualityMin,
-        config.qualityMetricMins,
-        signal,
-        onProgress
+      const current = volumeChapterDAO.getChapter(chapterId)
+      const cachedQuality = parseCachedQualityAssessment(
+        current?.quality_assessment_json,
+        current?.content ?? ''
       )
-      totalQualityRounds += quality.rounds
-      qualityScore = quality.finalScore
-      failures.push(...quality.failedMetrics)
-      if (!quality.passed) {
-        return { passed: false, qualityScore, rounds: totalQualityRounds, failedMetrics: [...new Set(failures)] }
+      if (cachedQuality) {
+        qualityScore = cachedQuality.scoreTotal
+        qualityDeferred = Boolean(cachedQuality.acceptedDeferred)
+        onProgress?.(`「${current?.title ?? chapterId}」复用当前正文已通过的质量检查点 ${qualityScore} 分`)
+      } else {
+        const quality = await diagnoseAndFixUntilPass(
+          workId,
+          chapterId,
+          config.qualityMin,
+          config.qualityMetricMins,
+          signal,
+          onProgress
+        )
+        totalQualityRounds += quality.rounds
+        qualityScore = quality.finalScore
+        failures.push(...quality.failedMetrics)
+        if (!quality.passed) {
+          return { passed: false, qualityScore, rounds: totalQualityRounds, failedMetrics: [...new Set(failures)] }
+        }
+        qualityDeferred = Boolean(quality.deferred)
       }
-      qualityDeferred = Boolean(quality.deferred)
     }
 
     const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma', [chapterId])
@@ -851,6 +886,13 @@ export async function runChapterAcceptanceGate(
       hardDimensionScores: hardEmotionScores
     })
     if (safeSoftEmotionDebt) {
+      await persistDeferredEmotionOutcome(
+        workId,
+        chapterId,
+        chapter?.content ?? '',
+        assessment,
+        signal
+      )
       onProgress?.(
         `「${chapter?.title ?? chapterId}」情绪承重维度均高于硬伤线，剩余 ${assessment.failure_layer} 层问题转入质量债务并继续`
       )
@@ -1857,8 +1899,12 @@ export async function runNovelGoalLoop(
                 `正文目标章节不属于当前已冻结分卷「${workflow?.kind === 'draft_body' ? workflow.volume.name : '未知'}」`
               )
             }
-            // 未完成验收的正文只能作为候选；先移除旧派生记忆，避免同章修订读到未来章末状态。
-            clearChapterNarrativeMemory(workId, chapter.id)
+            // 只有需要重新生成或重新验收正文时才失效派生记忆。
+            // 若质量/情绪已通过、只缺记忆指纹，则保留验收结果并从记忆检查点恢复。
+            if (chapter.needsGeneration || chapter.needsAcceptance) {
+              clearChapterNarrativeMemory(workId, chapter.id)
+              volumeChapterDAO.updateChapter(chapter.id, { status: 'draft' })
+            }
             if (chapter.needsGeneration) {
               emit(`正在生成正文「${chapter.title}」`, 'running')
               const gen = await generateBeatBody(workId, chapter.id, {
@@ -1906,39 +1952,68 @@ export async function runNovelGoalLoop(
                 })
               }
               emit(`生成候选正文「${chapter.title}」${gen.wordCount}字，开始执行质量与情绪门禁`, 'running')
-            } else {
+            } else if (chapter.needsAcceptance) {
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'diagnose_resume',
                 target_chapter_id: chapter.id,
                 summary: `检测到「${chapter.title}」已有正文但缺少完整验收，恢复质量与情绪门禁`
               })
               emit(`「${chapter.title}」正文已存在但尚未完整验收，正在补跑质量与情绪门禁`, 'running')
+            } else {
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'memory_resume',
+                target_chapter_id: chapter.id,
+                summary: `「${chapter.title}」质量与情绪验收已完成，仅恢复缺失的章级记忆检查点`
+              })
+              emit(`「${chapter.title}」验收结果完整，正在恢复章级记忆检查点`, 'running')
             }
 
-            const acceptance = await runChapterAcceptanceGate(
-              workId,
-              chapter.id,
-              fullConfig,
-              controller.signal,
-              msg => emit(msg, 'running')
-            )
-            goalRoutineDAO.appendTurn({
-              work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
-              target_chapter_id: chapter.id,
-              score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
-              summary: acceptance.passed
-                ? `「${chapter.title}」质量与情绪门禁通过（质量 ${acceptance.qualityScore} 分，累计诊断 ${acceptance.rounds} 轮）`
-                : `「${chapter.title}」质量与情绪门禁未通过：${acceptance.failedMetrics.join('、')}`
-            })
-            if (!acceptance.passed) {
-              clearChapterNarrativeMemory(workId, chapter.id)
-              volumeChapterDAO.updateChapter(chapter.id, {
-                status: 'draft', emotion_assessment_json: null, quality_assessment_json: null
-              })
-              throw new Error(
-                `「${chapter.title}」累计诊断 ${acceptance.rounds} 轮仍未通过质量与情绪联合门禁，已保留最佳正文并禁止进入下一章`
-                + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
+            let acceptance: Awaited<ReturnType<typeof runChapterAcceptanceGate>>
+            if (chapter.needsAcceptance) {
+              acceptance = await runChapterAcceptanceGate(
+                workId,
+                chapter.id,
+                fullConfig,
+                controller.signal,
+                msg => emit(msg, 'running')
               )
+              goalRoutineDAO.appendTurn({
+                work_id: workId, turn_no: turn, phase, action: 'diagnose_fix',
+                target_chapter_id: chapter.id,
+                score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
+                summary: acceptance.passed
+                  ? `「${chapter.title}」质量与情绪门禁通过（质量 ${acceptance.qualityScore} 分，累计诊断 ${acceptance.rounds} 轮）`
+                  : `「${chapter.title}」质量与情绪门禁未通过：${acceptance.failedMetrics.join('、')}`
+              })
+              if (!acceptance.passed) {
+                clearChapterNarrativeMemory(workId, chapter.id)
+                volumeChapterDAO.updateChapter(chapter.id, {
+                  status: 'draft', emotion_assessment_json: null
+                })
+                throw new Error(
+                  `「${chapter.title}」累计诊断 ${acceptance.rounds} 轮仍未通过质量与情绪联合门禁，已保留最佳正文并禁止进入下一章`
+                  + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
+                )
+              }
+            } else {
+              const resumed = volumeChapterDAO.getChapter(chapter.id)
+              const cachedQuality = parseCachedQualityAssessment(
+                resumed?.quality_assessment_json,
+                resumed?.content ?? ''
+              )
+              const cachedEmotion = parseStoredEmotionAssessment(resumed?.emotion_assessment_json)
+              acceptance = {
+                passed: true,
+                deferred: Boolean(cachedQuality?.acceptedDeferred
+                  || cachedEmotion?.outcome_meta?.accepted_deferred),
+                qualityScore: cachedQuality?.scoreTotal ?? -1,
+                emotionScore: cachedEmotion?.score,
+                rounds: 0,
+                failedMetrics: []
+              }
             }
 
             if (acceptance.deferred) {
@@ -1999,6 +2074,12 @@ export async function runNovelGoalLoop(
             }
             if (volumeCheckpoint.summary) emit(`分卷正文检查点通过：${volumeCheckpoint.summary}`, 'running')
 
+            const nextChapter = nextPendingDraftChapter(workId, fullConfig)
+            if (nextChapter?.id === chapter.id) {
+              throw new Error(
+                `「${chapter.title}」提交完成后仍被识别为待处理章节，拒绝写入虚假的 acceptance_complete`
+              )
+            }
             goalRoutineDAO.appendTurn({
               work_id: workId,
               turn_no: turn,
@@ -2008,7 +2089,7 @@ export async function runNovelGoalLoop(
               score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
               summary: `「${chapter.title}」全部门禁完成，可进入下一章`
             })
-            phase = nextPendingDraftChapter(workId, fullConfig)
+            phase = nextChapter
               ? 'draft_body'
               : phaseAfterCurrentDraftWindow(workId)
           }

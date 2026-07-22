@@ -6,6 +6,7 @@ export interface CachedQualityAssessment {
   hardFail: boolean
   report: string
   checkedAt: string
+  acceptedDeferred?: boolean
 }
 
 export function chapterContentHash(content: string): string {
@@ -36,12 +37,14 @@ export function serializeQualityAssessment(input: {
   scoreTotal: number
   hardFail: boolean
   report?: string
+  acceptedDeferred?: boolean
 }): string {
   return JSON.stringify({
     contentHash: chapterContentHash(input.content),
     scoreTotal: input.scoreTotal,
     hardFail: input.hardFail,
     report: input.report ?? '',
-    checkedAt: new Date().toISOString()
+    checkedAt: new Date().toISOString(),
+    acceptedDeferred: input.acceptedDeferred || undefined
   } satisfies CachedQualityAssessment)
 }

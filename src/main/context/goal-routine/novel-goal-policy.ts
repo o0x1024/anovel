@@ -118,6 +118,23 @@ export function isNovelChapterReadyForTransition(input: {
   return input.qualityReady && input.emotionReady && input.patternFingerprintReady
 }
 
+export type NovelChapterRecoveryAction = 'generate' | 'acceptance' | 'memory' | 'complete'
+
+/**
+ * 章节恢复只补最早缺失的持久化检查点，禁止因记忆缺失而重跑已完成的质量/情绪验收。
+ */
+export function resolveNovelChapterRecoveryAction(input: {
+  hasContent: boolean
+  qualityReady: boolean
+  emotionReady: boolean
+  patternFingerprintReady: boolean
+}): NovelChapterRecoveryAction {
+  if (!input.hasContent) return 'generate'
+  if (!input.qualityReady || !input.emotionReady) return 'acceptance'
+  if (!input.patternFingerprintReady) return 'memory'
+  return 'complete'
+}
+
 export interface NovelPolicyChapter {
   id: number
   volume_id: number
