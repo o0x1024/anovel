@@ -2334,19 +2334,6 @@ export async function runNovelGoalLoop(
           return
         }
         if (errorCode === 'EVALUATOR_PROTOCOL') {
-          if (keepConstructionRunning) {
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase: attemptedPhase,
-              action: 'construction_evaluator_retry',
-              summary: `整本施工尚未完成，保留章节候选并继续重试评估协议：${msg}`
-            })
-            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
-            emit(`评估协议异常，已保留候选并继续整本施工：${msg}`, 'running')
-            await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 2_000 * failureCount)))
-            continue
-          }
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({
             work_id: workId,
@@ -2355,7 +2342,7 @@ export async function runNovelGoalLoop(
             action: 'evaluator_protocol_pause',
             summary: msg
           })
-          emit(`章节候选已保留；评估器证据协议连续失败，已暂停且不会改写正文：${msg}`, 'paused')
+          emit(`章节候选已保留；评估器证据协议连续 3 次失败，已保存断点并暂停，不会重复改写或空转：${msg}`, 'paused')
           return
         }
         const boundaryState = readNovelGoalState(workId)

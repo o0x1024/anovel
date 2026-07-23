@@ -49,6 +49,14 @@ import {
   getPanelSelection,
   setPanelSelection
 } from '../../services/editorPanelPageState'
+import {
+  repairNovelExecutionUntilChecked,
+  type NovelExecutionGateResult
+} from '../../services/novel-execution-repair'
+import {
+  saveChapterDraft,
+  type SavedChapterDraft
+} from '../../services/chapter-draft-save'
 
 const props = defineProps<{ workId: number }>()
 const nav = inject(editorNavKey)
@@ -153,15 +161,7 @@ interface CrossChapterIssue {
   message: string
 }
 
-interface ConsistencyGateResult {
-  passed: boolean
-  blockers: string[]
-  warnings: string[]
-  execution?: {
-    passed: boolean
-    coverage: Array<{ event: string; verdict: 'covered' | 'partial' | 'missing'; evidence: string; reason: string }>
-  }
-}
+type ConsistencyGateResult = NovelExecutionGateResult
 
 interface BudgetPreview {
   maxContextTokens: number
@@ -203,6 +203,7 @@ const emotionAssessment = ref<EmotionBlindAssessment | null>(null)
 const worldviewViolations = ref<{ rule: string; detail: string }[]>([])
 const runningCritique = ref(false)
 const savingChapter = ref(false)
+const savingDraft = ref(false)
 const extractingMemory = ref(false)
 const copyHint = ref('')
 const humanizeHint = ref('')
@@ -223,6 +224,8 @@ const crossChapterReportRef = ref<HTMLElement | null>(null)
 let crossChapterScanHintTimer: ReturnType<typeof setTimeout> | null = null
 let crossChapterScanMsgTimer: ReturnType<typeof setTimeout> | null = null
 const gateResult = ref<ConsistencyGateResult | null>(null)
+const repairingExecutionGate = ref(false)
+const executionRepairMsg = ref('')
 const antiAiRulesPanelRef = ref<{ reload: () => Promise<void>; appendRules: (rules: string[]) => Promise<void> } | null>(null)
 const antiAiViolations = ref<AntiAiViolation[]>([])
 const autoHumanize = ref(true)
@@ -462,6 +465,7 @@ watch(selectedChapterId, async (id) => {
     qualityAiMetrics.value = null
     worldviewViolations.value = []
     gateResult.value = null
+    executionRepairMsg.value = ''
     memoryExtractMsg.value = ''
     fingerprintMsg.value = ''
     antiAiViolations.value = []
@@ -673,6 +677,64 @@ async function repairNovelExecutionBeforePreview(chapterId: number, initialConte
   return content
 }
 
+async function repairBlockedNovelExecution() {
+  const chapterId = selectedChapterId.value
+  const initialGate = gateResult.value
+  if (
+    workType.value !== 'novel'
+    || !chapterId
+    || !result.value.trim()
+    || !initialGate?.execution
+    || initialGate.passed
+    || repairingExecutionGate.value
+  ) return
+
+  repairingExecutionGate.value = true
+  executionRepairMsg.value = ''
+  try {
+    const repaired = await repairNovelExecutionUntilChecked({
+      workId: props.workId,
+      chapterId,
+      content: result.value,
+      blockers: initialGate.blockers,
+      maxRounds: 2,
+      onRoundStart: round => {
+        executionRepairMsg.value = `正在根据门禁阻塞项定向修复（${round}/2）…`
+      },
+      onCandidate: async content => {
+        if (selectedChapterId.value !== chapterId) throw new Error('当前章节已切换，已停止应用定向修复结果')
+        result.value = content
+        cacheBodyContent(chapterId, content)
+        qualityResult.value = null
+        qualityAiReport.value = ''
+        qualityAiMetrics.value = null
+        emotionAssessment.value = null
+        await recheckAntiAiViolations(content)
+      },
+      onGateChecked: checked => {
+        gateResult.value = checked
+      }
+    })
+
+    if (repaired.gate.passed) {
+      executionRepairMsg.value = '章节执行门禁已通过。修复后的正文尚未提交，请点击「验收并提交」完成情绪验收与叙事记忆提交。'
+      showToast('success', 'AI 定向修复完成，章节执行门禁已通过')
+    } else if (!repaired.gate.execution) {
+      executionRepairMsg.value = `执行合同问题已修复，但仍有其他一致性阻塞：${repaired.gate.blockers.join('；')}`
+      showToast('warning', '执行合同问题已修复，仍需处理其他一致性阻塞')
+    } else {
+      executionRepairMsg.value = `已完成两轮定向修复，仍未通过：${repaired.gate.blockers.join('；')}`
+      showToast('warning', '两轮 AI 定向修复后仍有门禁阻塞，请查看剩余问题')
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : '章节执行定向修复失败'
+    executionRepairMsg.value = message
+    showToast('error', message)
+  } finally {
+    repairingExecutionGate.value = false
+  }
+}
+
 async function generateBody() {
   const ch = selectedChapter.value
   if (!ch || generatingBody.value) return
@@ -706,6 +768,7 @@ async function generateBody() {
     emotionAssessment.value = null
     worldviewViolations.value = []
     gateResult.value = null
+    executionRepairMsg.value = ''
     humanizeMsg.value = ''
     humanizeHint.value = ''
 
@@ -1363,40 +1426,76 @@ async function extractNarrativeMemory(chapterId: number, content: string): Promi
   }
 }
 
+async function persistCurrentChapterDraft(ch: Chapter): Promise<SavedChapterDraft> {
+  const saved = await saveChapterDraft(ch.id, workType.value, result.value)
+  result.value = saved.content
+  const index = chapters.value.findIndex(chapter => chapter.id === ch.id)
+  if (index >= 0) {
+    chapters.value[index] = {
+      ...chapters.value[index],
+      content: saved.content || null,
+      word_count: saved.wordCount,
+      status: saved.status
+    }
+  }
+  clearCachedBodyContent(ch.id)
+  await nav?.refreshProgress()
+  return saved
+}
+
+function clearStaleAcceptanceResults() {
+  qualityResult.value = null
+  qualityAiReport.value = ''
+  qualityAiMetrics.value = null
+  emotionAssessment.value = null
+  gateResult.value = null
+  executionRepairMsg.value = ''
+  fingerprintMsg.value = ''
+}
+
+async function saveDraftOnly() {
+  const ch = selectedChapter.value
+  if (!ch || savingDraft.value || savingChapter.value) return
+  const normalized = normalizeBodyParagraphSpacing(result.value)
+  if (normalized === (ch.content ?? '')) {
+    showToast('info', '正文没有变化，无需重复保存草稿')
+    return
+  }
+
+  savingDraft.value = true
+  try {
+    const saved = await persistCurrentChapterDraft(ch)
+    clearStaleAcceptanceResults()
+    if (saved.cleared) {
+      await loadNarrativeMemory(ch.id)
+      showToast('success', '已清空本章正文及关联叙事记忆')
+    } else {
+      memoryExtractMsg.value = workType.value === 'novel'
+        ? '草稿已保存 · 内容变更，待重新验收并同步叙事记忆'
+        : '草稿已保存 · 内容变更，待重新验收'
+      showToast('success', '正文草稿已保存，未运行 AI 验收')
+    }
+  } catch (e) {
+    showToast('error', e instanceof Error ? e.message : '保存草稿失败')
+  } finally {
+    savingDraft.value = false
+  }
+}
+
 async function saveToChapter() {
   const ch = selectedChapter.value
-  if (!ch || savingChapter.value) return
+  if (!ch || savingChapter.value || savingDraft.value) return
 
-  const isClearing = !result.value.trim()
-  const wordCount = countWords(result.value)
-  const updateFields: Record<string, unknown> = {
-    content: result.value,
-    word_count: wordCount,
-    status: !isClearing && workType.value === 'novel' ? 'memory_pending' : 'draft'
-  }
   let bodyPersisted = false
   savingChapter.value = true
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   try {
     // 正文与旧版本快照必须先落库；后续门禁只决定是否允许提交记忆并标记完成。
-    const updated = await window.anovel.invoke('chapter:update', ch.id, updateFields)
-    if (updated !== true) throw new Error('章节正文未写入数据库')
+    const saved = await persistCurrentChapterDraft(ch)
     bodyPersisted = true
 
-    const idx = chapters.value.findIndex(c => c.id === ch.id)
-    if (idx >= 0) {
-      chapters.value[idx] = {
-        ...chapters.value[idx],
-        content: result.value || null,
-        word_count: wordCount,
-        status: updateFields.status as string
-      }
-    }
-    clearCachedBodyContent(ch.id)
-    await nav?.refreshProgress()
-
-    if (isClearing) {
+    if (saved.cleared) {
       emotionAssessment.value = null
       await loadNarrativeMemory(ch.id)
       showToast('success', '已清空本章正文及关联叙事记忆')
@@ -1409,7 +1508,7 @@ async function saveToChapter() {
     ) as EmotionBlindAssessment
     emotionAssessment.value = emotion
     if (!emotion.passed) {
-      alert(`正文已落库并保留旧版本，但情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}\n\n章节保持待同步状态，请修订后再次保存。`)
+      alert(`正文已落库并保留旧版本，但情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}\n\n章节保持待同步状态，请修订后再次点击「验收并提交」。`)
       return
     }
     const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
@@ -1550,6 +1649,7 @@ function resetBodyEditorDiagnostics() {
   emotionAssessment.value = null
   worldviewViolations.value = []
   gateResult.value = null
+  executionRepairMsg.value = ''
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   antiAiViolations.value = []
@@ -1922,15 +2022,29 @@ function generatePreviewReport() {
               </button>
               <button
                 class="btn btn-outline btn-primary btn-sm gap-1"
-                :disabled="!selectedChapter || savingChapter || extractingMemory"
+                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate"
+                title="只保存正文、字数和版本，不调用 AI 验收"
+                @click="saveDraftOnly"
+              >
+                <font-awesome-icon
+                  :icon="savingDraft ? 'spinner' : 'save'"
+                  :spin="savingDraft"
+                  class="w-3.5 h-3.5"
+                />
+                {{ savingDraft ? '保存中...' : '保存草稿' }}
+              </button>
+              <button
+                class="btn btn-primary btn-sm gap-1"
+                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate"
+                title="保存正文并运行情绪、执行合同、一致性和叙事记忆验收"
                 @click="saveToChapter"
               >
                 <font-awesome-icon
-                  :icon="savingChapter || extractingMemory ? 'spinner' : 'save'"
+                  :icon="savingChapter || extractingMemory ? 'spinner' : 'clipboard-check'"
                   :spin="savingChapter || extractingMemory"
                   class="w-3.5 h-3.5"
                 />
-                {{ savingChapter ? '保存中...' : extractingMemory ? '更新记忆中...' : '保存' }}
+                {{ savingChapter ? '验收中...' : extractingMemory ? '更新记忆中...' : '验收并提交' }}
               </button>
               <button
                 type="button"
@@ -2139,8 +2253,34 @@ function generatePreviewReport() {
                 </li>
               </ul>
             </div>
-            <div v-if="gateResult && !gateResult.passed" class="text-xs text-error mb-2 shrink-0">
-              门禁拦截：{{ gateResult.blockers.join('；') }}
+            <div
+              v-if="gateResult && !gateResult.passed"
+              class="text-xs text-error mb-2 shrink-0 rounded-lg border border-error/30 bg-error/5 px-3 py-2"
+            >
+              <p>门禁拦截：{{ gateResult.blockers.join('；') }}</p>
+              <button
+                v-if="workType === 'novel' && gateResult.execution"
+                type="button"
+                class="btn btn-error btn-outline btn-xs gap-1 mt-2"
+                :disabled="repairingExecutionGate || !result.trim()"
+                @click="repairBlockedNovelExecution"
+              >
+                <font-awesome-icon
+                  :icon="repairingExecutionGate ? 'spinner' : 'wrench'"
+                  :spin="repairingExecutionGate"
+                  class="w-3 h-3"
+                />
+                {{ repairingExecutionGate ? '定向修复中...' : 'AI 定向修复' }}
+              </button>
+            </div>
+            <div
+              v-if="executionRepairMsg"
+              class="text-xs mb-2 shrink-0 rounded-lg border px-3 py-2"
+              :class="gateResult?.passed
+                ? 'text-success border-success/30 bg-success/5'
+                : 'text-warning border-warning/30 bg-warning/5'"
+            >
+              {{ executionRepairMsg }}
             </div>
             <div v-if="antiAiViolations.length" class="alert alert-warning text-xs py-2 mb-2 shrink-0">
               <p class="font-medium mb-1">去AI规则违规（模型未完全遵守 system prompt）</p>

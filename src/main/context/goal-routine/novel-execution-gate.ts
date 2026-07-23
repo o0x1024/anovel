@@ -299,13 +299,17 @@ export function normalizeNovelExecutionAssessment(
       protocolErrors.push(`${requirementId} 的 verdict 无效`)
       continue
     }
-    const verdict = rawVerdict as NovelCoverageVerdict
+    let verdict = rawVerdict as NovelCoverageVerdict
     const requestedIds = strings(row.evidence_ids, 10)
     const evidenceIds = requestedIds.filter(id => ledger.has(id))
     const invalidIds = requestedIds.filter(id => !ledger.has(id))
     if (invalidIds.length > 0) warnings.push(`${requirementId} 已忽略无效证据编号：${invalidIds.join('、')}`)
-    if (verdict !== 'missing' && evidenceIds.length === 0) {
+    if (verdict === 'covered' && evidenceIds.length === 0) {
       protocolErrors.push(`${requirementId} 没有可定位的当前正文证据`)
+    }
+    if (verdict === 'partial' && evidenceIds.length === 0) {
+      verdict = 'missing'
+      warnings.push(`${requirementId} 的 partial 没有任何局部落地证据，已按 missing 进入正文修复`)
     }
     byRequirement.set(requirementId, {
       requirementId,
@@ -448,7 +452,7 @@ export async function assessNovelExecutionCandidate(
         '你是长篇小说章节执行法医。只核验大纲事件覆盖、禁止越界和跨章状态，不评价文笔。',
         `coverage 必须严格返回 ${requirements.length} 行，与 R 编号验收项一一对应。`,
         'covered/partial 的 evidence_ids 只能选择候选正文中实际列出的 C 编号；不要复制原文，不要使用上一章的 P 编号。',
-        'missing 的 evidence_ids 返回空数组。一个验收项可引用多个不连续的 C 编号。',
+        'covered 必须至少有一个 C 证据；partial 必须给出已经局部落地的 C 证据；找不到任何 C 证据时必须判 missing 并返回空数组。一个验收项可引用多个不连续的 C 编号。',
         'forbidden_violations 每项必须返回 description 和当前正文 C evidence_ids；continuity_blockers 每项必须返回 description 和相关 C/P evidence_ids。没有问题就返回空数组。',
         'partial 只表示合同要求的关键动作、选择或结果确实缺少；动作链分散在多个句段、使用同义表达或与下一验收项连续衔接，不得因此判 partial。',
         '若正文通过可定位动作表现出目标结果（例如藏匿、遮盖、压住物资已经实现“保住物资”），即使没有复述合同原句也应判 covered。',

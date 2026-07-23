@@ -338,6 +338,26 @@ const previousOnlyEvidence = normalizeNovelExecutionAssessment({
 assert.equal(previousOnlyEvidence.passed, false)
 assert(previousOnlyEvidence.evaluatorProtocolErrors?.every(item => item.includes('没有可定位的当前正文证据')))
 
+const partialWithoutEvidence = normalizeNovelExecutionAssessment({
+  passed: true,
+  coverage: legacyColonContract.requirements.map((requirement, index) => ({
+    requirement_id: requirement.id,
+    verdict: index === legacyColonContract.requirements.length - 1 ? 'partial' : 'covered',
+    evidence_ids: index === legacyColonContract.requirements.length - 1 ? [] : [`C00${index + 1}`],
+    reason: index === legacyColonContract.requirements.length - 1
+      ? '正文没有落地该验收项'
+      : '正文已经完成该验收项'
+  })),
+  forbidden_violations: [],
+  continuity_blockers: [],
+  warnings: []
+}, legacyColonContract, evidenceLedger, 2000)
+assert.equal(partialWithoutEvidence.passed, false)
+assert.equal(partialWithoutEvidence.evaluatorProtocolErrors, undefined)
+assert.equal(partialWithoutEvidence.coverage.at(-1)?.verdict, 'missing')
+assert(partialWithoutEvidence.blockers.some(item => item.includes('情节缺失')))
+assert(partialWithoutEvidence.warnings.some(item => item.includes('已按 missing 进入正文修复')))
+
 const wordOutOfRange = normalizeNovelExecutionAssessment({
   passed: true,
   coverage: legacyColonContract.requirements.map((requirement, index) => ({
