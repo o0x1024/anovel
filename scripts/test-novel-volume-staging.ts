@@ -35,8 +35,8 @@ import {
   novelPhaseFailureSignature,
   resolveNovelChapterRecoveryAction,
   resolveNovelPreparationPhase,
-  selectDeferredNovelExecutionCandidate,
   selectReusableNovelExecutionCandidate,
+  shouldPersistNovelExecutionCandidate,
   shouldContinueNovelAfterVolumeRepairBoundary,
   shouldDeferNovelChapterAcceptance,
   shouldDeferNovelQualityCandidate,
@@ -319,72 +319,6 @@ const reusableCandidate = selectReusableNovelExecutionCandidate([
   wordMax: 2200
 })
 assert.equal(reusableCandidate?.version_number, 27)
-const deferredCandidate = selectDeferredNovelExecutionCandidate([
-  {
-    version_number: 49,
-    outline: '本章大纲',
-    content: '隐藏物资后避战，随后被迫迎战。',
-    word_count: 2048,
-    model_type: 'novel_execution_candidate',
-    generation_round: 3,
-    snapshot_json: JSON.stringify({
-      contractHash: 'contract-v1',
-      gate: {
-        blockers: ['情节仅部分落地：R001 保护物资'],
-        coverage: [
-          { verdict: 'partial', evidenceIds: ['C003', 'C004'] },
-          { verdict: 'covered', evidenceIds: ['C010'] }
-        ],
-        forbiddenViolations: []
-      }
-    })
-  },
-  {
-    version_number: 50,
-    outline: '本章大纲',
-    content: '缺少关键情节。',
-    word_count: 2000,
-    model_type: 'novel_execution_candidate',
-    generation_round: 3,
-    snapshot_json: JSON.stringify({
-      contractHash: 'contract-v1',
-      gate: {
-        blockers: ['情节缺失：R001 保护物资'],
-        coverage: [{ verdict: 'missing', evidenceIds: [] }],
-        forbiddenViolations: []
-      }
-    })
-  }
-], {
-  outline: '本章大纲',
-  contractHash: 'contract-v1',
-  wordMin: 1800,
-  wordMax: 2200
-})
-assert.equal(deferredCandidate?.candidate.version_number, 49)
-assert.deepEqual(deferredCandidate?.blockers, ['情节仅部分落地：R001 保护物资'])
-assert.equal(selectDeferredNovelExecutionCandidate([
-  {
-    version_number: 51,
-    outline: '本章大纲',
-    content: '虽覆盖情节但发生跨章事实冲突。',
-    word_count: 2000,
-    model_type: 'novel_execution_candidate',
-    snapshot_json: JSON.stringify({
-      contractHash: 'contract-v1',
-      gate: {
-        blockers: ['人物位置与上一章冲突'],
-        coverage: [{ verdict: 'partial', evidenceIds: ['C001'] }],
-        forbiddenViolations: []
-      }
-    })
-  }
-], {
-  outline: '本章大纲',
-  contractHash: 'contract-v1',
-  wordMin: 1800,
-  wordMax: 2200
-}), undefined)
 assert.equal(shouldDeferNovelChapterAcceptance({
   score: 85,
   failureLayer: 'scene',
@@ -428,7 +362,73 @@ const repairedFrontier = selectReusableNovelExecutionCandidate([
   wordMin: 1800,
   wordMax: 2200
 })
-assert.equal(repairedFrontier?.version_number, 5)
+assert.equal(repairedFrontier?.version_number, 4)
+assert.equal(selectReusableNovelExecutionCandidate([
+  {
+    version_number: 1290,
+    outline: '本章大纲',
+    content: '旧合同候选不得污染新合同',
+    word_count: 2000,
+    model_type: 'novel_execution_candidate',
+    generation_round: 3,
+    snapshot_json: JSON.stringify({ contractHash: 'v3', gate: { coverage: [{ verdict: 'partial' }] } })
+  },
+  {
+    version_number: 1,
+    outline: '本章大纲',
+    content: '新合同候选',
+    word_count: 2000,
+    model_type: 'novel_execution_candidate',
+    generation_round: 1,
+    snapshot_json: JSON.stringify({ contractHash: 'v4', gate: { coverage: [{ verdict: 'covered' }] } })
+  }
+], {
+  outline: '本章大纲',
+  wordTarget: 2000,
+  wordMin: 1800,
+  wordMax: 2200,
+  contractHash: 'v4'
+})?.version_number, 1)
+const persistedExecutionCandidates = [{
+  version_number: 1,
+  outline: '本章大纲',
+  content: '已有候选',
+  word_count: 1750,
+  model_type: 'novel_execution_candidate',
+  generation_round: 1,
+  snapshot_json: JSON.stringify({
+    contractHash: 'v4',
+    gate: {
+      coverage: [{ verdict: 'partial' }, { verdict: 'missing' }],
+      forbiddenViolations: [{ description: '越界' }]
+    }
+  })
+}]
+assert.equal(shouldPersistNovelExecutionCandidate(persistedExecutionCandidates, {
+  contractHash: 'v4', content: '已有候选', wordCount: 1750,
+  wordMin: 1800, wordMax: 2200,
+  coverageVerdicts: ['partial', 'missing'], forbiddenViolationCount: 1
+}), false)
+assert.equal(shouldPersistNovelExecutionCandidate(persistedExecutionCandidates, {
+  contractHash: 'v4', content: '只换措辞但没有进步', wordCount: 1750,
+  wordMin: 1800, wordMax: 2200,
+  coverageVerdicts: ['partial', 'missing'], forbiddenViolationCount: 1
+}), false)
+assert.equal(shouldPersistNovelExecutionCandidate(persistedExecutionCandidates, {
+  contractHash: 'v4', content: '覆盖程度提高', wordCount: 1750,
+  wordMin: 1800, wordMax: 2200,
+  coverageVerdicts: ['covered', 'missing'], forbiddenViolationCount: 1
+}), true)
+assert.equal(shouldPersistNovelExecutionCandidate(persistedExecutionCandidates, {
+  contractHash: 'v4', content: '越界减少', wordCount: 1750,
+  wordMin: 1800, wordMax: 2200,
+  coverageVerdicts: ['partial', 'missing'], forbiddenViolationCount: 0
+}), true)
+assert.equal(shouldPersistNovelExecutionCandidate(persistedExecutionCandidates, {
+  contractHash: 'v5', content: '新合同首个候选', wordCount: 1800,
+  wordMin: 1800, wordMax: 2200,
+  coverageVerdicts: ['missing'], forbiddenViolationCount: 0
+}), true)
 assert.equal(selectReusableNovelExecutionCandidate([
   {
     version_number: 1,

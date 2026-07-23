@@ -66,7 +66,7 @@ export interface ChapterExecutionContract {
 }
 
 const TAGS = ['开场状态', '必须覆盖', '禁止越界', '结尾落点', '能力/状态约束', '连续性约束', '情节节点', '章末钩子', '戏剧契约'] as const
-export const CHAPTER_EXECUTION_CONTRACT_VERSION = 3
+export const CHAPTER_EXECUTION_CONTRACT_VERSION = 4
 
 function extractTaggedText(outline: string, tag: typeof TAGS[number]): string {
   const tokens = [`【${tag}】`, `${tag}：`, `${tag}:`]
@@ -94,10 +94,41 @@ function stableTextHash(text: string): string {
   return (value >>> 0).toString(16).padStart(8, '0')
 }
 
+function splitOutsideProtectedText(text: string, delimiters: ReadonlySet<string>): string[] {
+  const pairs: Record<string, string> = {
+    '“': '”', '‘': '’', '「': '」', '『': '』', '《': '》', '【': '】', '（': '）',
+    '(': ')', '[': ']', '{': '}', '"': '"', "'": "'"
+  }
+  const closers = new Set(Object.values(pairs))
+  const stack: string[] = []
+  const parts: string[] = []
+  let current = ''
+  for (const char of text) {
+    const expected = stack.at(-1)
+    if (expected && char === expected) {
+      stack.pop()
+      current += char
+      continue
+    }
+    if (pairs[char] && (!closers.has(char) || char === '"' || char === "'")) {
+      stack.push(pairs[char])
+      current += char
+      continue
+    }
+    if (stack.length === 0 && delimiters.has(char)) {
+      if (current.trim()) parts.push(current.trim())
+      current = ''
+      continue
+    }
+    current += char
+  }
+  if (current.trim()) parts.push(current.trim())
+  return parts
+}
+
 function splitContractItems(text: string): string[] {
   if (!text) return []
-  return text
-    .split(/[；;。\n]+/)
+  return splitOutsideProtectedText(text, new Set(['；', ';', '。', '\n', '\r']))
     .map(item => item.trim().replace(/^(?:[-*•]\s*|[\d一二三四五六七八九十]+[.、)]\s*)/, '').slice(0, 400))
     .filter(Boolean)
     .slice(0, 12)
@@ -111,7 +142,8 @@ function splitContractItems(text: string): string[] {
 export function splitCompoundExecutionEvent(event: string): string[] {
   const normalized = event.trim()
   if (normalized.length < 96) return normalized ? [normalized] : []
-  const rawClauses = normalized.split(/[，,]+/).map(item => item.trim()).filter(Boolean)
+  const rawClauses = splitOutsideProtectedText(normalized, new Set(['，', ',']))
+    .map(item => item.trim()).filter(Boolean)
   if (rawClauses.length < 3) return [normalized]
 
   const clauses: string[] = []
@@ -147,14 +179,22 @@ function structuredExecutionRequirements(outlineDiagnosis?: string | null): Arra
     }
     const dramatic = parsed.dramatic_contract
     if (!dramatic || typeof dramatic !== 'object' || Array.isArray(dramatic)) return []
-    const rows: Array<{ kind: ChapterExecutionRequirementKind; description: string }> = [
-      { kind: 'action', description: String(dramatic.protagonist_want ?? '').trim() },
-      { kind: 'turn', description: String(dramatic.turn ?? '').trim() },
-      { kind: 'state_change', description: String(dramatic.irreversible_change ?? '').trim() },
-      { kind: 'payoff_debt', description: String(dramatic.payoff_or_debt ?? '').trim() }
-    ].filter(row => Boolean(row.description))
-    // 只有结构化合同足够完整时才将其作为权威验收源，残缺旧数据仍走正文大纲兼容解析。
-    return rows.length >= 3 ? rows : []
+    const explicit = dramatic.required_outcomes
+    if (!Array.isArray(explicit)) return []
+    return explicit.flatMap(item => {
+      if (typeof item === 'string' && item.trim()) {
+        return [{ kind: 'event' as const, description: item.trim() }]
+      }
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+      const row = item as { kind?: unknown; description?: unknown }
+      const description = String(row.description ?? '').trim()
+      if (!description) return []
+      const kind = String(row.kind ?? 'event')
+      const validKind: ChapterExecutionRequirementKind = [
+        'action', 'turn', 'state_change', 'payoff_debt', 'event'
+      ].includes(kind) ? kind as ChapterExecutionRequirementKind : 'event'
+      return [{ kind: validKind, description }]
+    }).slice(0, 8)
   } catch {
     return []
   }
@@ -285,7 +325,9 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
   else if (explicitRequiredEvents.length === 0) warnings.push('大纲没有显式必须覆盖节点，已将情节节点编译为可验收事件')
   if (!explicitEndingState) warnings.push('大纲没有显式结尾落点，已在最后一个必写事件完成后立即停止')
   if (structuredExecutionRequirements(input.outlineDiagnosis).length > 0) {
-    warnings.push('验收项已优先采用结构化戏剧合同，正文大纲仍用于场景生成与边界约束')
+    warnings.push('验收项采用显式 required_outcomes；人物愿望、风险和信息差仅作为生成上下文')
+  } else if (input.outlineDiagnosis?.trim()) {
+    warnings.push('戏剧合同未声明 required_outcomes，人物愿望、风险和信息差仅作上下文；硬验收项只从本章明确必写事件编译')
   }
   if (muteInteraction) warnings.push('检测到无声互动章节：通用对话密度规则已由非语言互动质量替代')
 
@@ -420,10 +462,9 @@ const NOVEL_CRITICAL_METRICS = new Set<QualityAiMetricKey>([
   'setting_consistency'
 ])
 
-const NOVEL_HARD_FAILURE_PATTERN = /关键大纲|大纲节点缺失|严重逻辑|逻辑矛盾|设定矛盾|违反.*(?:能力|金手指)|能力越界|结尾越界|提前兑现|字数偏差|严重不足|严重超标|视角越界/
+const NOVEL_HARD_FAILURE_PATTERN = /关键大纲|大纲节点缺失|严重逻辑|逻辑矛盾|设定矛盾|违反.*(?:系统设定|能力|金手指)|不符合.*(?:系统设定|规则)|能力越界|结尾越界|提前兑现|字数偏差|严重不足|严重超标|视角越界|外在实体面板/
 
-export function isRecognizedNovelHardFail(hardFail: boolean, failedRules: string[]): boolean {
-  if (!hardFail) return false
+export function isRecognizedNovelHardFail(_hardFail: boolean, failedRules: string[]): boolean {
   return failedRules.some(rule => NOVEL_HARD_FAILURE_PATTERN.test(rule))
 }
 

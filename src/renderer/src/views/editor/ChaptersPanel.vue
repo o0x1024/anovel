@@ -139,6 +139,7 @@ const chapterCharacters = ref('')
 const aiChapterId = ref<number | null>(null)
 const batchSelectMode = ref(false)
 const batchSelectedIds = ref<Set<number>>(new Set())
+const batchClearingBodies = ref(false)
 const lastAiContext = ref('')
 const planningDetails = ref<ChapterPlanningDetails | null>(null)
 const planningDetailsLoading = ref(false)
@@ -585,7 +586,7 @@ function flattenContractRows(value: unknown, prefix = ''): ContractRow[] {
   }
   if (value && typeof value === 'object') {
     return Object.entries(value as Record<string, unknown>).flatMap(([key, child]) => {
-      if (key === 'execution_contract_v3') return []
+      if (key === 'execution_contract_v3' || key === 'execution_contract_v4' || key === 'execution_acceptance_v4') return []
       const label = prefix ? `${prefix} · ${contractLabel(key)}` : contractLabel(key)
       return flattenContractRows(child, label)
     })
@@ -723,6 +724,41 @@ async function batchDeleteChapters() {
   await loadChapters(selectedVolume.value!)
   await nav?.refreshProgress()
   await refreshPlan()
+}
+
+async function batchClearCurrentVolumeBodies() {
+  if (!selectedVolume.value || batchClearingBodies.value) return
+  const bodyCount = chapters.value.filter(chapter => Boolean(chapter.content?.trim()) || chapter.word_count > 0).length
+  if (bodyCount === 0) {
+    alert('当前卷没有可清空的正文。')
+    return
+  }
+  const volumeName = selectedVolumeInfo.value?.name ?? '当前卷'
+  if (!confirm(
+    `确定批量清空「${volumeName}」全部 ${bodyCount} 章正文吗？\n\n`
+    + '章节大纲和历史版本会保留；正文、字数、质量/情绪验收及派生记忆将被清空。'
+  )) return
+
+  batchClearingBodies.value = true
+  try {
+    const result = await window.anovel.invoke(
+      'chapter:clearVolumeBodies', selectedVolume.value
+    ) as { clearedCount: number; versionedCount: number }
+    if (editingChapterId.value && chapters.value.some(chapter => chapter.id === editingChapterId.value)) {
+      chapterContent.value = ''
+    }
+    batchSelectedIds.value = new Set()
+    batchSelectMode.value = false
+    await loadChapters(selectedVolume.value)
+    if (selectedChapterId.value) await loadChapterVersions(selectedChapterId.value)
+    await nav?.refreshProgress()
+    await refreshPlan()
+    alert(`已清空当前卷 ${result.clearedCount} 章正文，并保留 ${result.versionedCount} 个清空前版本。`)
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '批量清空正文失败')
+  } finally {
+    batchClearingBodies.value = false
+  }
 }
 
 function editChapter(ch: Chapter) {
@@ -1780,6 +1816,17 @@ async function clearDiagnosisResult() {
           <div v-if="batchSelectMode" class="flex items-center gap-2 mb-2 shrink-0">
             <button type="button" class="btn btn-ghost btn-xs" @click="selectAllChapters">
               {{ batchSelectedIds.size === chapters.length ? '取消全选' : '全选' }}
+            </button>
+            <button
+              type="button"
+              class="btn btn-warning btn-xs"
+              :disabled="batchClearingBodies"
+              title="清空当前卷全部正文，保留章节大纲和历史版本"
+              @click="batchClearCurrentVolumeBodies"
+            >
+              <font-awesome-icon v-if="batchClearingBodies" icon="spinner" spin class="w-3 h-3 mr-1" />
+              <font-awesome-icon v-else icon="eraser" class="w-3 h-3 mr-1" />
+              {{ batchClearingBodies ? '清空中...' : '批量清空正文' }}
             </button>
             <button
               type="button"

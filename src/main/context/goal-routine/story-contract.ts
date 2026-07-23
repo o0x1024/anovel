@@ -192,7 +192,8 @@ async function auditStoryContract(
   if (!response.success || !response.content?.trim()) {
     throw new Error(response.error || '故事合同独立语义审计无返回')
   }
-  const json = extractJsonText(response.content.trim()) ?? response.content.trim()
+  const json = extractJsonText(response.content.trim(), { allowEmptyArrays: true })
+    ?? response.content.trim()
   const parsed = parseJsonObjectWithRepairs<{ blockers?: unknown }>(json).value
   if (!Array.isArray(parsed.blockers)) throw new Error('故事合同独立语义审计缺少 blockers 数组')
   return parsed.blockers.map(String).map(item => item.trim()).filter(Boolean).slice(0, 6)

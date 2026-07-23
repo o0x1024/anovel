@@ -1,10 +1,10 @@
 import { modelService } from '../../model'
 import { volumeChapterDAO } from '../../db'
-import { extractJsonText } from '../parse-json-extract'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { retentionEvaluationRules } from './reader-retention'
 import { assessNovelSystemics } from './novel-systemic-gate'
 import type { NovelSystemIssue } from '../../../shared/novel-systemic-types'
+import { requestStructuredModelOutput } from './structured-model-output'
 
 export interface VolumeAssessment {
   volume: string
@@ -87,17 +87,6 @@ function validateVolumeEvidenceIssues(
     valid.push(issue)
   }
   return { valid, invalid }
-}
-
-function parseObject(content: string, label: string): Record<string, unknown> {
-  const json = extractJsonText(content.trim()) ?? content.trim()
-  try {
-    const parsed = JSON.parse(json) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('根节点必须是对象')
-    return parsed as Record<string, unknown>
-  } catch (error) {
-    throw new Error(`${label}解析失败：${error instanceof Error ? error.message : String(error)}`)
-  }
 }
 
 function chapterEvidence(chapter: ReturnType<typeof volumeChapterDAO.listChaptersByWork>[number]): string {
@@ -216,28 +205,34 @@ async function assessVolumeWindow(
   windowIndex: number,
   signal?: AbortSignal
 ): Promise<VolumeAssessment> {
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'goal_novel_volume_evaluation',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      maxTokens: 1800,
-      systemPrompt: [
-        '你是长篇网文分卷终审编辑。根据章节合同、大纲和正文首尾抽样，检查本卷是否形成因果闭环、压力升级、阶段兑现和进入下一卷的新债务。',
-        '同时识别重复任务结构、反派送人头、无代价获胜、连续水章、关系线停滞和伏笔久拖不决。',
-        retentionEvaluationRules('novel'),
-        '每个问题必须给出准确章节标题、正文抽样中逐字可见的证据和可执行修复要求；没有证据不得列为问题或压低分数。',
-        '只输出 JSON：{"structureScore":0,"escalationScore":0,"payoffScore":0,"continuityScore":0,"repetitionScore":0,"issues":[{"problem":"","chapterTitles":["完整章节标题"],"evidence":["原文证据"],"requiredFix":""}],"weakChapters":[],"summary":""}'
-      ].join('\n'),
-      prompt: `【分卷】${volumeName}\n【连续窗口】${windowIndex + 1}（${chapters[0]?.title} → ${chapters.at(-1)?.title}）\n\n${chapters.map(chapterEvidence).join('\n\n')}`
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(`${volumeName}第${windowIndex + 1}窗口终审失败：${response.error || '模型未返回内容'}`)
-  }
-  const parsed = parseObject(response.content, `${volumeName}终审`)
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: `${volumeName}第${windowIndex + 1}窗口终审`,
+    attempts: 2,
+    signal,
+    request: (attempt, lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'goal_novel_volume_evaluation',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        maxTokens: attempt === 1 ? 1800 : 3600,
+        forceThinkingDisabled: true,
+        systemPrompt: [
+          '你是长篇网文分卷终审编辑。根据章节合同、大纲和正文首尾抽样，检查本卷是否形成因果闭环、压力升级、阶段兑现和进入下一卷的新债务。',
+          '同时识别重复任务结构、反派送人头、无代价获胜、连续水章、关系线停滞和伏笔久拖不决。',
+          retentionEvaluationRules('novel'),
+          '每个问题必须给出准确章节标题、正文抽样中逐字可见的证据和可执行修复要求；没有证据不得列为问题或压低分数。',
+          '只输出 JSON：{"structureScore":0,"escalationScore":0,"payoffScore":0,"continuityScore":0,"repetitionScore":0,"issues":[{"problem":"","chapterTitles":["完整章节标题"],"evidence":["原文证据"],"requiredFix":""}],"weakChapters":[],"summary":""}'
+        ].join('\n'),
+        prompt: [
+          `【分卷】${volumeName}\n【连续窗口】${windowIndex + 1}（${chapters[0]?.title} → ${chapters.at(-1)?.title}）\n\n${chapters.map(chapterEvidence).join('\n\n')}`,
+          attempt > 1 ? `【格式重试】${lastError}。压缩问题数量并返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
   const parsedEvidenceIssues = volumeEvidenceIssues(parsed.issues)
   const evidenceValidation = validateVolumeEvidenceIssues(parsedEvidenceIssues, chapters)
   const evidenceIssues = evidenceValidation.valid
@@ -278,34 +273,38 @@ export async function assessNovelVolume(
   if (assessments.length === 1) return assessments[0]
 
   const volume = volumeChapterDAO.listVolumes(workId).find(item => item.name === volumeName)
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'goal_novel_volume_evaluation',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      maxTokens: 2200,
-      systemPrompt: [
-        '你是长篇小说分卷聚合终审。依据全部连续窗口报告和卷首卷末证据，判断整卷闭环；不得用局部高分掩盖任一窗口的阻断问题。',
-        '必须检查阶段目标、must-resolve承诺、高潮因果、不可逆代价、对手状态变化、允许跨卷债务和禁止新增一级主线后的收束。',
-        'repetitionScore 表示反重复健康度，重复越少分数越高；任一确定性重复或状态问题都必须进入issues。',
-        '新增问题必须给出准确章节标题和输入证据中的原文；没有证据不得新增阻断问题。',
-        '只输出 JSON：{"structureScore":0,"escalationScore":0,"payoffScore":0,"continuityScore":0,"repetitionScore":0,"issues":[{"problem":"","chapterTitles":["完整章节标题"],"evidence":["原文证据"],"requiredFix":""}],"weakChapters":[],"summary":""}'
-      ].join('\n'),
-      prompt: [
-        `【分卷】${volumeName}`,
-        volume?.description ? `【分卷闭环合同】\n${volume.description}` : '',
-        `【全部窗口报告】\n${JSON.stringify(assessments, null, 2)}`,
-        `【卷首证据】\n${chapters.slice(0, 2).map(chapterEvidence).join('\n\n')}`,
-        `【卷末证据】\n${chapters.slice(-2).map(chapterEvidence).join('\n\n')}`
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(`${volumeName}聚合终审失败：${response.error || '模型未返回内容'}`)
-  }
-  const parsed = parseObject(response.content, `${volumeName}聚合终审`)
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: `${volumeName}聚合终审`,
+    attempts: 2,
+    signal,
+    request: (attempt, lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'goal_novel_volume_evaluation',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        maxTokens: attempt === 1 ? 2200 : 4200,
+        forceThinkingDisabled: true,
+        systemPrompt: [
+          '你是长篇小说分卷聚合终审。依据全部连续窗口报告和卷首卷末证据，判断整卷闭环；不得用局部高分掩盖任一窗口的阻断问题。',
+          '必须检查阶段目标、must-resolve承诺、高潮因果、不可逆代价、对手状态变化、允许跨卷债务和禁止新增一级主线后的收束。',
+          'repetitionScore 表示反重复健康度，重复越少分数越高；任一确定性重复或状态问题都必须进入issues。',
+          '新增问题必须给出准确章节标题和输入证据中的原文；没有证据不得新增阻断问题。',
+          '只输出 JSON：{"structureScore":0,"escalationScore":0,"payoffScore":0,"continuityScore":0,"repetitionScore":0,"issues":[{"problem":"","chapterTitles":["完整章节标题"],"evidence":["原文证据"],"requiredFix":""}],"weakChapters":[],"summary":""}'
+        ].join('\n'),
+        prompt: [
+          `【分卷】${volumeName}`,
+          volume?.description ? `【分卷闭环合同】\n${volume.description}` : '',
+          `【全部窗口报告】\n${JSON.stringify(assessments, null, 2)}`,
+          `【卷首证据】\n${chapters.slice(0, 2).map(chapterEvidence).join('\n\n')}`,
+          `【卷末证据】\n${chapters.slice(-2).map(chapterEvidence).join('\n\n')}`,
+          attempt > 1 ? `【格式重试】${lastError}。减少问题条数并返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
   const aggregateEvidenceValidation = validateVolumeEvidenceIssues(
     volumeEvidenceIssues(parsed.issues),
     chapters
@@ -371,34 +370,38 @@ export async function assessWholeNovel(
     chapters.length - 1
   ].filter(index => index >= 0 && index < chapters.length))
   const proseSamples = [...sampleIndexes].sort((a, b) => a - b).map(index => chapterEvidence(chapters[index]))
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'goal_novel_whole_evaluation',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      maxTokens: 2200,
-      systemPrompt: [
-        '你是长篇小说整书终审。综合各卷报告与黄金前三章/四分之一/中点/四分之三/结局盲读样本评分。',
-        '黄金前三章必须联合检查“第一章立钩子、第二章扩大承诺、第三章首次兑现并打开长线目标”，任一缺失都要列入 issues 和 weakChapterTitles。',
-        '重点判断：用户目标是否贯穿、主线是否升级、高潮是否由前文因果触发、结局是否兑现、正文是否有追读感和人味。',
-        retentionEvaluationRules('novel'),
-        '只输出 JSON：{"goalMatchScore":0,"goalMatchReason":"","overallStoryScore":0,"overallStoryReason":"","previewHookScore":0,"previewHookReason":"","proseReadScore":0,"proseReadReason":"","weakChapterTitles":[],"issues":[]}'
-      ].join('\n'),
-      prompt: [
-        `【用户创作目标】\n${goalDescription.trim() || '无额外目标，以作品既定设定为准'}`,
-        `【分卷终审】\n${JSON.stringify(volumeAssessments, null, 2)}`,
-        rhythmIssues.length ? `【确定性节奏问题】\n${rhythmIssues.join('\n')}` : '',
-        systemicIssueMessages.length ? `【确定性跨章状态与模式问题 - blocker不得被综合分抵消】\n${systemicIssueMessages.join('\n')}` : '',
-        `【跨阶段正文盲读样本】\n${proseSamples.join('\n\n').slice(0, 30000)}`
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(`小说整书终审失败：${response.error || '模型未返回内容'}`)
-  }
-  const parsed = parseObject(response.content, '小说整书终审')
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: '小说整书终审',
+    attempts: 2,
+    signal,
+    request: (attempt, lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'goal_novel_whole_evaluation',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        maxTokens: attempt === 1 ? 2200 : 4200,
+        forceThinkingDisabled: true,
+        systemPrompt: [
+          '你是长篇小说整书终审。综合各卷报告与黄金前三章/四分之一/中点/四分之三/结局盲读样本评分。',
+          '黄金前三章必须联合检查“第一章立钩子、第二章扩大承诺、第三章首次兑现并打开长线目标”，任一缺失都要列入 issues 和 weakChapterTitles。',
+          '重点判断：用户目标是否贯穿、主线是否升级、高潮是否由前文因果触发、结局是否兑现、正文是否有追读感和人味。',
+          retentionEvaluationRules('novel'),
+          '只输出 JSON：{"goalMatchScore":0,"goalMatchReason":"","overallStoryScore":0,"overallStoryReason":"","previewHookScore":0,"previewHookReason":"","proseReadScore":0,"proseReadReason":"","weakChapterTitles":[],"issues":[]}'
+        ].join('\n'),
+        prompt: [
+          `【用户创作目标】\n${goalDescription.trim() || '无额外目标，以作品既定设定为准'}`,
+          `【分卷终审】\n${JSON.stringify(volumeAssessments, null, 2)}`,
+          rhythmIssues.length ? `【确定性节奏问题】\n${rhythmIssues.join('\n')}` : '',
+          systemicIssueMessages.length ? `【确定性跨章状态与模式问题 - blocker不得被综合分抵消】\n${systemicIssueMessages.join('\n')}` : '',
+          `【跨阶段正文盲读样本】\n${proseSamples.join('\n\n').slice(0, 30000)}`,
+          attempt > 1 ? `【格式重试】${lastError}。缩短原因和问题列表并返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
   return {
     goalMatchScore: clampScore(parsed.goalMatchScore),
     goalMatchReason: String(parsed.goalMatchReason ?? '').trim(),

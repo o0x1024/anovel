@@ -482,6 +482,47 @@ export class VolumeChapterDAO extends BaseDAO {
     })
   }
 
+  /** 清空当前分卷全部正文：有正文的章节先留版本，整批更新任一失败则回滚。 */
+  clearVolumeBodiesWithVersions(volumeId: number): {
+    chapterIds: number[]
+    clearedCount: number
+    versionedCount: number
+  } {
+    this.assertVolumeExists(volumeId)
+    const chapters = this.listChapters(volumeId)
+    return this.transaction(() => {
+      let clearedCount = 0
+      let versionedCount = 0
+      for (const chapter of chapters) {
+        const hasBody = Boolean(chapter.content?.trim()) || chapter.word_count > 0
+        if (hasBody) {
+          this.createVersion(chapter.id, {
+            outline: chapter.outline ?? undefined,
+            content: chapter.content ?? undefined,
+            word_count: chapter.word_count,
+            model_type: 'manual_batch_clear',
+            snapshot: chapter
+          })
+          versionedCount++
+        }
+        const changed = this.updateChapter(chapter.id, {
+          content: '',
+          word_count: 0,
+          status: 'draft',
+          emotion_assessment_json: null,
+          quality_assessment_json: null
+        })
+        if (!changed) throw new Error(`批量清空章节正文失败：${chapter.id}`)
+        if (hasBody) clearedCount++
+      }
+      return {
+        chapterIds: chapters.map(chapter => chapter.id),
+        clearedCount,
+        versionedCount
+      }
+    })
+  }
+
   restoreVersion(chapterId: number, versionId: number): boolean {
     const version = this.get<ChapterVersionRow>(
       'SELECT * FROM chapter_versions WHERE id = ? AND chapter_id = ?',

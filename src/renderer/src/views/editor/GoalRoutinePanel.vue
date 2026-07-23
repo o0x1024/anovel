@@ -373,6 +373,12 @@ function resumeInvokePayload() {
 
 async function start() {
   if (running.value) return
+  if (canResume.value) {
+    const confirmed = window.confirm(
+      '当前存在可恢复断点。“启动新一轮”会将轮次归零并可能重新执行所选阶段；已有正文和版本不会删除。若要保留原轮次，请取消并点击“断点续跑”。\n\n确定放弃本次断点位置并启动新一轮吗？'
+    )
+    if (!confirmed) return
+  }
   const useResumePayload = showResumePhasePicker.value
   const payload = useResumePayload ? resumeInvokePayload() : goalInvokePayload()
   const message = useResumePayload
@@ -676,7 +682,9 @@ watch(config, saveConfig, { deep: true })
         </button>
         <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
-          {{ terminalReason === 'needs_manual_editor' ? '重新验收当前正文' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环') }}
+          {{ terminalReason === 'needs_manual_editor'
+            ? '重新验收当前正文'
+            : (canResume ? '放弃断点并启动新一轮' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环')) }}
         </button>
         <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" @click="resume">
           <font-awesome-icon icon="forward" class="w-3.5 h-3.5" />

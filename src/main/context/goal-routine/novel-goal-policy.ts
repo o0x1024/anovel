@@ -195,14 +195,6 @@ export interface ReusableNovelExecutionCandidate {
   snapshot_json: string | null
 }
 
-export interface DeferredNovelExecutionCandidate {
-  candidate: ReusableNovelExecutionCandidate
-  blockers: string[]
-  coveredCount: number
-  partialCount: number
-  evidenceCount: number
-}
-
 function isLegacyEvidenceOnlyCandidate(candidate: ReusableNovelExecutionCandidate): boolean {
   if (candidate.model_type !== 'novel_execution_candidate' || !candidate.snapshot_json) return false
   try {
@@ -218,6 +210,16 @@ function isLegacyEvidenceOnlyCandidate(candidate: ReusableNovelExecutionCandidat
       )
   } catch {
     return false
+  }
+}
+
+function candidateContractHash(candidate: ReusableNovelExecutionCandidate): string {
+  if (!candidate.snapshot_json) return ''
+  try {
+    const snapshot = JSON.parse(candidate.snapshot_json) as { contractHash?: unknown }
+    return typeof snapshot.contractHash === 'string' ? snapshot.contractHash : ''
+  } catch {
+    return ''
   }
 }
 
@@ -261,8 +263,8 @@ function novelCandidateProgress(candidate: ReusableNovelExecutionCandidate): {
 }
 
 /**
- * 恢复时沿着章节修复前沿继续：修复轮次优先，其次是已覆盖验收项、越界风险、
- * 字数范围和版本新旧。不能仅按字数距离退回更早、语义进度更低的候选。
+ * 恢复时沿着语义修复前沿继续：覆盖程度优先，其次是越界风险、字数范围、
+ * 修复轮次和版本新旧。不能因版本更新而复用语义退化的候选。
  */
 export function selectReusableNovelExecutionCandidate(
   candidates: ReusableNovelExecutionCandidate[],
@@ -271,11 +273,13 @@ export function selectReusableNovelExecutionCandidate(
     wordTarget: number
     wordMin: number
     wordMax: number
+    contractHash?: string
   }
 ): ReusableNovelExecutionCandidate | undefined {
   return candidates
     .filter(candidate => Boolean(candidate.content?.trim()))
     .filter(candidate => !candidate.outline || candidate.outline === input.outline)
+    .filter(candidate => !input.contractHash || candidateContractHash(candidate) === input.contractHash)
     .filter(candidate =>
       candidate.model_type === 'novel_gate_evidence'
       || candidate.model_type === 'novel_execution_candidate'
@@ -283,8 +287,6 @@ export function selectReusableNovelExecutionCandidate(
       || isLegacyEvidenceOnlyCandidate(candidate)
     )
     .sort((left, right) => {
-      const round = (right.generation_round ?? 0) - (left.generation_round ?? 0)
-      if (round) return round
       const leftProgress = novelCandidateProgress(left)
       const rightProgress = novelCandidateProgress(right)
       if (leftProgress.coverage !== rightProgress.coverage) return rightProgress.coverage - leftProgress.coverage
@@ -292,79 +294,59 @@ export function selectReusableNovelExecutionCandidate(
       const leftInRange = left.word_count >= input.wordMin && left.word_count <= input.wordMax
       const rightInRange = right.word_count >= input.wordMin && right.word_count <= input.wordMax
       if (leftInRange !== rightInRange) return leftInRange ? -1 : 1
+      const round = (right.generation_round ?? 0) - (left.generation_round ?? 0)
+      if (round) return round
       const version = right.version_number - left.version_number
       if (version) return version
       return Math.abs(left.word_count - input.wordTarget) - Math.abs(right.word_count - input.wordTarget)
     })[0]
 }
 
-/**
- * 章节执行门禁长期不收敛时，只允许降级提交“已有完整可定位证据”的软缺口：
- * 每项至少 partial、没有缺失项、没有禁写越界或跨章连续性问题，且字数合规。
- * 这条路径用于终止评估器活锁，不能掩盖真正的正文缺失或事实冲突。
- */
-export function selectDeferredNovelExecutionCandidate(
+export function shouldPersistNovelExecutionCandidate(
   candidates: ReusableNovelExecutionCandidate[],
   input: {
-    outline: string | null | undefined
     contractHash: string
+    content: string
+    wordCount: number
     wordMin: number
     wordMax: number
+    coverageVerdicts: string[]
+    forbiddenViolationCount: number
   }
-): DeferredNovelExecutionCandidate | undefined {
-  const eligible = candidates.flatMap(candidate => {
-    if (
-      candidate.model_type !== 'novel_execution_candidate'
-      || !candidate.content?.trim()
-      || !candidate.snapshot_json
-      || (candidate.outline && candidate.outline !== input.outline)
-      || candidate.word_count < input.wordMin
-      || candidate.word_count > input.wordMax
-    ) return []
-    try {
-      const snapshot = JSON.parse(candidate.snapshot_json) as {
-        contractHash?: unknown
-        gate?: {
-          blockers?: unknown
-          coverage?: unknown
-          forbiddenViolations?: unknown
-          evaluatorProtocolErrors?: unknown
-        }
-      }
-      if (snapshot.contractHash !== input.contractHash) return []
-      const gate = snapshot.gate
-      if (!gate || !Array.isArray(gate.coverage) || gate.coverage.length === 0) return []
-      if (Array.isArray(gate.evaluatorProtocolErrors) && gate.evaluatorProtocolErrors.length > 0) return []
-      if (Array.isArray(gate.forbiddenViolations) && gate.forbiddenViolations.length > 0) return []
-      const verdicts = gate.coverage.map(row =>
-        row && typeof row === 'object' ? String((row as { verdict?: unknown }).verdict ?? '') : ''
-      )
-      if (verdicts.some(verdict => verdict !== 'covered' && verdict !== 'partial')) return []
-      const blockers = Array.isArray(gate.blockers)
-        ? gate.blockers.map(String).filter(Boolean)
-        : []
-      if (blockers.length === 0 || blockers.some(blocker => !blocker.startsWith('情节仅部分落地：'))) return []
-      const evidenceCount = gate.coverage.reduce((sum, row) => {
-        if (!row || typeof row !== 'object') return sum
-        const evidenceIds = (row as { evidenceIds?: unknown }).evidenceIds
-        return sum + (Array.isArray(evidenceIds) ? evidenceIds.length : 0)
-      }, 0)
-      return [{
-        candidate,
-        blockers,
-        coveredCount: verdicts.filter(verdict => verdict === 'covered').length,
-        partialCount: verdicts.filter(verdict => verdict === 'partial').length,
-        evidenceCount
-      }]
-    } catch {
-      return []
+): boolean {
+  const sameContract = candidates.filter(candidate =>
+    candidate.model_type === 'novel_execution_candidate'
+    && candidateContractHash(candidate) === input.contractHash
+  )
+  if (sameContract.some(candidate => candidate.content === input.content)) return false
+  if (sameContract.length === 0) return true
+
+  const candidateCoverage = input.coverageVerdicts.reduce(
+    (sum, verdict) => sum + (verdict === 'covered' ? 2 : verdict === 'partial' ? 1 : 0),
+    0
+  )
+  const candidateInRange = input.wordCount >= input.wordMin && input.wordCount <= input.wordMax
+  const best = sameContract.reduce((current, candidate) => {
+    const progress = novelCandidateProgress(candidate)
+    const inRange = candidate.word_count >= input.wordMin && candidate.word_count <= input.wordMax
+    if (!current || progress.coverage > current.coverage) return { ...progress, inRange }
+    if (progress.coverage === current.coverage && progress.violations < current.violations) {
+      return { ...progress, inRange }
     }
-  })
-  return eligible.sort((left, right) => {
-    if (left.coveredCount !== right.coveredCount) return right.coveredCount - left.coveredCount
-    if (left.evidenceCount !== right.evidenceCount) return right.evidenceCount - left.evidenceCount
-    return right.candidate.version_number - left.candidate.version_number
-  })[0]
+    if (
+      progress.coverage === current.coverage
+      && progress.violations === current.violations
+      && inRange
+      && !current.inRange
+    ) return { ...progress, inRange }
+    return current
+  }, undefined as { coverage: number; violations: number; inRange: boolean } | undefined)
+  if (!best) return true
+  if (candidateCoverage !== best.coverage) return candidateCoverage > best.coverage
+  if (input.forbiddenViolationCount !== best.violations) {
+    return input.forbiddenViolationCount < best.violations
+  }
+  return candidateInRange && !best.inRange
 }
 
 export function shouldDeferNovelChapterAcceptance(input: {

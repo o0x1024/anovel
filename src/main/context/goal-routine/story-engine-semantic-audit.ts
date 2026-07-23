@@ -59,7 +59,7 @@ export function storySemanticSource(workId: number, extra = ''): string {
 }
 
 function parseAuditIssues(content: string, scope: StoryHarnessScope): StoryHarnessIssue[] {
-  const json = extractJsonText(content.trim()) ?? content.trim()
+  const json = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
   const parsed = parseJsonObjectWithRepairs<{ blockers?: unknown }>(json).value
   if (!Array.isArray(parsed.blockers)) throw new Error('故事发动机窄问题审计缺少 blockers 数组')
   return parsed.blockers.map((raw): StoryHarnessIssue | null => {

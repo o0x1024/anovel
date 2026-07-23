@@ -54,7 +54,7 @@ const EMOTION_CONTRACT_JSON_SHAPE = {
 }
 
 function parseObject(content: string, label: string): Record<string, unknown> {
-  const raw = extractJsonText(content.trim()) ?? content.trim()
+  const raw = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
   try {
     const parsed = JSON.parse(raw) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('根节点必须是对象')
@@ -128,7 +128,9 @@ export function loadEmotionEngine(workId: number): EmotionEngine | null {
   for (const source of sources) {
     if (!source?.trim()) continue
     try {
-      const parsed = JSON.parse(extractJsonText(source) ?? source) as unknown
+      const parsed = JSON.parse(
+        extractJsonText(source, { allowEmptyArrays: true }) ?? source
+      ) as unknown
       const engine = normalizeEmotionEngine(parsed)
       if (engine) return engine
     } catch { /* 尝试下一来源 */ }

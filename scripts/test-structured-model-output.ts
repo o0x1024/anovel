@@ -26,6 +26,18 @@ async function main(): Promise<void> {
   })
   assert.equal(repaired.ok, true)
 
+  const emptyGateResult = await requestStructuredModelOutput<{ blockers: unknown[] }>({
+    workId: 1,
+    label: '测试空门禁结果',
+    log: false,
+    request: async () => ({
+      success: true,
+      content: '```json\n{"blockers":[]}\n```',
+      finishReason: 'stop'
+    })
+  })
+  assert.deepEqual(emptyGateResult.blockers, [])
+
   await assert.rejects(
     requestStructuredModelOutput({
       workId: 1,

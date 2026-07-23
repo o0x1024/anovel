@@ -96,7 +96,8 @@ export async function assessStoryBeatContinuity(
     return { passed: false, blockers: [response.error || '跨拍连续性门禁无返回'], warnings: [] }
   }
   try {
-    const json = extractJsonText(response.content.trim()) ?? response.content.trim()
+    const json = extractJsonText(response.content.trim(), { allowEmptyArrays: true })
+      ?? response.content.trim()
     const parsed = parseJsonObjectWithRepairs<Record<string, unknown>>(json).value
     const blockers = [...deterministic, ...list(parsed.blockers)]
     const warnings = list(parsed.warnings)

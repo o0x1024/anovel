@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { coreSettingDAO, volumeChapterDAO } from '../db'
 import { loadWritingPlan } from './writing-plan'
 import { loadCharacterCards, resolveChapterCharacterNames } from './character-cards'
@@ -20,6 +21,25 @@ const SETTING_LABELS: Record<string, string> = {
   pleasure_engine: '本章相关兑现规则',
   supporting_cast: '本章相关人物关系',
   main_plotline: '本章相关主线阶段'
+}
+
+const EXECUTION_ACCEPTANCE_KEY = 'execution_acceptance_v4'
+
+function chapterContentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+function parseOutlineDiagnosis(chapterId: number): Record<string, unknown> {
+  const raw = volumeChapterDAO.getChapter(chapterId)?.outline_diagnosis?.trim()
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+  } catch {
+    return {}
+  }
 }
 
 const QUERY_STOPWORDS = new Set([
@@ -130,17 +150,51 @@ export function persistChapterExecutionContract(
     }
   } catch { diagnosisReadable = false }
   if (!diagnosisReadable) return contract
-  const current = diagnosis.execution_contract_v3 as {
+  const current = diagnosis.execution_contract_v4 as {
     sourceOutlineHash?: unknown
     wordTarget?: unknown
   } | undefined
   if (current?.sourceOutlineHash !== contract.sourceOutlineHash || current?.wordTarget !== contract.wordTarget) {
+    const currentDiagnosis = { ...diagnosis }
+    delete currentDiagnosis.execution_contract_v3
+    delete currentDiagnosis[EXECUTION_ACCEPTANCE_KEY]
     volumeChapterDAO.updateChapter(chapterId, {
-      outline_diagnosis: JSON.stringify({ ...diagnosis, execution_contract_v3: contract }),
+      outline_diagnosis: JSON.stringify({ ...currentDiagnosis, execution_contract_v4: contract }),
       quality_assessment_json: null
     })
   }
   return contract
+}
+
+export function isChapterExecutionAccepted(
+  chapterId: number,
+  content: string,
+  contractHash: string
+): boolean {
+  const accepted = parseOutlineDiagnosis(chapterId)[EXECUTION_ACCEPTANCE_KEY] as {
+    contractHash?: unknown
+    contentHash?: unknown
+  } | undefined
+  return accepted?.contractHash === contractHash
+    && accepted.contentHash === chapterContentHash(content)
+}
+
+export function markChapterExecutionAccepted(
+  chapterId: number,
+  content: string,
+  contractHash: string
+): void {
+  const diagnosis = parseOutlineDiagnosis(chapterId)
+  volumeChapterDAO.updateChapter(chapterId, {
+    outline_diagnosis: JSON.stringify({
+      ...diagnosis,
+      [EXECUTION_ACCEPTANCE_KEY]: {
+        contractHash,
+        contentHash: chapterContentHash(content),
+        acceptedAt: new Date().toISOString()
+      }
+    })
+  })
 }
 
 export interface ChapterExecutionContextResult {

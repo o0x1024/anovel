@@ -88,12 +88,13 @@ import {
 import {
   isNovelExecutionEvaluatorFailure,
   assessNovelExecutionCandidate,
+  convergeNovelExecutionWordRange,
   repairNovelExecutionCandidate,
   type NovelExecutionGateResult
 } from './novel-execution-gate'
 import {
-  selectDeferredNovelExecutionCandidate,
-  selectReusableNovelExecutionCandidate
+  selectReusableNovelExecutionCandidate,
+  shouldPersistNovelExecutionCandidate
 } from './novel-goal-policy'
 
 function storyCandidateContextSource(
@@ -128,7 +129,6 @@ export interface BeatGenResult {
   requiresEscalation?: boolean
   failureKind?: 'contract' | 'body_integrity' | 'continuity' | 'evaluator_protocol' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
   memoryPending?: boolean
-  deferredExecution?: { sourceVersionNumber: number; blockers: string[] }
   memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; stateFacts?: number; patternFingerprint?: boolean; warnings?: string[]; foreshadowingResolved: number; foreshadowingPartial: number }
   error?: string
 }
@@ -553,7 +553,8 @@ export async function generateBeatBody(
         outline: existingChapter?.outline,
         wordTarget: executionContract.wordTarget,
         wordMin: executionContract.wordMin,
-        wordMax: executionContract.wordMax
+        wordMax: executionContract.wordMax,
+        contractHash: executionContract.sourceOutlineHash
       })
     : undefined
   if (reusableEvaluatorCandidate?.content?.trim()) {
@@ -834,12 +835,53 @@ async function persistGeneratedBody(
   let antiAiRepairRounds = antiAiRepair.rounds
   let wordCount = countWords(content)
   let continuityRepairRounds = 0
-  let deferredExecution: BeatGenResult['deferredExecution']
 
   if (workType === 'novel') {
     const contract = persistChapterExecutionContract(workId, chapterId)
     if (!contract) {
       return { success: false, content, wordCount, failureKind: 'contract', error: '无法编译长篇章节执行合同' }
+    }
+    if (wordCount < contract.wordMin || wordCount > contract.wordMax) {
+      onProgress?.(
+        `章节字数 ${wordCount} 超出合同 ${contract.wordMin}-${contract.wordMax}，正在先收敛长度再执行语义门禁`
+      )
+      const lengthConvergence = await convergeNovelExecutionWordRange(
+        workId,
+        chapterId,
+        content,
+        contract,
+        signal
+      )
+      content = lengthConvergence.content
+      wordCount = countWords(content)
+      if (!lengthConvergence.success) {
+        volumeChapterDAO.createVersion(chapterId, {
+          outline: currentChapter?.outline ?? undefined,
+          content,
+          word_count: wordCount,
+          model_type: 'novel_execution_candidate',
+          generation_round: lengthConvergence.attempts,
+          snapshot_json: JSON.stringify({
+            contractHash: contract.sourceOutlineHash,
+            lengthConvergence,
+            wordRangeFailure: true
+          })
+        })
+        return {
+          success: false,
+          content,
+          wordCount,
+          continuityRepairRounds: lengthConvergence.attempts,
+          continuityBlockers: [
+            lengthConvergence.error
+              || `章节字数 ${wordCount} 不在合同范围 ${contract.wordMin}-${contract.wordMax}`
+          ],
+          requiresEscalation: true,
+          failureKind: 'continuity',
+          error: `${lengthConvergence.error || '章节字数预收敛失败'}，候选已存入版本历史且禁止进入下一章`
+        }
+      }
+      onProgress?.(`章节字数已收敛到 ${wordCount}，开始执行情节点与连续性门禁`)
     }
     for (let round = 0; round <= 2; round++) {
       onProgress?.(`正在核验章节情节点覆盖与章际衔接（${round + 1}/3）`)
@@ -886,70 +928,39 @@ async function persistGeneratedBody(
         }
       }
       wordCount = countWords(content)
-      volumeChapterDAO.createVersion(chapterId, {
-        outline: currentChapter?.outline ?? undefined,
+      if (shouldPersistNovelExecutionCandidate(volumeChapterDAO.listVersions(chapterId), {
+        contractHash: contract.sourceOutlineHash,
         content,
-        word_count: wordCount,
-        model_type: 'novel_execution_candidate',
-        generation_round: round + 1,
-        snapshot_json: JSON.stringify({
-          contractHash: contract.sourceOutlineHash,
-          gate,
-          evaluatorAttempts
-        })
-      })
-      if (round >= 2) {
-        const deferred = selectDeferredNovelExecutionCandidate(
-          volumeChapterDAO.listVersions(chapterId),
-          {
-            outline: currentChapter?.outline,
-            contractHash: contract.sourceOutlineHash,
-            wordMin: contract.wordMin,
-            wordMax: contract.wordMax
-          }
-        )
-        if (!deferred?.candidate.content?.trim()) {
-          return {
-            success: false,
-            content,
-            wordCount,
-            continuityRepairRounds: round,
-            continuityBlockers: gate.blockers,
-            requiresEscalation: true,
-            failureKind: 'continuity',
-            error: `章节情节点覆盖/衔接经过 2 轮定向修复仍未通过：${gate.blockers.join('；')}`
-          }
-        }
-        content = deferred.candidate.content.trim()
-        wordCount = deferred.candidate.word_count
-        deferredExecution = {
-          sourceVersionNumber: deferred.candidate.version_number,
-          blockers: deferred.blockers
-        }
+        wordCount,
+        wordMin: contract.wordMin,
+        wordMax: contract.wordMax,
+        coverageVerdicts: gate.coverage.map(item => item.verdict),
+        forbiddenViolationCount: gate.forbiddenViolations.length
+      })) {
         volumeChapterDAO.createVersion(chapterId, {
           outline: currentChapter?.outline ?? undefined,
           content,
           word_count: wordCount,
-          model_type: 'novel_execution_deferred',
+          model_type: 'novel_execution_candidate',
           generation_round: round + 1,
           snapshot_json: JSON.stringify({
             contractHash: contract.sourceOutlineHash,
-            sourceVersionNumber: deferred.candidate.version_number,
-            deferredAt: new Date().toISOString(),
-            blockers: deferred.blockers,
-            reason: '全部验收项至少部分落地且有正文证据；无越界、连续性或字数硬伤，停止重复改写并转入质量债务'
+            gate,
+            evaluatorAttempts
           })
         })
-        appLogger.warn('goal_routine', '章节执行软门禁未收敛，提交最佳证据候选并继续整本施工', {
-          workId,
-          chapterId,
-          sourceVersionNumber: deferred.candidate.version_number,
-          coveredCount: deferred.coveredCount,
-          partialCount: deferred.partialCount,
-          blockers: deferred.blockers
-        })
-        onProgress?.(`章节执行软门禁未收敛，已采用最佳候选 v${deferred.candidate.version_number} 并记录质量债务`)
-        break
+      }
+      if (round >= 2) {
+        return {
+          success: false,
+          content,
+          wordCount,
+          continuityRepairRounds: round,
+          continuityBlockers: gate.blockers,
+          requiresEscalation: true,
+          failureKind: 'continuity',
+          error: `章节合同硬门禁经过 2 轮定向修复仍未全部 covered，禁止进入下一章：${gate.blockers.join('；')}`
+        }
       }
       onProgress?.(`章节执行门禁未通过，正在定向修复（${round + 1}/2）`)
       const repaired = await repairNovelExecutionCandidate(
@@ -1258,7 +1269,6 @@ async function persistGeneratedBody(
     antiAiRepairs,
     antiAiRepairRounds,
     continuityRepairRounds,
-    deferredExecution
   }
 }
 

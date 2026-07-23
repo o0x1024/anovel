@@ -70,7 +70,7 @@ interface EngineGatePayload {
 }
 
 function parsePayload(content: string): EngineGatePayload {
-  const json = extractJsonText(content.trim()) ?? content.trim()
+  const json = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
   const parsed = parseJsonObjectWithRepairs<Record<string, unknown>>(json, {
     arrayBeforeProperties: [
       'midpoint_choice_and_cost', 'climax_choice_and_cost',

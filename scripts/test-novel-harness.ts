@@ -21,13 +21,163 @@ import {
   splitCompoundExecutionEvent
 } from '../src/shared/chapter-execution-contract'
 import { QUALITY_AI_METRIC_DEFS, type QualityAiMetricKey } from '../src/shared/quality-ai-score'
+import { extractJsonText } from '../src/main/context/parse-json-extract'
 import {
   buildNovelEvidenceLedger,
+  canonicalizeNovelViolationRows,
+  coerceNovelSingleCoverageRow,
+  novelExecutionContentHash,
+  novelExecutionGateMaxTokens,
+  novelCoverageRowsMatchRequirementIds,
   novelCoverageProtocolErrors,
+  normalizeNovelCoverageRows,
   normalizeNovelExecutionAssessment,
+  normalizeNovelViolationRows,
   parseNovelCoverageEvidence,
+  shouldSplitNovelExecutionResponse,
+  splitNovelExecutionRequirements,
   validateNovelExecutionContract
 } from '../src/main/context/goal-routine/novel-execution-gate'
+
+const fencedEmptyViolations = [
+  '```json',
+  '{"violations":[]}',
+  '```'
+].join('\n')
+assert.equal(extractJsonText(fencedEmptyViolations), null)
+assert.equal(
+  extractJsonText(fencedEmptyViolations, { allowEmptyArrays: true }),
+  '{"violations":[]}'
+)
+assert.equal(
+  extractJsonText('结果如下：{"violations":[]}', { allowEmptyArrays: true }),
+  '{"violations":[]}'
+)
+assert.equal(
+  extractJsonText(
+    '```json\n{"forbidden_violations":[],"continuity_blockers":[],"warnings":[]}\n```',
+    { allowEmptyArrays: true }
+  ),
+  '{"forbidden_violations":[],"continuity_blockers":[],"warnings":[]}'
+)
+assert.equal(
+  extractJsonText(
+    '```json\n{"forbidden_violations":[],"continuity_blockers":[{"description":"断裂"}]}\n```'
+  ),
+  '{"forbidden_violations":[],"continuity_blockers":[{"description":"断裂"}]}'
+)
+
+assert.equal(novelExecutionGateMaxTokens(0), 3200)
+assert.equal(novelExecutionGateMaxTokens(2), 3200)
+assert.equal(novelExecutionGateMaxTokens(4), 4000)
+assert.equal(novelExecutionGateMaxTokens(20), 6000)
+assert.equal(shouldSplitNovelExecutionResponse({
+  success: true,
+  content: '{"coverage":[]}',
+  finishReason: 'length'
+}), true)
+assert.equal(shouldSplitNovelExecutionResponse({
+  success: true,
+  content: '{"coverage":[]}',
+  finishReason: 'stop'
+}), false)
+assert.deepEqual(splitNovelExecutionRequirements(['R001', 'R002', 'R003', 'R004', 'R005']), [
+  ['R001', 'R002'],
+  ['R003', 'R004'],
+  ['R005']
+])
+const coverageRow = {
+  requirement_id: 'R001',
+  verdict: 'covered',
+  evidence_ids: ['C001'],
+  reason: '已覆盖'
+}
+assert.deepEqual(normalizeNovelCoverageRows([coverageRow]), [coverageRow])
+assert.deepEqual(normalizeNovelCoverageRows({ coverage: [coverageRow] }), [coverageRow])
+assert.deepEqual(normalizeNovelCoverageRows({ items: [coverageRow] }), [coverageRow])
+assert.deepEqual(normalizeNovelCoverageRows(coverageRow), [coverageRow])
+assert.equal(novelCoverageRowsMatchRequirementIds([coverageRow], ['R001']), true)
+assert.equal(novelCoverageRowsMatchRequirementIds([coverageRow], ['R001', 'R002']), false)
+assert.deepEqual(
+  coerceNovelSingleCoverageRow(
+    { verdict: 'covered', evidence_ids: ['C1', 'C002'], reason: '已发生' },
+    '',
+    'R001'
+  ),
+  {
+    requirement_id: 'R001',
+    verdict: 'covered',
+    evidence_ids: ['C001', 'C002'],
+    reason: '已发生'
+  }
+)
+assert.deepEqual(
+  coerceNovelSingleCoverageRow(null, 'covered|C001,C003|完整发生', 'R009'),
+  {
+    requirement_id: 'R009',
+    verdict: 'covered',
+    evidence_ids: ['C001', 'C003'],
+    reason: ''
+  }
+)
+assert.equal(
+  coerceNovelSingleCoverageRow(null, 'not covered because evidence is weak', 'R009'),
+  null
+)
+assert.deepEqual(
+  coerceNovelSingleCoverageRow({ status: '部分覆盖', evidence: 'C7' }, '', 'R002'),
+  {
+    requirement_id: 'R002',
+    verdict: 'partial',
+    evidence_ids: ['C007'],
+    reason: ''
+  }
+)
+assert.equal(
+  novelExecutionContentHash('正文'),
+  novelExecutionContentHash('  正文  ')
+)
+const violationRow = { description: '提前越界', evidence_ids: ['C001'] }
+assert.deepEqual(normalizeNovelViolationRows([violationRow]), [violationRow])
+assert.deepEqual(normalizeNovelViolationRows({ violations: [violationRow] }), [violationRow])
+assert.deepEqual(normalizeNovelViolationRows({ items: [violationRow] }), [violationRow])
+assert.deepEqual(normalizeNovelViolationRows(violationRow), [violationRow])
+assert.deepEqual(
+  canonicalizeNovelViolationRows(
+    [{
+      description: '结尾越界',
+      citations: ['C041-C046']
+    }],
+    ['C041', 'C042', 'C043', 'C044', 'C045', 'C046']
+  ),
+  {
+    rows: [{
+      description: '结尾越界',
+      evidence_ids: ['C041', 'C042', 'C043', 'C044', 'C045', 'C046']
+    }],
+    error: ''
+  }
+)
+assert.deepEqual(
+  canonicalizeNovelViolationRows(
+    [{ message: '跨章状态断裂', evidenceIds: ['P7', 'C2'] }],
+    ['P007', 'C002']
+  ),
+  {
+    rows: [{
+      description: '跨章状态断裂',
+      evidence_ids: ['P007', 'C002']
+    }],
+    error: ''
+  }
+)
+assert.equal(
+  canonicalizeNovelViolationRows(
+    [{ description: '伪证据', evidence: ['C999'] }],
+    ['C001']
+  ).rows,
+  null
+)
 import {
   isFullProseOutputStep,
   resolveLayersForStep,
@@ -244,10 +394,34 @@ assert.deepEqual(legacyColonContract.requiredEvents, [
 assert.deepEqual(legacyColonContract.forbiddenEvents, ['不得让孩子当场报恩'])
 assert.equal(legacyColonContract.endingState, '三个黑狗帮小弟从巷口包抄。')
 assert.equal(legacyColonContract.continuityConstraints, '承接上一章完成首次兑换的状态。')
-assert.deepEqual(legacyColonContract.requirements.map(item => item.id), ['R001', 'R002', 'R003', 'R004'])
-assert.deepEqual(legacyColonContract.requirements.map(item => item.kind), [
-  'action', 'turn', 'state_change', 'payoff_debt'
-])
+assert.deepEqual(legacyColonContract.requirements.map(item => item.id), ['R001', 'R002'])
+assert.deepEqual(legacyColonContract.requirements.map(item => item.kind), ['event', 'event'])
+assert.deepEqual(
+  legacyColonContract.requirements.map(item => item.description),
+  legacyColonContract.requiredEvents
+)
+assert(legacyColonContract.warnings.some(item => item.includes('人物愿望')))
+const quotedHiddenMessage = '陈凉躲在集装箱阴影里盯着疯狗，军车人员突然折返开枪，疯狗扔出孢尘弹，陈凉滚向废油罐堆，军车人员扑来抢晶核，混乱中陈凉摸到通讯器，屏幕上跳出隐藏小字：“回收天敌，实为孢尘天敌”，远处鬣狗群继续逼近，三方冲突彻底爆发'
+const quotedHiddenMessageParts = splitCompoundExecutionEvent(quotedHiddenMessage)
+assert(quotedHiddenMessageParts.some(item => item.includes('“回收天敌，实为孢尘天敌”')))
+assert.equal(quotedHiddenMessageParts.some(item => item === '实为孢尘天敌”'), false)
+const chapter19Contract = buildChapterExecutionContract({
+  chapterId: 1329,
+  chapterTitle: '第19章 黑晶与猎影',
+  chapterOrdinal: 19,
+  outline: '陈凉躲在集装箱阴影里，攥着臂盾盯着摸向猎枪的疯狗，突然听到远处传来军车引擎声——军车人员折返了。疯狗掏出另一枚黑晶挑衅，陈凉刚要冲上去，军车人员突然开枪打穿疯狗的手腕，却又调转枪口对准陈凉，喊着“回收天敌必须死”。陈凉用臂盾挡下子弹，趁机滚向废油罐堆，系统提示回收点不足无法批量回收。此时三阶鬣狗群的呜咽声更近，疯狗爬起来扔出孢尘弹，军车人员却突然扑向陈凉抢他口袋里的二阶鬣狗晶核，混乱中陈凉摸到了军车留下的通讯器，屏幕上突然跳出“特级通缉”之外的一行小字：“回收天敌，实为孢尘天敌”。',
+  outlineDiagnosis: JSON.stringify({
+    dramatic_contract: {
+      protagonist_want: '夺回被抢的晶核、救下被掳走的小满、躲开三方追杀'
+    }
+  }),
+  characterNames: ['陈凉', '疯狗'],
+  wordTarget: 2000
+})
+assert.equal(chapter19Contract.requirements.some(item => item.description.includes('救下被掳走的小满')), false)
+assert.equal(chapter19Contract.requirements.some(item => item.description.includes('夺回被抢的晶核')), false)
+assert(chapter19Contract.requirements.some(item => item.description.includes('“回收天敌，实为孢尘天敌”')))
+assert.equal(chapter19Contract.requirements.some(item => item.description === '实为孢尘天敌”'), false)
 const coverage = parseNovelCoverageEvidence([
   {
     event: freeformContract.requiredEvents[0],
@@ -424,6 +598,7 @@ assert.equal(severeShort.passed, false)
 assert(severeShort.blockingFailures.some(item => item.includes('字数严重越界')))
 assert.equal(isRecognizedNovelHardFail(true, ['AI句式超过建议比例']), false)
 assert.equal(isRecognizedNovelHardFail(true, ['严重违反金手指能力限制']), true)
+assert.equal(isRecognizedNovelHardFail(false, ['违反系统设定：出现了不符合规则的外在实体面板']), true)
 
 assert.equal(isBetterNovelBodyCandidate({
   hardFail: false, blockingFailures: 1, scoreTotal: 77, wordCount: 1900, targetWords: 2000

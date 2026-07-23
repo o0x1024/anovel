@@ -3,6 +3,7 @@ import { ModelAdapter, ModelRequest, ModelResponse, AdapterChatOptions } from '.
 import type { ProviderProtocol } from '../../shared/model-providers'
 import { buildOpenAICompatibleBody } from '../../shared/kimi-api-params'
 import { openAICompatibleAuthHeaders } from '../../shared/mimo-api-params'
+import { appLogger } from '../logger/app-logger'
 import { consumeSseStream, isAbortError, parseAxiosErrorMessage } from './stream-utils'
 
 function normalizeFinishReason(value: unknown): ModelResponse['finishReason'] {
@@ -13,6 +14,94 @@ function normalizeFinishReason(value: unknown): ModelResponse['finishReason'] {
   if (reason.includes('safety') || reason.includes('content_filter')) return 'content_filter'
   if (reason.includes('tool')) return 'tool'
   return 'unknown'
+}
+
+interface OpenAICompatiblePayload {
+  content: string
+  reasoning?: string
+  finishReason?: ModelResponse['finishReason']
+  usage: {
+    promptTokens: number
+    completionTokens: number
+  }
+}
+
+function responseShape(data: unknown): string {
+  if (data == null) return String(data)
+  if (Array.isArray(data)) return `array(length=${data.length})`
+  if (typeof data !== 'object') return typeof data
+  const record = data as Record<string, unknown>
+  const keys = Object.keys(record).slice(0, 12).join(',') || 'none'
+  const choices = Array.isArray(record.choices) ? record.choices.length : 'missing'
+  return `keys=${keys}; choices=${choices}`
+}
+
+function upstreamErrorMessage(data: unknown): string | undefined {
+  if (!data || typeof data !== 'object') return undefined
+  const record = data as Record<string, unknown>
+  const error = record.error
+  if (typeof error === 'string' && error.trim()) return error.trim().replace(/\s+/g, ' ').slice(0, 500)
+  if (error && typeof error === 'object') {
+    const message = (error as Record<string, unknown>).message
+    if (typeof message === 'string' && message.trim()) {
+      return message.trim().replace(/\s+/g, ' ').slice(0, 500)
+    }
+  }
+  const message = record.message
+  if (typeof message === 'string' && message.trim()) {
+    return message.trim().replace(/\s+/g, ' ').slice(0, 500)
+  }
+  return undefined
+}
+
+function contentText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value
+    .map((item) => {
+      if (typeof item === 'string') return item
+      if (!item || typeof item !== 'object') return ''
+      const text = (item as Record<string, unknown>).text
+      return typeof text === 'string' ? text : ''
+    })
+    .join('')
+}
+
+function parseOpenAICompatiblePayload(data: unknown, status?: number): OpenAICompatiblePayload {
+  const record = data && typeof data === 'object'
+    ? data as Record<string, unknown>
+    : {}
+  const choices = Array.isArray(record.choices) ? record.choices : []
+  const firstChoice = choices[0] && typeof choices[0] === 'object'
+    ? choices[0] as Record<string, unknown>
+    : undefined
+  const message = firstChoice?.message && typeof firstChoice.message === 'object'
+    ? firstChoice.message as Record<string, unknown>
+    : undefined
+  const content = contentText(message?.content)
+  if (!content.trim()) {
+    const upstreamError = upstreamErrorMessage(data)
+    const statusLabel = status ? `HTTP ${status}` : 'HTTP 2xx'
+    throw new Error(
+      upstreamError
+        ? `OpenAI 兼容服务返回空正文（${statusLabel}）：${upstreamError}`
+        : `OpenAI 兼容服务返回空正文（${statusLabel}；${responseShape(data)}）`
+    )
+  }
+
+  const usage = record.usage && typeof record.usage === 'object'
+    ? record.usage as Record<string, unknown>
+    : {}
+  const reasoning = contentText(message?.reasoning_content ?? message?.reasoning)
+  return {
+    content,
+    reasoning: reasoning || undefined,
+    finishReason: normalizeFinishReason(firstChoice?.finish_reason),
+    usage: {
+      promptTokens: typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : 0,
+      completionTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens : 0
+    }
+  }
 }
 
 /**
@@ -66,36 +155,48 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           signal: options?.signal
       }
       let response
+      let schemaEnabled = !!request.responseSchema
       try {
         response = await axios.post(url, body, requestOptions)
       } catch (error: unknown) {
         const status = (error as { response?: { status?: number } }).response?.status
         if (!request.responseSchema || (status !== 400 && status !== 422)) throw error
         delete body.response_format
+        schemaEnabled = false
+        appLogger.warn('model', '提供商拒绝 JSON Schema，移除 response_format 后有限重试', {
+          step: request.step,
+          workId: request.workId,
+          status
+        })
         response = await axios.post(url, body, requestOptions)
       }
 
-      const data = response.data
-      const message = data.choices?.[0]?.message as {
-        content?: string
-        reasoning_content?: string
-        reasoning?: string
-      } | undefined
-      const content = message?.content ?? ''
-      const reasoning = message?.reasoning_content ?? message?.reasoning
-      if (reasoning) {
-        options?.onThinkingDelta?.(reasoning)
+      let payload: OpenAICompatiblePayload
+      try {
+        payload = parseOpenAICompatiblePayload(response.data, response.status)
+      } catch (error) {
+        if (!schemaEnabled) throw error
+        delete body.response_format
+        schemaEnabled = false
+        appLogger.warn('model', '结构化响应为空或不兼容，移除 JSON Schema 后有限重试', {
+          step: request.step,
+          workId: request.workId,
+          reason: error instanceof Error ? error.message : String(error)
+        })
+        response = await axios.post(url, body, requestOptions)
+        payload = parseOpenAICompatiblePayload(response.data, response.status)
+      }
+
+      if (payload.reasoning) {
+        options?.onThinkingDelta?.(payload.reasoning)
       }
 
       return {
         success: true,
-        content,
+        content: payload.content,
         modelType: this.protocol,
-        finishReason: normalizeFinishReason(data.choices?.[0]?.finish_reason),
-        usage: {
-          promptTokens: data.usage?.prompt_tokens ?? 0,
-          completionTokens: data.usage?.completion_tokens ?? 0
-        },
+        finishReason: payload.finishReason,
+        usage: payload.usage,
         durationMs: Date.now() - startTime
       }
     } catch (error: unknown) {
@@ -177,6 +278,18 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
           // ignore malformed chunk
         }
       }, options?.signal)
+
+      if (!content.trim()) {
+        return {
+          success: false,
+          content: '',
+          modelType: this.protocol,
+          error: 'OpenAI 兼容流式响应结束但未返回正文',
+          finishReason,
+          usage: { promptTokens, completionTokens },
+          durationMs: Date.now() - startTime
+        }
+      }
 
       return {
         success: true,

@@ -35,7 +35,7 @@ export async function requestStructuredModelOutput<T>(
         lastError = '输出达到长度上限（finishReason=length）'
       } else {
         const content = response.content.trim()
-        const json = extractJsonText(content) ?? content
+        const json = extractJsonText(content, { allowEmptyArrays: true }) ?? content
         const parsed = parseJsonObjectWithRepairs<Record<string, unknown>>(json, {
           arrayBeforeProperties: options.arrayBeforeProperties
         })

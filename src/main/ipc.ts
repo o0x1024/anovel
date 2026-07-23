@@ -16,7 +16,7 @@ import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
   generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO, storyHarnessDAO, causalNovelDAO,
-  storyStateDAO, emotionalStateDAO
+  storyStateDAO, emotionalStateDAO, goalRoutineDAO
 } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
@@ -105,6 +105,7 @@ import { ensureChapterEmotionContract } from './context/goal-routine/emotion-eng
 import { assessChapterEmotion } from './context/goal-routine/emotion-gate'
 import {
   invalidateNovelGoalStateAfterVolumeDeletion,
+  reconcileNovelWorkflowState,
   resetNovelGoalStateFromVolumePlan
 } from './context/goal-routine/novel-outline-pipeline'
 import { getChapterPlanningDetails } from './context/chapter-planning-details'
@@ -273,6 +274,36 @@ export function registerIpcHandlers(): void {
       throw new Error('因果小说不支持通用章节批量写入')
     }
     return volumeChapterDAO.batchCreateChapters(volumeId, items, mode ?? 'append')
+  })
+  ipcMain.handle('chapter:clearVolumeBodies', (_e, volumeId: number) => {
+    const volume = volumeChapterDAO.getVolume(volumeId)
+    if (!volume) throw new Error('当前分卷不存在')
+    const routine = goalRoutineDAO.getByWork(volume.work_id)
+    if (routine?.status === 'running') {
+      throw new Error('目标循环正在运行，请先停止循环再批量清空当前卷正文')
+    }
+    const chapters = volumeChapterDAO.listChapters(volumeId)
+    for (const chapter of chapters) {
+      assertCausalChapterDirectMutationAllowed(chapter.id, '批量清空章节正文')
+    }
+    const result = volumeChapterDAO.clearVolumeBodiesWithVersions(volumeId)
+    for (const chapterId of result.chapterIds) {
+      clearChapterNarrativeMemory(volume.work_id, chapterId)
+    }
+    reconcileNovelWorkflowState(volume.work_id)
+    goalRoutineDAO.update(volume.work_id, {
+      status: 'paused',
+      current_phase: 'draft_body',
+      goal_met: false
+    })
+    goalRoutineDAO.appendTurn({
+      work_id: volume.work_id,
+      turn_no: routine?.turn_count ?? 0,
+      phase: 'draft_body',
+      action: 'manual_volume_body_clear',
+      summary: `手动批量清空分卷「${volume.name}」${result.clearedCount} 章正文；已保留版本并恢复正文生成检查点`
+    })
+    return result
   })
   ipcMain.handle('chapter:parseSuggestions', (_e, content: string) => parseChapterSuggestions(content, false))
   ipcMain.handle('chapter:parseAbc', (_e, content: string) => parseChapterAbcFromAi(content))
