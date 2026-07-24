@@ -123,7 +123,7 @@ const workflowSteps = computed<StepDef[]>(() => {
 })
 
 const utilitySteps = computed<StepDef[]>(() => {
-  const base: StepDef[] = [
+  return [
     { key: 'names', label: '名称库', icon: 'tag' },
     { key: 'temperature', label: '创作温度', icon: 'thermometer-half' },
     { key: 'memory', label: '叙事记忆体', icon: 'project-diagram' },
@@ -136,7 +136,6 @@ const utilitySteps = computed<StepDef[]>(() => {
     { key: 'favorites', label: '收藏夹', icon: 'bookmark' },
     { key: 'goal', label: '目标循环', icon: 'rotate' }
   ]
-  return isCausalNovel.value ? base.filter(step => step.key !== 'goal') : base
 })
 
 const steps = computed<StepDef[]>(() => [...workflowSteps.value, ...utilitySteps.value])

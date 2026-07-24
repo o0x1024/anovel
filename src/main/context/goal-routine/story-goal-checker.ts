@@ -31,6 +31,7 @@ import {
   type StoryForensicIssue,
   type StoryWeakestLayer
 } from './story-whole-evaluator'
+import { causalChapterCountBounds } from '../../../shared/causal-novel-types'
 import { assessWholeNovel } from './novel-whole-evaluator'
 import type { NovelSystemIssue } from '../../../shared/novel-systemic-types'
 import type { EmotionBlindAssessment } from '../../../shared/emotion-contract'
@@ -218,6 +219,7 @@ export async function checkStoryGoal(
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const fullBody = collectFullBody(workId)
   const isStory = workDAO.getById(workId)?.work_type === 'story'
+  const isCausalNovel = workDAO.getById(workId)?.work_type === 'causal_novel'
   const harnessIssues: StoryHarnessIssue[] = []
   const parseBreakdown = isStory ? parseStoryQualityAiScoreBreakdown : parseQualityAiScoreReport
   const chapterDiagnostics: GoalChapterDiagnostic[] = chapters.map(ch => ({
@@ -238,11 +240,17 @@ export async function checkStoryGoal(
   const content = chapters.filter(c => c.content?.trim()).length
   const beatCompletion = total > 0 ? content / total : 0
   const expectedChapters = loadWritingPlan(workId).targetChapters
-  const chapterPlanComplete = isStory || expectedChapters <= 0 || total === expectedChapters
+  const causalBounds = causalChapterCountBounds(expectedChapters)
+  const chapterPlanComplete = isStory || expectedChapters <= 0 ||
+    (isCausalNovel
+      ? total >= causalBounds.min && total <= causalBounds.max
+      : total === expectedChapters)
   if (total === 0) {
     reasons.push('尚无节拍')
-  } else if (!isStory && expectedChapters > 0 && total !== expectedChapters) {
-    reasons.push(`章节数量不完整：${total}/${expectedChapters}`)
+  } else if (!isStory && expectedChapters > 0 && !chapterPlanComplete) {
+    reasons.push(isCausalNovel
+      ? `章节数量超出因果弹性合同：${total}（目标 ${expectedChapters}，允许 ${causalBounds.min}-${causalBounds.max}）`
+      : `章节数量不完整：${total}/${expectedChapters}`)
   } else if (config.requireAllBeatsContent && content < total) {
     reasons.push(`节拍未全部完成：${content}/${total} 有正文`)
   }

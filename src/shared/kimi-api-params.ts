@@ -81,7 +81,10 @@ export function buildOpenAICompatibleBody(
     }
     applyDoubaoThinkingParams(body, optionsToApply)
   } else {
-    const isReasoningModel = /deepseek-(?:r1|chat|reasoner)|doubao-.*thinking|reasoner|reasoning|thinking|k1\.5|qwq/i.test(modelId)
+    // 兼容直连 ID（deepseek-v4-flash）和聚合代理 ID
+    //（deepseek/deepseek-v4-flash）。不能只枚举 r1/chat 等旧名称，否则
+    // forceThinkingDisabled 会静默失效，模型可能只返回 reasoning_content。
+    const isReasoningModel = /(?:^|\/)deepseek(?:[-/])|doubao-.*thinking|reasoner|reasoning|thinking|k1\.5|qwq/i.test(modelId)
     if (isReasoningModel) {
       const thinkingEnabled = request.thinkingEnabled !== undefined
         ? request.thinkingEnabled

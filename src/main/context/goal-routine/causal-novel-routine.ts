@@ -14,12 +14,17 @@ import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-goa
 import {
   extractCausalOutcome,
   causalPlanFailureCode,
+  auditAndReplanCausalMacroArchitecture,
   initializeCausalNovelState,
   planNextCausalChapter,
   upgradeCausalNovelMacroArchitecture
 } from './causal-novel-engine'
 import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
-import { registerCausalPlanFailure, type CausalPlanFailureEvent } from '../../../shared/causal-novel-types'
+import {
+  causalChapterCountBounds,
+  registerCausalPlanFailure,
+  type CausalPlanFailureEvent
+} from '../../../shared/causal-novel-types'
 import type { GoalProgressEvent, Phase } from './novel-goal-routine'
 import { processPendingCausalReplay } from './causal-replay'
 import {
@@ -342,9 +347,19 @@ export async function runCausalNovelGoalLoop(
             summary: check.met ? `因果小说完成：${state.completionReason}` : check.reasons.join('；')
           })
           if (check.met) {
-            const completed = causalNovelDAO.confirmCompletion(workId, state.revision, state.completionReason)
+            const release = getDatabase().transaction(() => {
+              const completed = causalNovelDAO.confirmCompletion(workId, state.revision, state.completionReason)
+              const snapshotId = causalNovelDAO.createReleaseSnapshot(
+                workId,
+                `causal_release_ready_r${completed.revision}`
+              )
+              return { completed, snapshotId }
+            })()
             goalRoutineDAO.update(workId, { status: 'goal_met', goal_met: true })
-            emit(`因果小说完成并写入状态修订版 ${completed.revision}：${completed.completionReason}`, 'goal_met')
+            emit(
+              `因果小说完成并冻结发布快照 #${release.snapshotId}（状态 r${release.completed.revision}）：${release.completed.completionReason}`,
+              'goal_met'
+            )
           } else {
             const reopened = causalNovelDAO.rejectProposedCompletion(workId, state.revision, check.reasons)
             goalRoutineDAO.update(workId, { status: 'paused', goal_met: false })
@@ -355,9 +370,38 @@ export async function runCausalNovelGoalLoop(
 
         const targetChapters = loadWritingPlan(workId).targetChapters
         const committedChapterCount = decisions.filter(item => item.status === 'committed').length
-        if (committedChapterCount >= targetChapters) {
+        const scaleBounds = causalChapterCountBounds(targetChapters)
+        if (
+          committedChapterCount > 0 &&
+          (
+            committedChapterCount - state.lastMacroAuditChapter >= 8 ||
+            state.completionAuditFeedback.length > 0
+          )
+        ) {
+          phase = 'materialize_settings'
+          goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
+          const replanned = await auditAndReplanCausalMacroArchitecture(
+            workId,
+            committedChapterCount,
+            controller.signal,
+            progress => emit(progress, 'running')
+          )
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'causal_macro_replan',
+            summary: `阶段架构完成审计，权威状态推进到 r${replanned.revision}`
+          })
+          emit(`阶段架构已按已提交事实重审到 r${replanned.revision}`, 'running')
+          continue
+        }
+        if (committedChapterCount >= scaleBounds.max) {
           goalRoutineDAO.update(workId, { status: 'paused', current_phase: 'goal_check' })
-          emit(`已达到 ${targetChapters} 章，但核心终止条件尚未满足；已停止继续扩写`, 'paused')
+          emit(
+            `已达到弹性规模上限 ${scaleBounds.max} 章（目标 ${targetChapters} 章），但核心终止条件尚未满足；已停止继续扩写`,
+            'paused'
+          )
           return
         }
 

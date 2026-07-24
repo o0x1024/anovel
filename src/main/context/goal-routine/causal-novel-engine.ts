@@ -16,8 +16,10 @@ import {
   type CausalChapterOutcome,
   type CausalChapterPlan,
   type CausalChapterPlanDraft,
+  type CausalEventCandidate,
   type CausalEvidenceFact,
   type CausalEventCandidateDraft,
+  type CausalEventCandidateProposal,
   type CausalNarrativeState
 } from '../../../shared/causal-novel-types'
 import { withGoalLoopModelOptions } from './story-goal-model'
@@ -34,11 +36,17 @@ const INITIAL_STATE_SCHEMA: Record<string, unknown> = {
       type: 'array', minItems: 2, maxItems: 12,
       items: {
         type: 'object', additionalProperties: false,
-        required: ['name', 'currentGoal', 'fear', 'knowledge', 'resources', 'constraint'],
+        required: [
+          'name', 'currentGoal', 'fear', 'knowledge', 'resources', 'constraint',
+          'location', 'physicalState', 'relationships', 'obligations'
+        ],
         properties: {
           name: { type: 'string' }, currentGoal: { type: 'string' }, fear: { type: 'string' },
           knowledge: { type: 'array', items: { type: 'string' } },
-          resources: { type: 'array', items: { type: 'string' } }, constraint: { type: 'string' }
+          resources: { type: 'array', items: { type: 'string' } }, constraint: { type: 'string' },
+          location: { type: 'string' }, physicalState: { type: 'string' },
+          relationships: { type: 'array', maxItems: 20, items: { type: 'string' } },
+          obligations: { type: 'array', maxItems: 20, items: { type: 'string' } }
         }
       }
     },
@@ -90,6 +98,23 @@ const MACRO_UPGRADE_SCHEMA: Record<string, unknown> = {
   }
 }
 
+function macroReplanSchema(): Record<string, unknown> {
+  const macroArcs = JSON.parse(JSON.stringify(
+    (INITIAL_STATE_SCHEMA.properties as Record<string, unknown>).macroArcs
+  )) as { items: { properties: { status: Record<string, unknown> } } }
+  macroArcs.items.properties.status = {
+    type: 'string', enum: ['pending', 'active', 'completed']
+  }
+  return {
+    type: 'object', additionalProperties: false, required: ['changed', 'reason', 'macroArcs'],
+    properties: {
+      changed: { type: 'boolean' },
+      reason: { type: 'string' },
+      macroArcs
+    }
+  }
+}
+
 const PRESSURE_ITEM_SCHEMA = {
   type: 'object', additionalProperties: false,
   required: ['id', 'source', 'target', 'condition', 'escalation', 'urgency', 'status'],
@@ -103,9 +128,15 @@ const PRESSURE_ITEM_SCHEMA = {
 
 const CANDIDATE_SCORE_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['causalNecessity', 'promiseProgress', 'irreversibleImpact', 'novelty', 'pressureEscalation'],
+  required: [
+    'causalNecessity', 'promiseProgress', 'irreversibleImpact',
+    'novelty', 'pressureEscalation', 'pacingFitness'
+  ],
   properties: Object.fromEntries(
-    ['causalNecessity', 'promiseProgress', 'irreversibleImpact', 'novelty', 'pressureEscalation']
+    [
+      'causalNecessity', 'promiseProgress', 'irreversibleImpact',
+      'novelty', 'pressureEscalation', 'pacingFitness'
+    ]
       .map(key => [key, { type: 'integer', minimum: 0, maximum: 100 }])
   )
 }
@@ -188,11 +219,18 @@ const CHAPTER_PLAN_SCHEMA_BASE: Record<string, unknown> = {
       type: 'array', minItems: 3, maxItems: 5,
       items: {
         type: 'object', additionalProperties: false,
-        required: ['initiator', 'action', 'opposition', 'cost', 'irreversibleChange', 'promiseAdvanced', 'newQuestion', 'scores'],
+        required: [
+          'chapterFunction', 'initiator', 'action', 'opposition', 'cost',
+          'irreversibleChange', 'promiseAdvanced', 'newQuestion'
+        ],
         properties: {
+          chapterFunction: {
+            type: 'string',
+            enum: ['advance', 'complicate', 'reveal', 'payoff', 'consolidate', 'aftermath']
+          },
           initiator: { type: 'string' }, action: { type: 'string' },
           opposition: { type: 'string' }, cost: { type: 'string' }, irreversibleChange: { type: 'string' },
-          promiseAdvanced: { type: 'string' }, newQuestion: { type: 'string' }, scores: CANDIDATE_SCORE_SCHEMA
+          promiseAdvanced: { type: 'string' }, newQuestion: { type: 'string' }
         }
       }
     },
@@ -267,6 +305,26 @@ function buildCandidateDraftSchema(state: CausalNarrativeState, catalog: CausalE
     additionalProperties: false,
     required: ['candidates'],
     properties: { candidates: full.properties.candidates }
+  }
+}
+
+function buildCandidateScoreSchema(candidateIds: string[]): Record<string, unknown> {
+  return {
+    type: 'object', additionalProperties: false, required: ['scores'],
+    properties: {
+      scores: {
+        type: 'array', minItems: candidateIds.length, maxItems: candidateIds.length,
+        items: {
+          type: 'object', additionalProperties: false,
+          required: ['candidateId', 'reasons', ...Object.keys(CANDIDATE_SCORE_SCHEMA.properties)],
+          properties: {
+            candidateId: { type: 'string', enum: candidateIds },
+            ...(CANDIDATE_SCORE_SCHEMA.properties as Record<string, unknown>),
+            reasons: { type: 'array', minItems: 1, maxItems: 6, items: { type: 'string' } }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -387,7 +445,7 @@ export async function initializeCausalNovelState(
   const raw = parseStructured<
     Omit<
       CausalNarrativeState,
-      'schemaVersion' | 'revision' | 'recentEventSignatures' | 'archivedPromiseIds' |
+      'schemaVersion' | 'revision' | 'recentEventSignatures' | 'archivedPromiseIds' | 'lastMacroAuditChapter' |
       'macroArcs' | 'macroArchitectureReady' | 'completionStatus' | 'completionAuditFeedback' | 'completed' | 'completionReason'
     > & {
       macroArcs: Array<Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>>
@@ -404,6 +462,7 @@ export async function initializeCausalNovelState(
       lastAdvancedChapter: 0
     })),
     macroArchitectureReady: true,
+    lastMacroAuditChapter: 0,
     archivedPromiseIds: [], recentEventSignatures: [],
     completionStatus: 'writing', completionAuditFeedback: [],
     completed: false, completionReason: ''
@@ -460,6 +519,96 @@ export async function upgradeCausalNovelMacroArchitecture(
   }
   validateInitialState(next)
   causalNovelDAO.replaceState(workId, state.revision, next, { transitionType: 'macro_architecture_upgrade' })
+  return next
+}
+
+export async function auditAndReplanCausalMacroArchitecture(
+  workId: number,
+  committedChapterCount: number,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<CausalNarrativeState> {
+  const state = causalNovelDAO.getState(workId)
+  if (!state) throw new Error('因果状态尚未初始化')
+  const dueByInterval = committedChapterCount - state.lastMacroAuditChapter >= 8
+  const dueByFinalFeedback = state.completionAuditFeedback.length > 0
+  if (!dueByInterval && !dueByFinalFeedback) return state
+  if (causalNovelDAO.listDecisions(workId).some(item => item.status === 'planned')) {
+    throw new Error('存在尚未提交的章节决策，不能重审阶段架构')
+  }
+  onProgress?.('阶段重审：正在根据已提交事实检查剩余阶段是否仍可达')
+  const recentCommitted = causalNovelDAO.listDecisions(workId)
+    .filter(item => item.status === 'committed')
+    .slice(-8)
+    .map(item => ({
+      chapterId: item.chapterId,
+      decision: item.plan.decision,
+      outcome: item.outcome?.summary,
+      eventSignature: item.outcome?.eventSignature
+    }))
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId, step: 'goal_novel_causal_macro_replan',
+      enrichWorkContext: false, enrichNarrativeMemory: false,
+      temperature: 0, maxTokens: 4200, forceThinkingDisabled: true,
+      responseSchema: { name: 'causal_novel_macro_replan', schema: macroReplanSchema(), strict: true },
+      systemPrompt: [
+        '你是长篇因果架构审计器。只能重排或细化未完成阶段，不能改写已发生事实、硬规则、核心问题或终止条件。',
+        'completed 阶段必须逐字保留；剩余阶段必须且只能有一个 active，其他为 pending。',
+        '只有当新事实、连续失败或终审反馈使原路线不可达/失衡时 changed=true；否则原样返回。',
+        '允许拆分、合并或改写未完成阶段，但每个阶段仍只保存目标、进入/退出条件、兑现项和禁止漂移。',
+        '禁止生成逐章大纲。只返回 JSON。'
+      ].join('\n'),
+      prompt: [
+        `【权威状态】\n${JSON.stringify(state, null, 2)}`,
+        `【最近已提交结果】\n${JSON.stringify(recentCommitted, null, 2)}`,
+        state.completionAuditFeedback.length
+          ? `【终审退回原因】\n${state.completionAuditFeedback.join('\n')}`
+          : ''
+      ].filter(Boolean).join('\n\n')
+    }),
+    { stream: false, signal }
+  )
+  if (!response.success || !response.content?.trim()) {
+    throw new Error(response.error || '阶段架构重审失败')
+  }
+  const parsed = parseStructured<{
+    changed: boolean
+    reason: string
+    macroArcs: Array<Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>>
+  }>(response.content)
+  const completed = state.macroArcs.filter(item => item.status === 'completed')
+  const returnedCompleted = parsed.macroArcs.filter(item => item.status === 'completed')
+  const stableArc = (arc: Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>) =>
+    JSON.stringify({
+      id: arc.id, title: arc.title, objective: arc.objective,
+      entryConditions: arc.entryConditions, exitConditions: arc.exitConditions,
+      mandatoryPayoffs: arc.mandatoryPayoffs, forbiddenDrift: arc.forbiddenDrift, status: arc.status
+    })
+  if (
+    completed.length !== returnedCompleted.length ||
+    completed.some(item => !returnedCompleted.some(candidate => stableArc(candidate) === stableArc(item)))
+  ) {
+    throw new Error('阶段重审试图改写已经完成的阶段')
+  }
+  const macroArcs = parsed.macroArcs.map(item => {
+    const previous = state.macroArcs.find(arc => arc.id === item.id)
+    return {
+      ...item,
+      lastAdvancedChapter: previous?.lastAdvancedChapter ?? committedChapterCount
+    }
+  })
+  const activeCount = macroArcs.filter(item => item.status === 'active').length
+  if (activeCount !== 1 && !state.completed) throw new Error('阶段重审后必须且只能有一个活跃阶段')
+  const next: CausalNarrativeState = {
+    ...state,
+    revision: state.revision + 1,
+    macroArcs: parsed.changed ? macroArcs : state.macroArcs,
+    lastMacroAuditChapter: committedChapterCount
+  }
+  causalNovelDAO.replaceState(workId, state.revision, next, {
+    transitionType: parsed.changed ? 'macro_architecture_replanned' : 'macro_architecture_audited'
+  })
   return next
 }
 
@@ -520,6 +669,9 @@ export async function planNextCausalChapter(
   const recentEmotionalOutcomes = decisions.filter(item => item.status === 'committed').slice(-3)
     .map(item => item.outcome?.emotionalOutcome)
     .filter(Boolean)
+  const recentChapterFunctions = decisions.filter(item => item.status === 'committed').slice(-6)
+    .map(item => item.plan.candidates.find(candidate => candidate.id === item.plan.selectedCandidateId)?.chapterFunction)
+    .filter(Boolean)
   const previousHorizon = decisions.filter(item => item.status === 'committed').at(-1)?.plan.rollingHorizon?.slice(1) ?? []
   const context = buildWorkContext(workId, { includeVolumes: false, includeCoreSettings: true }).text.slice(0, 5000)
   const macroGuide = state.macroArchitectureReady ? '' : causalMacroGuide(workId)
@@ -542,8 +694,10 @@ export async function planNextCausalChapter(
         '你是滚动因果小说的候选事件生成器。基于当前权威状态提出3-5个互斥候选。',
         '禁止生成全书大纲、分卷计划、人物关系未来路线或为了制造冲突让人物降智。',
         '候选必须由人物当前目标与认知、世界压力、资源约束、未兑现读者承诺共同推出。',
-        '不要返回候选 id、总分或所选候选；服务端会分配 id、重算五项评分并冻结最高分项。',
-        '每章必须产生有正文证据的不可逆变化并推进至少一个未关闭承诺。',
+        '不要返回候选 id、评分或所选候选；独立评审器会在另一轮请求中盲评。',
+        '每章必须推进至少一个未关闭承诺，但允许 aftermath/consolidate 章通过消化后果、固定关系或澄清信息推进，不得强迫升级。',
+        'chapterFunction 必须从 advance/complicate/reveal/payoff/consolidate/aftermath 中选择。',
+        'irreversibleChange 对沉淀或余波章可填写“固定了什么后果/认知/义务”，不要求制造更大的外部冲突。',
         '关系变化不是评分项，也不能作为候选成立的唯一理由。',
         '每个 initiator 只能选择一个权威人物，禁止把多个人名拼在同一字符串中。'
       ].join('\n'),
@@ -576,8 +730,64 @@ export async function planNextCausalChapter(
   let candidateDrafts: CausalEventCandidateDraft[]
   let selectedCandidate: CausalChapterPlan['candidates'][number]
   try {
-    candidateDrafts = parseStructured<{ candidates: CausalEventCandidateDraft[] }>(candidateResponse.content).candidates
-    const candidates = materializeCausalCandidates(candidateDrafts)
+    const proposals = parseStructured<{ candidates: CausalEventCandidateProposal[] }>(
+      candidateResponse.content
+    ).candidates
+    const candidateIds = proposals.map((_, index) => `candidate_${index + 1}`)
+    onProgress?.('章节决策 3/7：独立评审器正在盲评候选的因果必要性与节奏适配')
+    const scoreResponse = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId, step: 'goal_novel_causal_candidate_scoring',
+        enrichWorkContext: false, enrichNarrativeMemory: false,
+        temperature: 0, maxTokens: 2200, forceThinkingDisabled: true,
+        responseSchema: {
+          name: 'causal_novel_candidate_scores',
+          schema: buildCandidateScoreSchema(candidateIds),
+          strict: true
+        },
+        systemPrompt: [
+          '你是独立候选评审器，不参与候选生成。不得相信候选中的自我评价，只根据权威状态逐项评分。',
+          'causalNecessity 看是否由已知目标、知识、资源和压力推出；promiseProgress 看是否真实推进承诺。',
+          'irreversibleImpact 只衡量状态固化程度，不得奖励无意义灾难；novelty 惩罚最近事件的重复。',
+          'pressureEscalation 不是越高越好：只评价该章节功能所需的压力变化是否恰当。',
+          'pacingFitness 评价它与最近章节功能、当前阶段和情绪余波是否形成健康节奏。',
+          '必须为每个 candidateId 恰好返回一次评分。只返回 JSON。'
+        ].join('\n'),
+        prompt: [
+          `【权威状态】\n${JSON.stringify(state, null, 2)}`,
+          `【最近事件签名】\n${state.recentEventSignatures.join('\n') || '无'}`,
+          `【最近章节功能】\n${recentChapterFunctions.join(' → ') || '无'}`,
+          `【待评候选】\n${JSON.stringify(proposals.map((item, index) => ({ id: candidateIds[index], ...item })), null, 2)}`
+        ].join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+    if (!scoreResponse.success || !scoreResponse.content?.trim()) {
+      throw new Error(scoreResponse.error || '独立候选评分失败')
+    }
+    const scoreRows = parseStructured<{
+      scores: Array<Omit<CausalEventCandidate['scores'], 'total'> & {
+        candidateId: string
+        reasons: string[]
+      }>
+    }>(scoreResponse.content).scores
+    if (
+      scoreRows.length !== candidateIds.length ||
+      new Set(scoreRows.map(item => item.candidateId)).size !== candidateIds.length ||
+      candidateIds.some(id => !scoreRows.some(item => item.candidateId === id))
+    ) {
+      throw new Error('独立候选评分没有完整覆盖所有候选')
+    }
+    const independentScores = candidateIds.map(id => {
+      const { candidateId: _candidateId, reasons: _reasons, ...scores } =
+        scoreRows.find(item => item.candidateId === id)!
+      return scores
+    })
+    candidateDrafts = proposals.map((proposal, index) => ({
+      ...proposal,
+      scores: independentScores[index]
+    }))
+    const candidates = materializeCausalCandidates(proposals, independentScores)
     selectedCandidate = candidates.reduce((best, item) => item.scores.total > best.scores.total ? item : best)
   } catch (error) {
     const message = errorMessage(error)
@@ -593,7 +803,7 @@ export async function planNextCausalChapter(
     throw error
   }
 
-  onProgress?.(`章节决策 3/6：已冻结最高分候选「${selectedCandidate.action}」，正在生成执行合同与近期窗口`)
+  onProgress?.(`章节决策 4/7：已冻结独立评分最高候选「${selectedCandidate.action}」，正在生成执行合同与近期窗口`)
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       workId, step: 'goal_novel_causal_decision', enrichWorkContext: false, enrichNarrativeMemory: false,
@@ -641,7 +851,7 @@ export async function planNextCausalChapter(
     })
     throw new Error(message)
   }
-  onProgress?.('章节决策 4/6：正在绑定人物、视角、承诺与原子证据')
+  onProgress?.('章节决策 5/7：正在绑定人物、视角、承诺与原子证据')
   let plan: CausalChapterPlan
   try {
     const details = parseStructured<Omit<CausalChapterPlanDraft, 'candidates'>>(response.content)
@@ -669,7 +879,7 @@ export async function planNextCausalChapter(
     })
     throw error
   }
-  onProgress?.('章节决策 5/6：正在由独立评审复核候选选择与滚动窗口')
+  onProgress?.('章节决策 6/7：正在由独立评审复核候选选择与滚动窗口')
   const auditResponse = await modelService.chat(
     withGoalLoopModelOptions(workId, {
       workId, step: 'goal_novel_causal_decision_audit', enrichWorkContext: false,
@@ -732,7 +942,7 @@ export async function planNextCausalChapter(
     })
     throw new Error(message)
   }
-  onProgress?.('章节决策 6/6：正在创建本章决策事务')
+  onProgress?.('章节决策 7/7：正在创建本章决策事务')
   const chapterId = causalNovelDAO.createPlannedChapter({
     workId, stateRevision: state.revision, plan, decisionCard: formatCausalDecisionCard(plan)
   })

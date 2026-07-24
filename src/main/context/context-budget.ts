@@ -1,4 +1,5 @@
 import type { ModelRequest } from '../model/types'
+import { resolveGenerationMaxTokens } from '../model/generation-token-budget'
 import { modelConfigDAO, writingStyleDAO, anchorDAO, appPreferenceDAO } from '../db'
 import type { AnchorRow } from '../db'
 import { buildWorkContext } from './work-context'
@@ -875,7 +876,7 @@ export function getMaxContextTokens(modelType?: string): number {
 export function estimateContextBudget(request: ModelRequest): ContextBudgetReport {
   const maxContext = getMaxContextTokens(request.modelType)
   const saved = appPreferenceDAO.getGenerationParams()
-  const reservedOutput = request.maxTokens ?? saved.maxTokens ?? 4096
+  const reservedOutput = resolveGenerationMaxTokens(request.maxTokens, saved.maxTokens)
   const sections = collectPromptSections(request)
   const { report } = assembleBudgetedPrompt(request.prompt, sections, maxContext, reservedOutput)
   return report

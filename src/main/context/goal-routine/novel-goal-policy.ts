@@ -48,6 +48,13 @@ export function isTerminalNovelRepairError(errorCode: string): boolean {
   return errorCode === 'REPAIR_BOUNDARY' || errorCode === 'REPAIR_STALL'
 }
 
+export function shouldPauseForNovelConstructionOutputFailure(input: {
+  phase: string
+  errorCode: string
+}): boolean {
+  return input.phase === 'generate_beats' && input.errorCode === 'OUTPUT_TRUNCATED'
+}
+
 /** 分卷生成中的修复边界只能停止改写，不能停止整本生成。 */
 export function shouldContinueNovelAfterVolumeRepairBoundary(input: {
   phase: string

@@ -24,6 +24,7 @@ import {
   resolveWorkRequestTemperature
 } from '../context/work-step-temperature'
 import { stepAcceptsRequestModel } from '../../shared/step-model-config'
+import { resolveGenerationMaxTokens } from './generation-token-budget'
 
 /**
  * 模型服务 - 统一调用入口
@@ -73,7 +74,9 @@ export class ModelService {
         : getMaxContextTokens(config.model_type)
 
       const stepDefaults = getStepGenerationDefaults(request.step, request.workId)
-      const resolvedMaxTokens = request.maxTokens ?? stepDefaults.maxTokens ?? 4096
+      const requestedMaxTokens = request.maxTokens ?? stepDefaults.maxTokens
+      const globalMaxTokens = stepDefaults.maxTokens
+      const resolvedMaxTokens = resolveGenerationMaxTokens(requestedMaxTokens, globalMaxTokens)
       const reservedOutput = resolvedMaxTokens
 
       const enrichMemory = request.workId && request.enrichNarrativeMemory !== false && (
@@ -167,6 +170,8 @@ export class ModelService {
         step: request.step,
         workId: request.workId,
         maxTokens: enrichedRequest.maxTokens ?? 4096,
+        requestedMaxTokens,
+        globalMaxTokens,
         ...tempLog,
         systemPrompt: enrichedRequest.systemPrompt ?? '',
         userPrompt: enrichedRequest.prompt,

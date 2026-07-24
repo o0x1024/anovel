@@ -76,11 +76,18 @@ function actorsSchema(state: CausalNarrativeState, units: CausalBodyEvidenceUnit
       actorUpdates: {
         type: 'array', maxItems: Math.min(12, actorNames.length), items: {
           type: 'object', additionalProperties: false,
-          required: ['actor', 'currentGoal', 'knowledgeAdded', 'resourcesAdded', 'resourcesRemoved', 'constraint', 'evidenceIds'],
+          required: [
+            'actor', 'currentGoal', 'knowledgeAdded', 'resourcesAdded', 'resourcesRemoved',
+            'constraint', 'location', 'physicalState', 'relationshipsAdded',
+            'relationshipsRemoved', 'obligationsAdded', 'obligationsRemoved', 'evidenceIds'
+          ],
           properties: {
             actor: knownIdSchema(actorNames), currentGoal: { type: 'string' },
             knowledgeAdded: STRING_ARRAY, resourcesAdded: STRING_ARRAY,
             resourcesRemoved: STRING_ARRAY, constraint: { type: 'string' },
+            location: { type: 'string' }, physicalState: { type: 'string' },
+            relationshipsAdded: STRING_ARRAY, relationshipsRemoved: STRING_ARRAY,
+            obligationsAdded: STRING_ARRAY, obligationsRemoved: STRING_ARRAY,
             evidenceIds: evidenceArraySchema(evidenceIds)
           }
         }
@@ -88,10 +95,15 @@ function actorsSchema(state: CausalNarrativeState, units: CausalBodyEvidenceUnit
       newActors: {
         type: 'array', maxItems: 4, items: {
           type: 'object', additionalProperties: false,
-          required: ['name', 'currentGoal', 'fear', 'knowledge', 'resources', 'constraint', 'evidenceIds'],
+          required: [
+            'name', 'currentGoal', 'fear', 'knowledge', 'resources', 'constraint',
+            'location', 'physicalState', 'relationships', 'obligations', 'evidenceIds'
+          ],
           properties: {
             name: { type: 'string' }, currentGoal: { type: 'string' }, fear: { type: 'string' },
             knowledge: STRING_ARRAY, resources: STRING_ARRAY, constraint: { type: 'string' },
+            location: { type: 'string' }, physicalState: { type: 'string' },
+            relationships: STRING_ARRAY, obligations: STRING_ARRAY,
             evidenceIds: evidenceArraySchema(evidenceIds)
           }
         }
@@ -401,9 +413,15 @@ function claimDescriptors(bundle: CausalOutcomeDraftBundle, state?: CausalNarrat
     const evidencePath = `actors.actorUpdates[${index}].evidenceIds`
     add(`actors.actorUpdates[${index}].currentGoal`, evidencePath, item.currentGoal)
     add(`actors.actorUpdates[${index}].constraint`, evidencePath, item.constraint)
+    add(`actors.actorUpdates[${index}].location`, evidencePath, item.location)
+    add(`actors.actorUpdates[${index}].physicalState`, evidencePath, item.physicalState)
     item.knowledgeAdded.forEach((claim, child) => add(`actors.actorUpdates[${index}].knowledgeAdded[${child}]`, evidencePath, claim))
     item.resourcesAdded.forEach((claim, child) => add(`actors.actorUpdates[${index}].resourcesAdded[${child}]`, evidencePath, claim))
     item.resourcesRemoved.forEach((claim, child) => add(`actors.actorUpdates[${index}].resourcesRemoved[${child}]`, evidencePath, claim))
+    item.relationshipsAdded.forEach((claim, child) => add(`actors.actorUpdates[${index}].relationshipsAdded[${child}]`, evidencePath, claim))
+    item.relationshipsRemoved.forEach((claim, child) => add(`actors.actorUpdates[${index}].relationshipsRemoved[${child}]`, evidencePath, claim))
+    item.obligationsAdded.forEach((claim, child) => add(`actors.actorUpdates[${index}].obligationsAdded[${child}]`, evidencePath, claim))
+    item.obligationsRemoved.forEach((claim, child) => add(`actors.actorUpdates[${index}].obligationsRemoved[${child}]`, evidencePath, claim))
   })
   bundle.actors.newActors.forEach((item, index) => {
     const evidencePath = `actors.newActors[${index}].evidenceIds`
@@ -411,6 +429,8 @@ function claimDescriptors(bundle: CausalOutcomeDraftBundle, state?: CausalNarrat
     add(`actors.newActors[${index}].currentGoal`, evidencePath, item.currentGoal)
     add(`actors.newActors[${index}].fear`, evidencePath, item.fear)
     add(`actors.newActors[${index}].constraint`, evidencePath, item.constraint)
+    add(`actors.newActors[${index}].location`, evidencePath, item.location)
+    add(`actors.newActors[${index}].physicalState`, evidencePath, item.physicalState)
   })
   bundle.world.pressureUpdates.forEach((item, index) => add(
     `world.pressureUpdates[${index}].condition`, `world.pressureUpdates[${index}].evidenceIds`, item.condition

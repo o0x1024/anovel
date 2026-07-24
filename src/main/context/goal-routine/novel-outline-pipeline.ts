@@ -468,7 +468,7 @@ export function planNovelVolumeGateWindows(
 
 export class NovelPipelineError extends Error {
     constructor(
-    public readonly code: 'OUTPUT_INVALID' | 'CONTRACT_INVALID' | 'PREREQUISITE_MISSING' | 'REPAIR_BOUNDARY' | 'REPAIR_STALL' | 'EVALUATOR_PROTOCOL',
+    public readonly code: 'OUTPUT_INVALID' | 'OUTPUT_TRUNCATED' | 'CONTRACT_INVALID' | 'PREREQUISITE_MISSING' | 'REPAIR_BOUNDARY' | 'REPAIR_STALL' | 'EVALUATOR_PROTOCOL',
     message: string
   ) {
     super(message)
@@ -2437,8 +2437,24 @@ export function chapterSkeletonBatchSchema(start: number, end: number): Record<s
   }
 }
 
+const CHAPTER_STRUCTURE_FIELD_MAX_LENGTH = 240
+const CHAPTER_STRUCTURE_BASE_MAX_TOKENS = 3200
+const CHAPTER_STRUCTURE_MAX_TOKENS = 12800
+
+export function chapterStructureContractTokenBudget(attempt: number): number {
+  const safeAttempt = Math.max(1, Math.floor(attempt))
+  return Math.min(
+    CHAPTER_STRUCTURE_MAX_TOKENS,
+    CHAPTER_STRUCTURE_BASE_MAX_TOKENS * 2 ** (safeAttempt - 1)
+  )
+}
+
 export function chapterStructureContractSchema(chapterNumber: number): Record<string, unknown> {
-  const stringProperties = (keys: readonly string[]) => Object.fromEntries(keys.map(key => [key, { type: 'string' }]))
+  const stringProperties = (keys: readonly string[]) => Object.fromEntries(keys.map(key => [key, {
+    type: 'string',
+    minLength: 1,
+    maxLength: CHAPTER_STRUCTURE_FIELD_MAX_LENGTH
+  }]))
   return {
     type: 'object',
     additionalProperties: false,
@@ -2519,14 +2535,18 @@ function chapterStructurePatchSchema(chapterNumber: number, missingFields: strin
     required.push('dramatic_contract')
     patchProperties.dramatic_contract = {
       type: 'object', additionalProperties: false, required: dramaticKeys,
-      properties: Object.fromEntries(dramaticKeys.map(key => [key, { type: 'string' }]))
+      properties: Object.fromEntries(dramaticKeys.map(key => [key, {
+        type: 'string', minLength: 1, maxLength: CHAPTER_STRUCTURE_FIELD_MAX_LENGTH
+      }]))
     }
   }
   if (patternKeys.length > 0) {
     required.push('pattern_contract')
     patchProperties.pattern_contract = {
       type: 'object', additionalProperties: false, required: patternKeys,
-      properties: Object.fromEntries(patternKeys.map(key => [key, { type: 'string' }]))
+      properties: Object.fromEntries(patternKeys.map(key => [key, {
+        type: 'string', minLength: 1, maxLength: CHAPTER_STRUCTURE_FIELD_MAX_LENGTH
+      }]))
     }
   }
   if (missingFields.includes('resource_budget')) {
@@ -2677,15 +2697,25 @@ function validateChapterResourceBudgetCompleteness(
   }
 }
 
-function formatRecentOutlineContext(workId: number): string {
+function formatRecentOutlineContext(
+  workId: number,
+  maxChapters = 5,
+  includePattern = true
+): string {
   return volumeChapterDAO.listChaptersByWork(workId)
-    .slice(-5)
+    .slice(-Math.max(1, maxChapters))
     .map((chapter, index, rows) => {
       let pattern = ''
-      try {
-        pattern = JSON.stringify(JSON.parse(chapter.outline_diagnosis ?? '{}').pattern_contract ?? {})
-      } catch { /* 忽略旧大纲 */ }
-      return `第 ${rows.length - index} 个最近章节：${chapter.title}\n${chapter.outline ?? ''}\n模式指纹：${pattern}`
+      if (includePattern) {
+        try {
+          pattern = JSON.stringify(JSON.parse(chapter.outline_diagnosis ?? '{}').pattern_contract ?? {})
+        } catch { /* 忽略旧大纲 */ }
+      }
+      return [
+        `第 ${rows.length - index} 个最近章节：${chapter.title}`,
+        chapter.outline ?? '',
+        includePattern ? `模式指纹：${pattern}` : ''
+      ].filter(Boolean).join('\n')
     })
     .join('\n\n')
 }
@@ -2802,92 +2832,117 @@ async function generateChapterStructureContract(input: {
   }
   let partialContract: Record<string, unknown> | null = null
   let missingFields: string[] = []
-  return requestStructuredModelOutput({
-    workId: input.workId,
-    label: `第 ${input.skeleton.chapterNumber} 章结构合同`,
-    attempts: 3,
-    signal: input.signal,
-    request: async (attempt, lastError) => modelService.chat(
-      {
-        ...withGoalLoopModelOptions(input.workId, {
-          workId: input.workId,
-          step: 'goal_novel_chapter_contract',
-          enrichWorkContext: false,
-          enrichNarrativeMemory: false,
-          temperature: 0.1,
-          maxTokens: 3200,
+  try {
+    return await requestStructuredModelOutput({
+      workId: input.workId,
+      label: `第 ${input.skeleton.chapterNumber} 章结构合同`,
+      attempts: 3,
+      signal: input.signal,
+      request: async (attempt, lastError) => modelService.chat(
+        {
+          ...withGoalLoopModelOptions(input.workId, {
+            workId: input.workId,
+            step: 'goal_novel_chapter_contract',
+            enrichWorkContext: false,
+            enrichNarrativeMemory: false,
+            temperature: 0.1,
+            maxTokens: chapterStructureContractTokenBudget(attempt),
+            thinkingEnabled: false,
+            forceThinkingDisabled: true,
+            responseSchema: {
+              name: missingFields.length > 0
+                ? 'novel_chapter_structure_missing_fields'
+                : 'novel_chapter_structure_contract',
+              schema: missingFields.length > 0
+                ? chapterStructurePatchSchema(input.skeleton.chapterNumber, missingFields)
+                : chapterStructureContractSchema(input.skeleton.chapterNumber),
+              strict: true
+            },
+            systemPrompt: [
+              '你是长篇小说单章结构合同编辑。剧情骨架已经冻结；只补充这一章的结构合同和资源预算，不得改写标题、大纲、角色或钩子。',
+              'dramatic_contract 和 pattern_contract 的每个字段都必须是非空字符串。',
+              'pattern_contract 使用抽象语义；对手无调整时明确填写“不适用：原因”，禁止省略 antagonist_tactic。',
+              resourceConstraints
+                ? 'resource_budget 必须按资源账本逐项完整输出，名称不得改写，开章区间承接上一章。'
+                : 'resource_budget 必须输出空数组。',
+              '所有合同字符串只写可执行约束，每字段 40-120 个汉字，禁止复述整章剧情、禁止同义反复。',
+              attempt > 1
+                ? missingFields.length > 0
+                  ? `上一轮只有以下字段缺失：${missingFields.join('、')}。只在 patch 中返回这些字段，禁止返回或改写其他字段。`
+                  : /finishReason=length|长度上限|截断/.test(lastError)
+                    ? '上一轮输出被截断。本轮必须压缩措辞，完整闭合 JSON；不得扩写解释。'
+                    : '上一轮有结构或格式错误。本轮保持已有剧情含义，禁止重新设计章节。'
+                : '',
+              `结构示例：${JSON.stringify(example)}`
+            ].filter(Boolean).join('\n'),
+            prompt: [
+              `【用户目标】\n${input.goal.trim() || '自动策划一部长篇小说'}`,
+              `【分卷合同】\n${JSON.stringify(attempt === 1 ? input.volume : {
+                name: input.volume.name,
+                objective: input.volume.objective,
+                midpoint: input.volume.midpoint,
+                climax: input.volume.climax,
+                mustResolve: input.volume.mustResolve,
+                mayCarryForward: input.volume.mayCarryForward
+              })}`,
+              `【冻结的章节骨架】\n${JSON.stringify(input.skeleton, null, 2)}`,
+              resourceConstraints,
+              previousResourceBudgetContext(input.previousBudgets),
+              input.recentOutlineContext
+                ? `【最近章节模式，只读】\n${attempt === 1
+                  ? input.recentOutlineContext
+                  : formatRecentOutlineContext(input.workId, 1, false)}`
+                : '',
+              partialContract && missingFields.length > 0
+                ? `【已通过字段，只读且禁止重写】\n${JSON.stringify(partialContract, null, 2)}`
+                : '',
+              attempt > 1 ? `【上一轮缺失/非法字段】\n${lastError}` : ''
+            ].filter(Boolean).join('\n\n')
+          }),
           thinkingEnabled: false,
-          forceThinkingDisabled: true,
-          responseSchema: {
-            name: missingFields.length > 0
-              ? 'novel_chapter_structure_missing_fields'
-              : 'novel_chapter_structure_contract',
-            schema: missingFields.length > 0
-              ? chapterStructurePatchSchema(input.skeleton.chapterNumber, missingFields)
-              : chapterStructureContractSchema(input.skeleton.chapterNumber),
-            strict: true
-          },
-          systemPrompt: [
-            '你是长篇小说单章结构合同编辑。剧情骨架已经冻结；只补充这一章的结构合同和资源预算，不得改写标题、大纲、角色或钩子。',
-            'dramatic_contract 和 pattern_contract 的每个字段都必须是非空字符串。',
-            'pattern_contract 使用抽象语义；对手无调整时明确填写“不适用：原因”，禁止省略 antagonist_tactic。',
-            resourceConstraints
-              ? 'resource_budget 必须按资源账本逐项完整输出，名称不得改写，开章区间承接上一章。'
-              : 'resource_budget 必须输出空数组。',
-            attempt > 1
-              ? missingFields.length > 0
-                ? `上一轮只有以下字段缺失：${missingFields.join('、')}。只在 patch 中返回这些字段，禁止返回或改写其他字段。`
-                : '上一轮有结构或格式错误。本轮保持已有剧情含义，禁止重新设计章节。'
-              : '',
-            `结构示例：${JSON.stringify(example)}`
-          ].filter(Boolean).join('\n'),
-          prompt: [
-            `【用户目标】\n${input.goal.trim() || '自动策划一部长篇小说'}`,
-            `【分卷合同】\n${JSON.stringify(input.volume)}`,
-            `【冻结的章节骨架】\n${JSON.stringify(input.skeleton, null, 2)}`,
-            resourceConstraints,
-            previousResourceBudgetContext(input.previousBudgets),
-            input.recentOutlineContext ? `【最近章节模式，只读】\n${input.recentOutlineContext}` : '',
-            partialContract && missingFields.length > 0
-              ? `【已通过字段，只读且禁止重写】\n${JSON.stringify(partialContract, null, 2)}`
-              : '',
-            attempt > 1 ? `【上一轮缺失/非法字段】\n${lastError}` : ''
-          ].filter(Boolean).join('\n\n')
-        }),
-        thinkingEnabled: false,
-        forceThinkingDisabled: true
-      },
-      { stream: false, signal: input.signal }
-    ),
-    validate: parsed => {
-      const candidate = partialContract && parsed.patch
-        ? mergeChapterStructurePatch(partialContract, parsed)
-        : parsed
-      try {
-        const validated = validateChapterStructureContract(candidate, input.skeleton.chapterNumber)
-        validateChapterResourceBudgetCompleteness(
-          input.workId,
-          input.skeleton.chapterNumber,
-          input.previousBudgets,
-          validated.resourceBudgets
-        )
-        return validated
-      } catch (error) {
-        const missing = missingChapterStructureFields(candidate)
-        if (/资源|resource_budget/.test(error instanceof Error ? error.message : String(error))) {
-          missing.push('resource_budget')
+          forceThinkingDisabled: true
+        },
+        { stream: false, signal: input.signal }
+      ),
+      validate: parsed => {
+        const candidate = partialContract && parsed.patch
+          ? mergeChapterStructurePatch(partialContract, parsed)
+          : parsed
+        try {
+          const validated = validateChapterStructureContract(candidate, input.skeleton.chapterNumber)
+          validateChapterResourceBudgetCompleteness(
+            input.workId,
+            input.skeleton.chapterNumber,
+            input.previousBudgets,
+            validated.resourceBudgets
+          )
+          return validated
+        } catch (error) {
+          const missing = missingChapterStructureFields(candidate)
+          if (/资源|resource_budget/.test(error instanceof Error ? error.message : String(error))) {
+            missing.push('resource_budget')
+          }
+          if (missing.length > 0) {
+            partialContract = candidate
+            missingFields = [...new Set(missing)]
+          } else {
+            partialContract = null
+            missingFields = []
+          }
+          throw error
         }
-        if (missing.length > 0) {
-          partialContract = candidate
-          missingFields = [...new Set(missing)]
-        } else {
-          partialContract = null
-          missingFields = []
-        }
-        throw error
       }
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (/finishReason=length|长度上限|输出.*截断/.test(message)) {
+      throw new NovelPipelineError(
+        'OUTPUT_TRUNCATED',
+        `第 ${input.skeleton.chapterNumber} 章结构合同在动态扩容重试后仍被截断，已保留前序章节检查点：${message}`
+      )
     }
-  })
+    throw error
+  }
 }
 
 async function enrichChapterSkeletons(input: {

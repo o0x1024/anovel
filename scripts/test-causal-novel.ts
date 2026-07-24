@@ -3,10 +3,12 @@ import {
   CAUSAL_NOVEL_SCHEMA_VERSION,
   applyCausalChapterOutcome,
   buildCausalEvidenceCatalog,
+  causalChapterCountBounds,
   causalCandidateTotal,
   causalEmotionGroundingRefs,
   formatCausalDecisionCard,
   materializeCausalChapterPlan,
+  materializeCausalCandidates,
   normalizeCausalNarrativeState,
   registerCausalPlanFailure,
   validateCausalChapterEmotionContract,
@@ -274,6 +276,41 @@ const plan: CausalChapterPlan = {
   }))
 }
 assert.equal(causalCandidateTotal(plan.candidates[0]), 87)
+assert.deepEqual(causalChapterCountBounds(100), { min: 85, max: 115 })
+const independentlyScored = materializeCausalCandidates(
+  [{
+    ...plan.candidates[0],
+    chapterFunction: 'aftermath',
+    id: undefined as never,
+    scores: undefined as never
+  }],
+  [{
+    causalNecessity: 80,
+    promiseProgress: 75,
+    irreversibleImpact: 35,
+    novelty: 85,
+    pressureEscalation: 20,
+    pacingFitness: 95
+  }]
+)
+assert.equal(independentlyScored[0].chapterFunction, 'aftermath')
+assert.equal(independentlyScored[0].scores.total, 72)
+const normalizedLegacyState = normalizeCausalNarrativeState({
+  ...state,
+  schemaVersion: 2 as never,
+  lastMacroAuditChapter: undefined as never,
+  actors: state.actors.map(actor => ({
+    ...actor,
+    location: undefined as never,
+    physicalState: undefined as never,
+    relationships: undefined as never,
+    obligations: undefined as never
+  }))
+})
+assert.equal(normalizedLegacyState.schemaVersion, CAUSAL_NOVEL_SCHEMA_VERSION)
+assert.equal(normalizedLegacyState.lastMacroAuditChapter, 0)
+assert.equal(normalizedLegacyState.actors[0].location, '未记录')
+assert.deepEqual(normalizedLegacyState.actors[0].relationships, [])
 const evidenceCatalog = buildCausalEvidenceCatalog(state)
 const { total: _total, ...draftScores } = plan.candidates[0].scores
 const { id: _candidateId, scores: _candidateScores, ...draftCandidate } = plan.candidates[0]

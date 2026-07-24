@@ -35,6 +35,12 @@ export interface CausalOutcomeActorDraft {
     resourcesAdded: string[]
     resourcesRemoved: string[]
     constraint: string
+    location: string
+    physicalState: string
+    relationshipsAdded: string[]
+    relationshipsRemoved: string[]
+    obligationsAdded: string[]
+    obligationsRemoved: string[]
     evidenceIds: string[]
   }>
   newActors: Array<{
@@ -44,6 +50,10 @@ export interface CausalOutcomeActorDraft {
     knowledge: string[]
     resources: string[]
     constraint: string
+    location: string
+    physicalState: string
+    relationships: string[]
+    obligations: string[]
     evidenceIds: string[]
   }>
 }
@@ -259,6 +269,12 @@ export function materializeCausalOutcomeDraft(input: {
       resourcesAdded: update.resourcesAdded.map(value => value.trim()).filter(Boolean),
       resourcesRemoved: update.resourcesRemoved.map(value => value.trim()).filter(Boolean),
       constraint: update.constraint.trim() || undefined,
+      location: update.location?.trim() || undefined,
+      physicalState: update.physicalState?.trim() || undefined,
+      relationshipsAdded: (update.relationshipsAdded ?? []).map(value => value.trim()).filter(Boolean),
+      relationshipsRemoved: (update.relationshipsRemoved ?? []).map(value => value.trim()).filter(Boolean),
+      obligationsAdded: (update.obligationsAdded ?? []).map(value => value.trim()).filter(Boolean),
+      obligationsRemoved: (update.obligationsRemoved ?? []).map(value => value.trim()).filter(Boolean),
       evidence: evidenceText(evidenceIds, unitMap),
       evidenceIds
     }
@@ -278,7 +294,11 @@ export function materializeCausalOutcomeDraft(input: {
         fear: item.fear.trim(),
         knowledge: item.knowledge.map(value => value.trim()).filter(Boolean),
         resources: item.resources.map(value => value.trim()).filter(Boolean),
-        constraint: item.constraint.trim()
+        constraint: item.constraint.trim(),
+        location: item.location?.trim() || '未记录',
+        physicalState: item.physicalState?.trim() || '未记录',
+        relationships: (item.relationships ?? []).map(value => value.trim()).filter(Boolean),
+        obligations: (item.obligations ?? []).map(value => value.trim()).filter(Boolean)
       },
       evidence: evidenceText(evidenceIds, unitMap),
       evidenceIds

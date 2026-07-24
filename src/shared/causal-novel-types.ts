@@ -4,10 +4,25 @@ import {
   type EmotionContract
 } from './emotion-contract'
 
-export const CAUSAL_NOVEL_SCHEMA_VERSION = 2
+export const CAUSAL_NOVEL_SCHEMA_VERSION = 3
 
 export type CausalPromiseStatus = 'open' | 'advanced' | 'resolved'
 export type CausalCompletionStatus = 'writing' | 'proposed' | 'completed'
+export type CausalChapterFunction =
+  | 'advance'
+  | 'complicate'
+  | 'reveal'
+  | 'payoff'
+  | 'consolidate'
+  | 'aftermath'
+
+export function causalChapterCountBounds(targetChapters: number): { min: number; max: number } {
+  if (!Number.isFinite(targetChapters) || targetChapters <= 0) return { min: 0, max: Number.MAX_SAFE_INTEGER }
+  return {
+    min: Math.max(1, Math.floor(targetChapters * 0.85)),
+    max: Math.max(1, Math.ceil(targetChapters * 1.15))
+  }
+}
 
 export interface CausalMacroArc {
   id: string
@@ -28,6 +43,10 @@ export interface CausalActorState {
   knowledge: string[]
   resources: string[]
   constraint: string
+  location: string
+  physicalState: string
+  relationships: string[]
+  obligations: string[]
 }
 
 export interface CausalPressure {
@@ -59,6 +78,7 @@ export interface CausalNarrativeState {
   promises: CausalReaderPromise[]
   macroArcs: CausalMacroArc[]
   macroArchitectureReady: boolean
+  lastMacroAuditChapter: number
   archivedPromiseIds: string[]
   recentEventSignatures: string[]
   completionStatus: CausalCompletionStatus
@@ -69,6 +89,7 @@ export interface CausalNarrativeState {
 
 export interface CausalEventCandidate {
   id: string
+  chapterFunction: CausalChapterFunction
   initiator: string
   action: string
   opposition: string
@@ -82,16 +103,27 @@ export interface CausalEventCandidate {
     irreversibleImpact: number
     novelty: number
     pressureEscalation: number
+    pacingFitness: number
     total: number
   }
 }
 
 export function causalCandidateTotal(candidate: CausalEventCandidate): number {
   const scores = candidate.scores
-  return Math.round((
-    scores.causalNecessity + scores.promiseProgress + scores.irreversibleImpact +
-    scores.novelty + scores.pressureEscalation
-  ) / 5)
+  if (scores.pacingFitness == null) {
+    return Math.round((
+      scores.causalNecessity + scores.promiseProgress + scores.irreversibleImpact +
+      scores.novelty + scores.pressureEscalation
+    ) / 5)
+  }
+  return Math.round(
+    scores.causalNecessity * 0.25 +
+    scores.promiseProgress * 0.20 +
+    scores.irreversibleImpact * 0.10 +
+    scores.novelty * 0.15 +
+    scores.pressureEscalation * 0.10 +
+    scores.pacingFitness * 0.20
+  )
 }
 
 export interface CausalChapterDecision {
@@ -190,6 +222,8 @@ export type CausalChapterEmotionContractDraft = Omit<
   groundingEvidence: CausalEvidenceSelection
 }
 
+export type CausalEventCandidateProposal = Omit<CausalEventCandidate, 'id' | 'scores'>
+
 export type CausalEventCandidateDraft = Omit<CausalEventCandidate, 'id' | 'scores'> & {
   scores: Omit<CausalEventCandidate['scores'], 'total'>
 }
@@ -229,6 +263,12 @@ export interface CausalActorUpdate {
   resourcesAdded?: string[]
   resourcesRemoved?: string[]
   constraint?: string
+  location?: string
+  physicalState?: string
+  relationshipsAdded?: string[]
+  relationshipsRemoved?: string[]
+  obligationsAdded?: string[]
+  obligationsRemoved?: string[]
   evidence: string
   evidenceIds?: string[]
 }
@@ -296,6 +336,7 @@ export function normalizeCausalNarrativeState(input: CausalNarrativeState): Caus
     archivedPromiseIds?: string[]
     completionStatus?: CausalCompletionStatus
     completionAuditFeedback?: string[]
+    lastMacroAuditChapter?: number
   }
   const fallbackArc: CausalMacroArc = {
     id: 'arc_main',
@@ -313,6 +354,14 @@ export function normalizeCausalNarrativeState(input: CausalNarrativeState): Caus
     schemaVersion: CAUSAL_NOVEL_SCHEMA_VERSION,
     macroArcs: legacy.macroArcs?.length ? legacy.macroArcs : [fallbackArc],
     macroArchitectureReady: legacy.macroArchitectureReady === true,
+    lastMacroAuditChapter: Math.max(0, legacy.lastMacroAuditChapter ?? 0),
+    actors: legacy.actors.map(actor => ({
+      ...actor,
+      location: actor.location ?? '未记录',
+      physicalState: actor.physicalState ?? '未记录',
+      relationships: unique(actor.relationships ?? []),
+      obligations: unique(actor.obligations ?? [])
+    })),
     archivedPromiseIds: unique(legacy.archivedPromiseIds ?? []).slice(-1000),
     completionStatus: legacy.completionStatus ?? (legacy.completed ? 'completed' : 'writing'),
     completionAuditFeedback: unique(legacy.completionAuditFeedback ?? []).slice(-12),
@@ -327,7 +376,10 @@ export function causalEmotionGroundingSources(
   return Object.fromEntries([
     ...state.actors.map(actor => [
       `actor:${actor.name}`,
-      [actor.currentGoal, actor.fear, actor.constraint, ...actor.knowledge, ...actor.resources].join('\n')
+      [
+        actor.currentGoal, actor.fear, actor.constraint, actor.location, actor.physicalState,
+        ...actor.knowledge, ...actor.resources, ...(actor.relationships ?? []), ...(actor.obligations ?? [])
+      ].join('\n')
     ] as const),
     ...state.activePressures
       .filter(item => item.status === 'active')
@@ -356,8 +408,8 @@ export function causalEmotionGroundingRefs(
   ]
 }
 
-function evidenceText(value: string): string {
-  return value.trim()
+function evidenceText(value: string | null | undefined): string {
+  return value?.trim() ?? ''
 }
 
 /**
@@ -370,7 +422,7 @@ export function buildCausalEvidenceCatalog(
 ): CausalEvidenceFact[] {
   const facts: CausalEvidenceFact[] = []
   const seen = new Set<string>()
-  const add = (id: string, ref: string, value: string): void => {
+  const add = (id: string, ref: string, value: string | null | undefined): void => {
     const text = evidenceText(value)
     if (text.replace(/\s/g, '').length < 3) return
     const key = `${ref}\u0000${text}`
@@ -384,8 +436,12 @@ export function buildCausalEvidenceCatalog(
     add(`actor_${actorIndex}_goal`, ref, actor.currentGoal)
     add(`actor_${actorIndex}_fear`, ref, actor.fear)
     add(`actor_${actorIndex}_constraint`, ref, actor.constraint)
+    add(`actor_${actorIndex}_location`, ref, actor.location)
+    add(`actor_${actorIndex}_physical`, ref, actor.physicalState)
     actor.knowledge.forEach((item, index) => add(`actor_${actorIndex}_knowledge_${index}`, ref, item))
     actor.resources.forEach((item, index) => add(`actor_${actorIndex}_resource_${index}`, ref, item))
+    ;(actor.relationships ?? []).forEach((item, index) => add(`actor_${actorIndex}_relationship_${index}`, ref, item))
+    ;(actor.obligations ?? []).forEach((item, index) => add(`actor_${actorIndex}_obligation_${index}`, ref, item))
   })
   state.activePressures.filter(item => item.status === 'active').forEach((pressure, index) => {
     const ref = `pressure:${pressure.id}`
@@ -417,12 +473,18 @@ function includeEvidence(field: string, evidence: string): string {
 }
 
 /** 服务端固化所有跨字段等值关系和可计算字段，模型不再负责重复抄写。 */
-export function materializeCausalCandidates(drafts: CausalEventCandidateDraft[]): CausalEventCandidate[] {
+export function materializeCausalCandidates(
+  drafts: Array<CausalEventCandidateDraft | CausalEventCandidateProposal>,
+  independentScores?: Array<Omit<CausalEventCandidate['scores'], 'total'>>
+): CausalEventCandidate[] {
   return drafts.map((candidate, index) => {
+    const score = independentScores?.[index] ?? ('scores' in candidate ? candidate.scores : null)
+    if (!score) throw new Error(`候选 candidate_${index + 1} 缺少独立评分`)
+    const { scores: _ignored, ...proposal } = candidate as CausalEventCandidateDraft
     const withTotal: CausalEventCandidate = {
-      ...candidate,
+      ...proposal,
       id: `candidate_${index + 1}`,
-      scores: { ...candidate.scores, total: 0 }
+      scores: { ...score, total: 0 }
     }
     withTotal.scores.total = causalCandidateTotal(withTotal)
     return withTotal
@@ -650,7 +712,17 @@ export function applyCausalChapterOutcome(
         ...current.resources.filter(resource => !(update.resourcesRemoved ?? []).includes(resource)),
         ...(update.resourcesAdded ?? [])
       ]),
-      constraint: update.constraint?.trim() || current.constraint
+      constraint: update.constraint?.trim() || current.constraint,
+      location: update.location?.trim() || current.location || '未记录',
+      physicalState: update.physicalState?.trim() || current.physicalState || '未记录',
+      relationships: unique([
+        ...(current.relationships ?? []).filter(item => !(update.relationshipsRemoved ?? []).includes(item)),
+        ...(update.relationshipsAdded ?? [])
+      ]),
+      obligations: unique([
+        ...(current.obligations ?? []).filter(item => !(update.obligationsRemoved ?? []).includes(item)),
+        ...(update.obligationsAdded ?? [])
+      ])
     }), actor)
   })
 
@@ -667,7 +739,11 @@ export function applyCausalChapterOutcome(
       ...actor,
       name: actor.name.trim(),
       knowledge: unique(actor.knowledge),
-      resources: unique(actor.resources)
+      resources: unique(actor.resources),
+      location: actor.location || '未记录',
+      physicalState: actor.physicalState || '未记录',
+      relationships: unique(actor.relationships ?? []),
+      obligations: unique(actor.obligations ?? [])
     })
   }
 
@@ -748,7 +824,9 @@ export function applyCausalChapterOutcome(
 
 export function formatCausalDecisionCard(plan: CausalChapterPlan): string {
   const decision = plan.decision
+  const selected = plan.candidates.find(item => item.id === plan.selectedCandidateId)
   return [
+    `【章节功能】${selected?.chapterFunction ?? 'advance'}`,
     `【开场状态】${decision.openingState}`,
     `【必须覆盖】${decision.mustCover.join('；')}`,
     `【禁止越界】${decision.forbiddenEvents.join('；')}`,

@@ -11,6 +11,7 @@ import {
   classifyVolumeGenerationFailure,
   chapterSkeletonBatchSchema,
   chapterStructureContractSchema,
+  chapterStructureContractTokenBudget,
   checkNovelVolumeRepairBudget,
   isActionableNovelVolumeGateIssue,
   locateNovelVolumeGateEvidenceFragments,
@@ -41,6 +42,7 @@ import {
   shouldDeferNovelChapterAcceptance,
   shouldDeferNovelQualityCandidate,
   shouldExtendNovelConstructionBudget,
+  shouldPauseForNovelConstructionOutputFailure,
   shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from '../src/main/context/goal-routine/novel-goal-policy'
@@ -533,6 +535,19 @@ const contractSchemaText = JSON.stringify(chapterStructureContractSchema(1))
 assert.match(contractSchemaText, /dramatic_contract/)
 assert.match(contractSchemaText, /antagonist_tactic/)
 assert.match(contractSchemaText, /resource_budget/)
+assert.match(contractSchemaText, /"maxLength":240/)
+assert.equal(chapterStructureContractTokenBudget(1), 3200)
+assert.equal(chapterStructureContractTokenBudget(2), 6400)
+assert.equal(chapterStructureContractTokenBudget(3), 12800)
+assert.equal(chapterStructureContractTokenBudget(4), 12800)
+assert.equal(shouldPauseForNovelConstructionOutputFailure({
+  phase: 'generate_beats',
+  errorCode: 'OUTPUT_TRUNCATED'
+}), true)
+assert.equal(shouldPauseForNovelConstructionOutputFailure({
+  phase: 'generate_volumes',
+  errorCode: 'OUTPUT_TRUNCATED'
+}), false)
 assert.deepEqual(missingChapterStructureFields({
   chapterNumber: 1,
   dramatic_contract: Object.fromEntries([

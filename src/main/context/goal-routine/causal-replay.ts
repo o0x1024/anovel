@@ -1,6 +1,10 @@
-import { applyCausalChapterOutcome, type CausalChapterOutcome, type CausalNarrativeState } from '../../../shared/causal-novel-types'
+import type { CausalChapterOutcome, CausalNarrativeState } from '../../../shared/causal-novel-types'
 import { causalNovelDAO, getDatabase, volumeChapterDAO } from '../../db'
-import { commitPreparedNarrativeMemory, prepareNarrativeMemoryAfterGeneration } from './story-goal-doer'
+import {
+  commitPreparedNarrativeMemory,
+  prepareNarrativeMemoryAfterGeneration,
+  type PreparedNarrativeMemory
+} from './story-goal-doer'
 import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-goal-routine'
 import type { StoryGoalConfig } from './story-goal-checker'
 import { extractCausalOutcome } from './causal-novel-engine'
@@ -93,28 +97,34 @@ export async function processPendingCausalReplay(
     onProgress?.(`重放 3/4：逐章验证 ${job.affectedChapterIds.length} 个后续章节`)
     for (const chapterId of job.affectedChapterIds) {
       activeChapterId = chapterId
-      const decision = causalNovelDAO.getDecision(chapterId)
       const chapter = volumeChapterDAO.getChapter(chapterId)
-      if (!decision?.outcome || !chapter?.content?.trim()) {
-        throw new Error(`后续章节 ${chapterId} 缺少已提交结果或正文`)
+      if (!causalNovelDAO.getDecision(chapterId)?.outcome || !chapter?.content?.trim()) {
+        throw new Error(`后续章节 ${chapterId} 缺少已提交决策、结果或正文`)
       }
       const contentVersion = causalNovelDAO.ensureCurrentContentVersion(
         workId, chapterId, 'replay_rebind', 'generated'
       )
-      const nextState = applyCausalChapterOutcome(
-        workingState, decision.outcome, ordinalOf(chapterId), chapter.content
+      onProgress?.(`重放语义审计：重新提取「${chapter.title}」在新前置状态下的章后结果`)
+      // 不能把旧 outcome 机械套到新状态。重新运行完整证据与蕴含协议；
+      // 若旧决策、正文或承诺不再能由新前置状态推出，提取会失败并把重放停在第一处冲突。
+      const replayed = await extractCausalOutcome(
+        workId,
+        chapterId,
+        signal,
+        message => onProgress?.(`重放提取：${message}`),
+        { baseState: workingState, allowCommittedDecision: true, ordinal: ordinalOf(chapterId) }
       )
       transitions.push({
         chapterId,
         contentVersionId: contentVersion.id,
         stateBeforeRevision: workingState.revision,
-        nextState,
-        outcome: decision.outcome
+        nextState: replayed.state,
+        outcome: replayed.outcome
       })
-      workingState = nextState
+      workingState = replayed.state
     }
 
-    const preparedMemories = []
+    const preparedMemories: Array<{ chapterId: number; prepared: PreparedNarrativeMemory }> = []
     for (const transition of transitions) {
       activeChapterId = transition.chapterId
       const chapter = volumeChapterDAO.getChapter(transition.chapterId)

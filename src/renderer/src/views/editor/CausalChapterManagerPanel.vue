@@ -774,8 +774,9 @@ onUnmounted(() => {
               <div v-if="decisionPlan" class="space-y-2">
                 <h3 class="font-semibold text-sm">候选事件与评分</h3>
                 <div v-for="candidate in decisionPlan.candidates" :key="candidate.id" class="rounded-lg border p-3" :class="candidate.id === decisionPlan.selectedCandidateId ? 'border-primary bg-primary/5' : 'border-base-300'">
-                  <div class="flex gap-2"><span class="font-semibold text-sm">{{ candidate.action }}</span><span class="badge badge-xs ml-auto">{{ candidate.scores.total }}分</span></div>
+                  <div class="flex gap-2"><span class="font-semibold text-sm">{{ candidate.action }}</span><span class="badge badge-outline badge-xs">{{ candidate.chapterFunction || 'legacy' }}</span><span class="badge badge-xs ml-auto">{{ candidate.scores.total }}分</span></div>
                   <p class="text-xs text-base-content/50 mt-1">阻力：{{ candidate.opposition }} · 代价：{{ candidate.cost }}</p>
+                  <p class="text-[11px] text-base-content/40 mt-1">节奏适配：{{ candidate.scores.pacingFitness ?? '旧协议未评分' }}</p>
                 </div>
               </div>
               <div v-if="decisionPlan?.rollingHorizon?.length" class="space-y-2">

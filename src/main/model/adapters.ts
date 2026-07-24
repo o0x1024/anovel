@@ -32,8 +32,33 @@ function responseShape(data: unknown): string {
   if (typeof data !== 'object') return typeof data
   const record = data as Record<string, unknown>
   const keys = Object.keys(record).slice(0, 12).join(',') || 'none'
-  const choices = Array.isArray(record.choices) ? record.choices.length : 'missing'
-  return `keys=${keys}; choices=${choices}`
+  const choices = Array.isArray(record.choices) ? record.choices : []
+  const firstChoice = choices[0] && typeof choices[0] === 'object'
+    ? choices[0] as Record<string, unknown>
+    : undefined
+  const message = firstChoice?.message && typeof firstChoice.message === 'object'
+    ? firstChoice.message as Record<string, unknown>
+    : undefined
+  const choiceKeys = firstChoice ? Object.keys(firstChoice).slice(0, 10).join(',') || 'none' : 'none'
+  const messageKeys = message ? Object.keys(message).slice(0, 10).join(',') || 'none' : 'none'
+  const usage = record.usage && typeof record.usage === 'object'
+    ? record.usage as Record<string, unknown>
+    : undefined
+  const completionTokens = typeof usage?.completion_tokens === 'number'
+    ? usage.completion_tokens
+    : 'unknown'
+  const content = contentText(message?.content ?? message?.text ?? firstChoice?.text ?? record.output_text)
+  const reasoning = contentText(message?.reasoning_content ?? message?.reasoning)
+  return [
+    `keys=${keys}`,
+    `choices=${Array.isArray(record.choices) ? choices.length : 'missing'}`,
+    `choiceKeys=${choiceKeys}`,
+    `messageKeys=${messageKeys}`,
+    `finishReason=${String(firstChoice?.finish_reason ?? 'missing')}`,
+    `contentChars=${content.length}`,
+    `reasoningChars=${reasoning.length}`,
+    `completionTokens=${completionTokens}`
+  ].join('; ')
 }
 
 function upstreamErrorMessage(data: unknown): string | undefined {
@@ -56,15 +81,15 @@ function upstreamErrorMessage(data: unknown): string | undefined {
 
 function contentText(value: unknown): string {
   if (typeof value === 'string') return value
-  if (!Array.isArray(value)) return ''
-  return value
-    .map((item) => {
-      if (typeof item === 'string') return item
-      if (!item || typeof item !== 'object') return ''
-      const text = (item as Record<string, unknown>).text
-      return typeof text === 'string' ? text : ''
-    })
-    .join('')
+  if (Array.isArray(value)) return value.map(contentText).join('')
+  if (!value || typeof value !== 'object') return ''
+  const record = value as Record<string, unknown>
+  if (typeof record.text === 'string') return record.text
+  if (typeof record.value === 'string') return record.value
+  if (typeof record.content === 'string' || Array.isArray(record.content)) {
+    return contentText(record.content)
+  }
+  return ''
 }
 
 function parseOpenAICompatiblePayload(data: unknown, status?: number): OpenAICompatiblePayload {
@@ -78,7 +103,7 @@ function parseOpenAICompatiblePayload(data: unknown, status?: number): OpenAICom
   const message = firstChoice?.message && typeof firstChoice.message === 'object'
     ? firstChoice.message as Record<string, unknown>
     : undefined
-  const content = contentText(message?.content)
+  const content = contentText(message?.content ?? message?.text ?? firstChoice?.text ?? record.output_text)
   if (!content.trim()) {
     const upstreamError = upstreamErrorMessage(data)
     const statusLabel = status ? `HTTP ${status}` : 'HTTP 2xx'
@@ -175,10 +200,14 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       try {
         payload = parseOpenAICompatiblePayload(response.data, response.status)
       } catch (error) {
-        if (!schemaEnabled) throw error
-        delete body.response_format
-        schemaEnabled = false
-        appLogger.warn('model', '结构化响应为空或不兼容，移除 JSON Schema 后有限重试', {
+        const retryingWithoutSchema = schemaEnabled
+        if (retryingWithoutSchema) {
+          delete body.response_format
+          schemaEnabled = false
+        }
+        appLogger.warn('model', retryingWithoutSchema
+          ? '结构化响应为空或不兼容，移除 JSON Schema 后有限重试'
+          : 'OpenAI 兼容响应为空或不兼容，进行一次有限重试', {
           step: request.step,
           workId: request.workId,
           reason: error instanceof Error ? error.message : String(error)

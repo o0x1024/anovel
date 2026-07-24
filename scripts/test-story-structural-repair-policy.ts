@@ -5,6 +5,13 @@ import {
   routineFailureSignature,
   structuralRepairTokenBudget
 } from '../src/main/context/goal-routine/story-structural-repair-policy'
+import { resolveGenerationMaxTokens } from '../src/main/model/generation-token-budget'
+
+assert.equal(resolveGenerationMaxTokens(undefined, 5250), 5250)
+assert.equal(resolveGenerationMaxTokens(12000, 5250), 5250)
+assert.equal(resolveGenerationMaxTokens(2600, 5250), 2600)
+assert.equal(resolveGenerationMaxTokens(2600.9, 5250.9), 2600)
+assert.equal(resolveGenerationMaxTokens(0, 5250), 5250)
 
 assert.equal(structuralRepairTokenBudget(22528, 1, 1), 6000)
 assert.equal(structuralRepairTokenBudget(22528, 1, 2), 12000)

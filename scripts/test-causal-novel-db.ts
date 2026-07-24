@@ -324,11 +324,48 @@ async function main(): Promise<void> {
       completionStatus: 'proposed',
       completionReason: '主角已经作出不可逆选择'
     }, { transitionType: 'test_completion_proposed' })
-    const completed = causalNovelDAO.confirmCompletion(workId, 4, '独立终审确认完成')
+    const atomicityReplay = causalNovelDAO.queueReplay({
+      workId,
+      chapterId,
+      baseStateRevision: 0,
+      sourceVersionId: immutableVersions[0].id,
+      targetVersionId: factualCandidate.id,
+      editKind: 'factual',
+      affectedChapterIds: []
+    })
+    assert.throws(() => getDatabase().transaction(() => {
+      causalNovelDAO.confirmCompletion(workId, 4, '不应单独提交的完结状态')
+      causalNovelDAO.createReleaseSnapshot(workId)
+    })(), /未完成因果重放/)
+    assert.equal(causalNovelDAO.getState(workId)?.revision, 4)
+    assert.equal(causalNovelDAO.getState(workId)?.completionStatus, 'proposed')
+    causalNovelDAO.cancelReplay(atomicityReplay.id)
+    causalNovelDAO.activateContentVersion({
+      workId,
+      chapterId,
+      contentVersionId: immutableVersions[0].id,
+      stateBeforeRevision: 0,
+      stateAfterRevision: 1,
+      decisionStatus: 'committed',
+      bindingStatus: 'active'
+    })
+    const releaseResult = getDatabase().transaction(() => {
+      const completed = causalNovelDAO.confirmCompletion(workId, 4, '独立终审确认完成')
+      const snapshotId = causalNovelDAO.createReleaseSnapshot(workId)
+      return { completed, snapshotId }
+    })()
+    const { completed } = releaseResult
     assert.equal(completed.revision, 5)
     assert.equal(completed.completionStatus, 'completed')
     assert.equal(completed.completed, true)
     assert.equal(causalNovelDAO.getStateRevision(workId, 5)?.transitionType, 'completion_confirmed')
+    const releaseSnapshot = getDatabase().prepare(
+      'SELECT content_hash, snapshot_json, is_frozen FROM story_release_snapshots WHERE id = ?'
+    ).get(releaseResult.snapshotId) as { content_hash: string; snapshot_json: string; is_frozen: number }
+    assert.equal(releaseSnapshot.is_frozen, 1)
+    assert.equal(releaseSnapshot.content_hash.length, 64)
+    assert.match(releaseSnapshot.snapshot_json, /causal_novel_release_v1/)
+    assert.match(releaseSnapshot.snapshot_json, /activeContentVersions/)
 
     coreSettingDAO.upsert(workId, 'emotion_engine', '错误传统情绪发动机第一版')
     coreSettingDAO.upsert(workId, 'emotion_engine', '错误传统情绪发动机第二版')

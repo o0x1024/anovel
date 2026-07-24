@@ -90,7 +90,45 @@ async function main(): Promise<void> {
     )
     assert.equal(plainEmpty.success, false)
     assert.match(plainEmpty.error ?? '', /choices=0/)
-    assert.equal(call, 1)
+    assert.equal(call, 2)
+
+    call = 0
+    axios.post = (async (_url: string, body: Record<string, unknown>) => {
+      bodies.push(structuredClone(body))
+      call++
+      return call === 1
+        ? {
+            status: 200,
+            data: {
+              choices: [{
+                message: { content: '', reasoning_content: 'internal reasoning' },
+                finish_reason: 'length'
+              }],
+              usage: { completion_tokens: 1200 }
+            }
+          }
+        : {
+            status: 200,
+            data: {
+              choices: [{ text: 'recovered plain text', finish_reason: 'stop' }],
+              usage: { completion_tokens: 4 }
+            }
+          }
+    }) as AxiosPost
+
+    const recoveredPlain = await adapter.chat(
+      { prompt: 'plain retry', thinkingEnabled: false },
+      'test-key',
+      'https://example.invalid/v1',
+      'deepseek/deepseek-v4-flash',
+      { stream: false }
+    )
+    assert.equal(recoveredPlain.success, true)
+    assert.equal(recoveredPlain.content, 'recovered plain text')
+    assert.equal(call, 2)
+    const retryBodies = bodies.slice(-2)
+    assert.deepEqual(retryBodies[0].thinking, { type: 'disabled' })
+    assert.deepEqual(retryBodies[1].thinking, { type: 'disabled' })
 
     axios.post = (async () => ({
       status: 200,

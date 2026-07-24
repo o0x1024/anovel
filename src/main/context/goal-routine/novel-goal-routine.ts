@@ -117,6 +117,7 @@ import {
   resolveNovelChapterRecoveryAction,
   resolveNovelPreparationPhase,
   shouldContinueNovelAfterVolumeRepairBoundary,
+  shouldPauseForNovelConstructionOutputFailure,
   shouldExtendNovelConstructionBudget,
   shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
@@ -2474,6 +2475,21 @@ export async function runNovelGoalLoop(
             summary: msg
           })
           emit(`章节候选已保留；评估器证据协议连续 3 次失败，已保存断点并暂停，不会重复改写或空转：${msg}`, 'paused')
+          return
+        }
+        if (shouldPauseForNovelConstructionOutputFailure({
+          phase: attemptedPhase,
+          errorCode
+        })) {
+          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'output_truncation_pause',
+            summary: msg
+          })
+          emit(`结构合同已动态扩容重试但仍被截断；已保留前序章节检查点并暂停，禁止跨轮空转：${msg}`, 'paused')
           return
         }
         const boundaryState = readNovelGoalState(workId)

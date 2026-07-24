@@ -4,6 +4,7 @@ import { useBodyGenerationModel } from '../../composables/useBodyGenerationModel
 import {
   STORY_GOAL_ROUTINE_PHASE_ORDER,
   NOVEL_GOAL_ROUTINE_PHASE_ORDER,
+  getGoalRoutinePhaseOrder,
   getGoalRoutinePhaseLabels,
   goalRoutinePhaseLabel,
   isGoalRoutinePhase,
@@ -17,10 +18,13 @@ import {
   type QualityAiMetricKey
 } from '../../../../shared/quality-ai-score'
 
-const props = defineProps<{ workId: number; workType?: 'novel' | 'story' }>()
+const props = defineProps<{ workId: number; workType?: 'novel' | 'story' | 'causal_novel' }>()
 const { modelParams: bodyModelParams } = useBodyGenerationModel(() => props.workId)
 
 const availablePhases = computed<GoalRoutinePhase[]>(() => {
+  if (props.workType === 'causal_novel') {
+    return getGoalRoutinePhaseOrder(props.workType)
+  }
   if (props.workType === 'novel') {
     return config.value.incubatorEnabled
       ? [...STORY_GOAL_ROUTINE_PHASE_ORDER.slice(0, 3), ...NOVEL_GOAL_ROUTINE_PHASE_ORDER]
@@ -62,7 +66,7 @@ const DEFAULT_CONFIG: GoalConfig = {
   humanReviewTitleHook: false,
   checkConsistencyGate: true,
   checkAntiAiRules: true,
-  maxTurns: props.workType === 'novel' ? 60 : 30,
+  maxTurns: props.workType === 'story' ? 30 : 60,
   goalMatchMin: 85,
   overallStoryMin: 80,
   previewHookMin: 75,
@@ -177,6 +181,10 @@ const lastMessage = ref('')
 const lastStatus = ref('')
 const lastCheck = ref<GoalCheckResult | null>(null)
 const terminalReason = ref<string | null>(null)
+const causalWorldSeed = ref('')
+const savedCausalWorldSeed = ref('')
+const causalStateInitialized = ref(false)
+const savingCausalWorldSeed = ref(false)
 
 const statusLabel = computed(() => {
   const s = state.value?.status
@@ -203,15 +211,31 @@ const phaseLabel = computed(() => goalRoutinePhaseLabel(state.value?.current_pha
 const liveTurn = ref<GoalProgressEvent | null>(null)
 const canResume = computed(() => {
   const s = state.value?.status
-  if (!s || s === 'goal_met' || s === 'timeout') return false
+  if (!s || s === 'goal_met') return false
   if (running.value && s === 'running') return false
-  return s === 'paused' || s === 'cancelled'
+  return s === 'paused' || s === 'cancelled' || s === 'timeout'
     || (s === 'running' && !running.value)
 })
 
 const resumeLabel = computed(() =>
-  state.value?.status === 'timeout' ? '继续运行' : '断点续跑'
+  props.workType === 'causal_novel'
+    ? '继续运行'
+    : state.value?.status === 'timeout' ? '继续运行' : '断点续跑'
 )
+
+const startLabel = computed(() => {
+  if (props.workType !== 'causal_novel') {
+    return terminalReason.value === 'needs_manual_editor'
+      ? '重新验收当前正文'
+      : canResume.value
+        ? '放弃断点并启动新一轮'
+        : state.value?.status === 'timeout' && !state.value?.goal_met
+          ? '继续运行'
+          : '启动目标循环'
+  }
+  if (!causalStateInitialized.value) return '初始化并启动自动写作'
+  return '启动新一轮'
+})
 
 const canContinueRepair = computed(() => {
   const s = state.value
@@ -225,6 +249,7 @@ const resumeFromPhase = ref<GoalRoutinePhase>(availablePhases.value[0] ?? 'mater
 const phasePickerTouched = ref(false)
 
 const showResumePhasePicker = computed(() => {
+  if (props.workType === 'causal_novel') return false
   if (running.value) return false
   const s = state.value
   if (!s) return false
@@ -237,7 +262,7 @@ function normalizePhase(phase: string | null | undefined): GoalRoutinePhase {
   if (phase && isGoalRoutinePhase(phase) && availablePhases.value.includes(phase)) {
     return phase
   }
-  return availablePhases.value[0] ?? NOVEL_START_PHASE
+  return availablePhases.value[0] ?? 'materialize_settings'
 }
 
 function syncResumePhaseFromState(): void {
@@ -287,6 +312,50 @@ const previewRatioPct = computed({
   get: () => Math.round(config.value.previewRatio * 100),
   set: (v: number) => { config.value.previewRatio = Math.max(0.01, Math.min(0.95, v / 100)) }
 })
+
+async function refreshCausalContext(preserveDraft = true): Promise<void> {
+  if (props.workType !== 'causal_novel') return
+  const draftBeforeRefresh = causalWorldSeed.value
+  const savedBeforeRefresh = savedCausalWorldSeed.value
+  const [workInfo, causalSnapshot] = await Promise.all([
+    window.anovel.invoke('work:get', props.workId) as Promise<{ description: string | null }>,
+    window.anovel.invoke('causal:getState', props.workId) as Promise<{ state: unknown | null }>
+  ])
+  const persistedSeed = workInfo.description ?? ''
+  if (!preserveDraft || draftBeforeRefresh === savedBeforeRefresh) {
+    causalWorldSeed.value = persistedSeed
+  }
+  savedCausalWorldSeed.value = persistedSeed
+  causalStateInitialized.value = Boolean(causalSnapshot.state)
+}
+
+async function persistCausalWorldSeedBeforeStart(): Promise<boolean> {
+  if (props.workType !== 'causal_novel') return true
+  await refreshCausalContext(true)
+  if (causalStateInitialized.value) return true
+
+  const seed = causalWorldSeed.value.trim()
+  if (!seed && !config.value.goalDescription.trim()) {
+    lastStatus.value = 'error'
+    lastMessage.value = '请先填写世界起点；只填一个题材词也可以，例如“丧尸修仙”。'
+    return false
+  }
+  if (seed === savedCausalWorldSeed.value.trim()) return true
+
+  savingCausalWorldSeed.value = true
+  try {
+    await window.anovel.invoke('work:update', props.workId, { description: seed })
+    causalWorldSeed.value = seed
+    savedCausalWorldSeed.value = seed
+    return true
+  } catch (error) {
+    lastStatus.value = 'error'
+    lastMessage.value = `保存世界起点失败：${error instanceof Error ? error.message : String(error)}`
+    return false
+  } finally {
+    savingCausalWorldSeed.value = false
+  }
+}
 
 async function refreshState() {
   const res = await window.anovel.invoke('goal:getState', props.workId) as {
@@ -373,17 +442,20 @@ function resumeInvokePayload() {
 
 async function start() {
   if (running.value) return
+  if (!await persistCausalWorldSeedBeforeStart()) return
   if (canResume.value) {
-    const confirmed = window.confirm(
-      '当前存在可恢复断点。“启动新一轮”会将轮次归零并可能重新执行所选阶段；已有正文和版本不会删除。若要保留原轮次，请取消并点击“断点续跑”。\n\n确定放弃本次断点位置并启动新一轮吗？'
-    )
+    const confirmed = window.confirm(props.workType === 'causal_novel'
+      ? '当前存在可继续的因果写作断点。“启动新一轮”会将本次轮次重新计数，但不会清除正文、章节决策或权威状态。若要沿用断点，请取消并点击“继续运行”。\n\n确定启动新一轮吗？'
+      : '当前存在可恢复断点。“启动新一轮”会将轮次归零并可能重新执行所选阶段；已有正文和版本不会删除。若要保留原轮次，请取消并点击“断点续跑”。\n\n确定放弃本次断点位置并启动新一轮吗？')
     if (!confirmed) return
   }
   const useResumePayload = showResumePhasePicker.value
   const payload = useResumePayload ? resumeInvokePayload() : goalInvokePayload()
   const message = useResumePayload
     ? `从「${goalRoutinePhaseLabel(resumeFromPhase.value, props.workType)}」启动新一轮…`
-    : '目标循环启动新一轮…'
+    : props.workType === 'causal_novel'
+      ? causalStateInitialized.value ? '正在从当前权威状态启动新一轮…' : '正在从世界起点建立权威状态并自动写作…'
+      : '目标循环启动新一轮…'
   phasePickerTouched.value = false
   running.value = true
   lastStatus.value = 'running'
@@ -391,6 +463,7 @@ async function start() {
   liveTurn.value = null
   await window.anovel.invoke('goal:start', props.workId, payload)
   await refreshState()
+  await refreshCausalContext(true)
 }
 
 async function cancel() {
@@ -400,11 +473,16 @@ async function cancel() {
 
 async function resume() {
   if (running.value) return
+  if (!await persistCausalWorldSeedBeforeStart()) return
   const payload = goalInvokePayload()
   const savedPhase = normalizePhase(state.value?.current_phase)
   const message = state.value?.status === 'timeout'
-    ? `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」继续运行…`
-    : `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」续跑…`
+    ? props.workType === 'causal_novel'
+      ? '正在从最后一次安全提交继续因果写作…'
+      : `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」继续运行…`
+    : props.workType === 'causal_novel'
+      ? '正在从最后一次安全提交继续因果写作…'
+      : `从断点「${goalRoutinePhaseLabel(savedPhase, props.workType)}」续跑…`
   phasePickerTouched.value = false
   running.value = true
   lastStatus.value = 'running'
@@ -412,6 +490,7 @@ async function resume() {
   liveTurn.value = null
   await window.anovel.invoke('goal:resume', props.workId, payload)
   await refreshState()
+  await refreshCausalContext(true)
 }
 
 async function resumeAtPhase(phase: GoalRoutinePhase, message: string) {
@@ -465,10 +544,12 @@ function onProgress(payload: unknown) {
 onMounted(() => {
   window.anovel.on('goal:progress', onProgress)
   void refreshState()
+  void refreshCausalContext(false)
 })
 
 onActivated(() => {
   void refreshState()
+  void refreshCausalContext(true)
 })
 
 onUnmounted(() => {
@@ -478,7 +559,11 @@ onUnmounted(() => {
 watch(() => props.workId, () => {
   config.value = loadConfig()
   phasePickerTouched.value = false
+  causalWorldSeed.value = ''
+  savedCausalWorldSeed.value = ''
+  causalStateInitialized.value = false
   void refreshState()
+  void refreshCausalContext(false)
 })
 
 watch(config, saveConfig, { deep: true })
@@ -492,24 +577,60 @@ watch(config, saveConfig, { deep: true })
       </div>
       <div>
         <h3 class="text-lg font-bold">目标循环</h3>
-        <p class="text-xs text-base-content/50">给定创作目标，AI 自主生成一篇完整{{ workType === 'novel' ? '小说' : '短故事' }}直到达成或轮次上限</p>
+        <p class="text-xs text-base-content/50">
+          {{ workType === 'causal_novel'
+            ? '唯一运行入口：设置世界起点和轮次预算，自动滚动生成章节，直到收束或本次预算用完'
+            : `给定创作目标，AI 自主生成一篇完整${workType === 'story' ? '短故事' : '小说'}直到达成或轮次上限` }}
+        </p>
       </div>
       <span class="badge badge-sm ml-auto" :class="statusBadge">{{ statusLabel }}</span>
     </div>
 
+    <div v-if="workType === 'causal_novel'" class="card bg-base-200 border border-base-300 shadow-sm p-5 space-y-3">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h4 class="font-semibold text-sm">世界起点</h4>
+          <p class="text-xs text-base-content/40 mt-1">
+            {{ causalStateInitialized
+              ? '权威状态已经建立。此处只读；后续世界变化只能由已提交的正文事实推进。'
+              : '只输入题材也可以，系统会扩展人物、规则、压力、承诺和阶段锚点；不要填写全书章节大纲。' }}
+          </p>
+        </div>
+        <span class="badge badge-sm" :class="causalStateInitialized ? 'badge-success' : 'badge-outline'">
+          {{ causalStateInitialized ? '已初始化' : '待初始化' }}
+        </span>
+      </div>
+      <textarea
+        v-model="causalWorldSeed"
+        rows="5"
+        :disabled="causalStateInitialized || running || savingCausalWorldSeed"
+        class="textarea textarea-bordered w-full text-sm leading-relaxed"
+        placeholder="例如：丧尸修仙。也可以补充世界规则、主角、力量代价、基调或禁止方向。"
+      />
+      <p v-if="!causalStateInitialized" class="text-[11px] text-base-content/40 leading-relaxed">
+        点击下方“初始化并启动自动写作”时自动保存并建立权威状态，无需单独初始化。
+      </p>
+    </div>
+
     <!-- 创作目标（自由文字） -->
     <div class="card bg-base-200 border border-base-300 shadow-sm p-5 space-y-3">
-      <h4 class="font-semibold text-sm">创作目标</h4>
+      <h4 class="font-semibold text-sm">{{ workType === 'causal_novel' ? '本轮创作目标（可选）' : '创作目标' }}</h4>
       <textarea
         v-model="config.goalDescription"
         :disabled="running"
         rows="3"
-        :placeholder="workType === 'novel'
+        :placeholder="workType === 'causal_novel'
+          ? '可选：补充本轮关注点、风格或边界。它不会被当作未来章节大纲；留空时系统按当前权威状态自主推进。'
+          : workType === 'novel'
           ? '描述你想要的小说：题材、风格、主角、情节走向、结局要求……例如「都市重生，男主修仙，20章，逆袭爽文」'
           : '描述你想要的故事：题材、风格、主角、情节走向、结局要求……例如「都市言情，女主复仇，5个节拍，反转结局」'"
         class="textarea textarea-bordered w-full text-sm rounded-lg resize-none leading-relaxed"
       ></textarea>
-      <p class="text-xs text-base-content/40">会自动回填：{{ workType === 'novel' ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 整体自检 → 分卷大纲 → 章节大纲 → 书名导语 → 正文生成' : '核心设定 → 主角人设卡 → 故事发动机 → 节拍大纲 → 书名导语 → 整体自检 → 正文生成' }}；进度区会显示当前子步骤。</p>
+      <p class="text-xs text-base-content/40">{{ workType === 'causal_novel' ? '自动执行' : '会自动回填' }}：{{ workType === 'causal_novel'
+        ? '权威状态 → 下一章候选与独立评分 → 正文门禁 → 章后事实 → 原子提交'
+        : workType === 'novel'
+          ? (config.incubatorEnabled ? '大纲孵化 → AI 门禁/冻结 → ' : '') + '核心设定 → 主角人设卡 → 整体自检 → 分卷大纲 → 章节大纲 → 书名导语 → 正文生成'
+          : '核心设定 → 主角人设卡 → 故事发动机 → 节拍大纲 → 书名导语 → 整体自检 → 正文生成' }}；进度区会显示当前子步骤。</p>
       <label v-if="workType === 'novel'" class="flex items-center gap-2 text-xs cursor-pointer pt-1 border-t border-base-300/40">
         <input v-model="config.incubatorEnabled" type="checkbox" :disabled="running"
           class="checkbox checkbox-xs checkbox-primary" />
@@ -641,12 +762,13 @@ watch(config, saveConfig, { deep: true })
         <div class="rounded-xl bg-base-100 border border-base-300/70 p-4 space-y-3">
           <p class="text-xs font-bold text-base-content/70">运行控制</p>
           <label class="flex items-center justify-between gap-3 text-xs">
-            <span>轮次上限</span>
+            <span>{{ workType === 'causal_novel' ? '本次运行轮次预算' : '轮次上限' }}</span>
             <input v-model.number="config.maxTurns" type="number" min="1" step="1"
               :disabled="running" class="input input-bordered input-xs w-20 rounded-lg text-right" />
           </label>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">达到用户设置的轮次上限后保留正文与候选并暂停，不会自动修改运行预算。</p>
-          <p class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节大纲、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
+          <p class="text-[11px] text-base-content/40 leading-relaxed">可输入任意大于等于 1 的整数。达到预算后保留正文、候选、检查点和权威状态并暂停。</p>
+          <p v-if="workType === 'causal_novel'" class="text-[11px] text-base-content/40 leading-relaxed">因果模式中，每次“启动新一轮”或“继续运行”都使用这里当前设置的预算；它不是整部作品的累计寿命上限。</p>
+          <p v-else class="text-[11px] text-base-content/40 leading-relaxed">轮次包含{{ workType === 'novel' ? '核心设定、卡片、整体自检、分卷大纲、章节大纲、书名导语、正文生成、验收和修复' : '核心设定、卡片、故事发动机、节拍、书名导语、自检、正文、验收和修复' }}阶段。</p>
         </div>
       </div>
 
@@ -663,7 +785,9 @@ watch(config, saveConfig, { deep: true })
           </option>
         </select>
         <p class="text-[11px] text-base-content/40 leading-relaxed">
-          “启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”严格恢复已保存步骤并保留原轮次。已有作品内容不会被自动清除。
+          {{ workType === 'causal_novel'
+            ? '“启动新一轮”或“继续运行”会从安全检查点恢复，并按当前自定义预算重新计数；已有正文、版本和权威状态不会被清除。'
+            : '“启动目标循环”会从所选步骤开启新一轮并将轮次归零；“断点续跑”严格恢复已保存步骤并保留原轮次。已有作品内容不会被自动清除。' }}
         </p>
         <p v-if="workType === 'novel'" class="text-[11px] text-warning/80 leading-relaxed">
           长篇会按“本卷大纲 → 本卷正文 → 冻结”滚动运行；整书终审只读。终审未过时，只有手动点击“继续修复”才会改写，且自动范围限于尾部 8 章。
@@ -680,13 +804,11 @@ watch(config, saveConfig, { deep: true })
           <font-awesome-icon icon="stethoscope" class="w-3.5 h-3.5" />
           重新验收已有正文
         </button>
-        <button v-if="!running" class="btn btn-primary btn-sm gap-2" @click="start">
+        <button v-if="!running" class="btn btn-primary btn-sm gap-2" :disabled="savingCausalWorldSeed" @click="start">
           <font-awesome-icon icon="play" class="w-3.5 h-3.5" />
-          {{ terminalReason === 'needs_manual_editor'
-            ? '重新验收当前正文'
-            : (canResume ? '放弃断点并启动新一轮' : (state?.status === 'timeout' && !state?.goal_met ? '继续运行' : '启动目标循环')) }}
+          {{ savingCausalWorldSeed ? '保存世界起点…' : startLabel }}
         </button>
-        <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" @click="resume">
+        <button v-if="!running && canResume" class="btn btn-warning btn-sm gap-2" :disabled="savingCausalWorldSeed" @click="resume">
           <font-awesome-icon icon="forward" class="w-3.5 h-3.5" />
           {{ resumeLabel }}
         </button>

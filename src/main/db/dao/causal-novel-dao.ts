@@ -770,6 +770,72 @@ export class CausalNovelDAO extends BaseDAO {
     return next
   }
 
+  createReleaseSnapshot(workId: number, label = 'causal_release_ready'): number {
+    return this.transaction(() => {
+      const state = this.getState(workId)
+      if (!state?.completed || state.completionStatus !== 'completed') {
+        throw new Error('因果小说尚未确认完结，禁止创建发布快照')
+      }
+      const unfinished = this.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM causal_chapter_decisions
+         WHERE work_id = ? AND status <> 'committed'`,
+        [workId]
+      )?.n ?? 0
+      if (unfinished > 0) throw new Error(`仍有 ${unfinished} 个未提交因果决策，禁止创建发布快照`)
+      const replaying = this.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM causal_replay_jobs
+         WHERE work_id = ? AND status IN ('pending', 'running', 'blocked')`,
+        [workId]
+      )?.n ?? 0
+      if (replaying > 0) throw new Error(`仍有 ${replaying} 个未完成因果重放，禁止创建发布快照`)
+      const staleBindings = this.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM causal_chapter_bindings
+         WHERE work_id = ? AND binding_status <> 'active'`,
+        [workId]
+      )?.n ?? 0
+      if (staleBindings > 0) throw new Error(`仍有 ${staleBindings} 个非权威正文绑定，禁止创建发布快照`)
+      const work = this.get<Record<string, unknown>>('SELECT * FROM works WHERE id = ?', [workId])
+      const chapters = this.all<Record<string, unknown>>(
+        `SELECT c.*, v.name AS volume_name, v.sort AS volume_sort
+         FROM chapters c JOIN volumes v ON v.id = c.volume_id
+         WHERE v.work_id = ? ORDER BY v.sort, c.sort`,
+        [workId]
+      )
+      if (!work || chapters.length === 0 || chapters.some(item => !String(item.content ?? '').trim())) {
+        throw new Error('作品或完整正文不存在，禁止创建发布快照')
+      }
+      const snapshot = JSON.stringify({
+        protocol: 'causal_novel_release_v1',
+        work,
+        chapters,
+        state,
+        stateRevisions: this.all<Record<string, unknown>>(
+          'SELECT * FROM causal_state_revisions WHERE work_id = ? ORDER BY revision',
+          [workId]
+        ),
+        decisions: this.all<Record<string, unknown>>(
+          'SELECT * FROM causal_chapter_decisions WHERE work_id = ? ORDER BY chapter_id',
+          [workId]
+        ),
+        bindings: this.all<Record<string, unknown>>(
+          'SELECT * FROM causal_chapter_bindings WHERE work_id = ? ORDER BY chapter_id',
+          [workId]
+        ),
+        activeContentVersions: this.all<Record<string, unknown>>(
+          `SELECT * FROM causal_content_versions
+           WHERE work_id = ? AND status = 'active' ORDER BY chapter_id`,
+          [workId]
+        )
+      })
+      return this.insert(
+        `INSERT INTO story_release_snapshots (
+          work_id, label, content_hash, snapshot_json, is_frozen
+        ) VALUES (?, ?, ?, ?, 1)`,
+        [workId, label, createHash('sha256').update(snapshot).digest('hex'), snapshot]
+      )
+    })
+  }
+
   rejectProposedCompletion(
     workId: number,
     expectedRevision: number,

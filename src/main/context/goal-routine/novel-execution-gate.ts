@@ -775,10 +775,11 @@ function evaluatorProtocolFailure(message: string): NovelExecutionGateResult {
 
 function modelProtocolError(
   response: Awaited<ReturnType<typeof modelService.chat>>,
-  fallback: string
+  fallback: string,
+  outputLabel = '评估器输出'
 ): string {
   if (response.finishReason === 'length') {
-    return 'truncation_failure：评估器输出达到长度上限（finishReason=length）'
+    return `truncation_failure：${outputLabel}达到长度上限（finishReason=length）`
   }
   if (!response.success || !response.content?.trim()) {
     return `transport_failure：${response.error || fallback}`
@@ -1335,36 +1336,50 @@ export async function repairNovelExecutionCandidate(
   signal?: AbortSignal
 ): Promise<{ success: boolean; content: string; error?: string }> {
   const previous = previousChapterTail(workId, chapterId)
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      chapterId,
-      step: 'novel_execution_repair',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0.25,
-      maxTokens: Math.max(6000, Math.min(12000, Math.ceil(countWords(content) * 2))),
-      systemPrompt: [
-        '你是长篇小说章节执行修复编辑。只输出修复后的完整正文，不要解释、标题或 Markdown。',
-        '只修复门禁指出的遗漏、概括带过、提前越界和跨章断裂；保留已通过的事件、人物表达和文风。',
-        '补写遗漏时必须融入原有因果顺序，不能把情节点作为说明句硬插入；删除越界内容后要让相邻段落自然接合。',
-        '开头必须写上一章末尾之后发生的新结果，禁止复述上一章。结尾必须停在合同落点。',
-        `修复后的完整正文必须保持在 ${contract.wordMin}-${contract.wordMax} 字；优先替换或删除重复解释，不得靠堆叠说明句扩写。`
-      ].join('\n'),
-      prompt: [
-        formatChapterExecutionContract(contract),
-        previous ? `【上一章最终正文尾部】\n${previous}` : '',
-        `【必须修复的问题】\n${blockers.map((item, index) => `${index + 1}. ${item}`).join('\n')}`,
-        `【待修复正文】\n${content}`
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim() || response.finishReason === 'length') {
+  const maxTokens = Math.max(6000, Math.min(12000, Math.ceil(countWords(content) * 2)))
+  let response: Awaited<ReturnType<typeof modelService.chat>> | undefined
+  for (let attempt = 0; attempt < 2; attempt++) {
+    response = await modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        chapterId,
+        step: 'novel_execution_repair',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        forceThinkingDisabled: true,
+        temperature: attempt === 0 ? 0.25 : 0.1,
+        maxTokens,
+        systemPrompt: [
+          '你是长篇小说章节执行修复编辑。只输出修复后的完整正文，不要解释、标题或 Markdown。',
+          '只修复门禁指出的遗漏、概括带过、提前越界和跨章断裂；保留已通过的事件、人物表达和文风。',
+          '补写遗漏时必须融入原有因果顺序，不能把情节点作为说明句硬插入；删除越界内容后要让相邻段落自然接合。',
+          '开头必须写上一章末尾之后发生的新结果，禁止复述上一章。结尾必须停在合同落点。',
+          `修复后的完整正文必须保持在 ${contract.wordMin}-${contract.wordMax} 字；优先替换或删除重复解释，不得靠堆叠说明句扩写。`,
+          attempt > 0
+            ? `上一轮输出触及长度上限。本轮必须在 ${contract.wordMax} 字以内完整收尾；只改阻塞项，每个阻塞项使用最少必要句段，删除重复动作、解释和氛围铺陈。`
+            : ''
+        ].filter(Boolean).join('\n'),
+        prompt: [
+          formatChapterExecutionContract(contract),
+          previous ? `【上一章最终正文尾部】\n${previous}` : '',
+          `【必须修复的问题】\n${blockers.map((item, index) => `${index + 1}. ${item}`).join('\n')}`,
+          `【待修复正文】\n${content}`
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+    if (response.success && response.content?.trim() && response.finishReason !== 'length') {
+      return { success: true, content: response.content.trim() }
+    }
+    if (response.cancelled || response.finishReason !== 'length') break
+  }
+  if (!response || !response.success || !response.content?.trim() || response.finishReason === 'length') {
     return {
       success: false,
       content,
-      error: modelProtocolError(response, '章节执行定向修复失败')
+      error: response
+        ? modelProtocolError(response, '章节执行定向修复失败', '章节修复正文')
+        : '章节执行定向修复失败'
     }
   }
   return { success: true, content: response.content.trim() }
