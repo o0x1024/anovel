@@ -17,6 +17,24 @@ interface ParsedVolume {
   description: string
 }
 
+interface NovelReplanPreview {
+  workId: number
+  title: string
+  volumeCount: number
+  chapterCount: number
+  bodyChapterCount: number
+  totalWordCount: number
+  authorityDecisionCount: number
+  coreSettingCount: number
+}
+
+interface NovelReplanResult extends NovelReplanPreview {
+  settingsMode: 'preserve' | 'regenerate'
+  databaseBackupPath: string
+  workBackupPath: string
+  nextPhase: 'materialize_settings'
+}
+
 const volumes = ref<{ id: number; name: string; description: string | null; sort: number }[]>([])
 const newVolumeName = ref('')
 const addingVolume = ref(false)
@@ -41,6 +59,21 @@ const volumeFixResult = ref('')
 
 const batchSelectMode = ref(false)
 const batchSelectedIds = ref<Set<number>>(new Set())
+const currentWorkTitle = ref('')
+const replanModalOpen = ref(false)
+const replanPreview = ref<NovelReplanPreview | null>(null)
+const replanSettingsMode = ref<'preserve' | 'regenerate'>('preserve')
+const replanConfirmationTitle = ref('')
+const replanLoading = ref(false)
+const replanError = ref('')
+const replanResult = ref<NovelReplanResult | null>(null)
+
+const canConfirmReplan = computed(() =>
+  !replanLoading.value
+  && !!replanPreview.value
+  && replanConfirmationTitle.value.trim().normalize('NFC')
+    === currentWorkTitle.value.trim().normalize('NFC')
+)
 
 const diagnosisConclusion = computed(() => {
   if (!volumeDiagnosisResult.value) return ''
@@ -147,7 +180,12 @@ function isInvalidVolumeName(name: string): boolean {
 }
 
 async function loadVolumes() {
-  volumes.value = await window.anovel.invoke('volume:list', props.workId) as never[]
+  const [volumeRows, work] = await Promise.all([
+    window.anovel.invoke('volume:list', props.workId),
+    window.anovel.invoke('work:get', props.workId)
+  ])
+  volumes.value = volumeRows as never[]
+  currentWorkTitle.value = String((work as { title?: string } | null)?.title ?? '')
 }
 
 async function addVolume() {
@@ -160,9 +198,52 @@ async function addVolume() {
 }
 
 async function deleteVolume(id: number, name: string) {
-  if (!confirm(`删除分卷「${name}」？`)) return
+  if (!confirm(`删除分卷「${name}」会同时永久删除该卷全部章节正文和历史版本。确定继续？`)) return
   await window.anovel.invoke('volume:delete', id)
   await loadVolumes()
+}
+
+async function openReplanModal() {
+  replanModalOpen.value = true
+  replanLoading.value = true
+  replanError.value = ''
+  replanResult.value = null
+  replanConfirmationTitle.value = ''
+  replanSettingsMode.value = 'preserve'
+  try {
+    replanPreview.value = await window.anovel.invoke(
+      'novel:previewReplanReset',
+      props.workId
+    ) as NovelReplanPreview
+  } catch (cause) {
+    replanError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    replanLoading.value = false
+  }
+}
+
+function closeReplanModal() {
+  if (replanLoading.value) return
+  replanModalOpen.value = false
+}
+
+async function confirmReplanReset() {
+  if (!canConfirmReplan.value) return
+  replanLoading.value = true
+  replanError.value = ''
+  try {
+    replanResult.value = await window.anovel.invoke('novel:restartPlanning', {
+      workId: props.workId,
+      confirmationTitle: replanConfirmationTitle.value,
+      settingsMode: replanSettingsMode.value
+    }) as NovelReplanResult
+    await loadVolumes()
+    await nav?.refreshProgress()
+  } catch (cause) {
+    replanError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    replanLoading.value = false
+  }
 }
 
 function toggleBatchSelect() {
@@ -188,10 +269,8 @@ function selectAllVolumes() {
 async function batchDeleteVolumes() {
   const count = batchSelectedIds.value.size
   if (count === 0) return
-  if (!confirm(`确定删除选中的 ${count} 个分卷？此操作不可撤销。`)) return
-  for (const id of batchSelectedIds.value) {
-    await window.anovel.invoke('volume:delete', id)
-  }
+  if (!confirm(`确定删除选中的 ${count} 个分卷？这些分卷下的章节正文和历史版本会一起永久删除。`)) return
+  await window.anovel.invoke('volume:batchDelete', [...batchSelectedIds.value])
   batchSelectedIds.value = new Set()
   batchSelectMode.value = false
   await loadVolumes()
@@ -581,16 +660,25 @@ function aiSuggestionSummary(): string {
             <h4 class="font-semibold text-sm">分卷列表</h4>
             <p v-if="volumes.length" class="text-xs text-base-content/50 mt-0.5">共 {{ volumes.length }} 卷</p>
           </div>
-          <button
-            v-if="volumes.length"
-            type="button"
-            class="btn btn-outline btn-xs gap-1"
-            :class="batchSelectMode ? 'btn-error' : 'btn-neutral'"
-            @click="toggleBatchSelect"
-          >
-            <font-awesome-icon icon="check-double" class="w-3 h-3" />
-            {{ batchSelectMode ? '退出批量' : '批量操作' }}
-          </button>
+          <div v-if="volumes.length" class="flex items-center gap-2">
+            <button
+              type="button"
+              class="btn btn-outline btn-error btn-xs gap-1"
+              @click="openReplanModal"
+            >
+              <font-awesome-icon icon="rotate" class="w-3 h-3" />
+              重新规划整本
+            </button>
+            <button
+              type="button"
+              class="btn btn-outline btn-xs gap-1"
+              :class="batchSelectMode ? 'btn-error' : 'btn-neutral'"
+              @click="toggleBatchSelect"
+            >
+              <font-awesome-icon icon="check-double" class="w-3 h-3" />
+              {{ batchSelectMode ? '退出批量' : '批量操作' }}
+            </button>
+          </div>
         </div>
         <div v-if="batchSelectMode" class="flex items-center gap-2 mt-2">
           <button type="button" class="btn btn-ghost btn-xs" @click="selectAllVolumes">
@@ -684,6 +772,88 @@ function aiSuggestionSummary(): string {
         </div>
       </div>
     </div>
+
+    <dialog class="modal" :class="{ 'modal-open': replanModalOpen }">
+      <div class="modal-box max-w-xl">
+        <h3 class="font-bold text-lg">重新规划整本小说</h3>
+        <p class="mt-2 text-sm text-base-content/65">
+          该操作不是普通删除：系统会先保存数据库备份和可导入作品备份，然后一次性清理全部分卷、章节正文、历史版本、因果状态、资源账本和目标循环检查点。
+        </p>
+
+        <div v-if="replanLoading && !replanPreview" class="py-8 text-center text-base-content/50">
+          <span class="loading loading-spinner loading-sm mr-2" />正在核对可删除范围…
+        </div>
+
+        <template v-else-if="replanPreview">
+          <div class="alert alert-warning mt-4 text-sm">
+            <div>
+              <div class="font-semibold">将清理 {{ replanPreview.volumeCount }} 卷、{{ replanPreview.chapterCount }} 章</div>
+              <div class="mt-1 opacity-80">
+                其中 {{ replanPreview.bodyChapterCount }} 章已有正文，共 {{ replanPreview.totalWordCount.toLocaleString() }} 字；
+                {{ replanPreview.authorityDecisionCount }} 个权威章节事务也会重置。
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-5 space-y-2">
+            <div class="text-sm font-semibold">新一轮保留哪些设定？</div>
+            <label class="flex gap-3 rounded-lg border border-primary/40 bg-primary/5 p-3 cursor-pointer">
+              <input v-model="replanSettingsMode" type="radio" value="preserve" class="radio radio-primary radio-sm mt-0.5" />
+              <span>
+                <span class="block text-sm font-medium">保留核心设定（推荐）</span>
+                <span class="block text-xs text-base-content/60 mt-1">保留人物、世界观、金手指、主线、角色卡、灵感和文风，只重做分卷与章节。</span>
+              </span>
+            </label>
+            <label class="flex gap-3 rounded-lg border border-base-300 p-3 cursor-pointer">
+              <input v-model="replanSettingsMode" type="radio" value="regenerate" class="radio radio-error radio-sm mt-0.5" />
+              <span>
+                <span class="block text-sm font-medium">重新生成核心设定</span>
+                <span class="block text-xs text-base-content/60 mt-1">只保留作品基本信息、初始灵感和文风；清空其他核心设定、角色卡、锚点与名称登记。</span>
+              </span>
+            </label>
+          </div>
+
+          <div class="form-control mt-5">
+            <label class="label"><span class="label-text text-sm">输入作品名确认</span></label>
+            <div class="rounded bg-base-200 px-3 py-2 text-sm font-medium select-all">{{ currentWorkTitle }}</div>
+            <input
+              v-model="replanConfirmationTitle"
+              class="input input-bordered mt-2"
+              :placeholder="currentWorkTitle"
+              autocomplete="off"
+            />
+          </div>
+
+          <div v-if="replanError" class="alert alert-error mt-4 text-sm">{{ replanError }}</div>
+          <div v-if="replanResult" class="alert alert-success mt-4 text-sm">
+            <div class="min-w-0">
+              <div class="font-semibold">重新规划准备完成，当前作品已回到设定检查阶段。</div>
+              <div class="mt-2 break-all">数据库备份：{{ replanResult.databaseBackupPath }}</div>
+              <div class="mt-1 break-all">作品备份：{{ replanResult.workBackupPath }}</div>
+            </div>
+          </div>
+        </template>
+
+        <div class="modal-action">
+          <button type="button" class="btn btn-ghost" :disabled="replanLoading" @click="closeReplanModal">
+            {{ replanResult ? '完成' : '取消' }}
+          </button>
+          <button
+            v-if="!replanResult"
+            type="button"
+            class="btn btn-error"
+            :disabled="!canConfirmReplan"
+            @click="confirmReplanReset"
+          >
+            <span v-if="replanLoading" class="loading loading-spinner loading-sm" />
+            备份并重新规划
+          </button>
+        </div>
+      </div>
+      <form method="dialog" class="modal-backdrop" @submit.prevent="closeReplanModal">
+        <button type="submit">关闭</button>
+      </form>
+    </dialog>
 
     <StepNavFooter step="volumes" class="mt-4" />
   </div>

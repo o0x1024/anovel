@@ -87,7 +87,11 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'quality_diagnosis_ai', label: 'AI 质量诊断' },
       { step: 'emotion_blind_read', label: '情绪盲读门禁' },
       { step: 'emotion_target_compare', label: '情绪目标比较' },
+      { step: 'emotion_repair', label: '情绪问题修复' },
       { step: 'emotion_state_extract', label: '情绪状态提取' },
+      { step: 'novel_execution_gate', label: '章节执行门禁' },
+      { step: 'novel_execution_gate_coverage', label: '章节执行证据取证' },
+      { step: 'novel_execution_gate_safety', label: '章节边界与连续性' },
       { step: 'critique_dual_channel', label: '双通道批判' },
       { step: 'critique_apply_fixes', label: '批判修复' },
       { step: 'milestone_audit_scan', label: '里程碑审计' },
@@ -125,6 +129,8 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'story_whole_evaluation', label: '短故事整篇终审' },
       { step: 'story_forensic_audit', label: '短故事法医审计' },
       { step: 'story_prose_blind_read', label: '短故事原文盲读' },
+      { step: 'story_release_promise_gate', label: '短故事发布兑现合同' },
+      { step: 'story_compliance_gate', label: '短故事事实与平台合规' },
       { step: 'story_title_hook_pairwise', label: '书名导语盲评' },
       { step: 'story_repair_pairwise', label: '改稿前后盲评' },
       { step: 'story_repair_blueprint', label: '结构层修复' },
@@ -134,11 +140,12 @@ export const STEP_MODEL_GROUPS: StepModelGroupDef[] = [
       { step: 'goal_novel_volume_plan', label: '长篇分卷合同' },
       { step: 'goal_novel_chapter_batch', label: '长篇章节批次' },
       { step: 'goal_novel_chapter_contract', label: '长篇单章结构合同' },
-      { step: 'goal_novel_causal_state', label: '因果小说初始状态' },
-      { step: 'goal_novel_causal_decision', label: '因果小说下一章决策' },
-      { step: 'goal_novel_causal_outcome', label: '因果小说章后状态提交' },
+      { step: 'goal_novel_causal_state', label: '小说权威状态初始化' },
+      { step: 'goal_novel_causal_decision', label: '小说章级因果决策' },
+      { step: 'goal_novel_causal_outcome', label: '小说章后状态提交' },
       { step: 'goal_novel_volume_chapter_gate', label: '长篇分卷章节窗口门禁' },
       { step: 'goal_novel_volume_chapter_repair', label: '长篇分卷章节定点修复' },
+      { step: 'goal_novel_release_window_audit', label: '长篇八章首发窗口审读' },
       { step: 'goal_novel_volume_evaluation', label: '长篇分卷终审' },
       { step: 'goal_novel_whole_evaluation', label: '长篇整书终审' },
     ]
@@ -163,8 +170,8 @@ export function getStepLabel(step: string): string {
   return step
 }
 
-/** 仅正文生成采纳作品「正文模型槽位」（正文工作台 / 目标循环正文配置） */
-export const WORK_BODY_SLOT_STEPS = new Set(['body_generation'])
+/** 正文及其分场景执行器采纳作品「正文模型槽位」。 */
+export const WORK_BODY_SLOT_STEPS = new Set(['body_generation', 'body_length_normalization'])
 
 /**
  * 采纳调用方显式传入的模型（诊断槽位、助手选模等），非正文槽位。

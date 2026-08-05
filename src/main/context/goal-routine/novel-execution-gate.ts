@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto'
 import { modelService } from '../../model'
 import { volumeChapterDAO } from '../../db'
 import { countWords } from '../../../shared/body-word-target'
-import { extractJsonText } from '../parse-json-extract'
-import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
+import { isModelCapabilityUnsupported } from '../../../shared/model-capability-error'
+import { classifyWorkflowError } from '../../workflow/workflow-errors'
+import { requestStructuredModelOutput } from './structured-model-output'
 import {
   formatChapterExecutionContract,
   type ChapterExecutionContract
@@ -30,10 +31,7 @@ export interface NovelExecutionGateResult {
   evaluatorProtocolErrors?: string[]
 }
 
-function responseSchema(contract: ChapterExecutionContract): Record<string, unknown> {
-  const requirements = contract.requirements.length > 0
-    ? contract.requirements
-    : contract.requiredEvents.map((description, index) => ({ id: `R${String(index + 1).padStart(3, '0')}`, description }))
+function responseSchema(): Record<string, unknown> {
   const violationSchema = {
     type: 'object',
     additionalProperties: false,
@@ -43,7 +41,6 @@ function responseSchema(contract: ChapterExecutionContract): Record<string, unkn
       evidence_ids: {
         type: 'array',
         minItems: 1,
-        maxItems: 6,
         items: { type: 'string', pattern: '^[CP][0-9]{3}$' }
       }
     }
@@ -56,22 +53,20 @@ function responseSchema(contract: ChapterExecutionContract): Record<string, unkn
       passed: { type: 'boolean' },
       coverage: {
         type: 'array',
-        minItems: requirements.length,
-        maxItems: requirements.length,
+        minItems: 1,
         items: {
           type: 'object',
           additionalProperties: false,
           required: ['requirement_id', 'verdict', 'evidence_ids', 'reason'],
           properties: {
-            requirement_id: { type: 'string', enum: requirements.map(item => item.id) },
+            requirement_id: { type: 'string' },
             verdict: { type: 'string', enum: ['covered', 'partial', 'missing'] },
             evidence_ids: {
               type: 'array',
               minItems: 0,
-              maxItems: 6,
               items: { type: 'string', pattern: '^C[0-9]{3}$' }
             },
-            reason: { type: 'string', maxLength: 160 }
+            reason: { type: 'string' }
           }
         }
       },
@@ -79,118 +74,7 @@ function responseSchema(contract: ChapterExecutionContract): Record<string, unkn
       continuity_blockers: { type: 'array', items: violationSchema },
       warnings: {
         type: 'array',
-        maxItems: 6,
-        items: { type: 'string', maxLength: 160 }
-      }
-    }
-  }
-}
-
-function coverageResponseSchema(
-  requirements: Array<{ id: string; description: string }>
-): Record<string, unknown> {
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['coverage'],
-    properties: {
-      coverage: {
-        type: 'array',
-        minItems: requirements.length,
-        maxItems: requirements.length,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['requirement_id', 'verdict', 'evidence_ids', 'reason'],
-          properties: {
-            requirement_id: { type: 'string', enum: requirements.map(item => item.id) },
-            verdict: { type: 'string', enum: ['covered', 'partial', 'missing'] },
-            evidence_ids: {
-              type: 'array',
-              minItems: 0,
-              maxItems: 6,
-              items: { type: 'string', pattern: '^C[0-9]{3}$' }
-            },
-            reason: { type: 'string', maxLength: 160 }
-          }
-        }
-      }
-    }
-  }
-}
-
-function singleCoverageResponseSchema(): Record<string, unknown> {
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['verdict', 'evidence_ids', 'reason'],
-    properties: {
-      verdict: { type: 'string', enum: ['covered', 'partial', 'missing'] },
-      evidence_ids: {
-        type: 'array',
-        minItems: 0,
-        maxItems: 6,
-        items: { type: 'string', pattern: '^C[0-9]{3}$' }
-      },
-      reason: { type: 'string', maxLength: 120 }
-    }
-  }
-}
-
-function safetyResponseSchema(): Record<string, unknown> {
-  const violationSchema = {
-    type: 'object',
-    additionalProperties: false,
-    required: ['description', 'evidence_ids'],
-    properties: {
-      description: { type: 'string', maxLength: 200 },
-      evidence_ids: {
-        type: 'array',
-        minItems: 1,
-        maxItems: 6,
-        items: { type: 'string', pattern: '^[CP][0-9]{3}$' }
-      }
-    }
-  }
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['forbidden_violations', 'continuity_blockers', 'warnings'],
-    properties: {
-      forbidden_violations: { type: 'array', maxItems: 12, items: violationSchema },
-      continuity_blockers: { type: 'array', maxItems: 12, items: violationSchema },
-      warnings: {
-        type: 'array',
-        maxItems: 6,
-        items: { type: 'string', maxLength: 160 }
-      }
-    }
-  }
-}
-
-function violationResponseSchema(): Record<string, unknown> {
-  return {
-    type: 'object',
-    additionalProperties: false,
-    required: ['violations'],
-    properties: {
-      violations: {
-        type: 'array',
-        maxItems: 12,
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['description', 'evidence_ids'],
-          properties: {
-            description: { type: 'string', maxLength: 200 },
-            evidence_ids: {
-              type: 'array',
-              minItems: 1,
-              maxItems: 6,
-              items: { type: 'string', pattern: '^[CP][0-9]{3}$' }
-            }
-          }
-        }
+        items: { type: 'string' }
       }
     }
   }
@@ -737,7 +621,8 @@ export function normalizeNovelExecutionAssessment(
   const coverageBlockers = coverage
     .filter(item => item.verdict !== 'covered')
     .map(item => `${item.verdict === 'partial' ? '情节仅部分落地' : '情节缺失'}：${item.requirementId} ${item.event}${item.reason ? `（${item.reason}）` : ''}`)
-  const wordBlocker = actualWordCount < contract.wordMin || actualWordCount > contract.wordMax
+  const wordBlocker = actualWordCount < contract.wordMin
+    || actualWordCount > contract.wordMax
     ? [`章节字数 ${actualWordCount} 不在合同范围 ${contract.wordMin}-${contract.wordMax}`]
     : []
   const blockers = [
@@ -773,11 +658,23 @@ function evaluatorProtocolFailure(message: string): NovelExecutionGateResult {
   }
 }
 
-function modelProtocolError(
+class NovelExecutionProtocolValidationError extends Error {
+  readonly code = 'EVALUATOR_PROTOCOL'
+
+  constructor(public readonly issues: string[]) {
+    super(issues.join('；') || '章节执行门禁证据协议无效')
+    this.name = 'NovelExecutionProtocolValidationError'
+  }
+}
+
+export function novelExecutionModelProtocolError(
   response: Awaited<ReturnType<typeof modelService.chat>>,
   fallback: string,
   outputLabel = '评估器输出'
 ): string {
+  if (isModelCapabilityUnsupported(response.error ?? '')) {
+    return `capability_failure：${response.error}`
+  }
   if (response.finishReason === 'length') {
     return `truncation_failure：${outputLabel}达到长度上限（finishReason=length）`
   }
@@ -785,19 +682,6 @@ function modelProtocolError(
     return `transport_failure：${response.error || fallback}`
   }
   return `protocol_failure：${response.error || fallback}`
-}
-
-function parseAssessmentValue(content: string): unknown {
-  const json = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
-  return parseJsonObjectWithRepairs<Record<string, unknown>>(json).value as unknown
-}
-
-function parseAssessmentObject(content: string): Record<string, unknown> {
-  const value = parseAssessmentValue(content)
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('评估器没有返回 JSON 对象')
-  }
-  return value as Record<string, unknown>
 }
 
 function previousChapterTail(workId: number, chapterId: number): string {
@@ -825,7 +709,7 @@ export async function assessNovelExecutionCandidate(
   const previousLedger = buildNovelEvidenceLedger(previous, 'P')
   const requirements = contractRequirements(contract)
   const contentHash = novelExecutionContentHash(content)
-  let checkpoint = readNovelExecutionGateCheckpoint(
+  const checkpoint = readNovelExecutionGateCheckpoint(
     chapterId,
     contract.sourceOutlineHash,
     contentHash
@@ -834,497 +718,107 @@ export async function assessNovelExecutionCandidate(
   const cachedCoverage = (checkpoint?.coverage ?? []).filter(row =>
     validRequirementIds.has(String(row.requirement_id ?? ''))
   )
-  const response = cachedCoverage.length > 0
-    ? null
-    : await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      chapterId,
-      step: 'novel_execution_gate',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: novelExecutionGateMaxTokens(requirements.length),
-      forceThinkingDisabled: true,
-      responseSchema: { name: 'novel_execution_gate', schema: responseSchema(contract), strict: false },
-      systemPrompt: [
-        '你是长篇小说章节执行法医。只核验大纲事件覆盖、禁止越界和跨章状态，不评价文笔。',
-        `coverage 必须严格返回 ${requirements.length} 行，与 R 编号验收项一一对应。`,
-        'covered/partial 的 evidence_ids 只能选择候选正文中实际列出的 C 编号；不要复制原文，不要使用上一章的 P 编号。',
-        'covered 必须至少有一个 C 证据；partial 必须给出已经局部落地的 C 证据；找不到任何 C 证据时必须判 missing 并返回空数组。一个验收项可引用多个不连续的 C 编号。',
-        'forbidden_violations 每项必须返回 description 和当前正文 C evidence_ids；continuity_blockers 每项必须返回 description 和相关 C/P evidence_ids。没有问题就返回空数组。',
-        'partial 只表示合同要求的关键动作、选择或结果确实缺少；动作链分散在多个句段、使用同义表达或与下一验收项连续衔接，不得因此判 partial。',
-        '若正文通过可定位动作表现出目标结果（例如藏匿、遮盖、压住物资已经实现“保住物资”），即使没有复述合同原句也应判 covered。',
-        '相邻验收项存在先后转折时分别按各自阶段判断，例如先避战保护物资、后被迫交战；不得因为后续行为不同而否定前一阶段已经完成的动作。missing 或 partial 都会阻止提交。',
-        '以下情况必须 continuity_blockers：开头复述上一章；时间地点无过渡跳变；人物位置、伤势、资源或知情状态无来源变化；上一章未完成动作被跳过；结尾越过合同落点。',
-        'reason 每项不超过 80 个汉字，warnings 最多 6 项；不要复述正文。',
-        '不要按关键词机械匹配，要判断语义事件是否真实发生。只输出 JSON。'
-      ].join('\n'),
-      prompt: [
-        formatChapterExecutionContract(contract),
-        `【逐项验收合同】\n${requirements.map(item => `${item.id} ${item.description}`).join('\n')}`,
-        previousLedger.length > 0
-          ? `【上一章参考句段；仅供连续性判断，禁止作为 coverage 证据】\n${formatEvidenceLedger(previousLedger)}`
-          : '【上一章】无，这是第一章',
-        `【候选正文证据账本，系统计数 ${countWords(content)} 字】\n${formatEvidenceLedger(candidateLedger)}`,
-        protocolFeedback.length > 0
-          ? `【上次返回的协议错误；只修正这些格式问题，不改变语义判断】\n${protocolFeedback.join('\n')}`
-          : ''
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  let fullProtocolError = ''
-  if (!response) {
-    fullProtocolError = `已恢复 ${cachedCoverage.length}/${requirements.length} 个逐项证据检查点`
-  } else if (shouldSplitNovelExecutionResponse(response)) {
-    fullProtocolError = modelProtocolError(response, '章节执行门禁无返回')
-  } else {
-    try {
-      const assessment = normalizeNovelExecutionAssessment(
-        parseAssessmentObject(response.content),
-        contract,
-        candidateLedger,
-        countWords(content),
-        previousLedger
-      )
-      if (!isNovelExecutionEvaluatorFailure(assessment.blockers)) return assessment
-      fullProtocolError = assessment.evaluatorProtocolErrors?.join('；')
-        || '整批评估证据协议无效'
-    } catch (error) {
-      fullProtocolError = error instanceof Error
-        ? error.message
-        : '章节执行门禁返回格式无效'
-    }
-  }
-
-  // 整批响应一旦截断或协议失效，就缩成最多两个验收项一批。
-  // 每批仍读取完整证据账本，但只产生很小的 JSON；最终 passed 由程序计算。
-  const coverage: unknown[] = [...cachedCoverage]
-  const completedRequirementIds = new Set(
-    cachedCoverage.map(row => String(row.requirement_id ?? ''))
-  )
-  for (const plannedBatch of splitNovelExecutionRequirements(requirements)) {
-    const batch = plannedBatch.filter(item => !completedRequirementIds.has(item.id))
-    if (batch.length === 0) continue
-    const batchResponse = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId,
-        chapterId,
-        step: 'novel_execution_gate_coverage',
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false,
-        temperature: 0,
-        maxTokens: Math.max(1800, batch.length * 700),
-        forceThinkingDisabled: true,
-        responseSchema: {
-          name: 'novel_execution_gate_coverage',
-          schema: coverageResponseSchema(batch),
-          strict: false
-        },
-        systemPrompt: [
-          '你是章节情节点取证器，只核验本批指定验收项。',
-          '每个验收项必须返回一行。covered/partial 只能引用当前正文 C 编号；missing 返回空 evidence_ids。',
-          'reason 不超过 80 个汉字，不要复述正文，只输出 JSON。'
-        ].join('\n'),
-        prompt: [
-          `【本批验收项】\n${batch.map(item => `${item.id} ${item.description}`).join('\n')}`,
-          `【候选正文证据账本】\n${formatEvidenceLedger(candidateLedger)}`,
-          `【降级原因】整批协议失败：${fullProtocolError}。本次只返回本批 coverage。`
-        ].join('\n\n')
-      }),
-      { stream: false, signal }
-    )
-    let batchRows: unknown[] | null = null
-    let batchError = ''
-    try {
-      if (shouldSplitNovelExecutionResponse(batchResponse)) {
-        batchError = modelProtocolError(batchResponse, '模型未返回内容')
-      } else {
-        batchRows = normalizeNovelCoverageRows(parseAssessmentValue(batchResponse.content))
-        if (!batchRows) {
-          batchError = '返回值不包含 coverage 数组、根数组或单项对象'
-        } else if (!novelCoverageRowsMatchRequirementIds(
-          batchRows,
-          batch.map(item => item.id)
-        )) {
-          batchError = '返回的验收项缺失、重复或编号不匹配'
-          batchRows = null
-        } else {
-          const canonicalRows: Record<string, unknown>[] = []
-          for (const requirement of batch) {
-            const raw = batchRows.find(item =>
-              item
-              && typeof item === 'object'
-              && !Array.isArray(item)
-              && String((item as Record<string, unknown>).requirement_id ?? '') === requirement.id
-            )
-            const coerced = coerceNovelSingleCoverageRow(
-              raw,
-              raw ? JSON.stringify(raw) : '',
-              requirement.id
-            )
-            const verdict = String(coerced?.verdict ?? '')
-            const requestedEvidence = strings(coerced?.evidence_ids, 6)
-            const validEvidence = requestedEvidence.filter(id =>
-              candidateLedger.some(segment => segment.id === id)
-            )
-            if (
-              !coerced
-              || requestedEvidence.length !== validEvidence.length
-              || ((verdict === 'covered' || verdict === 'partial') && validEvidence.length === 0)
-            ) {
-              batchError = `${requirement.id} 的判定或证据编号无效`
-              batchRows = null
-              break
-            }
-            canonicalRows.push({ ...coerced, evidence_ids: validEvidence })
-          }
-          if (batchRows) batchRows = canonicalRows
-        }
-      }
-    } catch (error) {
-      batchError = error instanceof Error ? error.message : '无法解析 JSON'
-    }
-    if (batchRows) {
-      coverage.push(...batchRows)
-      for (const item of batchRows) {
-        if (item && typeof item === 'object' && !Array.isArray(item)) {
-          completedRequirementIds.add(String((item as Record<string, unknown>).requirement_id ?? ''))
-        }
-      }
-      checkpoint = persistNovelExecutionGateCheckpoint(
-        chapterId,
-        content,
-        contract.sourceOutlineHash,
-        { coverage: coverage.filter((item): item is Record<string, unknown> => (
-          Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-        )) }
-      )
-      continue
-    }
-
-    // 两项批次失败后继续缩成单项；单项第二次重试提高预算，绝不原样重放。
-    for (const requirement of batch) {
-      let row: unknown | null = null
-      let singleError = batchError
-      for (let attempt = 1; attempt <= 2 && row == null; attempt++) {
-        const singleResponse = await modelService.chat(
-          withGoalLoopModelOptions(workId, {
-            workId,
-            chapterId,
-            step: 'novel_execution_gate_coverage',
-            enrichWorkContext: false,
-            enrichNarrativeMemory: false,
-            temperature: 0,
-            maxTokens: attempt === 1 ? 1800 : 800,
-            forceThinkingDisabled: true,
-            ...(attempt === 1
-              ? {
-                  responseSchema: {
-                    name: 'novel_execution_gate_coverage_single_v2',
-                    schema: singleCoverageResponseSchema(),
-                    strict: false
-                  }
-                }
-              : {}),
-            systemPrompt: attempt === 1
-              ? [
-                  '你是章节单项情节点取证器，本次只核验一个验收项。',
-                  '不要返回 requirement_id，验收项身份由程序绑定。',
-                  '只输出对象：{"verdict":"covered|partial|missing","evidence_ids":["C001"],"reason":"不超过60字"}。',
-                  'covered/partial 只能引用当前正文 C 编号；missing 必须返回空 evidence_ids。'
-                ].join('\n')
-              : [
-                  '你是章节单项情节点取证器。不要输出 JSON、解释或思考过程。',
-                  '只输出一行：covered|C001,C002|原因，或 partial|C001|原因，或 missing||原因。',
-                  '证据只能使用输入中真实存在的 C 编号。'
-                ].join('\n'),
-            prompt: [
-              `【唯一验收项】\n${requirement.id} ${requirement.description}`,
-              `【候选正文证据账本】\n${formatEvidenceLedger(candidateLedger)}`,
-              `【上次失败】${singleError || fullProtocolError}。本次只判断该验收项，禁止回传或改写其编号。`
-            ].join('\n\n')
-          }),
-          { stream: false, signal }
-        )
-        if (shouldSplitNovelExecutionResponse(singleResponse)) {
-          singleError = modelProtocolError(singleResponse, '模型未返回内容')
-          continue
-        }
-        let parsed: unknown = null
-        try {
-          parsed = parseAssessmentValue(singleResponse.content)
-        } catch { /* 第二协议允许非 JSON 紧凑行 */ }
-        const coerced = coerceNovelSingleCoverageRow(
-          parsed,
-          singleResponse.content,
-          requirement.id
-        )
-        if (!coerced) {
-          singleError = '没有返回可识别的 covered/partial/missing 判定'
-          continue
-        }
-        const verdict = String(coerced.verdict ?? '')
-        const requestedEvidence = strings(coerced.evidence_ids, 6)
-        const validEvidence = requestedEvidence.filter(id =>
-          candidateLedger.some(segment => segment.id === id)
-        )
-        if (requestedEvidence.length !== validEvidence.length) {
-          singleError = '返回了当前正文证据账本中不存在的 C 编号'
-          continue
-        }
-        if ((verdict === 'covered' || verdict === 'partial') && validEvidence.length === 0) {
-          singleError = `${verdict} 没有当前正文可定位证据`
-          continue
-        }
-        row = { ...coerced, evidence_ids: validEvidence }
-      }
-      if (!row) {
-        return evaluatorProtocolFailure(
-          `单项 coverage ${requirement.id} 自适应重试失败：${singleError}`
-        )
-      }
-      coverage.push(row)
-      completedRequirementIds.add(requirement.id)
-      checkpoint = persistNovelExecutionGateCheckpoint(
-        chapterId,
-        content,
-        contract.sourceOutlineHash,
-        { coverage: coverage.filter((item): item is Record<string, unknown> => (
-          Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-        )) }
-      )
-    }
-  }
-
-  const candidateEvidenceIds = candidateLedger.map(item => item.id)
-  const continuityEvidenceIds = [...candidateLedger, ...previousLedger].map(item => item.id)
-  const cachedForbidden = checkpoint && Array.isArray(checkpoint.forbidden_violations)
-    ? canonicalizeNovelViolationRows(checkpoint.forbidden_violations, candidateEvidenceIds)
-    : { rows: null, error: '' }
-  const cachedContinuity = checkpoint && Array.isArray(checkpoint.continuity_blockers)
-    ? canonicalizeNovelViolationRows(checkpoint.continuity_blockers, continuityEvidenceIds)
-    : { rows: null, error: '' }
-  let forbiddenRows = cachedForbidden.rows
-  let continuityRows = cachedContinuity.rows
-  const hasCachedSafety = forbiddenRows != null && continuityRows != null
-  const checkpointContainedSafety = Array.isArray(checkpoint?.forbidden_violations)
-    || Array.isArray(checkpoint?.continuity_blockers)
-  if (hasCachedSafety && checkpoint?.protocolVersion === 1) {
-    checkpoint = persistNovelExecutionGateCheckpoint(
-      chapterId,
-      content,
-      contract.sourceOutlineHash,
+  if (cachedCoverage.length === requirements.length && checkpoint) {
+    const restored = normalizeNovelExecutionAssessment(
       {
-        coverage: coverage.filter((item): item is Record<string, unknown> => (
-          Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-        )),
-        forbidden_violations: forbiddenRows ?? [],
-        continuity_blockers: continuityRows ?? [],
+        passed: false,
+        coverage: cachedCoverage,
+        forbidden_violations: checkpoint.forbidden_violations ?? [],
+        continuity_blockers: checkpoint.continuity_blockers ?? [],
         warnings: checkpoint.warnings ?? []
-      }
-    )
-  }
-  const safetyResponse = hasCachedSafety || checkpointContainedSafety
-    ? null
-    : await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      chapterId,
-      step: 'novel_execution_gate_safety',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 2600,
-      forceThinkingDisabled: true,
-      responseSchema: {
-        name: 'novel_execution_gate_safety',
-        schema: safetyResponseSchema(),
-        strict: false
       },
-      systemPrompt: [
-        '你是章节边界取证器，只检查提前越界和跨章连续性，不评价文笔和情节点覆盖。',
-        '所有问题必须引用当前正文 C 编号；连续性问题还可引用上一章 P 编号。没有问题返回空数组。',
-        'description 不超过 100 个汉字，warnings 最多 6 项，不要复述正文，只输出 JSON。'
-      ].join('\n'),
-      prompt: [
-        formatChapterExecutionContract(contract),
-        previousLedger.length > 0
-          ? `【上一章尾部证据账本】\n${formatEvidenceLedger(previousLedger)}`
-          : '【上一章】无，这是第一章',
-        `【候选正文证据账本】\n${formatEvidenceLedger(candidateLedger)}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  let safety: Record<string, unknown> | null = hasCachedSafety
-    ? {
-        forbidden_violations: forbiddenRows ?? [],
-        continuity_blockers: continuityRows ?? [],
-        warnings: checkpoint?.warnings ?? []
-      }
-    : null
-  let safetyError = ''
-  if (safetyResponse) {
-    try {
-      if (shouldSplitNovelExecutionResponse(safetyResponse)) {
-        safetyError = modelProtocolError(safetyResponse, '模型未返回内容')
-      } else {
-        const parsed = parseAssessmentObject(safetyResponse.content)
-        if (
-          Array.isArray(parsed.forbidden_violations)
-          && Array.isArray(parsed.continuity_blockers)
-        ) {
-          const forbidden = canonicalizeNovelViolationRows(
-            parsed.forbidden_violations,
-            candidateEvidenceIds
-          )
-          const continuity = canonicalizeNovelViolationRows(
-            parsed.continuity_blockers,
-            continuityEvidenceIds
-          )
-          forbiddenRows = forbidden.rows
-          continuityRows = continuity.rows
-          if (forbiddenRows != null && continuityRows != null) {
-            safety = {
-              forbidden_violations: forbiddenRows,
-              continuity_blockers: continuityRows,
-              warnings: strings(parsed.warnings, 6)
-            }
-            checkpoint = persistNovelExecutionGateCheckpoint(
-              chapterId,
-              content,
-              contract.sourceOutlineHash,
-              {
-                coverage: coverage.filter((item): item is Record<string, unknown> => (
-                  Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-                )),
-                forbidden_violations: forbiddenRows,
-                continuity_blockers: continuityRows,
-                warnings: strings(parsed.warnings, 6)
-              }
-            )
-          } else {
-            safetyError = [
-              forbidden.rows == null ? `forbidden：${forbidden.error}` : '',
-              continuity.rows == null ? `continuity：${continuity.error}` : ''
-            ].filter(Boolean).join('；')
-          }
-        } else {
-          safetyError = '返回值缺少 forbidden_violations 或 continuity_blockers 数组'
-        }
-      }
-    } catch (error) {
-      safetyError = error instanceof Error ? error.message : '无法解析 JSON'
-    }
+      contract,
+      candidateLedger,
+      countWords(content),
+      previousLedger
+    )
+    if (!isNovelExecutionEvaluatorFailure(restored.blockers)) return restored
   }
 
-  if (!safety) {
-    const requestViolationRows = async (
-      kind: 'forbidden' | 'continuity'
-    ): Promise<{ rows: unknown[] | null; error: string }> => {
-      let lastError = safetyError
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        const response = await modelService.chat(
+  const schema = responseSchema()
+  let lastProtocolError = ''
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await requestStructuredModelOutput<NovelExecutionGateResult>({
+        workId,
+        label: '章节硬合同只读取证',
+        attempts: 1,
+        signal,
+        schema,
+        request: async () => modelService.chat(
           withGoalLoopModelOptions(workId, {
             workId,
             chapterId,
-            step: 'novel_execution_gate_safety',
+            step: 'novel_execution_gate',
             enrichWorkContext: false,
             enrichNarrativeMemory: false,
             temperature: 0,
-            maxTokens: attempt === 1 ? 1800 : 3000,
+            maxTokens: novelExecutionGateMaxTokens(requirements.length),
             forceThinkingDisabled: true,
-            responseSchema: {
-              name: `novel_execution_gate_${kind}`,
-              schema: violationResponseSchema(),
-              strict: false
-            },
-            systemPrompt: kind === 'forbidden'
-              ? [
-                  '你是章节提前越界单项取证器，只检查正文是否发生合同禁止事件或越过结尾落点。',
-                  '问题只能引用当前正文 C 编号。没有问题返回空 violations 数组。',
-                  'description 不超过 80 个汉字，不要复述正文，不要输出思考过程。'
-                ].join('\n')
-              : [
-                  '你是章节连续性单项取证器，只检查上一章到本章的状态衔接。',
-                  '问题必须引用当前正文 C 编号，可同时引用上一章 P 编号。没有问题返回空 violations 数组。',
-                  'description 不超过 80 个汉字，不要复述正文，不要输出思考过程。'
-                ].join('\n'),
+            responseSchema: { name: 'novel_execution_gate', schema, strict: false },
+            structuredOutputMode: 'prompt_json',
+            systemPrompt: [
+              '你是长篇小说章节执行法医。只核验大纲事件覆盖、禁止越界和跨章状态，不评价文笔。',
+              `coverage 必须严格返回 ${requirements.length} 行，与 R 编号验收项一一对应。`,
+              'covered/partial 的 evidence_ids 只能选择候选正文中实际列出的 C 编号；不要复制原文，不要使用上一章的 P 编号。',
+              'covered 必须至少有一个 C 证据；partial 必须给出已经局部落地的 C 证据；找不到任何 C 证据时必须判 missing 并返回空数组。',
+              'forbidden_violations 每项必须返回 description 和当前正文 C evidence_ids；continuity_blockers 每项必须返回 description 和相关 C/P evidence_ids。没有问题就返回空数组。',
+              'missing 或 partial 都会阻止提交；不得为了通过而虚构证据编号。',
+              '以下情况必须 continuity_blockers：开头复述上一章；时间地点无过渡跳变；人物位置、伤势、资源或知情状态无来源变化；上一章未完成动作被跳过；结尾越过合同落点。',
+              'reason 每项不超过 80 个汉字，warnings 最多 6 项；不要复述正文。',
+              '不要按关键词机械匹配，要判断语义事件是否真实发生。只输出 JSON。'
+            ].join('\n'),
             prompt: [
               formatChapterExecutionContract(contract),
-              kind === 'continuity' && previousLedger.length > 0
-                ? `【上一章尾部证据账本】\n${formatEvidenceLedger(previousLedger)}`
-                : '',
-              `【候选正文证据账本】\n${formatEvidenceLedger(candidateLedger)}`,
-              `【上次失败】${lastError || '整批安全协议无效'}。本次只返回 ${kind} violations。`
+              `【逐项验收合同】\n${requirements.map(item => `${item.id} ${item.description}`).join('\n')}`,
+              previousLedger.length > 0
+                ? `【上一章参考句段；仅供连续性判断，禁止作为 coverage 证据】\n${formatEvidenceLedger(previousLedger)}`
+                : '【上一章】无，这是第一章',
+              `【候选正文证据账本，系统计数 ${countWords(content)} 字】\n${formatEvidenceLedger(candidateLedger)}`,
+              [...protocolFeedback, lastProtocolError].filter(Boolean).length > 0
+                ? `【上次返回的协议错误；只修正这些引用和格式问题，不改变语义判断】\n${[
+                    ...protocolFeedback,
+                    lastProtocolError
+                  ].filter(Boolean).join('\n')}`
+                : ''
             ].filter(Boolean).join('\n\n')
           }),
           { stream: false, signal }
-        )
-        if (shouldSplitNovelExecutionResponse(response)) {
-          lastError = modelProtocolError(response, '模型未返回内容')
-          continue
-        }
-        try {
-          const canonical = canonicalizeNovelViolationRows(
-            parseAssessmentValue(response.content),
-            kind === 'forbidden' ? candidateEvidenceIds : continuityEvidenceIds
+        ),
+        validate: value => {
+          const assessment = normalizeNovelExecutionAssessment(
+            value,
+            contract,
+            candidateLedger,
+            countWords(content),
+            previousLedger
           )
-          if (canonical.rows) return { rows: canonical.rows, error: '' }
-          lastError = canonical.error
-        } catch (error) {
-          lastError = error instanceof Error ? error.message : '无法解析 JSON'
+          if (isNovelExecutionEvaluatorFailure(assessment.blockers)) {
+            throw new NovelExecutionProtocolValidationError(
+              assessment.evaluatorProtocolErrors ?? ['整批评估证据协议无效']
+            )
+          }
+          return assessment
         }
+      })
+    } catch (error) {
+      const classified = classifyWorkflowError(error)
+      if (
+        classified.errorClass === 'cancelled'
+        || classified.errorClass === 'transient_transport'
+        || classified.errorClass === 'provider_rate_limit'
+        || classified.errorClass === 'user_action_required'
+      ) {
+        throw error
       }
-      return { rows: null, error: lastError }
+      lastProtocolError = classified.message
     }
-
-    if (forbiddenRows == null) {
-      const forbidden = await requestViolationRows('forbidden')
-      if (!forbidden.rows) {
-        return evaluatorProtocolFailure(
-          `提前越界单项评估失败：${forbidden.error || cachedForbidden.error}`
-        )
-      }
-      forbiddenRows = forbidden.rows
-    }
-    if (continuityRows == null) {
-      const continuity = await requestViolationRows('continuity')
-      if (!continuity.rows) {
-        return evaluatorProtocolFailure(
-          `连续性单项评估失败：${continuity.error || cachedContinuity.error}`
-        )
-      }
-      continuityRows = continuity.rows
-    }
-    safety = {
-      forbidden_violations: forbiddenRows,
-      continuity_blockers: continuityRows,
-      warnings: []
-    }
-    checkpoint = persistNovelExecutionGateCheckpoint(
-      chapterId,
-      content,
-      contract.sourceOutlineHash,
-      {
-        coverage: coverage.filter((item): item is Record<string, unknown> => (
-          Boolean(item) && typeof item === 'object' && !Array.isArray(item)
-        )),
-        forbidden_violations: forbiddenRows,
-        continuity_blockers: continuityRows,
-        warnings: []
-      }
-    )
   }
-  return normalizeNovelExecutionAssessment({
-    passed: false,
-    coverage,
-    forbidden_violations: safety.forbidden_violations,
-    continuity_blockers: safety.continuity_blockers,
-    warnings: safety.warnings
-  }, contract, candidateLedger, countWords(content), previousLedger)
+
+  return evaluatorProtocolFailure(
+    `章节硬合同连续 2 次只读取证仍未形成完整 coverage/safety：${lastProtocolError}`
+  )
+
 }
 
 export async function repairNovelExecutionCandidate(
@@ -1333,10 +827,13 @@ export async function repairNovelExecutionCandidate(
   content: string,
   contract: ChapterExecutionContract,
   blockers: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  outputWordMax?: number
 ): Promise<{ success: boolean; content: string; error?: string }> {
   const previous = previousChapterTail(workId, chapterId)
-  const maxTokens = Math.max(6000, Math.min(12000, Math.ceil(countWords(content) * 2)))
+  const maxTokens = outputWordMax == null
+    ? Math.max(6000, Math.min(12000, Math.ceil(countWords(content) * 2)))
+    : Math.max(2200, Math.ceil(outputWordMax * 1.15))
   let response: Awaited<ReturnType<typeof modelService.chat>> | undefined
   for (let attempt = 0; attempt < 2; attempt++) {
     response = await modelService.chat(
@@ -1355,6 +852,9 @@ export async function repairNovelExecutionCandidate(
           '补写遗漏时必须融入原有因果顺序，不能把情节点作为说明句硬插入；删除越界内容后要让相邻段落自然接合。',
           '开头必须写上一章末尾之后发生的新结果，禁止复述上一章。结尾必须停在合同落点。',
           `修复后的完整正文必须保持在 ${contract.wordMin}-${contract.wordMax} 字；优先替换或删除重复解释，不得靠堆叠说明句扩写。`,
+          outputWordMax == null
+            ? ''
+            : `这是长度收敛事务。输出不得超过 ${outputWordMax} 字；必须主动删去重复解释、同义心理活动、重复动作与不推进的环境描写，禁止复述被删除内容。`,
           attempt > 0
             ? `上一轮输出触及长度上限。本轮必须在 ${contract.wordMax} 字以内完整收尾；只改阻塞项，每个阻塞项使用最少必要句段，删除重复动作、解释和氛围铺陈。`
             : ''
@@ -1378,7 +878,7 @@ export async function repairNovelExecutionCandidate(
       success: false,
       content,
       error: response
-        ? modelProtocolError(response, '章节执行定向修复失败', '章节修复正文')
+        ? novelExecutionModelProtocolError(response, '章节执行定向修复失败', '章节修复正文')
         : '章节执行定向修复失败'
     }
   }
@@ -1391,8 +891,29 @@ export async function convergeNovelExecutionWordRange(
   content: string,
   contract: ChapterExecutionContract,
   signal?: AbortSignal,
-  maxAttempts = 2
+  maxAttempts = 4
 ): Promise<{ success: boolean; content: string; attempts: number; error?: string }> {
+  const softMargin = Math.max(50, Math.round(contract.wordTarget * 0.02))
+
+  const withinSoftBounds = (wordCount: number): boolean =>
+    wordCount >= contract.wordMin - softMargin && wordCount <= contract.wordMax + softMargin
+
+  const trimToWordMax = (text: string): string => {
+    let candidate = text.trim()
+    for (let guard = 0; guard < 80 && countWords(candidate) > contract.wordMax; guard++) {
+      const clipped = candidate
+        .replace(/(?:\n+|[。！？!?；;]+)[^。！？!?\n]*$/u, '')
+        .trim()
+      if (!clipped || clipped === candidate) {
+        const overflow = countWords(candidate) - contract.wordMax
+        candidate = candidate.slice(0, Math.max(0, candidate.length - overflow - 8)).trim()
+        break
+      }
+      candidate = clipped
+    }
+    return candidate
+  }
+
   let candidate = content.trim()
   for (let attempt = 0; attempt <= maxAttempts; attempt++) {
     const wordCount = countWords(candidate)
@@ -1400,6 +921,20 @@ export async function convergeNovelExecutionWordRange(
       return { success: true, content: candidate, attempts: attempt }
     }
     if (attempt === maxAttempts) {
+      if (withinSoftBounds(wordCount)) {
+        return { success: true, content: candidate, attempts: attempt }
+      }
+      if (wordCount > contract.wordMax) {
+        const trimmed = trimToWordMax(candidate)
+        const trimmedCount = countWords(trimmed)
+        if (
+          trimmed
+          && (trimmedCount <= contract.wordMax || withinSoftBounds(trimmedCount))
+          && trimmedCount >= Math.max(1, contract.wordMin - softMargin)
+        ) {
+          return { success: true, content: trimmed, attempts: attempt }
+        }
+      }
       return {
         success: false,
         content: candidate,
@@ -1412,10 +947,25 @@ export async function convergeNovelExecutionWordRange(
       chapterId,
       candidate,
       contract,
-      [`章节字数 ${wordCount} 不在合同范围 ${contract.wordMin}-${contract.wordMax}；只做删减或必要补足，不新增事实`],
-      signal
+      [
+        wordCount > contract.wordMax
+          ? `当前正文 ${wordCount} 字，必须压缩到 ${contract.wordTarget}-${contract.wordMax} 字，至少删除 ${wordCount - contract.wordMax} 个非推进字；不新增事实`
+          : `当前正文 ${wordCount} 字，必须补足到 ${contract.wordMin}-${contract.wordTarget} 字；只补必要行动、因果和场景反馈`
+      ],
+      signal,
+      wordCount > contract.wordMax ? contract.wordMax : undefined
     )
     if (!repaired.success || !repaired.content.trim()) {
+      if (withinSoftBounds(wordCount)) {
+        return { success: true, content: candidate, attempts: attempt + 1 }
+      }
+      if (wordCount > contract.wordMax) {
+        const trimmed = trimToWordMax(candidate)
+        const trimmedCount = countWords(trimmed)
+        if (trimmed && withinSoftBounds(trimmedCount)) {
+          return { success: true, content: trimmed, attempts: attempt + 1 }
+        }
+      }
       return {
         success: false,
         content: candidate,

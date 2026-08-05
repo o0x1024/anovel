@@ -1,4 +1,5 @@
 import type { QualityAiMetricKey } from './quality-ai-score'
+import { bodyWordCountBounds, BODY_WORD_COUNT_TOLERANCE } from './body-word-target'
 
 export type ChapterDialogueMode = 'mute_interaction' | 'solo' | 'scene_driven'
 
@@ -29,6 +30,8 @@ export interface ChapterExecutionContractInput {
   characterNames?: string[]
   characterSpeechStyles?: string[]
   wordTarget: number
+  /** 字数门禁容差（0.05–1）；缺省使用全局默认 ±25% */
+  wordCountTolerance?: number
 }
 
 export type ChapterExecutionRequirementKind = 'action' | 'turn' | 'state_change' | 'payoff_debt' | 'event'
@@ -66,7 +69,65 @@ export interface ChapterExecutionContract {
 }
 
 const TAGS = ['开场状态', '必须覆盖', '禁止越界', '结尾落点', '能力/状态约束', '连续性约束', '情节节点', '章末钩子', '戏剧契约'] as const
-export const CHAPTER_EXECUTION_CONTRACT_VERSION = 4
+export const CHAPTER_EXECUTION_CONTRACT_VERSION = 6
+
+interface AuthorityExecutionContract {
+  openingState: string
+  requiredOutcomes: Array<{
+    kind: ChapterExecutionRequirementKind
+    description: string
+  }>
+  forbiddenEvents: string[]
+  endingState: string
+  continuityConstraints: string[]
+}
+
+function authorityExecutionContract(outlineDiagnosis?: string | null): AuthorityExecutionContract | null {
+  if (!outlineDiagnosis?.trim()) return null
+  try {
+    const parsed = JSON.parse(outlineDiagnosis) as {
+      authority_transaction?: {
+        protocol?: unknown
+        execution_contract?: {
+          opening_state?: unknown
+          required_outcomes?: unknown
+          forbidden_events?: unknown
+          ending_state?: unknown
+          continuity_constraints?: unknown
+        }
+      }
+    }
+    const authority = parsed.authority_transaction
+    const contract = authority?.execution_contract
+    if (authority?.protocol !== 'unified_novel_v2' || !contract) return null
+    const requiredOutcomes = Array.isArray(contract.required_outcomes)
+      ? contract.required_outcomes.flatMap(item => {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+          const row = item as { kind?: unknown; description?: unknown }
+          const description = String(row.description ?? '').trim()
+          if (!description) return []
+          const rawKind = String(row.kind ?? 'event')
+          const kind = ['action', 'turn', 'state_change', 'payoff_debt', 'event'].includes(rawKind)
+            ? rawKind as ChapterExecutionRequirementKind
+            : 'event'
+          return [{ kind, description }]
+        }).slice(0, 12)
+      : []
+    const strings = (value: unknown): string[] => Array.isArray(value)
+      ? value.map(String).map(item => item.trim()).filter(Boolean).slice(0, 20)
+      : []
+    if (requiredOutcomes.length === 0) return null
+    return {
+      openingState: String(contract.opening_state ?? '').trim(),
+      requiredOutcomes,
+      forbiddenEvents: strings(contract.forbidden_events),
+      endingState: String(contract.ending_state ?? '').trim(),
+      continuityConstraints: strings(contract.continuity_constraints)
+    }
+  } catch {
+    return null
+  }
+}
 
 function extractTaggedText(outline: string, tag: typeof TAGS[number]): string {
   const tokens = [`【${tag}】`, `${tag}：`, `${tag}:`]
@@ -172,6 +233,8 @@ function structuredExecutionRequirements(outlineDiagnosis?: string | null): Arra
   kind: ChapterExecutionRequirementKind
   description: string
 }> {
+  const authority = authorityExecutionContract(outlineDiagnosis)
+  if (authority) return authority.requiredOutcomes
   if (!outlineDiagnosis?.trim()) return []
   try {
     const parsed = JSON.parse(outlineDiagnosis) as {
@@ -286,22 +349,27 @@ function normalizeComparable(text: string): string {
 export function buildChapterExecutionContract(input: ChapterExecutionContractInput): ChapterExecutionContract {
   const outline = input.outline?.trim() ?? ''
   const wordTarget = Math.max(0, Math.round(input.wordTarget))
-  const explicitOpeningState = extractTaggedText(outline, '开场状态')
-  const explicitRequiredEvents = splitContractItems(extractTaggedText(outline, '必须覆盖'))
-    .flatMap(splitCompoundExecutionEvent)
+  const wordBounds = bodyWordCountBounds(wordTarget, input.wordCountTolerance)
+  const authority = authorityExecutionContract(input.outlineDiagnosis)
+  const explicitOpeningState = authority?.openingState || extractTaggedText(outline, '开场状态')
+  const explicitRequiredEvents = authority
+    ? authority.requiredOutcomes.map(item => item.description)
+    : splitContractItems(extractTaggedText(outline, '必须覆盖')).flatMap(splitCompoundExecutionEvent)
   const fallbackEvents = explicitRequiredEvents.length === 0
     ? deriveOutlineEvents(outline).flatMap(splitCompoundExecutionEvent)
     : []
   const requiredEvents = explicitRequiredEvents.length > 0 ? explicitRequiredEvents : fallbackEvents
   const requirements = buildExecutionRequirements(requiredEvents, input.outlineDiagnosis)
-  const forbiddenEvents = splitContractItems(extractTaggedText(outline, '禁止越界'))
-  const explicitEndingState = extractTaggedText(outline, '结尾落点')
+  const forbiddenEvents = authority?.forbiddenEvents
+    ?? splitContractItems(extractTaggedText(outline, '禁止越界'))
+  const explicitEndingState = authority?.endingState || extractTaggedText(outline, '结尾落点')
   const openingState = explicitOpeningState
     || (requiredEvents[0] ? '承接上一章最终正文状态，从本章第一个既定事件发生前继续行动' : '')
   const endingState = explicitEndingState
     || (requiredEvents.length > 0 ? '完成本章最后一个必写事件后立即收束，不提前进入下一章事件' : '')
   const abilityConstraints = extractTaggedText(outline, '能力/状态约束')
-  const continuityConstraints = extractTaggedText(outline, '连续性约束')
+  const continuityConstraints = authority?.continuityConstraints.join('；')
+    || extractTaggedText(outline, '连续性约束')
   const characterNames = [...new Set((input.characterNames ?? []).map(name => name.trim()).filter(Boolean))]
   const dialogueEvidence = [outline, ...(input.characterSpeechStyles ?? [])].join('\n')
   const muteInteraction = /哑巴|不会说话|无法说话|全程无对话|全程没有对话|无声互动/.test(dialogueEvidence)
@@ -346,8 +414,8 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
     volumeName: input.volumeName?.trim() ?? '',
     volumeGoal: input.volumeGoal?.trim() ?? '',
     wordTarget,
-    wordMin: Math.round(wordTarget * 0.9),
-    wordMax: Math.round(wordTarget * 1.1),
+    wordMin: wordBounds.min,
+    wordMax: wordBounds.max,
     openingState,
     requiredEvents,
     requirements,
@@ -355,7 +423,23 @@ export function buildChapterExecutionContract(input: ChapterExecutionContractInp
     endingState,
     abilityConstraints,
     continuityConstraints,
-    sourceOutlineHash: stableTextHash(`${CHAPTER_EXECUTION_CONTRACT_VERSION}\n${outline}\n${JSON.stringify(requirements)}`),
+    sourceOutlineHash: stableTextHash(`${CHAPTER_EXECUTION_CONTRACT_VERSION}\n${outline}\n${JSON.stringify({
+      authority,
+      wordTarget,
+      wordMin: wordBounds.min,
+      wordMax: wordBounds.max,
+      volumeName: input.volumeName?.trim() ?? '',
+      volumeGoal: input.volumeGoal?.trim() ?? '',
+      requirements,
+      openingState,
+      endingState,
+      forbiddenEvents,
+      abilityConstraints,
+      continuityConstraints,
+      characterNames,
+      dialogueMode,
+      dialogueRange
+    })}`),
     characterNames,
     dialogueMode,
     dialogueRange,
@@ -426,9 +510,9 @@ export function formatChapterQualityOverride(contract: ChapterExecutionContract)
   return [
     '【本章动态评分覆盖规则 - 优先于通用比例】',
     interactionRule,
-    `字数由系统按 ${contract.wordMin}-${contract.wordMax} 字判断；只有偏差超过25%才是字数硬失败。`,
+    `字数由系统按 ${contract.wordMin}-${contract.wordMax} 字判断；落在此范围外视为字数硬失败。`,
     'AI句式、句长、短句和环境比例属于软质量项，不得单独触发 hard_fail。',
-    'hard_fail 只用于：关键大纲缺失、严重逻辑/设定矛盾、能力越界、结尾越界、字数偏差超过25%。'
+    'hard_fail 只用于：关键大纲缺失、严重逻辑/设定矛盾、能力越界、结尾越界、正文超出上述系统字数范围。'
   ].join('\n')
 }
 
@@ -475,10 +559,13 @@ export function evaluateNovelQualityAcceptance(input: NovelQualityAcceptanceInpu
   const acceptanceFloor = Math.max(65, input.qualityMin - 5)
 
   if (input.hardFail) blockingFailures.push('存在质量硬失败项')
-  const severeWordMin = Math.round(input.contract.wordTarget * 0.75)
-  const severeWordMax = Math.round(input.contract.wordTarget * 1.25)
-  if (input.actualWordCount < severeWordMin || input.actualWordCount > severeWordMax) {
-    blockingFailures.push(`字数严重越界 ${input.actualWordCount}/${input.contract.wordMin}-${input.contract.wordMax}`)
+  if (
+    input.actualWordCount < input.contract.wordMin
+    || input.actualWordCount > input.contract.wordMax
+  ) {
+    blockingFailures.push(
+      `字数越界 ${input.actualWordCount}/${input.contract.wordMin}-${input.contract.wordMax}`
+    )
   }
 
   for (const item of input.items) {
@@ -522,8 +609,8 @@ export function isBetterNovelBodyCandidate(
   if (candidate.blockingFailures !== best.blockingFailures) {
     return candidate.blockingFailures < best.blockingFailures
   }
-  const candidateWordSafe = Math.abs(candidate.wordCount - candidate.targetWords) <= candidate.targetWords * 0.25
-  const bestWordSafe = Math.abs(best.wordCount - best.targetWords) <= best.targetWords * 0.25
+  const candidateWordSafe = Math.abs(candidate.wordCount - candidate.targetWords) <= candidate.targetWords * BODY_WORD_COUNT_TOLERANCE
+  const bestWordSafe = Math.abs(best.wordCount - best.targetWords) <= best.targetWords * BODY_WORD_COUNT_TOLERANCE
   if (candidateWordSafe !== bestWordSafe) return candidateWordSafe
   if (candidate.scoreTotal !== best.scoreTotal) return candidate.scoreTotal > best.scoreTotal
   return Math.abs(candidate.wordCount - candidate.targetWords) < Math.abs(best.wordCount - best.targetWords)

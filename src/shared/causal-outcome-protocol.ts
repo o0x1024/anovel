@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto'
 import type {
   CausalChapterOutcome,
-  CausalNarrativeState
+  CausalNarrativeState,
+  CausalOutcomeMutation
 } from './causal-novel-types'
 
-export const CAUSAL_OUTCOME_PROTOCOL_VERSION = 2
+export const CAUSAL_OUTCOME_PROTOCOL_VERSION = 29
+export const CAUSAL_OUTCOME_AUDIT_BATCH_SIZE = 6
+export const CAUSAL_OUTCOME_ATOMIC_EVIDENCE_MAX = 4
 
 export interface CausalBodyEvidenceUnit {
   id: string
@@ -14,81 +17,113 @@ export interface CausalBodyEvidenceUnit {
   text: string
 }
 
-export interface CausalOutcomeCoreDraft {
-  summary: string
-  eventSignature: string
+export interface CausalOutcomeEvidenceClaimDraft {
+  claim: string
   evidenceIds: string[]
-  advancedPromiseIds: string[]
-  resolvedPromiseIds: string[]
-  newPromiseQuestions: string[]
-  terminalConditionMet: boolean
-  matchedTerminalCondition: string
-  terminalEvidenceIds: string[]
-  completionReason: string
+}
+
+export interface CausalOutcomeCoreDraft {
+  primaryEvent: CausalOutcomeEvidenceClaimDraft & {
+    eventSignature: string
+  }
+  supportingEvents: CausalOutcomeEvidenceClaimDraft[]
+  advancedPromises: Array<CausalOutcomeEvidenceClaimDraft & {
+    promiseId: string
+  }>
+  resolvedPromises: Array<CausalOutcomeEvidenceClaimDraft & {
+    promiseId: string
+  }>
+  newPromises: Array<CausalOutcomeEvidenceClaimDraft & {
+    question: string
+  }>
+  terminal: {
+    conditionMet: boolean
+    matchedCondition: string
+    completionReason: string
+    evidenceIds: string[]
+  }
 }
 
 export interface CausalOutcomeActorDraft {
-  actorUpdates: Array<{
+  actorMutations: Array<{
     actor: string
-    currentGoal: string
-    knowledgeAdded: string[]
-    resourcesAdded: string[]
-    resourcesRemoved: string[]
-    constraint: string
-    location: string
-    physicalState: string
-    relationshipsAdded: string[]
-    relationshipsRemoved: string[]
-    obligationsAdded: string[]
-    obligationsRemoved: string[]
+    field:
+      | 'currentGoal'
+      | 'knowledge'
+      | 'resources'
+      | 'constraint'
+      | 'location'
+      | 'physicalState'
+      | 'relationships'
+      | 'obligations'
+    operation: 'set' | 'add' | 'remove'
+    value: string
     evidenceIds: string[]
   }>
   newActors: Array<{
-    name: string
-    currentGoal: string
-    fear: string
-    knowledge: string[]
-    resources: string[]
-    constraint: string
-    location: string
-    physicalState: string
-    relationships: string[]
-    obligations: string[]
-    evidenceIds: string[]
+    key: string
+    facts: Array<{
+      field:
+        | 'name'
+        | 'currentGoal'
+        | 'fear'
+        | 'knowledge'
+        | 'resources'
+        | 'constraint'
+        | 'location'
+        | 'physicalState'
+        | 'relationships'
+        | 'obligations'
+      value: string
+      evidenceIds: string[]
+    }>
   }>
 }
 
 export interface CausalOutcomeWorldDraft {
-  pressureUpdates: Array<{
+  pressureConditionUpdates: Array<{
     id: string
-    direction: 'stable' | 'escalated' | 'relieved' | 'resolved'
-    condition: string
-    urgency: number
+    value: string
+    evidenceIds: string[]
+  }>
+  pressureStatusUpdates: Array<{
+    id: string
+    value: 'stable' | 'escalated' | 'relieved' | 'resolved'
+    evidenceIds: string[]
+  }>
+  pressureUrgencyUpdates: Array<{
+    id: string
+    value: number
     evidenceIds: string[]
   }>
   newPressures: Array<{
-    source: string
-    target: string
-    condition: string
-    escalation: string
-    urgency: number
-    evidenceIds: string[]
+    key: string
+    source: CausalOutcomeEvidenceClaimDraft
+    target: CausalOutcomeEvidenceClaimDraft
+    condition: CausalOutcomeEvidenceClaimDraft
+    escalation: CausalOutcomeEvidenceClaimDraft
+    urgency: {
+      value: number
+      claim: string
+      evidenceIds: string[]
+    }
   }>
   arcUpdates: Array<{
     id: string
     status: 'active' | 'completed'
+    claim: string
     evidenceIds: string[]
   }>
 }
 
 export interface CausalOutcomeEmotionDraft {
-  readerEffectSummary: string
-  triggerEvidenceIds: string[]
-  choiceEvidenceIds: string[]
-  costEvidenceIds: string[]
-  residueEvidenceIds: string[]
-  emotionalDebtOpened: string
-  emotionalDebtPaid: string
+  readerEffect: CausalOutcomeEvidenceClaimDraft
+  trigger: CausalOutcomeEvidenceClaimDraft
+  choice: CausalOutcomeEvidenceClaimDraft
+  cost: CausalOutcomeEvidenceClaimDraft
+  residue: CausalOutcomeEvidenceClaimDraft
+  debtOpened: CausalOutcomeEvidenceClaimDraft
+  debtPaid: CausalOutcomeEvidenceClaimDraft
 }
 
 export interface CausalOutcomeDraftBundle {
@@ -100,26 +135,52 @@ export interface CausalOutcomeDraftBundle {
 
 export type CausalOutcomeFailureCode =
   | 'OUTCOME_TRANSPORT'
+  | 'OUTCOME_TRUNCATED'
   | 'OUTCOME_SCHEMA'
   | 'OUTCOME_EVIDENCE_ID'
+  | 'OUTCOME_ATOMIZATION_REQUIRED'
   | 'OUTCOME_REFERENCE'
   | 'OUTCOME_OPERATION'
   | 'OUTCOME_PROMISE_PROGRESS'
   | 'OUTCOME_EMOTION'
   | 'OUTCOME_ENTAILMENT'
+  | 'OUTCOME_BODY_CONTRACT'
   | 'OUTCOME_BUDGET'
   | 'OUTCOME_STALE_BODY'
   | 'OUTCOME_UNKNOWN'
+
+export function causalOutcomeAuditBatches<T>(
+  items: readonly T[],
+  batchSize = CAUSAL_OUTCOME_AUDIT_BATCH_SIZE
+): T[][] {
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error('章后结果审计批大小必须是正整数')
+  }
+  const batches: T[][] = []
+  for (let index = 0; index < items.length; index += batchSize) {
+    batches.push(items.slice(index, index + batchSize))
+  }
+  return batches
+}
 
 export class CausalOutcomeProtocolError extends Error {
   constructor(
     public readonly code: CausalOutcomeFailureCode,
     message: string,
-    public readonly paths: string[] = []
+    public readonly paths: string[] = [],
+    public readonly issues: CausalOutcomeProtocolIssue[] = []
   ) {
     super(message)
     this.name = 'CausalOutcomeProtocolError'
   }
+}
+
+export interface CausalOutcomeProtocolIssue {
+  path: string
+  actualCount?: number
+  min?: number
+  max?: number
+  invalidIds?: string[]
 }
 
 function trimmedSpan(content: string, start: number, end: number): { start: number; end: number; text: string } | null {
@@ -188,21 +249,101 @@ export function validateCausalEvidenceIds(
   options: { min?: number; max?: number } = {}
 ): string[] {
   const allowed = new Set(units.map(unit => unit.id))
-  const normalized = [...new Set(ids.map(id => id.trim()).filter(Boolean))]
+  const normalized = [...new Set((ids ?? []).map(id => String(id).trim()).filter(Boolean))]
   const min = options.min ?? 1
   const max = options.max ?? 8
   if (normalized.length < min || normalized.length > max) {
+    const requiresAtomization = normalized.length > max
     throw new CausalOutcomeProtocolError(
-      'OUTCOME_EVIDENCE_ID', `${path} 需要 ${min}-${max} 个正文证据 ID`, [path]
+      requiresAtomization ? 'OUTCOME_ATOMIZATION_REQUIRED' : 'OUTCOME_EVIDENCE_ID',
+      requiresAtomization
+        ? `${path} 实际包含 ${normalized.length} 个正文证据 ID，单条原子结论上限为 ${max}；需要拆分结论`
+        : `${path} 需要 ${min}-${max} 个正文证据 ID，实际为 ${normalized.length} 个`,
+      [path],
+      [{ path, actualCount: normalized.length, min, max }]
     )
   }
   const invalid = normalized.filter(id => !allowed.has(id))
   if (invalid.length) {
     throw new CausalOutcomeProtocolError(
-      'OUTCOME_EVIDENCE_ID', `${path} 引用了不存在的正文证据 ID：${invalid.join('、')}`, [path]
+      'OUTCOME_EVIDENCE_ID',
+      `${path} 引用了不存在的正文证据 ID：${invalid.join('、')}`,
+      [path],
+      [{ path, invalidIds: invalid }]
     )
   }
   return normalized
+}
+
+export function causalStageEvidencePaths(
+  value: unknown,
+  base = ''
+): Array<{ path: string; ids: string[] }> {
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => causalStageEvidencePaths(item, `${base}[${index}]`))
+  }
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, child]) => {
+    const path = base ? `${base}.${key}` : key
+    if (/EvidenceIds$|^evidenceIds$/.test(key) && Array.isArray(child)) {
+      return [{ path, ids: child.map(String) }]
+    }
+    return causalStageEvidencePaths(child, path)
+  })
+}
+
+function causalProtocolPathValue(root: unknown, path: string): unknown {
+  const parts = path.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean)
+  let current = root as any
+  for (const part of parts) current = current?.[part]
+  return current
+}
+
+export function validateCausalStageEvidence(
+  stage: unknown,
+  units: CausalBodyEvidenceUnit[]
+): void {
+  const failures: Array<{
+    path: string
+    reason: string
+    code: CausalOutcomeFailureCode
+    issues: CausalOutcomeProtocolIssue[]
+  }> = []
+  for (const item of causalStageEvidencePaths(stage)) {
+    const claimPath = item.path.replace(/\.evidenceIds$/, '.claim')
+    const associatedClaim = causalProtocolPathValue(stage, claimPath)
+    const allowsEmptyEvidence = (
+      item.path.endsWith('terminal.evidenceIds') &&
+      !(stage as CausalOutcomeCoreDraft).terminal?.conditionMet
+    ) || (
+      typeof associatedClaim === 'string' &&
+      !associatedClaim.trim() &&
+      /(?:debtOpened|debtPaid)\.evidenceIds$/.test(item.path)
+    )
+    const min = allowsEmptyEvidence ? 0 : 1
+    const max = CAUSAL_OUTCOME_ATOMIC_EVIDENCE_MAX
+    try {
+      validateCausalEvidenceIds(units, item.ids, item.path, { min, max })
+    } catch (error) {
+      failures.push({
+        path: item.path,
+        reason: error instanceof Error ? error.message : String(error),
+        code: error instanceof CausalOutcomeProtocolError ? error.code : 'OUTCOME_EVIDENCE_ID',
+        issues: error instanceof CausalOutcomeProtocolError ? error.issues : []
+      })
+    }
+  }
+  if (failures.length) {
+    const code = failures.some(item => item.code === 'OUTCOME_ATOMIZATION_REQUIRED')
+      ? 'OUTCOME_ATOMIZATION_REQUIRED'
+      : 'OUTCOME_EVIDENCE_ID'
+    throw new CausalOutcomeProtocolError(
+      code,
+      failures.map(item => item.reason).join('；'),
+      [...new Set(failures.map(item => item.path))],
+      failures.flatMap(item => item.issues)
+    )
+  }
 }
 
 function nextServerId(prefix: string, existing: Iterable<string>): string {
@@ -222,83 +363,190 @@ function assertNonEmpty(value: string, path: string, code: CausalOutcomeFailureC
   return normalized
 }
 
-function looksLikeCondition(value: string): boolean {
-  return /伤|血|感染|中毒|骨折|残疾|疼痛|昏迷|僵硬|咳血|症状/.test(value)
+const PHYSICAL_CONDITION_PATTERN =
+  /受伤|负伤|伤势|伤口|创伤|失血|流血|出血|感染|中毒|骨折|残疾|疼痛|昏迷|僵硬|咳血|吐血|症状|疲劳|虚弱|发烧|高烧|脱臼|扭伤|烧伤|烫伤|冻伤/
+const PHYSICAL_CONDITION_RESOURCE_HEAD_PATTERN =
+  /(?:徽章|钥匙|药|药剂|血清|样本|报告|记录|档案|文件|衣物|绷带|夹板|武器|工具|设备|仪器|容器|瓶|盒|包|信物|证件|照片|录音|录像|芯片|零件|材料|账本|地图|名单|票据|笔记|令牌|通行证)$/
+
+export function isCausalPhysicalConditionValue(value: string): boolean {
+  const normalized = value.trim()
+  return PHYSICAL_CONDITION_PATTERN.test(normalized)
+    && !PHYSICAL_CONDITION_RESOURCE_HEAD_PATTERN.test(normalized)
 }
 
 export function materializeCausalOutcomeDraft(input: {
   state: CausalNarrativeState
   units: CausalBodyEvidenceUnit[]
   draft: CausalOutcomeDraftBundle
+  mutations: CausalOutcomeMutation[]
 }): CausalChapterOutcome {
-  const { state, units, draft } = input
+  const { state, units, draft, mutations } = input
+  if (!mutations.length) {
+    throw new CausalOutcomeProtocolError('OUTCOME_SCHEMA', '章后结果缺少 v6 原子状态变更制品')
+  }
   const unitMap = new Map(units.map(unit => [unit.id, unit]))
   const usedEvidenceIds = new Set<string>()
   const useEvidence = (ids: string[], path: string, min = 1): string[] => {
-    const valid = validateCausalEvidenceIds(units, ids, path, { min })
+    const valid = validateCausalEvidenceIds(units, ids, path, {
+      min,
+      max: Math.max(min, units.length)
+    })
     valid.forEach(id => usedEvidenceIds.add(id))
     return valid
   }
 
   const activePromises = new Set(state.promises.filter(item => item.status !== 'resolved').map(item => item.id))
-  for (const id of [...draft.core.advancedPromiseIds, ...draft.core.resolvedPromiseIds]) {
+  const advancedPromiseIds = draft.core.advancedPromises.map(item => item.promiseId)
+  const resolvedPromiseIds = draft.core.resolvedPromises.map(item => item.promiseId)
+  for (const id of [...advancedPromiseIds, ...resolvedPromiseIds]) {
     if (!activePromises.has(id)) {
-      throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', `章后结果引用了不存在或已关闭的读者承诺：${id}`, ['core.advancedPromiseIds'])
+      throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', `章后结果引用了不存在或已关闭的读者承诺：${id}`, ['core.advancedPromises'])
     }
   }
-  const progressed = new Set([...draft.core.advancedPromiseIds, ...draft.core.resolvedPromiseIds])
+  const progressed = new Set([...advancedPromiseIds, ...resolvedPromiseIds])
   if (!progressed.size) {
-    throw new CausalOutcomeProtocolError('OUTCOME_PROMISE_PROGRESS', '章后结果没有推进任何读者承诺', ['core.advancedPromiseIds'])
+    throw new CausalOutcomeProtocolError('OUTCOME_PROMISE_PROGRESS', '章后结果没有推进任何读者承诺', ['core.advancedPromises'])
   }
-  const coreEvidenceIds = useEvidence(draft.core.evidenceIds, 'core.evidenceIds')
+  const coreEvidenceIds = [
+    ...useEvidence(draft.core.primaryEvent.evidenceIds, 'core.primaryEvent.evidenceIds'),
+    ...draft.core.supportingEvents.flatMap((event, index) => useEvidence(
+      event.evidenceIds,
+      `core.supportingEvents[${index}].evidenceIds`
+    ))
+  ]
   const actorNames = new Set(state.actors.map(actor => actor.name))
-  const actorUpdates = draft.actors.actorUpdates.map((update, index) => {
-    const path = `actors.actorUpdates[${index}]`
-    if (!actorNames.has(update.actor)) {
-      throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', `${path} 引用了不存在的人物：${update.actor}`, [`${path}.actor`])
+  type ActorUpdateAccumulator = CausalChapterOutcome['actorUpdates'][number] & {
+    evidenceIds: string[]
+  }
+  const actorUpdateMap = new Map<string, ActorUpdateAccumulator>()
+  const actorMutationKeys = new Set<string>()
+  const addUnique = (items: string[] | undefined, value: string): string[] => (
+    [...new Set([...(items ?? []), value])]
+  )
+  draft.actors.actorMutations.forEach((mutation, index) => {
+    const path = `actors.actorMutations[${index}]`
+    if (!actorNames.has(mutation.actor)) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_REFERENCE',
+        `${path} 引用了不存在的人物：${mutation.actor}`,
+        [`${path}.actor`]
+      )
     }
-    const evidenceIds = useEvidence(update.evidenceIds, `${path}.evidenceIds`)
-    const invalidResource = [...update.resourcesAdded, ...update.resourcesRemoved].find(looksLikeCondition)
-    if (invalidResource) {
-      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `${path} 把伤势/身体状态误当作资源：${invalidResource}`, [`${path}.resourcesAdded`])
+    const value = assertNonEmpty(mutation.value, `${path}.value`)
+    const scalarField = ['currentGoal', 'constraint', 'location', 'physicalState'].includes(mutation.field)
+    const mutationKey = scalarField
+      ? `${mutation.actor}\u0000${mutation.field}`
+      : `${mutation.actor}\u0000${mutation.field}\u0000${mutation.operation}\u0000${value}`
+    if (actorMutationKeys.has(mutationKey)) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_OPERATION',
+        `${path} 与同阶段的另一条人物操作重复`,
+        [path]
+      )
     }
-    return {
-      actor: update.actor,
-      currentGoal: update.currentGoal.trim() || undefined,
-      knowledgeAdded: update.knowledgeAdded.map(value => value.trim()).filter(Boolean),
-      resourcesAdded: update.resourcesAdded.map(value => value.trim()).filter(Boolean),
-      resourcesRemoved: update.resourcesRemoved.map(value => value.trim()).filter(Boolean),
-      constraint: update.constraint.trim() || undefined,
-      location: update.location?.trim() || undefined,
-      physicalState: update.physicalState?.trim() || undefined,
-      relationshipsAdded: (update.relationshipsAdded ?? []).map(value => value.trim()).filter(Boolean),
-      relationshipsRemoved: (update.relationshipsRemoved ?? []).map(value => value.trim()).filter(Boolean),
-      obligationsAdded: (update.obligationsAdded ?? []).map(value => value.trim()).filter(Boolean),
-      obligationsRemoved: (update.obligationsRemoved ?? []).map(value => value.trim()).filter(Boolean),
-      evidence: evidenceText(evidenceIds, unitMap),
-      evidenceIds
+    actorMutationKeys.add(mutationKey)
+    const evidenceIds = useEvidence(mutation.evidenceIds, `${path}.evidenceIds`)
+    const allowedOperation = scalarField
+      ? mutation.operation === 'set'
+      : mutation.field === 'knowledge'
+        ? mutation.operation === 'add'
+        : mutation.operation === 'add' || mutation.operation === 'remove'
+    if (!allowedOperation) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_OPERATION',
+        `${path} 的 ${mutation.field} 不支持 ${mutation.operation} 操作`,
+        [`${path}.operation`]
+      )
     }
+    if (mutation.field === 'resources' && isCausalPhysicalConditionValue(value)) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_OPERATION',
+        `${path} 把伤势/身体状态误当作资源：${value}`,
+        [`${path}.value`]
+      )
+    }
+    const update = actorUpdateMap.get(mutation.actor) ?? {
+      actor: mutation.actor,
+      evidence: '',
+      evidenceIds: []
+    }
+    for (const id of evidenceIds) update.evidenceIds = addUnique(update.evidenceIds, id)
+    if (mutation.field === 'currentGoal') update.currentGoal = value
+    if (mutation.field === 'constraint') update.constraint = value
+    if (mutation.field === 'location') update.location = value
+    if (mutation.field === 'physicalState') update.physicalState = value
+    if (mutation.field === 'knowledge') update.knowledgeAdded = addUnique(update.knowledgeAdded, value)
+    if (mutation.field === 'resources') {
+      if (mutation.operation === 'add') update.resourcesAdded = addUnique(update.resourcesAdded, value)
+      else update.resourcesRemoved = addUnique(update.resourcesRemoved, value)
+    }
+    if (mutation.field === 'relationships') {
+      if (mutation.operation === 'add') update.relationshipsAdded = addUnique(update.relationshipsAdded, value)
+      else update.relationshipsRemoved = addUnique(update.relationshipsRemoved, value)
+    }
+    if (mutation.field === 'obligations') {
+      if (mutation.operation === 'add') update.obligationsAdded = addUnique(update.obligationsAdded, value)
+      else update.obligationsRemoved = addUnique(update.obligationsRemoved, value)
+    }
+    actorUpdateMap.set(mutation.actor, update)
   })
+  const actorUpdates = [...actorUpdateMap.values()].map(update => ({
+    ...update,
+    evidence: evidenceText(update.evidenceIds, unitMap)
+  }))
+
   const newActors = draft.actors.newActors.map((item, index) => {
     const path = `actors.newActors[${index}]`
-    const name = assertNonEmpty(item.name, `${path}.name`)
+    if (!item.key.trim() || !item.facts.length) {
+      throw new CausalOutcomeProtocolError('OUTCOME_SCHEMA', `${path} 缺少 key 或原子人物事实`, [path])
+    }
+    const factMap = new Map<string, string[]>()
+    const evidenceIds: string[] = []
+    item.facts.forEach((fact, factIndex) => {
+      const factPath = `${path}.facts[${factIndex}]`
+      const value = assertNonEmpty(fact.value, `${factPath}.value`)
+      if (
+        ['name', 'currentGoal', 'fear', 'constraint', 'location', 'physicalState'].includes(fact.field) &&
+        factMap.has(fact.field)
+      ) {
+        throw new CausalOutcomeProtocolError(
+          'OUTCOME_OPERATION',
+          `${factPath} 重复定义新增人物的标量字段 ${fact.field}`,
+          [factPath]
+        )
+      }
+      const ids = useEvidence(fact.evidenceIds, `${factPath}.evidenceIds`)
+      ids.forEach(id => {
+        if (!evidenceIds.includes(id)) evidenceIds.push(id)
+      })
+      factMap.set(fact.field, addUnique(factMap.get(fact.field), value))
+    })
+    const names = factMap.get('name') ?? []
+    if (names.length !== 1) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_SCHEMA',
+        `${path} 必须且只能包含一个 name 原子事实`,
+        [`${path}.facts`]
+      )
+    }
+    const name = names[0]
     if (actorNames.has(name)) {
-      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `新增人物重复：${name}`, [`${path}.name`])
+      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `新增人物重复：${name}`, [`${path}.facts`])
     }
     actorNames.add(name)
-    const evidenceIds = useEvidence(item.evidenceIds, `${path}.evidenceIds`)
+    const scalar = (field: string, fallback = ''): string => factMap.get(field)?.[0] ?? fallback
     return {
       actor: {
         name,
-        currentGoal: item.currentGoal.trim(),
-        fear: item.fear.trim(),
-        knowledge: item.knowledge.map(value => value.trim()).filter(Boolean),
-        resources: item.resources.map(value => value.trim()).filter(Boolean),
-        constraint: item.constraint.trim(),
-        location: item.location?.trim() || '未记录',
-        physicalState: item.physicalState?.trim() || '未记录',
-        relationships: (item.relationships ?? []).map(value => value.trim()).filter(Boolean),
-        obligations: (item.obligations ?? []).map(value => value.trim()).filter(Boolean)
+        currentGoal: scalar('currentGoal'),
+        fear: scalar('fear'),
+        knowledge: factMap.get('knowledge') ?? [],
+        resources: factMap.get('resources') ?? [],
+        constraint: scalar('constraint'),
+        location: scalar('location', '未记录'),
+        physicalState: scalar('physicalState', '未记录'),
+        relationships: factMap.get('relationships') ?? [],
+        obligations: factMap.get('obligations') ?? []
       },
       evidence: evidenceText(evidenceIds, unitMap),
       evidenceIds
@@ -306,26 +554,63 @@ export function materializeCausalOutcomeDraft(input: {
   })
 
   const pressureMap = new Map(state.activePressures.map(item => [item.id, item]))
-  const pressureUpdates = draft.world.pressureUpdates.map((update, index) => {
-    const path = `world.pressureUpdates[${index}]`
-    const previous = pressureMap.get(update.id)
-    if (!previous) {
-      throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', `${path} 引用了不存在的压力：${update.id}`, [`${path}.id`])
+  type PressureUpdateAccumulator = CausalChapterOutcome['pressureUpdates'][number] & {
+    evidenceIds: string[]
+  }
+  const pressureUpdateMap = new Map<string, PressureUpdateAccumulator>()
+  const pressureAccumulator = (id: string, path: string): PressureUpdateAccumulator => {
+    if (!pressureMap.has(id)) {
+      throw new CausalOutcomeProtocolError(
+        'OUTCOME_REFERENCE',
+        `${path} 引用了不存在的压力：${id}`,
+        [`${path}.id`]
+      )
     }
-    if (update.direction === 'escalated' && update.urgency < previous.urgency) {
-      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `${path} 声明升级但紧迫度下降`, [`${path}.urgency`])
+    const current = pressureUpdateMap.get(id) ?? {
+      id,
+      status: 'unchanged',
+      evidence: '',
+      evidenceIds: []
     }
-    if (update.direction === 'relieved' && update.urgency > previous.urgency) {
-      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `${path} 声明缓解但紧迫度上升`, [`${path}.urgency`])
+    pressureUpdateMap.set(id, current)
+    return current
+  }
+  draft.world.pressureConditionUpdates.forEach((item, index) => {
+    const path = `world.pressureConditionUpdates[${index}]`
+    const update = pressureAccumulator(item.id, path)
+    update.condition = assertNonEmpty(item.value, `${path}.value`)
+    for (const id of useEvidence(item.evidenceIds, `${path}.evidenceIds`)) {
+      update.evidenceIds = addUnique(update.evidenceIds, id)
     }
-    const evidenceIds = useEvidence(update.evidenceIds, `${path}.evidenceIds`)
+  })
+  draft.world.pressureStatusUpdates.forEach((item, index) => {
+    const path = `world.pressureStatusUpdates[${index}]`
+    const update = pressureAccumulator(item.id, path)
+    update.status = item.value
+    for (const id of useEvidence(item.evidenceIds, `${path}.evidenceIds`)) {
+      update.evidenceIds = addUnique(update.evidenceIds, id)
+    }
+  })
+  draft.world.pressureUrgencyUpdates.forEach((item, index) => {
+    const path = `world.pressureUrgencyUpdates[${index}]`
+    const update = pressureAccumulator(item.id, path)
+    update.urgency = item.value
+    for (const id of useEvidence(item.evidenceIds, `${path}.evidenceIds`)) {
+      update.evidenceIds = addUnique(update.evidenceIds, id)
+    }
+  })
+  const pressureUpdates = [...pressureUpdateMap.values()].map(update => {
+    const previous = pressureMap.get(update.id)!
+    const nextUrgency = update.urgency ?? previous.urgency
+    if (update.status === 'escalated' && nextUrgency < previous.urgency) {
+      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `压力 ${update.id} 声明升级但紧迫度下降`)
+    }
+    if (update.status === 'relieved' && nextUrgency > previous.urgency) {
+      throw new CausalOutcomeProtocolError('OUTCOME_OPERATION', `压力 ${update.id} 声明缓解但紧迫度上升`)
+    }
     return {
-      id: update.id,
-      status: update.direction,
-      condition: update.condition.trim() || undefined,
-      urgency: update.urgency,
-      evidence: evidenceText(evidenceIds, unitMap),
-      evidenceIds
+      ...update,
+      evidence: evidenceText(update.evidenceIds, unitMap)
     }
   })
   const assignedPressureIds = new Set(pressureMap.keys())
@@ -333,15 +618,27 @@ export function materializeCausalOutcomeDraft(input: {
     const path = `world.newPressures[${index}]`
     const id = nextServerId('ap', assignedPressureIds)
     assignedPressureIds.add(id)
-    const evidenceIds = useEvidence(item.evidenceIds, `${path}.evidenceIds`)
+    const sourceEvidenceIds = useEvidence(item.source.evidenceIds, `${path}.source.evidenceIds`)
+    const targetEvidenceIds = useEvidence(item.target.evidenceIds, `${path}.target.evidenceIds`)
+    const conditionEvidenceIds = useEvidence(item.condition.evidenceIds, `${path}.condition.evidenceIds`)
+    const escalationEvidenceIds = useEvidence(item.escalation.evidenceIds, `${path}.escalation.evidenceIds`)
+    const urgencyEvidenceIds = useEvidence(item.urgency.evidenceIds, `${path}.urgency.evidenceIds`)
+    assertNonEmpty(item.urgency.claim, `${path}.urgency.claim`)
+    const evidenceIds = [...new Set([
+      ...sourceEvidenceIds,
+      ...targetEvidenceIds,
+      ...conditionEvidenceIds,
+      ...escalationEvidenceIds,
+      ...urgencyEvidenceIds
+    ])]
     return {
       pressure: {
         id,
-        source: assertNonEmpty(item.source, `${path}.source`),
-        target: assertNonEmpty(item.target, `${path}.target`),
-        condition: assertNonEmpty(item.condition, `${path}.condition`),
-        escalation: assertNonEmpty(item.escalation, `${path}.escalation`),
-        urgency: item.urgency,
+        source: assertNonEmpty(item.source.claim, `${path}.source.claim`),
+        target: assertNonEmpty(item.target.claim, `${path}.target.claim`),
+        condition: assertNonEmpty(item.condition.claim, `${path}.condition.claim`),
+        escalation: assertNonEmpty(item.escalation.claim, `${path}.escalation.claim`),
+        urgency: item.urgency.value,
         status: 'active' as const
       },
       evidence: evidenceText(evidenceIds, unitMap),
@@ -355,35 +652,56 @@ export function materializeCausalOutcomeDraft(input: {
       throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', `${path} 引用了不存在的阶段：${update.id}`, [`${path}.id`])
     }
     const evidenceIds = useEvidence(update.evidenceIds, `${path}.evidenceIds`)
-    return { ...update, evidence: evidenceText(evidenceIds, unitMap), evidenceIds }
+    return {
+      ...update,
+      claim: assertNonEmpty(update.claim, `${path}.claim`),
+      evidence: evidenceText(evidenceIds, unitMap),
+      evidenceIds
+    }
   })
 
   const emotion = draft.emotion
-  const triggerEvidenceIds = useEvidence(emotion.triggerEvidenceIds, 'emotion.triggerEvidenceIds')
-  const choiceEvidenceIds = useEvidence(emotion.choiceEvidenceIds, 'emotion.choiceEvidenceIds')
-  const costEvidenceIds = useEvidence(emotion.costEvidenceIds, 'emotion.costEvidenceIds')
-  const residueEvidenceIds = useEvidence(emotion.residueEvidenceIds, 'emotion.residueEvidenceIds')
-  const terminalEvidenceIds = draft.core.terminalConditionMet
-    ? useEvidence(draft.core.terminalEvidenceIds, 'core.terminalEvidenceIds')
-    : useEvidence(draft.core.terminalEvidenceIds, 'core.terminalEvidenceIds', 0)
-  if (draft.core.terminalConditionMet && !state.terminalConditions.includes(draft.core.matchedTerminalCondition.trim())) {
-    throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', '完结声明没有命中权威终止条件', ['core.matchedTerminalCondition'])
+  const triggerEvidenceIds = useEvidence(emotion.trigger.evidenceIds, 'emotion.trigger.evidenceIds')
+  const choiceEvidenceIds = useEvidence(emotion.choice.evidenceIds, 'emotion.choice.evidenceIds')
+  const costEvidenceIds = useEvidence(emotion.cost.evidenceIds, 'emotion.cost.evidenceIds')
+  const residueEvidenceIds = useEvidence(emotion.residue.evidenceIds, 'emotion.residue.evidenceIds')
+  const terminalEvidenceIds = draft.core.terminal.conditionMet
+    ? useEvidence(draft.core.terminal.evidenceIds, 'core.terminal.evidenceIds')
+    : useEvidence(draft.core.terminal.evidenceIds, 'core.terminal.evidenceIds', 0)
+  if (draft.core.terminal.conditionMet && !state.terminalConditions.includes(draft.core.terminal.matchedCondition.trim())) {
+    throw new CausalOutcomeProtocolError('OUTCOME_REFERENCE', '完结声明没有命中权威终止条件', ['core.terminal.matchedCondition'])
   }
 
   const promiseIds = new Set([...state.promises.map(item => item.id), ...state.archivedPromiseIds])
-  const newPromises = draft.core.newPromiseQuestions.map(question => {
+  const newPromises = draft.core.newPromises.map(item => {
     const id = nextServerId('p', promiseIds)
     promiseIds.add(id)
-    return { id, question: assertNonEmpty(question, 'core.newPromiseQuestions') }
+    return { id, question: assertNonEmpty(item.question, 'core.newPromises.question') }
   })
+  const summary = [
+    assertNonEmpty(draft.core.primaryEvent.claim, 'core.primaryEvent.claim'),
+    ...draft.core.supportingEvents.map((event, index) =>
+      assertNonEmpty(event.claim, `core.supportingEvents[${index}].claim`)
+    )
+  ].join('；')
+  for (const mutation of mutations) {
+    const evidenceIds = validateCausalEvidenceIds(
+      units,
+      mutation.evidenceIds,
+      `mutations.${mutation.id}.evidenceIds`,
+      { min: 1, max: CAUSAL_OUTCOME_ATOMIC_EVIDENCE_MAX }
+    )
+    evidenceIds.forEach(id => usedEvidenceIds.add(id))
+  }
   const evidenceRefs = [...usedEvidenceIds].map(id => ({ id, text: unitMap.get(id)!.text }))
   return {
-    summary: assertNonEmpty(draft.core.summary, 'core.summary'),
-    eventSignature: assertNonEmpty(draft.core.eventSignature, 'core.eventSignature'),
-    evidenceQuotes: coreEvidenceIds.map(id => unitMap.get(id)!.text),
+    summary,
+    eventSignature: assertNonEmpty(draft.core.primaryEvent.eventSignature, 'core.primaryEvent.eventSignature'),
+    evidenceQuotes: [...new Set(coreEvidenceIds)].map(id => unitMap.get(id)!.text),
     evidenceRefs,
-    advancedPromiseIds: [...new Set(draft.core.advancedPromiseIds)],
-    resolvedPromiseIds: [...new Set(draft.core.resolvedPromiseIds)],
+    mutations,
+    advancedPromiseIds: [...new Set(advancedPromiseIds)],
+    resolvedPromiseIds: [...new Set(resolvedPromiseIds)],
     newPromises,
     actorUpdates,
     newActors,
@@ -391,7 +709,11 @@ export function materializeCausalOutcomeDraft(input: {
     newPressures,
     arcUpdates,
     emotionalOutcome: {
-      readerEffectSummary: assertNonEmpty(emotion.readerEffectSummary, 'emotion.readerEffectSummary', 'OUTCOME_EMOTION'),
+      readerEffectSummary: assertNonEmpty(
+        emotion.readerEffect.claim,
+        'emotion.readerEffect.claim',
+        'OUTCOME_EMOTION'
+      ),
       triggerEvidence: evidenceText(triggerEvidenceIds, unitMap),
       choiceEvidence: evidenceText(choiceEvidenceIds, unitMap),
       costEvidence: evidenceText(costEvidenceIds, unitMap),
@@ -400,14 +722,16 @@ export function materializeCausalOutcomeDraft(input: {
       choiceEvidenceIds,
       costEvidenceIds,
       residueEvidenceIds,
-      emotionalDebtOpened: emotion.emotionalDebtOpened.trim(),
-      emotionalDebtPaid: emotion.emotionalDebtPaid.trim()
+      emotionalDebtOpened: emotion.debtOpened.claim.trim(),
+      emotionalDebtPaid: emotion.debtPaid.claim.trim()
     },
-    terminalConditionMet: draft.core.terminalConditionMet,
-    matchedTerminalCondition: draft.core.terminalConditionMet ? draft.core.matchedTerminalCondition.trim() : '',
+    terminalConditionMet: draft.core.terminal.conditionMet,
+    matchedTerminalCondition: draft.core.terminal.conditionMet ? draft.core.terminal.matchedCondition.trim() : '',
     terminalEvidence: evidenceText(terminalEvidenceIds, unitMap),
     terminalEvidenceIds,
-    completionReason: draft.core.terminalConditionMet ? assertNonEmpty(draft.core.completionReason, 'core.completionReason') : ''
+    completionReason: draft.core.terminal.conditionMet
+      ? assertNonEmpty(draft.core.terminal.completionReason, 'core.terminal.completionReason')
+      : ''
   }
 }
 
@@ -418,7 +742,12 @@ export function causalOutcomeFailureCode(error: unknown): CausalOutcomeFailureCo
     ? message.slice(message.lastIndexOf('结构化输出无效：') + '结构化输出无效：'.length)
     : message
   if (/预算|调用次数|超过 \d+ 次/.test(cause)) return 'OUTCOME_BUDGET'
+  if (/finishReason=length|长度上限|输出.*截断/i.test(cause)) return 'OUTCOME_TRUNCATED'
   if (/timeout|timed out|网络|连接|模型无返回|请求失败/i.test(cause)) return 'OUTCOME_TRANSPORT'
+  if (/正文合同|正文没有支持必要状态变更/.test(cause)) return 'OUTCOME_BODY_CONTRACT'
+  if (/需要拆分结论|原子结论上限|actualCount|atomization/i.test(cause)) {
+    return 'OUTCOME_ATOMIZATION_REQUIRED'
+  }
   if (/蕴含|审计/.test(cause)) return 'OUTCOME_ENTAILMENT'
   if (/证据|evidence/i.test(cause)) return 'OUTCOME_EVIDENCE_ID'
   if (/资源|紧迫度|操作类型|重复/.test(cause)) return 'OUTCOME_OPERATION'
@@ -428,4 +757,21 @@ export function causalOutcomeFailureCode(error: unknown): CausalOutcomeFailureCo
   if (/正文.*变化|过期|哈希/.test(cause)) return 'OUTCOME_STALE_BODY'
   if (/JSON|结构化|格式|Unexpected token|Expected property|缺少.*字段/.test(cause)) return 'OUTCOME_SCHEMA'
   return 'OUTCOME_UNKNOWN'
+}
+
+export function causalOutcomeFailureIssues(error: unknown): CausalOutcomeProtocolIssue[] {
+  if (error instanceof CausalOutcomeProtocolError && error.issues.length) {
+    return error.issues.map(issue => ({ ...issue }))
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  const issues: CausalOutcomeProtocolIssue[] = []
+  const capacityPattern = /([A-Za-z0-9_.[\]-]+) 实际包含 (\d+) 个正文证据 ID，单条原子结论上限为 (\d+)/g
+  for (const match of message.matchAll(capacityPattern)) {
+    issues.push({
+      path: match[1],
+      actualCount: Number(match[2]),
+      max: Number(match[3])
+    })
+  }
+  return issues
 }

@@ -5,11 +5,13 @@ import { formatStoryContractForPrompt } from './story-contract'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { detectStoryMetaResidues, STORY_META_RESIDUE_RULES } from '../../../shared/story-hard-guards'
 import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
+import { requestQualityEvaluatorEvidence } from './quality-evaluator-policy'
 
 export interface StoryContinuityGateResult {
   passed: boolean
   blockers: string[]
   warnings: string[]
+  evaluatorFailureCode?: 'QUALITY_EVALUATOR_UNAVAILABLE' | 'QUALITY_EVALUATOR_PROTOCOL'
 }
 
 const STORY_CONTINUITY_RESPONSE_SCHEMA = {
@@ -61,8 +63,12 @@ export async function assessStoryBeatContinuity(
 
   const current = chapters[index]
   const isFinal = index === chapters.length - 1
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
+  const evidence = await requestQualityEvaluatorEvidence<StoryContinuityGateResult>({
+    workId,
+    label: '跨拍连续性门禁',
+    signal,
+    request: (attempt, lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
       workId,
       chapterId,
       step: 'story_continuity_gate',
@@ -71,7 +77,8 @@ export async function assessStoryBeatContinuity(
       temperature: 0,
       maxTokens: 1500,
       forceThinkingDisabled: true,
-      responseSchema: { name: 'story_continuity_gate', schema: STORY_CONTINUITY_RESPONSE_SCHEMA, strict: false },
+      responseSchema: { name: 'story_continuity_gate', schema: STORY_CONTINUITY_RESPONSE_SCHEMA, strict: true },
+      structuredOutputMode: 'prompt_json',
       systemPrompt: [
         '你是短故事连续性法医。只判断候选正文能否安全接入整篇，不评价文采，不替作者脑补。',
         '下列任一情况必须 blocker：时间顺序冲突；地点或座位无过渡跳变；同一关键事件重复发生；证据/道具状态倒退；人物忘记已知信息；上一拍明确提出的阻碍被本拍无解法跳过；对手主动降智配合；高潮靠临时权威、巧合或新证据；正文出现生成提示。',
@@ -87,25 +94,32 @@ export async function assessStoryBeatContinuity(
         `【当前节拍蓝图】\n${current.outline ?? ''}\n${current.outline_diagnosis ?? ''}`,
         previous ? `【上一拍结尾原文】\n${sliceTail(previous, 1800)}` : '【上一拍】无，这是第一拍',
         `【候选正文】\n${candidate}`,
-        next ? `【已有下一拍开头，修订时不得与之冲突】\n${next.slice(0, 1800)}` : ''
+        next ? `【已有下一拍开头，修订时不得与之冲突】\n${next.slice(0, 1800)}` : '',
+        attempt > 1 ? `【上次取证协议错误】\n${lastError}` : ''
       ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    return { passed: false, blockers: [response.error || '跨拍连续性门禁无返回'], warnings: [] }
+      }),
+      { stream: false, signal }
+    ),
+    parse: content => {
+      const json = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
+      const parsed = parseJsonObjectWithRepairs<Record<string, unknown>>(json).value
+      if (typeof parsed.passed !== 'boolean' || !Array.isArray(parsed.blockers) || !Array.isArray(parsed.warnings)) {
+        throw new Error('跨拍连续性门禁返回协议缺少 passed、blockers 或 warnings')
+      }
+      const blockers = [...deterministic, ...list(parsed.blockers)]
+      const warnings = list(parsed.warnings)
+      return { passed: parsed.passed && blockers.length === 0, blockers, warnings }
+    }
+  })
+  if (!evidence.success) {
+    return {
+      passed: false,
+      blockers: [`${evidence.code}：${evidence.message}`],
+      warnings: [],
+      evaluatorFailureCode: evidence.code
+    }
   }
-  try {
-    const json = extractJsonText(response.content.trim(), { allowEmptyArrays: true })
-      ?? response.content.trim()
-    const parsed = parseJsonObjectWithRepairs<Record<string, unknown>>(json).value
-    const blockers = [...deterministic, ...list(parsed.blockers)]
-    const warnings = list(parsed.warnings)
-    const declaredPassed = parsed.passed === true
-    return { passed: declaredPassed && blockers.length === 0, blockers, warnings }
-  } catch {
-    return { passed: false, blockers: ['跨拍连续性门禁返回格式无效'], warnings: [] }
-  }
+  return evidence.value
 }
 
 export { detectStoryMetaResidues }

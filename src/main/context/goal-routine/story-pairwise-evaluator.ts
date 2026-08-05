@@ -1,6 +1,10 @@
 import { modelService } from '../../model'
-import { extractJsonText } from '../parse-json-extract'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import { parseStructuredModelContent } from './structured-model-output'
+import {
+  requestQualityEvaluatorEvidence,
+  requireQualityEvaluatorEvidence
+} from './quality-evaluator-policy'
 
 export interface TitleHookOption {
   title: string
@@ -14,17 +18,32 @@ export interface VariantComparison {
   baselineWins: number
 }
 
-function parseObject(content: string): Record<string, unknown> | null {
-  const text = extractJsonText(content.trim()) ?? content.match(/(\{[\s\S]*\})/)?.[1]
-  if (!text) return null
-  try {
-    const value = JSON.parse(text) as unknown
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : null
-  } catch {
-    return null
+const TITLE_PAIR_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['first', 'swapped', 'reason'],
+  properties: {
+    first: {
+      type: 'object', required: ['a', 'b'],
+      properties: { a: { type: 'number' }, b: { type: 'number' } }
+    },
+    swapped: {
+      type: 'object', required: ['a', 'b'],
+      properties: { a: { type: 'number' }, b: { type: 'number' } }
+    },
+    reason: { type: 'string' }
   }
+}
+
+const VARIANT_PAIR_RESPONSE_SCHEMA = {
+  type: 'object',
+  required: ['winner', 'reason'],
+  properties: { winner: { type: 'string', enum: ['a', 'b', 'tie'] }, reason: { type: 'string' } }
+}
+
+function requireScore(value: unknown, path: string): number {
+  const score = Number(value)
+  if (!Number.isFinite(score) || score < 0 || score > 100) throw new Error(`${path} 必须是 0-100 分`)
+  return score
 }
 
 function deterministicOrder<T extends TitleHookOption>(workId: number, candidates: T[]): T[] {
@@ -43,37 +62,60 @@ async function compareTitleHookPair<T extends TitleHookOption>(
   right: T,
   signal?: AbortSignal
 ): Promise<T> {
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_title_hook_pairwise',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 1000,
-      systemPrompt: [
-        '你是独立短故事包装终审。对同一故事的两个书名+导语做盲化成对比较。',
-        '必须分别按两种展示顺序评分，降低位置偏差；不要因为更长、更夸张或堆热词而偏爱某项。',
-        '评估：目标受众匹配、前三句冲突、具体场景、信息差、正文承诺、读完后的具体追问、标题与导语一致。',
-        '只输出 JSON：{"first":{"a":0,"b":0},"swapped":{"a":0,"b":0},"reason":"..."}。分数 0-100。'
-      ].join('\n'),
-      prompt: [
-        `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
-        `【顺序一·A】\n书名：${left.title}\n导语：${left.hook}`,
-        `【顺序一·B】\n书名：${right.title}\n导语：${right.hook}`,
-        `【顺序二·A】\n书名：${right.title}\n导语：${right.hook}`,
-        `【顺序二·B】\n书名：${left.title}\n导语：${left.hook}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) return left
-  const parsed = parseObject(res.content)
-  const first = parsed?.first as Record<string, unknown> | undefined
-  const swapped = parsed?.swapped as Record<string, unknown> | undefined
-  const score = (value: unknown) => Number.isFinite(Number(value)) ? Number(value) : 0
-  const leftScore = score(first?.a) + score(swapped?.b)
-  const rightScore = score(first?.b) + score(swapped?.a)
+  const evidence = await requestQualityEvaluatorEvidence<{
+    first: { a: number; b: number }
+    swapped: { a: number; b: number }
+  }>({
+    workId,
+    label: '短故事书名导语成对终审',
+    signal,
+    request: (attempt, error) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_title_hook_pairwise',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1000,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_title_hook_pairwise', schema: TITLE_PAIR_RESPONSE_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是独立短故事包装终审。对同一故事的两个书名+导语做盲化成对比较。',
+          '必须分别按两种展示顺序评分，降低位置偏差；不要因为更长、更夸张或堆热词而偏爱某项。',
+          '评估：目标受众匹配、前三句冲突、具体场景、信息差、正文承诺、读完后的具体追问、标题与导语一致。',
+          '只输出 JSON：{"first":{"a":0,"b":0},"swapped":{"a":0,"b":0},"reason":"..."}。分数 0-100。'
+        ].join('\n'),
+        prompt: [
+          `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
+          `【顺序一·A】\n书名：${left.title}\n导语：${left.hook}`,
+          `【顺序一·B】\n书名：${right.title}\n导语：${right.hook}`,
+          `【顺序二·A】\n书名：${right.title}\n导语：${right.hook}`,
+          `【顺序二·B】\n书名：${left.title}\n导语：${left.hook}`,
+          attempt > 1 ? `【协议重试】${error}。只返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    parse: content => parseStructuredModelContent({
+      content,
+      schema: TITLE_PAIR_RESPONSE_SCHEMA,
+      validate: value => {
+        const first = value.first as Record<string, unknown>
+        const swapped = value.swapped as Record<string, unknown>
+        if (!first || !swapped) throw new Error('成对终审缺少交换顺序评分')
+        const reason = typeof value.reason === 'string' ? value.reason.trim() : ''
+        if (!reason) throw new Error('成对终审缺少判定理由')
+        return {
+          first: { a: requireScore(first.a, 'first.a'), b: requireScore(first.b, 'first.b') },
+          swapped: { a: requireScore(swapped.a, 'swapped.a'), b: requireScore(swapped.b, 'swapped.b') }
+        }
+      }
+    }).value
+  })
+  const parsed = requireQualityEvaluatorEvidence(evidence, '短故事书名导语成对终审')
+  const leftScore = parsed.first.a + parsed.swapped.b
+  const rightScore = parsed.first.b + parsed.swapped.a
   return rightScore > leftScore ? right : left
 }
 
@@ -102,34 +144,52 @@ async function judgeVariantOrder(
   b: string,
   signal?: AbortSignal
 ): Promise<'a' | 'b' | 'tie'> {
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_repair_pairwise',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 900,
-      systemPrompt: [
-        '你是独立短故事改稿验收员。盲评两个版本，只判断哪个更适合作为最终正文。',
-        '优先级：不违反大纲/设定与连续性 > 读者是否具体在乎人物并形成希望/恐惧 > 戏剧因果和局面变化 > 人物声音与潜台词 > 阅读自然度 > 局部华丽。',
-        '情绪不按情绪词数量判断：必须由欲望、阻力、选择、代价和不可逆后果在正文中产生，并留下可感知余波。',
-        '更长不等于更好；若新版修好一项却损坏已通过项，应判旧版胜。',
-        '只输出 JSON：{"winner":"a|b|tie","reason":"..."}'
-      ].join('\n'),
-      prompt: [
-        `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
-        `【本拍蓝图】\n${outline}`,
-        `【版本 A】\n${a}`,
-        `【版本 B】\n${b}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) return 'tie'
-  const parsed = parseObject(res.content)
-  const winner = String(parsed?.winner ?? '').toLowerCase()
-  return winner === 'a' || winner === 'b' ? winner : 'tie'
+  const evidence = await requestQualityEvaluatorEvidence<'a' | 'b' | 'tie'>({
+    workId,
+    label: '短故事改稿成对终审',
+    signal,
+    request: (attempt, error) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_repair_pairwise',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 900,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_repair_pairwise', schema: VARIANT_PAIR_RESPONSE_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是独立短故事改稿验收员。盲评两个版本，只判断哪个更适合作为最终正文。',
+          '优先级：不违反大纲/设定与连续性 > 读者是否具体在乎人物并形成希望/恐惧 > 戏剧因果和局面变化 > 人物声音与潜台词 > 阅读自然度 > 局部华丽。',
+          '情绪不按情绪词数量判断：必须由欲望、阻力、选择、代价和不可逆后果在正文中产生，并留下可感知余波。',
+          '更长不等于更好；若新版修好一项却损坏已通过项，应判旧版胜。',
+          '只输出 JSON：{"winner":"a|b|tie","reason":"..."}'
+        ].join('\n'),
+        prompt: [
+          `【创作目标】\n${goal.trim() || '高完读率短故事'}`,
+          `【本拍蓝图】\n${outline}`,
+          `【版本 A】\n${a}`,
+          `【版本 B】\n${b}`,
+          attempt > 1 ? `【协议重试】${error}。只返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    parse: content => parseStructuredModelContent({
+      content,
+      schema: VARIANT_PAIR_RESPONSE_SCHEMA,
+      validate: value => {
+        const winner = value.winner
+        const reason = typeof value.reason === 'string' ? value.reason.trim() : ''
+        if ((winner !== 'a' && winner !== 'b' && winner !== 'tie') || !reason) {
+          throw new Error('改稿终审缺少合法 winner 或 reason')
+        }
+        return winner
+      }
+    }).value
+  })
+  return requireQualityEvaluatorEvidence(evidence, '短故事改稿成对终审')
 }
 
 /**

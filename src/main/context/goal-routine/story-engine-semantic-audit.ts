@@ -1,7 +1,6 @@
 import { coreSettingDAO } from '../../db'
 import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
-import { appLogger } from '../../logger/app-logger'
 import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
 import {
   detectStorySettingContradictions,
@@ -9,6 +8,10 @@ import {
   type StoryHarnessScope
 } from '../../../shared/story-harness'
 import { withGoalLoopModelOptions } from './story-goal-model'
+import {
+  requestQualityEvaluatorEvidence,
+  requireQualityEvaluatorEvidence
+} from './quality-evaluator-policy'
 
 interface RawAuditIssue {
   code?: unknown
@@ -86,10 +89,12 @@ async function runNarrowAudit(
   question: string,
   signal?: AbortSignal
 ): Promise<StoryHarnessIssue[]> {
-  let lastError = '未知格式错误'
-  for (let attempt = 1; attempt <= SEMANTIC_AUDIT_FORMAT_ATTEMPTS; attempt++) {
-    if (signal?.aborted) throw new Error('已取消')
-    const response = await modelService.chat(
+  const result = await requestQualityEvaluatorEvidence<StoryHarnessIssue[]>({
+    workId,
+    label: '故事发动机窄问题审计',
+    attempts: SEMANTIC_AUDIT_FORMAT_ATTEMPTS,
+    signal,
+    request: (attempt, lastError) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId,
         step: 'story_engine_semantic_audit',
@@ -103,6 +108,7 @@ async function runNarrowAudit(
           schema: SEMANTIC_AUDIT_RESPONSE_SCHEMA,
           strict: true
         },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是短故事发动机的单问题审计器。只审查指定问题，不评分、不润色、不扩写。',
           'candidate_engine.setting_resolutions 是 Harness 已裁决的权威口径；审计时用它覆盖上游互斥或含糊表述，不得把已被覆盖的旧说法再次报为冲突。',
@@ -119,26 +125,10 @@ async function runNarrowAudit(
         ].filter(Boolean).join('\n\n')
       }),
       { stream: false, signal }
-    )
-    if (!response.success || !response.content?.trim()) {
-      lastError = response.error || '故事发动机窄问题审计无返回'
-    } else if (response.finishReason === 'length') {
-      lastError = '输出达到长度上限（finishReason=length）'
-    } else {
-      try {
-        return parseAuditIssues(response.content, 'engine')
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-      }
-    }
-    appLogger.warn('story_engine_gate', '故事发动机语义审计结构化输出无效，局部重试', {
-      workId,
-      attempt,
-      finishReason: response.finishReason,
-      error: lastError
-    })
-  }
-  throw new Error(`故事发动机语义审计连续 ${SEMANTIC_AUDIT_FORMAT_ATTEMPTS} 次格式无效：${lastError}`)
+    ),
+    parse: content => parseAuditIssues(content, 'engine')
+  })
+  return requireQualityEvaluatorEvidence(result, '故事发动机窄问题审计')
 }
 
 /**

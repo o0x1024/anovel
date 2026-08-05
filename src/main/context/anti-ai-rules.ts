@@ -1058,7 +1058,7 @@ export function buildStyleRewriteUserPrompt(
   if (wordTarget && wordTarget > 0) {
     const { min, max } = bodyWordCountBounds(wordTarget)
     parts.push(
-      `【字数硬性约束】重写后正文必须控制在约 ${wordTarget} 字（±10%，即 ${min}–${max} 字）。可删减冗余描写以达到字数要求。`
+      `【字数硬性约束】重写后正文必须控制在约 ${wordTarget} 字（允许 ${min}–${max} 字）。可删减冗余描写以达到字数要求。`
     )
   }
   return parts.join('\n\n')

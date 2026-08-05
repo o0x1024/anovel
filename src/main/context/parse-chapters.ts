@@ -52,6 +52,12 @@ export interface TensionPlan {
  * 不单独落数据库列，随 outline_diagnosis 保存，供节拍门禁与正文生成共同使用。
  */
 export interface ContinuityContract {
+  /**
+   * 权威交接键。第 i 拍 exit_boundary 必须与第 i+1 拍 entry_boundary 完全一致，
+   * 用于在任何正文生成前做确定性相邻拍校验。
+   */
+  entry_boundary?: string
+  exit_boundary?: string
   time_anchor?: string
   elapsed_from_previous?: string
   start_location?: string
@@ -357,6 +363,8 @@ function normalizeContinuityContract(value: unknown): ContinuityContract | null 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
   const contract: ContinuityContract = {
+    entry_boundary: firstString(row, ['entry_boundary', 'entryBoundary']),
+    exit_boundary: firstString(row, ['exit_boundary', 'exitBoundary']),
     time_anchor: firstString(row, ['time_anchor', 'timeAnchor']),
     elapsed_from_previous: firstString(row, ['elapsed_from_previous', 'elapsedFromPrevious']),
     start_location: firstString(row, ['start_location', 'startLocation']),

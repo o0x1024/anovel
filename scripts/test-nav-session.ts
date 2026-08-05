@@ -23,15 +23,13 @@ Object.defineProperty(globalThis, 'sessionStorage', {
 })
 
 assert.equal(navKeyForPath('/novel/12'), '/')
-assert.equal(navKeyForPath('/causal-novel/27'), '/causal-novels')
 assert.equal(navKeyForPath('/story/34'), '/stories')
-assert.equal(navKeyForPath('/causal-novels'), '/causal-novels')
 
-saveNavPath('/causal-novel/27', '/causal-novel/27?panel=causal_chapters')
+saveNavPath('/novel/27', '/novel/27?panel=causal_chapters')
 assert.equal(
-  getNavRestorePath('/causal-novels', '/causal-novels'),
-  '/causal-novel/27?panel=causal_chapters'
+  getNavRestorePath('/', '/'),
+  '/novel/27?panel=causal_chapters'
 )
-assert.equal(getNavRestorePath('/', '/'), '/')
+assert.equal(getNavRestorePath('/stories', '/stories'), '/stories')
 
 console.log('navigation session cache tests passed')

@@ -282,11 +282,34 @@ export interface CausalPressureUpdate {
   evidenceIds?: string[]
 }
 
+export type CausalOutcomeMutationKind =
+  | 'core_summary'
+  | 'promise_advance'
+  | 'promise_resolve'
+  | 'promise_open'
+  | 'actor_state'
+  | 'actor_create'
+  | 'pressure_state'
+  | 'pressure_create'
+  | 'arc_state'
+  | 'emotion_result'
+  | 'terminal_state'
+
+export interface CausalOutcomeMutation {
+  id: string
+  kind: CausalOutcomeMutationKind
+  subject: string
+  claim: string
+  evidenceIds: string[]
+  required: boolean
+}
+
 export interface CausalChapterOutcome {
   summary: string
   eventSignature: string
   evidenceQuotes: string[]
   evidenceRefs?: Array<{ id: string; text: string }>
+  mutations: CausalOutcomeMutation[]
   advancedPromiseIds: string[]
   resolvedPromiseIds: string[]
   newPromises: Array<{ id: string; question: string }>
@@ -612,14 +635,169 @@ export function validateCausalChapterEmotionContract(
   }
 }
 
+function normalizedNarrativeKey(value: string): string {
+  return value.toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '')
+}
+
+export class CausalProgressGateError extends Error {
+  readonly code = 'CAUSAL_PROGRESS_GATE_BLOCKED'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'CausalProgressGateError'
+  }
+}
+
+function narrativeBigramSimilarity(left: string, right: string): number {
+  const a = normalizedNarrativeKey(left)
+  const b = normalizedNarrativeKey(right)
+  if (!a || !b) return 0
+  if (a === b) return 1
+  const grams = (value: string): Set<string> => {
+    const result = new Set<string>()
+    for (let index = 0; index < value.length - 1; index++) result.add(value.slice(index, index + 2))
+    return result
+  }
+  const aGrams = grams(a)
+  const bGrams = grams(b)
+  if (aGrams.size === 0 || bGrams.size === 0) return 0
+  let overlap = 0
+  for (const gram of aGrams) if (bGrams.has(gram)) overlap++
+  return overlap / new Set([...aGrams, ...bGrams]).size
+}
+
+function hasMaterialCausalProgress(
+  state: CausalNarrativeState,
+  outcome: CausalChapterOutcome
+): boolean {
+  if (outcome.terminalConditionMet || outcome.resolvedPromiseIds.length > 0) return true
+  if ((outcome.newActors ?? []).length > 0 || outcome.newPressures.length > 0) return true
+  if ((outcome.arcUpdates ?? []).length > 0) return true
+  if (outcome.actorUpdates.some(update => {
+    const actor = state.actors.find(item => item.name === update.actor)
+    if (!actor) return true
+    return Boolean(
+      (update.currentGoal?.trim() && update.currentGoal.trim() !== actor.currentGoal)
+      || (update.constraint?.trim() && update.constraint.trim() !== actor.constraint)
+      || (update.location?.trim() && update.location.trim() !== actor.location)
+      || (update.physicalState?.trim() && update.physicalState.trim() !== actor.physicalState)
+      || (update.knowledgeAdded ?? []).some(item => !actor.knowledge.includes(item))
+      || (update.resourcesAdded ?? []).some(item => !actor.resources.includes(item))
+      || (update.resourcesRemoved ?? []).some(item => actor.resources.includes(item))
+      || (update.relationshipsAdded ?? []).some(item => !(actor.relationships ?? []).includes(item))
+      || (update.relationshipsRemoved ?? []).some(item => (actor.relationships ?? []).includes(item))
+      || (update.obligationsAdded ?? []).some(item => !(actor.obligations ?? []).includes(item))
+      || (update.obligationsRemoved ?? []).some(item => (actor.obligations ?? []).includes(item))
+    )
+  })) return true
+  return outcome.pressureUpdates.some(update => {
+    const pressure = state.activePressures.find(item => item.id === update.id)
+    if (!pressure) return true
+    return Boolean((update.condition?.trim() && update.condition.trim() !== pressure.condition)
+      || (update.urgency != null && clampUrgency(update.urgency) !== pressure.urgency)
+      || update.status === 'resolved')
+  })
+}
+
 export function applyCausalChapterOutcome(
   state: CausalNarrativeState,
   outcome: CausalChapterOutcome,
   chapterOrdinal: number,
   content: string
 ): CausalNarrativeState {
+  if (!hasMaterialCausalProgress(state, outcome)) {
+    throw new CausalProgressGateError('CHAPTER_NO_MATERIAL_PROGRESS：本章没有改变人物、压力、宏观阶段或已承诺结果，禁止仅靠新增悬念提交')
+  }
+  const repeatedEvent = state.recentEventSignatures.find(signature =>
+    narrativeBigramSimilarity(signature, outcome.eventSignature) >= 0.82
+  )
+  if (repeatedEvent) {
+    throw new CausalProgressGateError(`REPEATED_EVENT_SIGNATURE：本章核心事件与近期事件重复（${repeatedEvent}）`)
+  }
+  const staleArc = state.macroArcs.find(arc =>
+    arc.status === 'active'
+    && chapterOrdinal - arc.lastAdvancedChapter >= 3
+    && !(outcome.arcUpdates ?? []).some(update => update.id === arc.id)
+  )
+  if (staleArc) {
+    throw new CausalProgressGateError(`MACRO_ARC_STAGNATION：阶段「${staleArc.title}」连续三章没有可验证推进`)
+  }
   const evidenceRefMap = new Map((outcome.evidenceRefs ?? []).map(item => [item.id, item.text]))
   for (const ref of outcome.evidenceRefs ?? []) assertEvidence(content, ref.text, `证据单元「${ref.id}」`)
+  if (!Array.isArray(outcome.mutations) || outcome.mutations.length === 0) {
+    throw new Error('章节结果缺少 v6 原子状态变更制品')
+  }
+  const mutationIds = outcome.mutations.map(item => item.id)
+  if (new Set(mutationIds).size !== mutationIds.length) {
+    throw new Error('章节结果包含重复的原子状态变更 ID')
+  }
+  for (const mutation of outcome.mutations) {
+    if (!mutation.id.trim() || !mutation.claim.trim() || !mutation.subject.trim()) {
+      throw new Error('章节结果包含不完整的原子状态变更')
+    }
+    if (!mutation.evidenceIds.length) {
+      throw new Error(`原子状态变更 ${mutation.id} 缺少正文证据`)
+    }
+    const missing = mutation.evidenceIds.filter(id => !evidenceRefMap.has(id))
+    if (missing.length) {
+      throw new Error(`原子状态变更 ${mutation.id} 引用了不存在的证据单元：${missing.join('、')}`)
+    }
+  }
+  const mutationKeys = new Set(outcome.mutations.map(item => `${item.kind}\u0000${item.subject}`))
+  const requireMutation = (
+    kind: CausalOutcomeMutationKind,
+    subject: string,
+    label: string
+  ): void => {
+    if (!mutationKeys.has(`${kind}\u0000${subject}`)) {
+      throw new Error(`${label}缺少对应的 v6 原子状态变更`)
+    }
+  }
+  requireMutation('core_summary', 'chapter', '章节摘要')
+  for (const id of outcome.advancedPromiseIds) {
+    requireMutation('promise_advance', id, `推进读者承诺「${id}」`)
+  }
+  for (const id of outcome.resolvedPromiseIds) {
+    requireMutation('promise_resolve', id, `关闭读者承诺「${id}」`)
+  }
+  outcome.newPromises.forEach((_item, index) => {
+    requireMutation('promise_open', `new:${index}`, `新增读者承诺 #${index + 1}`)
+  })
+  for (const update of outcome.actorUpdates) {
+    const prefix = `actor_state\u0000${update.actor}:`
+    if (!outcome.mutations.some(item => `${item.kind}\u0000${item.subject}`.startsWith(prefix))) {
+      throw new Error(`人物「${update.actor}」更新缺少对应的 v6 原子状态变更`)
+    }
+  }
+  for (const item of outcome.newActors ?? []) {
+    requireMutation('actor_create', `${item.actor.name}:name`, `新增人物「${item.actor.name}」`)
+  }
+  for (const update of outcome.pressureUpdates) {
+    const prefix = `pressure_state\u0000${update.id}:`
+    if (!outcome.mutations.some(item => `${item.kind}\u0000${item.subject}`.startsWith(prefix))) {
+      throw new Error(`压力「${update.id}」更新缺少对应的 v6 原子状态变更`)
+    }
+  }
+  for (const [index] of outcome.newPressures.entries()) {
+    for (const field of ['source', 'target', 'condition', 'escalation', 'urgency']) {
+      requireMutation('pressure_create', `new:${index}:${field}`, `新增压力 #${index + 1} 的 ${field}`)
+    }
+  }
+  for (const update of outcome.arcUpdates ?? []) {
+    requireMutation('arc_state', update.id, `阶段「${update.id}」更新`)
+  }
+  requireMutation('emotion_result', 'reader_effect', '读者情绪结果')
+  requireMutation('emotion_result', 'trigger', '情绪触发')
+  requireMutation('emotion_result', 'choice', '人物选择')
+  requireMutation('emotion_result', 'cost', '人物代价')
+  requireMutation('emotion_result', 'residue', '后续情绪余波')
+  if (outcome.terminalConditionMet) {
+    requireMutation(
+      'terminal_state',
+      outcome.matchedTerminalCondition?.trim() ?? '',
+      '终止条件'
+    )
+  }
   const assertBoundEvidence = (evidence: string, evidenceIds: string[] | undefined, label: string): void => {
     if (evidenceIds?.length) {
       const missing = evidenceIds.filter(id => !evidenceRefMap.has(id))
@@ -681,6 +859,9 @@ export function applyCausalChapterOutcome(
 
   const activePromiseIds = new Set(state.promises.map(item => item.id))
   const knownPromiseIds = new Set([...activePromiseIds, ...state.archivedPromiseIds])
+  const promiseQuestions = state.promises
+    .filter(item => item.status !== 'resolved')
+    .map(item => item.question)
   for (const id of [...outcome.advancedPromiseIds, ...outcome.resolvedPromiseIds]) {
     if (!activePromiseIds.has(id)) throw new Error(`章节结果引用不存在或已归档的读者承诺：${id}`)
   }
@@ -695,11 +876,22 @@ export function applyCausalChapterOutcome(
   })
   for (const item of outcome.newPromises) {
     if (!item.id.trim() || knownPromiseIds.has(item.id)) throw new Error(`新增读者承诺 ID 非法或重复：${item.id}`)
+    const duplicateQuestion = promiseQuestions.find(question =>
+      narrativeBigramSimilarity(question, item.question) >= 0.82
+    )
+    if (duplicateQuestion) {
+      throw new CausalProgressGateError(`DUPLICATE_READER_PROMISE：新增问题与未兑现承诺语义重复（${duplicateQuestion}）`)
+    }
     knownPromiseIds.add(item.id)
+    promiseQuestions.push(item.question)
     nextPromises.push({
       id: item.id.trim(), question: item.question.trim(), status: 'open',
       openedChapter: chapterOrdinal, lastAdvancedChapter: chapterOrdinal
     })
+  }
+  const unresolvedPromiseCount = nextPromises.filter(item => item.status !== 'resolved').length
+  if (unresolvedPromiseCount > 24) {
+    throw new CausalProgressGateError(`PROMISE_LEDGER_OVERFLOW：未兑现读者承诺 ${unresolvedPromiseCount} 个，超过硬上限 24 个`)
   }
 
   const actors = state.actors.map(actor => {

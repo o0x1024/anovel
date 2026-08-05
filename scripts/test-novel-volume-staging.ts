@@ -21,16 +21,34 @@ import {
   planNovelVolumeRanges,
   replaceUniqueRepairText,
   resolveNovelVolumeWorkflowCheckpoint,
-  shouldDeferNovelVolumeGateIssues,
+  shouldBlockNovelVolumeGateIssues,
   selectDeterministicNovelRepairChapterNumbers,
   selectNovelVolumeGateRepairTargets,
   validatePartialVolumePlan,
+  validateUniqueChapterTitles,
   volumeGenerationProfile
 } from '../src/main/context/goal-routine/novel-outline-pipeline'
 import {
+  CHAPTER_SKELETON_MAX_ATTEMPTS,
+  CHAPTER_SKELETON_PROTOCOL_VERSION,
+  CHAPTER_SKELETON_FORESHADOW_MAX_CHARS,
+  RECENT_SKELETON_CONTEXT_CHAPTERS,
+  buildChapterSkeletonAuthorityConstraints,
+  chapterSkeletonRequestTokenBudget,
+  chapterSkeletonTokenBudget,
+  compactOutlineForSkeletonContext,
+  compactPatternForSkeletonContext,
+  materializeChapterSkeletonAuthorityLedger,
+  projectChapterSkeletonDelta,
+  validateChapterSkeletonAuthorityLedger
+} from '../src/main/context/goal-routine/novel-chapter-skeleton-policy'
+import {
   MAX_AUTO_NOVEL_REPAIR_CHAPTERS,
+  classifyNovelConstructionOutputTerminal,
   capNovelAutomaticRepairTargets,
+  isNovelHardBudgetExhausted,
   isNovelChapterReadyForTransition,
+  isNovelChapterCheckpointFailure,
   isTerminalNovelRepairError,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
@@ -38,25 +56,105 @@ import {
   resolveNovelPreparationPhase,
   selectReusableNovelExecutionCandidate,
   shouldPersistNovelExecutionCandidate,
-  shouldContinueNovelAfterVolumeRepairBoundary,
   shouldDeferNovelChapterAcceptance,
   shouldDeferNovelQualityCandidate,
-  shouldExtendNovelConstructionBudget,
   shouldPauseForNovelConstructionOutputFailure,
   shouldRecoverNovelChapterExecutionProtocol,
   shouldPauseForReadOnlyNovelAudit
 } from '../src/main/context/goal-routine/novel-goal-policy'
 import {
+  novelVolumeGateIssueFingerprint,
+  planNovelVolumeGateRepairClusters,
+  selectNovelVolumeRepairWave
+} from '../src/main/context/goal-routine/novel-volume-chapter-gate'
+import {
   shouldInjectTasteAndConditionRules,
   shouldInjectWritingStyle
 } from '../src/main/context/step-prompt-policy'
-import { isEmotionAssessmentAcceptedForTransition } from '../src/main/context/goal-routine/emotion-gate'
+import {
+  emotionAssessmentMatchesContent,
+  emotionContentHash,
+  isEmotionAssessmentAcceptedForTransition
+} from '../src/main/context/goal-routine/emotion-gate'
 import {
   parseCachedQualityAssessment,
   serializeQualityAssessment
 } from '../src/main/context/goal-routine/chapter-assessment-cache'
+import {
+  MAX_QUALITY_EVALUATOR_FAILURES,
+  classifyQualityDiagnosisFailure,
+  qualityEvaluatorFailureCode,
+  shouldOpenQualityEvaluatorCircuit
+} from '../src/main/context/goal-routine/quality-evaluator-policy'
+import {
+  NARRATIVE_MEMORY_BASE_MAX_TOKENS,
+  NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS,
+  decideNarrativeMemoryRetry,
+  narrativeMemoryTokenBudget
+} from '../src/main/context/goal-routine/narrative-memory-failure'
 
 const targetChapters = 260
+
+assert.equal(classifyQualityDiagnosisFailure('timeout of 240000ms exceeded'), 'timeout')
+assert.equal(classifyQualityDiagnosisFailure('ECONNRESET'), 'transport')
+assert.equal(classifyQualityDiagnosisFailure('已取消', true), 'cancelled')
+assert.equal(qualityEvaluatorFailureCode('timeout'), 'QUALITY_EVALUATOR_UNAVAILABLE')
+assert.equal(qualityEvaluatorFailureCode('protocol'), 'QUALITY_EVALUATOR_PROTOCOL')
+assert.equal(MAX_QUALITY_EVALUATOR_FAILURES, 2)
+assert.equal(shouldOpenQualityEvaluatorCircuit({
+  failureKind: 'timeout',
+  consecutiveFailures: 1
+}), false)
+assert.equal(isNovelChapterCheckpointFailure('EMOTION_LEDGER_TRUNCATED'), true)
+assert.equal(isNovelChapterCheckpointFailure('MEMORY_EXTRACT_TRANSPORT'), true)
+assert.equal(isNovelChapterCheckpointFailure('QUALITY_EVALUATOR_UNAVAILABLE'), false)
+assert.equal(shouldOpenQualityEvaluatorCircuit({
+  failureKind: 'timeout',
+  consecutiveFailures: 2
+}), true)
+assert.equal(shouldOpenQualityEvaluatorCircuit({
+  failureKind: 'cancelled',
+  consecutiveFailures: 2
+}), false)
+assert.equal(
+  narrativeMemoryTokenBudget(1),
+  NARRATIVE_MEMORY_BASE_MAX_TOKENS
+)
+assert.equal(
+  narrativeMemoryTokenBudget(2),
+  8400
+)
+assert.equal(
+  narrativeMemoryTokenBudget(3),
+  12600
+)
+assert.equal(NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS, 2)
+assert.throws(() => narrativeMemoryTokenBudget(4), /生成轮次/)
+assert.equal(decideNarrativeMemoryRetry({
+  failureCode: 'MEMORY_EXTRACT_TRANSPORT',
+  generationAttempt: 1,
+  transportAttempt: 1
+}), 'retry_transport')
+assert.equal(decideNarrativeMemoryRetry({
+  failureCode: 'MEMORY_EXTRACT_TRANSPORT',
+  generationAttempt: 1,
+  transportAttempt: 2
+}), 'pause')
+assert.equal(decideNarrativeMemoryRetry({
+  failureCode: 'MEMORY_EXTRACT_PROTOCOL',
+  generationAttempt: 1,
+  transportAttempt: 1
+}), 'next_generation')
+assert.equal(decideNarrativeMemoryRetry({
+  failureCode: 'MEMORY_EXTRACT_TRUNCATED',
+  generationAttempt: 2,
+  transportAttempt: 1
+}), 'next_generation')
+assert.equal(decideNarrativeMemoryRetry({
+  failureCode: 'MEMORY_EXTRACT_TRUNCATED',
+  generationAttempt: 3,
+  transportAttempt: 1
+}), 'pause')
 
 assert.equal(isActionableNovelVolumeGateIssue({
   code: 'STATE_CONTINUITY_BREAK',
@@ -91,22 +189,22 @@ const modelResidualIssue = {
   evidence: [{ chapterNumber: 26, quote: '证据文本' }],
   requiredFix: '后续定点复核'
 }
-assert.equal(shouldDeferNovelVolumeGateIssues({
+assert.equal(shouldBlockNovelVolumeGateIssues({
   score: 92,
   issues: [modelResidualIssue],
   deterministicIssueCount: 0
 }), true)
-assert.equal(shouldDeferNovelVolumeGateIssues({
+assert.equal(shouldBlockNovelVolumeGateIssues({
   score: 89,
   issues: [modelResidualIssue],
   deterministicIssueCount: 0
 }), true)
-assert.equal(shouldDeferNovelVolumeGateIssues({
+assert.equal(shouldBlockNovelVolumeGateIssues({
   score: 92,
   issues: [{ ...modelResidualIssue, source: 'deterministic' }],
   deterministicIssueCount: 1
 }), true)
-assert.equal(shouldDeferNovelVolumeGateIssues({
+assert.equal(shouldBlockNovelVolumeGateIssues({
   score: 0,
   issues: [],
   deterministicIssueCount: 0
@@ -130,6 +228,11 @@ assert.equal(resolveNovelPreparationPhase({
   requestedPhase: 'generate_beats',
   characterCardsReady: false
 }), 'generate_character_cards')
+assert.equal(resolveNovelPreparationPhase({
+  ...completePreparation,
+  requestedPhase: 'overall_self_check',
+  settingsReady: false
+}), 'materialize_settings')
 assert.equal(resolveNovelPreparationPhase({
   ...completePreparation,
   requestedPhase: 'generate_beats',
@@ -219,17 +322,103 @@ assert.deepEqual(
 const initialBudget = checkNovelVolumeRepairBudget({ chapterNumbers: [4, 5] })
 assert.equal(initialBudget.allowed, true)
 assert.equal(NOVEL_VOLUME_GATE_MAX_REPAIRED_CHAPTERS, 6)
-assert.equal(NOVEL_VOLUME_GATE_MAX_REWRITES_PER_CHAPTER, 1)
+assert.equal(NOVEL_VOLUME_GATE_MAX_REWRITES_PER_CHAPTER, Number.MAX_SAFE_INTEGER)
 if (initialBudget.allowed) {
   assert.equal(checkNovelVolumeRepairBudget({
     chapterNumbers: [4],
     control: { ...initialBudget.control, rewriteCounts: { '4': 1 } }
-  }).allowed, false)
+  }).allowed, true)
+  assert.equal(checkNovelVolumeRepairBudget({
+    chapterNumbers: [4],
+    control: { ...initialBudget.control, rewriteCounts: { '4': 2 } }
+  }).allowed, true)
   assert.equal(checkNovelVolumeRepairBudget({
     chapterNumbers: [6, 7, 8, 9, 10],
     control: initialBudget.control
   }).allowed, false)
 }
+const rootCauseIssues = [[10], [12], [14, 15], [22], [28, 29], [31, 32], [40, 41, 42]].map(repairChapterNumbers => ({
+  source: 'model' as const,
+  severity: 'hard' as const,
+  code: 'STATE_CONTINUITY_BREAK',
+  problem: `问题${repairChapterNumbers[0]}`,
+  repairChapterNumbers,
+  evidence: [],
+  requiredFix: '修复根因'
+}))
+const rootClusters = planNovelVolumeGateRepairClusters(rootCauseIssues)
+assert.deepEqual(rootClusters.map(cluster => cluster.chapterNumbers), [[10], [12], [14], [22], [28], [31], [40]])
+assert.deepEqual(
+  planNovelVolumeGateRepairClusters([
+    { ...rootCauseIssues[0], repairChapterNumbers: [10, 11] },
+    { ...rootCauseIssues[1], repairChapterNumbers: [12, 13] }
+  ], {
+    changedChapterNumbers: [10],
+    rewriteCounts: { '10': 2 },
+    lastRoundVersions: []
+  }).map(cluster => cluster.chapterNumbers),
+  [[10], [12]]
+)
+const exhaustedOnlyIssue = {
+  ...rootCauseIssues[0],
+  repairChapterNumbers: [19],
+  evidence: [{ chapterNumber: 18, quote: '前章已完成揭露' }, { chapterNumber: 19, quote: '本章重复揭露' }]
+}
+assert.deepEqual(
+  planNovelVolumeGateRepairClusters([exhaustedOnlyIssue], {
+    changedChapterNumbers: [19],
+    rewriteCounts: { '19': Number.MAX_SAFE_INTEGER },
+    lastRoundVersions: []
+  }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]).map(cluster => cluster.chapterNumbers),
+  [[18]]
+)
+assert.deepEqual(
+  planNovelVolumeGateRepairClusters([exhaustedOnlyIssue], {
+    changedChapterNumbers: [17, 18, 19, 20],
+    rewriteCounts: {
+      '17': Number.MAX_SAFE_INTEGER,
+      '18': Number.MAX_SAFE_INTEGER,
+      '19': Number.MAX_SAFE_INTEGER,
+      '20': Number.MAX_SAFE_INTEGER
+    },
+    lastRoundVersions: []
+  }, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]).map(cluster => cluster.chapterNumbers),
+  [[21]]
+)
+assert.equal(
+  novelVolumeGateIssueFingerprint([exhaustedOnlyIssue]),
+  novelVolumeGateIssueFingerprint([{ ...exhaustedOnlyIssue, evidence: [...exhaustedOnlyIssue.evidence].reverse() }])
+)
+assert.deepEqual(selectNovelVolumeRepairWave(rootClusters).map(cluster => cluster.chapterNumbers), [[10], [12], [14], [22], [28], [31]])
+assert.deepEqual(selectNovelVolumeRepairWave(rootClusters, 6).map(cluster => cluster.chapterNumbers), [[40]])
+assert.deepEqual(
+  selectNovelVolumeRepairWave(rootClusters, 1, [10, 12, 14, 22, 28, 31]).map(cluster => cluster.chapterNumbers),
+  [[12], [14], [22], [28], [31]]
+)
+assert.deepEqual(
+  selectNovelVolumeRepairWave(rootClusters, 1, [10, 12, 14, 22, 28, 31]).map(cluster => cluster.chapterNumbers).flat(),
+  [12, 14, 22, 28, 31]
+)
+assert.equal(checkNovelVolumeRepairBudget({
+  chapterNumbers: [12, 14],
+  control: {
+    changedChapterNumbers: [10, 12, 14, 22, 28, 31],
+    rewriteCounts: { '10': 1 },
+    completedWaveCount: undefined,
+    waveChapterNumbers: [10, 12, 14, 22, 28, 31],
+    lastRoundVersions: []
+  }
+}).allowed, true)
+assert.equal(checkNovelVolumeRepairBudget({
+  chapterNumbers: [40],
+  control: {
+    changedChapterNumbers: [10, 12, 14, 22, 28, 31],
+    rewriteCounts: { '10': 1, '12': 1, '14': 1, '22': 1, '28': 1, '31': 1 },
+    completedWaveCount: 1,
+    waveChapterNumbers: [],
+    lastRoundVersions: []
+  }
+}).allowed, true)
 assert.equal(replaceUniqueRepairText({
   chapterNumber: 14,
   field: 'outline',
@@ -276,6 +465,22 @@ assert.equal(
   novelPhaseFailureSignature('draft_body', 'Error', '叙事记忆提取连续3轮失败：chapter_pattern 缺失'),
   novelPhaseFailureSignature('draft_body', 'Error', '章节模式指纹提取失败，禁止进入下一章')
 )
+assert.equal(
+  novelPhaseFailureSignature(
+    'draft_body',
+    'EMOTION_LEDGER_TRUNCATED',
+    '情绪账本批次 002:沈清瑶|苏菱 连续 2 次失败：finishReason=length'
+  ),
+  'draft_body:emotion_ledger:EMOTION_LEDGER_TRUNCATED:truncated'
+)
+assert.equal(
+  novelPhaseFailureSignature(
+    'draft_body',
+    'MEMORY_EXTRACT_TRANSPORT',
+    '叙事记忆提取连续3轮未通过结构与证据门禁：timeout of 120000ms exceeded'
+  ),
+  'draft_body:memory_extraction:MEMORY_EXTRACT_TRANSPORT:timeout'
+)
 assert.notEqual(
   novelPhaseFailureSignature('draft_body', 'Error', '章节情节点覆盖/衔接经过 2 轮定向修复仍未通过'),
   novelPhaseFailureSignature('draft_body', 'Error', '章节执行修复后仍有 1 处泛白类模板反应')
@@ -283,6 +488,14 @@ assert.notEqual(
 assert.notEqual(
   novelPhaseFailureSignature('draft_body', 'EVALUATOR_PROTOCOL', '章节执行评估器连续 3 次未返回可逐项验证的精确证据'),
   novelPhaseFailureSignature('draft_body', 'Error', '章节情节点覆盖/衔接经过 2 轮定向修复仍未通过')
+)
+assert.equal(
+  novelPhaseFailureSignature(
+    'draft_body',
+    'QUALITY_EVALUATOR_UNAVAILABLE',
+    '质量评估器连续 2 次不可用，未产生任何有效质量轮次；最后错误：timeout of 240000ms exceeded'
+  ),
+  'draft_body:quality_evaluator:QUALITY_EVALUATOR_UNAVAILABLE:timeout'
 )
 const reusableCandidate = selectReusableNovelExecutionCandidate([
   {
@@ -531,11 +744,143 @@ assert.deepEqual(planNovelChapterBatch(1, 44), {
 const skeletonSchemaText = JSON.stringify(chapterSkeletonBatchSchema(1, 3))
 assert.doesNotMatch(skeletonSchemaText, /emotion_contract|dramatic_contract|pattern_contract|resource_budget/)
 assert.match(skeletonSchemaText, /next_hook/)
+assert.doesNotMatch(skeletonSchemaText, /"const"/, '章节骨架传输 Schema 不得绑定运行时章号')
+assert.doesNotMatch(skeletonSchemaText, /startChapter|endChapter|chapterNumber/, '批次范围和章号必须由系统按顺序注入')
+assert.doesNotMatch(skeletonSchemaText, /"minItems":3(?:,|})|"maxItems":1(?:,|})/, '章节数量必须由业务校验，不得固化进传输 Schema')
+assert.doesNotMatch(skeletonSchemaText, /outline_sections|must_cover|forbidden_boundary|"continuity_constraints"/)
+assert.match(skeletonSchemaText, /required_beats/)
+assert.match(skeletonSchemaText, /resolved_constraints/)
+assert.match(skeletonSchemaText, /fact_changes/)
+assert.doesNotMatch(skeletonSchemaText, /state_changes|fact_updates|fact_creations|"before"|new_constraints|replacement|constraint_changes/)
+assert.equal(CHAPTER_SKELETON_PROTOCOL_VERSION, 9)
+assert.equal(CHAPTER_SKELETON_FORESHADOW_MAX_CHARS, 120)
+assert.match(skeletonSchemaText, /life_status/)
+assert.doesNotMatch(skeletonSchemaText, /"rule"/)
+assert.equal(CHAPTER_SKELETON_MAX_ATTEMPTS, 3)
+assert.deepEqual(
+  Array.from({ length: CHAPTER_SKELETON_MAX_ATTEMPTS }, (_, index) => chapterSkeletonTokenBudget(index + 1)),
+  [1600, 3200, 6400]
+)
+assert.equal(chapterSkeletonRequestTokenBudget(2, 'OUTPUT_INVALID: Schema 校验失败'), 1600)
+assert.equal(chapterSkeletonRequestTokenBudget(2, '输出达到长度上限（finishReason=length）'), 3200)
+assert.equal(chapterSkeletonRequestTokenBudget(3, 'Unexpected end of JSON'), 6400)
+assert.equal(chapterSkeletonRequestTokenBudget(2, 'OUTPUT_TRUNCATED: 结构化响应达到长度上限'), 3200)
+assert.equal(chapterSkeletonRequestTokenBudget(3, 'OUTPUT_TRUNCATED: 结构化响应达到长度上限'), 6400)
+validateUniqueChapterTitles([
+  { chapterNumber: 1, title: '第1章 垃圾房的反击' },
+  { chapterNumber: 2, title: '第2章 管道逃生' }
+])
+assert.throws(
+  () => validateUniqueChapterTitles([
+    { chapterNumber: 1, title: '第1章 垃圾堆里的第一桶金' },
+    { chapterNumber: 2, title: '第2章 垃圾堆里的第一桶金' }
+  ]),
+  /章节标题重复/
+)
+assert.throws(
+  () => validateUniqueChapterTitles(
+    [{ chapterNumber: 9, title: '第9章 管道逃生' }],
+    ['第2章 管道逃生']
+  ),
+  /章节标题重复/
+)
+const authorityConstraints = buildChapterSkeletonAuthorityConstraints(
+  '【禁止越界】不得让刀疤死亡；不得暴露系统【连续性约束】手枪由刀疤持有；陈凉左肩带伤',
+  32
+)
+assert.ok(authorityConstraints.every(item => /^K[0-9a-f]{12}$/.test(item.id)))
+assert.equal(new Set(authorityConstraints.map(item => item.id)).size, 4)
+const commaSeparatedAuthority = buildChapterSkeletonAuthorityConstraints(
+  '【禁止越界】不得回收手枪，不得击杀刀疤，不得揭晓白大褂身份【连续性约束】陈凉必须持有铁钉、铁蒺藜、短撬棍，消防斧必须藏在通风管道，系统升级已完成，手枪必须由刀疤持有',
+  32
+)
+assert.deepEqual(
+  commaSeparatedAuthority.map(item => item.value),
+  [
+    '不得回收手枪',
+    '不得击杀刀疤',
+    '不得揭晓白大褂身份',
+    '陈凉必须持有铁钉、铁蒺藜、短撬棍',
+    '消防斧必须藏在通风管道',
+    '系统升级已完成',
+    '手枪必须由刀疤持有'
+  ]
+)
+const authorityLedger = materializeChapterSkeletonAuthorityLedger(
+  '【禁止越界】不得让刀疤死亡；不得暴露系统【连续性约束】手枪由刀疤持有；陈凉左肩带伤',
+  32
+)
+validateChapterSkeletonAuthorityLedger(authorityLedger, 32)
+const resolvedConstraintId = Object.values(authorityLedger.constraints)
+  .find(item => item.value === '陈凉左肩带伤')!.id
+const projection = projectChapterSkeletonDelta({
+  opening_state: '密室中的机器人开始启动',
+  required_beats: ['陈凉制作干扰器', '干扰器瘫痪机器人'],
+  ending_state: '机器人瘫痪，密室外出现新信号',
+  foreshadow_target: '第三台终端身份将在后续揭晓',
+  fact_changes: [{ subject: '工业机器人', field: 'condition', after: '瘫痪', beat_index: 2 }],
+  resolved_constraints: [{ constraint_id: resolvedConstraintId, beat_index: 1 }],
+}, authorityLedger, 33)
+assert.match(projection.outline, /【开场状态】密室中的机器人开始启动/)
+assert.match(projection.outline, /承诺K[0-9a-f]{12}/)
+assert.match(projection.outline, /F[0-9a-f]{12}@2/)
+assert.doesNotMatch(projection.outline, /陈凉左肩带伤/)
+assert.equal(projection.ledger.lastCommittedChapter, 33)
+assert.equal(projection.ledger.revision, 1)
+const robotFact = Object.values(projection.ledger.facts)
+  .find(item => item.subject === '工业机器人' && item.field === 'condition')!
+const updatedProjection = projectChapterSkeletonDelta({
+  opening_state: '机器人瘫痪在密室中央',
+  required_beats: ['陈凉拆开机器人外壳', '机器人核心被取出'],
+  ending_state: '机器人被拆解，核心落入陈凉手中',
+  foreshadow_target: '',
+  fact_changes: [{ subject: robotFact.subject, field: robotFact.field, after: '已拆解，核心被取出', beat_index: 2 }],
+  resolved_constraints: [],
+}, projection.ledger, 34)
+assert.match(updatedProjection.outline, /F[0-9a-f]{12}@2/)
+assert.equal(updatedProjection.ledger.facts[robotFact.id]?.value, '已拆解，核心被取出')
+assert.throws(() => projectChapterSkeletonDelta({
+  opening_state: '开场',
+  required_beats: ['行动一', '行动二'],
+  ending_state: '结尾',
+  foreshadow_target: '',
+  fact_changes: [{ subject: '工业机器人', field: 'condition', after: '重新运行', beat_index: 1 }, { subject: '工业机器人', field: 'condition', after: '再次运行', beat_index: 2 }],
+  resolved_constraints: [],
+}, projection.ledger, 34), /只能操作一次/)
+assert.throws(() => projectChapterSkeletonDelta({
+  opening_state: '开场',
+  required_beats: ['行动一', '行动二'],
+  ending_state: '结尾',
+  fact_changes: [{ subject: '新线索', field: 'knowledge', after: '首次出现', beat_index: 1 }],
+  resolved_constraints: [{ constraint_id: 'K000000000000', beat_index: 1 }],
+}, authorityLedger, 33), /不存在的权威约束 K000000000000/)
+assert.equal(RECENT_SKELETON_CONTEXT_CHAPTERS, 3)
+const oversizedOutline = [
+  `【开场状态】${'甲'.repeat(500)}`,
+  `【必须覆盖】${'乙'.repeat(500)}`,
+  `【禁止越界】${'丙'.repeat(500)}`,
+  `【结尾落点】${'丁'.repeat(500)}`,
+  `【连续性约束】${'戊'.repeat(500)}`
+].join('')
+const compactedOutline = compactOutlineForSkeletonContext(oversizedOutline)
+assert.ok(compactedOutline.length <= 804)
+assert.match(compactedOutline, /【开场状态】/)
+assert.match(compactedOutline, /【连续性约束】/)
+const compactedPattern = compactPatternForSkeletonContext({
+  conflict_type: '不得进入下一章上下文',
+  hook_type: '钩'.repeat(500),
+  relationship_delta: '关系'.repeat(500),
+  volume_objective_delta: '卷目标'.repeat(500)
+})
+assert.equal('conflict_type' in compactedPattern, false)
+assert.ok(Object.values(compactedPattern).every(value => value.length <= 140))
 const contractSchemaText = JSON.stringify(chapterStructureContractSchema(1))
 assert.match(contractSchemaText, /dramatic_contract/)
 assert.match(contractSchemaText, /antagonist_tactic/)
 assert.match(contractSchemaText, /resource_budget/)
 assert.match(contractSchemaText, /"maxLength":240/)
+assert.doesNotMatch(contractSchemaText, /"const"/, '章节结构合同传输 Schema 不得绑定运行时章号')
+assert.doesNotMatch(contractSchemaText, /chapterNumber/, '单章结构合同不得要求模型照抄系统章号')
 assert.equal(chapterStructureContractTokenBudget(1), 3200)
 assert.equal(chapterStructureContractTokenBudget(2), 6400)
 assert.equal(chapterStructureContractTokenBudget(3), 12800)
@@ -544,10 +889,30 @@ assert.equal(shouldPauseForNovelConstructionOutputFailure({
   phase: 'generate_beats',
   errorCode: 'OUTPUT_TRUNCATED'
 }), true)
+assert.deepEqual(classifyNovelConstructionOutputTerminal({
+  errorCode: 'RESPONSE_PROTOCOL_EXHAUSTED',
+  message: 'OUTPUT_INVALID: novel_chapter_skeleton_batch 本地 Schema 校验失败'
+}), {
+  action: 'chapter_skeleton_contract_terminal',
+  progress: '章节骨架状态操作连续不满足合同，已保留检查点并暂停'
+})
+assert.equal(classifyNovelConstructionOutputTerminal({
+  errorCode: 'CHAPTER_SKELETON_PROTOCOL_EXHAUSTED',
+  message: 'fact_updates[0] 引用了不存在的权威事实'
+}).action, 'chapter_skeleton_contract_terminal')
+assert.equal(classifyNovelConstructionOutputTerminal({
+  errorCode: 'OUTPUT_TRUNCATED',
+  message: 'finishReason=length'
+}).action, 'output_truncation_terminal')
 assert.equal(shouldPauseForNovelConstructionOutputFailure({
   phase: 'generate_volumes',
   errorCode: 'OUTPUT_TRUNCATED'
 }), false)
+assert.equal(shouldPauseForNovelConstructionOutputFailure({
+  phase: 'generate_beats',
+  errorCode: 'RESPONSE_PROTOCOL_EXHAUSTED',
+  message: '连续 3 次结构化输出无效：OUTPUT_INVALID: 本地 Schema 校验失败'
+}), true)
 assert.deepEqual(missingChapterStructureFields({
   chapterNumber: 1,
   dramatic_contract: Object.fromEntries([
@@ -585,27 +950,9 @@ assert.equal(MAX_AUTO_NOVEL_REPAIR_CHAPTERS, 8)
 assert.equal(isTerminalNovelRepairError('REPAIR_STALL'), true)
 assert.equal(isTerminalNovelRepairError('REPAIR_BOUNDARY'), true)
 assert.equal(isTerminalNovelRepairError('OUTPUT_INVALID'), false)
-assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
-  phase: 'generate_beats', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: true
-}), true)
-assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
-  phase: 'generate_beats', errorCode: 'REPAIR_BOUNDARY', hasVolumeCheckpoint: true
-}), true)
-assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
-  phase: 'draft_body', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: true
-}), false)
-assert.equal(shouldExtendNovelConstructionBudget({
-  turn: 1000, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 800, completedBodies: 400
-}), true)
-assert.equal(shouldExtendNovelConstructionBudget({
-  turn: 1000, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 800, completedBodies: 800
-}), false)
-assert.equal(shouldExtendNovelConstructionBudget({
-  turn: 999, maxTurns: 1000, expectedChapters: 800, outlinedChapters: 400, completedBodies: 0
-}), false)
-assert.equal(shouldContinueNovelAfterVolumeRepairBoundary({
-  phase: 'generate_beats', errorCode: 'REPAIR_STALL', hasVolumeCheckpoint: false
-}), false)
+assert.equal(isNovelHardBudgetExhausted(1000, 1000), true)
+assert.equal(isNovelHardBudgetExhausted(1001, 1000), true)
+assert.equal(isNovelHardBudgetExhausted(999, 1000), false)
 assert.equal(isNovelChapterReadyForTransition({
   qualityReady: true,
   emotionReady: true,
@@ -645,6 +992,23 @@ assert.equal(isEmotionAssessmentAcceptedForTransition({
     ledger_schema_version: 2
   }
 } as never), false)
+const emotionBoundContent = '与情绪问题报告绑定的正文'
+assert.equal(emotionAssessmentMatchesContent({
+  passed: false,
+  outcome_meta: {
+    content_hash: emotionContentHash(emotionBoundContent),
+    ledger_complete: false,
+    ledger_schema_version: 2
+  }
+} as never, emotionBoundContent), true)
+assert.equal(emotionAssessmentMatchesContent({
+  passed: false,
+  outcome_meta: {
+    content_hash: emotionContentHash(emotionBoundContent),
+    ledger_complete: false,
+    ledger_schema_version: 2
+  }
+} as never, `${emotionBoundContent}（已修改）`), false)
 const deferredQualityContent = '延后验收正文'
 const deferredQuality = parseCachedQualityAssessment(serializeQualityAssessment({
   content: deferredQualityContent,

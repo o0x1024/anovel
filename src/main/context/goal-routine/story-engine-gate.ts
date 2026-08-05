@@ -1,13 +1,13 @@
 import { coreSettingDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
-import { appLogger } from '../../logger/app-logger'
 import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
 import { auditStoryEngineSemantics } from './story-engine-semantic-audit'
 import { GoalPhaseExhaustedError } from './goal-phase-error'
 import { deriveRequiredStorySettingResolutions } from '../../../shared/story-harness'
+import { requestStructuredModelOutput } from './structured-model-output'
 
 const STORY_ENGINE_MAX_ROUNDS = 3
 const STORY_ENGINE_FORMAT_ATTEMPTS = 2
@@ -119,11 +119,18 @@ async function requestEnginePayload(
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<EngineGatePayload> {
-  let lastError = '未知格式错误'
-  for (let attempt = 1; attempt <= STORY_ENGINE_FORMAT_ATTEMPTS; attempt++) {
-    if (signal?.aborted) throw new Error('已取消')
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
+  return requestStructuredModelOutput<EngineGatePayload>({
+    workId,
+    label: '故事发动机结构化输出',
+    attempts: STORY_ENGINE_FORMAT_ATTEMPTS,
+    signal,
+    schema: STORY_ENGINE_RESPONSE_SCHEMA,
+    request: (attempt, lastError) => {
+      if (attempt > 1) {
+        onProgress?.(`故事发动机结构化输出无效，正在本轮内部压缩重试（${attempt}/${STORY_ENGINE_FORMAT_ATTEMPTS}）`)
+      }
+      return modelService.chat(
+        withGoalLoopModelOptions(workId, {
         workId,
         step: 'story_engine_gate',
         enrichWorkContext: false,
@@ -136,6 +143,7 @@ async function requestEnginePayload(
           schema: STORY_ENGINE_RESPONSE_SCHEMA,
           strict: true
         },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: request.systemPrompt,
         prompt: [
           request.prompt,
@@ -143,40 +151,12 @@ async function requestEnginePayload(
             ? `【格式重试】上一输出无效：${lastError}。压缩表述并重新输出完整 JSON；不得续写、解释或复制残缺片段。`
             : ''
         ].filter(Boolean).join('\n\n')
-      }),
-      { stream: false, signal }
-    )
-    if (!response.success || !response.content?.trim()) {
-      lastError = response.error || '模型无返回'
-    } else if (response.finishReason === 'length') {
-      lastError = `输出达到 ${STORY_ENGINE_MAX_TOKENS} token 上限（finishReason=length）`
-    } else {
-      try {
-        const parsed = parsePayload(response.content)
-        if (parsed.formatRepairs.length > 0) {
-          appLogger.warn('story_engine_gate', '故事发动机 JSON 已做确定性结构修复', {
-            workId,
-            attempt,
-            repairs: parsed.formatRepairs
-          })
-          onProgress?.('故事发动机返回存在可证明的闭合符遗漏，已自动修复并继续门禁')
-        }
-        return parsed
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-      }
-    }
-    appLogger.warn('story_engine_gate', '故事发动机结构化输出无效，局部重试', {
-      workId,
-      attempt,
-      finishReason: response.finishReason,
-      error: lastError
-    })
-    if (attempt < STORY_ENGINE_FORMAT_ATTEMPTS) {
-      onProgress?.(`故事发动机结构化输出无效，正在本轮内部压缩重试（${attempt}/${STORY_ENGINE_FORMAT_ATTEMPTS}）`)
-    }
-  }
-  throw new Error(`故事发动机结构化输出连续 ${STORY_ENGINE_FORMAT_ATTEMPTS} 次无效：${lastError}`)
+        }),
+        { stream: false, signal }
+      )
+    },
+    validate: value => parsePayload(JSON.stringify(value))
+  })
 }
 
 function sourceContext(workId: number): string {

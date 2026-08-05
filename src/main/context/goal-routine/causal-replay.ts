@@ -5,7 +5,7 @@ import {
   prepareNarrativeMemoryAfterGeneration,
   type PreparedNarrativeMemory
 } from './story-goal-doer'
-import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-goal-routine'
+import { novelMemoryCommitBlockers, runChapterAcceptanceGate } from './novel-chapter-acceptance'
 import type { StoryGoalConfig } from './story-goal-checker'
 import { extractCausalOutcome } from './causal-novel-engine'
 

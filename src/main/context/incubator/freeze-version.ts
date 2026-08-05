@@ -52,7 +52,7 @@ export async function freezeIncubatorStorylineVersion(
     console.log(`[freeze] workId=${workId} 使用缓存门禁报告: passed=${gate.passed}, issues=${gate.issues.length}, coherence=${gate.coherence.length}`)
   } else {
     console.log(`[freeze] workId=${workId} 无缓存门禁报告，重新运行 AI 门禁`)
-    gate = await runIncubatorGate(workId, undefined, modelOpts)
+    gate = await runIncubatorGate(workId, undefined, undefined, modelOpts)
     console.log(`[freeze] workId=${workId} AI 门禁结果: passed=${gate.passed}, issues=${gate.issues.length}`)
   }
 

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { parseChapterSuggestions } from '../src/main/context/parse-chapters'
 import {
+  StoryCandidateFailureError,
   classifyStructuralRepairParseFailure,
   routineFailureSignature,
   structuralRepairTokenBudget
@@ -8,6 +9,7 @@ import {
 import { resolveGenerationMaxTokens } from '../src/main/model/generation-token-budget'
 
 assert.equal(resolveGenerationMaxTokens(undefined, 5250), 5250)
+assert.equal(resolveGenerationMaxTokens(undefined, 15360), 15360)
 assert.equal(resolveGenerationMaxTokens(12000, 5250), 5250)
 assert.equal(resolveGenerationMaxTokens(2600, 5250), 2600)
 assert.equal(resolveGenerationMaxTokens(2600.9, 5250.9), 2600)
@@ -56,9 +58,25 @@ assert.equal(
   routineFailureSignature('repair_execute', new Error('输出达到 2600 token')),
   routineFailureSignature('repair_execute', new Error('输出达到 12000 token'))
 )
+assert.notEqual(
+  routineFailureSignature(
+    'draft_body',
+    new StoryCandidateFailureError('正文确定性门禁未通过：正文存在孤立引号行', 'BODY_TEXT_INTEGRITY:chapter:7:candidate:10:aaa:evidence:4:111')
+  ),
+  routineFailureSignature(
+    'draft_body',
+    new StoryCandidateFailureError('正文确定性门禁未通过：正文存在未闭合中文引号', 'BODY_TEXT_INTEGRITY:chapter:7:candidate:12:bbb:evidence:4:222')
+  )
+)
 assert.equal(
-  routineFailureSignature('draft_body', new Error('正文确定性门禁未通过：正文存在孤立引号行')),
-  routineFailureSignature('draft_body', new Error('正文确定性门禁未通过：正文存在未闭合中文引号'))
+  routineFailureSignature(
+    'draft_body',
+    new StoryCandidateFailureError('第一次错误文案', 'BODY_TEXT_INTEGRITY:chapter:7:candidate:10:aaa:evidence:4:111')
+  ),
+  routineFailureSignature(
+    'draft_body',
+    new StoryCandidateFailureError('第二次错误文案', 'BODY_TEXT_INTEGRITY:chapter:7:candidate:10:aaa:evidence:4:111')
+  )
 )
 assert.equal(
   routineFailureSignature('draft_body', new Error('叙事记忆提取连续3轮未通过：证据错误')),

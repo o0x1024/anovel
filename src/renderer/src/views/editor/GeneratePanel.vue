@@ -53,6 +53,7 @@ import {
   repairNovelExecutionUntilChecked,
   type NovelExecutionGateResult
 } from '../../services/novel-execution-repair'
+import { useEmotionCandidateRepair } from '../../composables/useEmotionCandidateRepair'
 import {
   saveChapterDraft,
   type SavedChapterDraft
@@ -200,6 +201,9 @@ const qualityResult = ref<QualityResult | null>(null)
 const qualityAiReport = ref('')
 const qualityAiMetrics = ref<QualityAiMetrics | null>(null)
 const emotionAssessment = ref<EmotionBlindAssessment | null>(null)
+const emotionDeferredAccepted = computed(
+  () => emotionAssessment.value?.outcome_meta?.accepted_deferred === true
+)
 const worldviewViolations = ref<{ rule: string; detail: string }[]>([])
 const runningCritique = ref(false)
 const savingChapter = ref(false)
@@ -251,6 +255,32 @@ const generatingBody = ref(false)
 
 const { loading, result, error, contextBudget, chat } = useModelChat(() => props.workId)
 const { showToast } = useToast()
+const {
+  repairingEmotion,
+  emotionRepairMsg,
+  repairBlockedEmotion,
+  resetEmotionRepair
+} = useEmotionCandidateRepair({
+  getWorkId: () => props.workId,
+  getWorkType: () => workType.value,
+  getChapterId: () => selectedChapterId.value,
+  getContent: () => result.value,
+  getAssessment: () => emotionAssessment.value,
+  applyCandidate: (chapterId, content) => {
+    if (selectedChapterId.value !== chapterId) throw new Error('当前章节已切换，已停止应用情绪修复结果')
+    result.value = content
+    cacheBodyContent(chapterId, content)
+    qualityResult.value = null
+    qualityAiReport.value = ''
+    qualityAiMetrics.value = null
+    gateResult.value = null
+    executionRepairMsg.value = ''
+  },
+  applyAssessment: assessment => {
+    emotionAssessment.value = assessment
+  },
+  notify: showToast
+})
 const lastPrompt = ref('')
 
 const selectedChapter = computed(() =>
@@ -466,6 +496,8 @@ watch(selectedChapterId, async (id) => {
     worldviewViolations.value = []
     gateResult.value = null
     executionRepairMsg.value = ''
+    emotionAssessment.value = null
+    resetEmotionRepair()
     memoryExtractMsg.value = ''
     fingerprintMsg.value = ''
     antiAiViolations.value = []
@@ -709,6 +741,7 @@ async function repairBlockedNovelExecution() {
         qualityAiReport.value = ''
         qualityAiMetrics.value = null
         emotionAssessment.value = null
+        resetEmotionRepair()
         await recheckAntiAiViolations(content)
       },
       onGateChecked: checked => {
@@ -766,6 +799,7 @@ async function generateBody() {
     qualityAiReport.value = ''
     qualityAiMetrics.value = null
     emotionAssessment.value = null
+    resetEmotionRepair()
     worldviewViolations.value = []
     gateResult.value = null
     executionRepairMsg.value = ''
@@ -1384,11 +1418,11 @@ async function adjustWordCount(action: 'expand' | 'compress') {
   }
 }
 
-async function extractNarrativeMemory(chapterId: number, content: string): Promise<boolean> {
+async function extractNarrativeMemory(chapterId: number, content: string, sessionId?: string): Promise<boolean> {
   extractingMemory.value = true
   memoryExtractMsg.value = ''
   try {
-    const extract = await window.anovel.invoke('memory:extractFromChapter', props.workId, chapterId, content, bodyModelParams()) as {
+    const extract = await window.anovel.invoke('memory:extractFromChapter', props.workId, chapterId, content, bodyModelParams(), sessionId) as {
       success: boolean
       planted?: number
       resolved?: number
@@ -1408,8 +1442,10 @@ async function extractNarrativeMemory(chapterId: number, content: string): Promi
         props.workId,
         chapterId,
         content,
-        toPlainForIpc(bodyModelParams())
+        toPlainForIpc(bodyModelParams()),
+        sessionId
       ) as { success: boolean; resolved?: number; partial?: number; total?: number; error?: string }
+      if (sessionId) await appendAcceptanceOutput(sessionId, '伏笔回收检测结果', detect)
       if (detect.success && (detect.resolved || detect.partial)) {
         const parts: string[] = []
         if (detect.resolved) parts.push(`${detect.resolved} 条已回收`)
@@ -1424,6 +1460,37 @@ async function extractNarrativeMemory(chapterId: number, content: string): Promi
   } finally {
     extractingMemory.value = false
   }
+}
+
+const ACCEPTANCE_SESSION_STEPS = [
+  '保存正文草稿',
+  '准备情绪合同',
+  '情绪盲读与目标比较',
+  '章节执行与连续性核验',
+  '提交情绪状态账本',
+  '提取叙事记忆'
+]
+
+async function startAcceptanceSession(): Promise<string> {
+  const result = await window.anovel.invoke(
+    'ai:startManagedSession',
+    '章节验收并提交',
+    ACCEPTANCE_SESSION_STEPS
+  ) as { sessionId: string }
+  return result.sessionId
+}
+
+async function updateAcceptanceSession(sessionId: string, stepIndex: number, status: 'running' | 'done' | 'error', message?: string) {
+  await window.anovel.invoke('ai:updateManagedSession', sessionId, stepIndex, status, message)
+}
+
+async function appendAcceptanceOutput(sessionId: string, title: string, value: unknown) {
+  const content = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+  await window.anovel.invoke('ai:appendManagedSessionOutput', sessionId, `### ${title}\n\n\`\`\`json\n${content}\n\`\`\``)
+}
+
+async function completeAcceptanceSession(sessionId: string, success: boolean, error?: string) {
+  await window.anovel.invoke('ai:completeManagedSession', sessionId, success, error)
 }
 
 async function persistCurrentChapterDraft(ch: Chapter): Promise<SavedChapterDraft> {
@@ -1448,6 +1515,7 @@ function clearStaleAcceptanceResults() {
   qualityAiReport.value = ''
   qualityAiMetrics.value = null
   emotionAssessment.value = null
+  resetEmotionRepair()
   gateResult.value = null
   executionRepairMsg.value = ''
   fingerprintMsg.value = ''
@@ -1482,52 +1550,124 @@ async function saveDraftOnly() {
   }
 }
 
-async function saveToChapter() {
+async function acceptCurrentEmotionAndSubmit() {
+  const emotion = emotionAssessment.value
+  if (!emotion || emotion.passed || savingChapter.value || repairingEmotion.value) return
+  const issues = emotion.blocking_issues.join('\n') || emotion.repair_instruction
+  if (!confirm(
+    `确认接受当前情绪问题并继续提交本章？\n\n${issues}\n\n`
+    + '系统会保留情绪问题和正文指纹，并提交情绪状态账本与叙事记忆。后续仍可返回本章修订。'
+  )) return
+  await saveToChapter(true)
+}
+
+async function saveToChapter(acceptEmotionDebt = false) {
   const ch = selectedChapter.value
   if (!ch || savingChapter.value || savingDraft.value) return
 
+  const acceptedEmotionSnapshot = acceptEmotionDebt && emotionAssessment.value
+    ? toPlainForIpc(emotionAssessment.value)
+    : null
   let bodyPersisted = false
+  let acceptanceSessionId: string | null = null
+  let pendingEmotionDebt: EmotionBlindAssessment | null = null
   savingChapter.value = true
   memoryExtractMsg.value = ''
   fingerprintMsg.value = ''
   try {
+    acceptanceSessionId = await startAcceptanceSession()
+    await updateAcceptanceSession(acceptanceSessionId, 0, 'running')
     // 正文与旧版本快照必须先落库；后续门禁只决定是否允许提交记忆并标记完成。
     const saved = await persistCurrentChapterDraft(ch)
     bodyPersisted = true
+    await appendAcceptanceOutput(acceptanceSessionId, '正文草稿已落库', {
+      chapterId: ch.id,
+      wordCount: saved.wordCount,
+      status: saved.status
+    })
+    await updateAcceptanceSession(acceptanceSessionId, 0, 'done')
 
     if (saved.cleared) {
       emotionAssessment.value = null
+      resetEmotionRepair()
       await loadNarrativeMemory(ch.id)
+      await completeAcceptanceSession(acceptanceSessionId, true)
       showToast('success', '已清空本章正文及关联叙事记忆')
       return
     }
 
-    await window.anovel.invoke('emotion:ensureContract', props.workId, ch.id, '')
-    const emotion = await window.anovel.invoke(
-      'emotion:assessChapter', props.workId, ch.id, result.value, false, false
-    ) as EmotionBlindAssessment
+    await updateAcceptanceSession(acceptanceSessionId, 1, 'running')
+    const emotionContract = await window.anovel.invoke(
+      'emotion:ensureContract', props.workId, ch.id, '', acceptanceSessionId
+    )
+    await appendAcceptanceOutput(acceptanceSessionId, '情绪合同', emotionContract)
+    await updateAcceptanceSession(acceptanceSessionId, 1, 'done')
+    await updateAcceptanceSession(acceptanceSessionId, 2, 'running')
+    const emotion = acceptedEmotionSnapshot
+      ?? await window.anovel.invoke(
+        'emotion:assessChapter', props.workId, ch.id, result.value, false, false, acceptanceSessionId
+      ) as EmotionBlindAssessment
     emotionAssessment.value = emotion
+    await appendAcceptanceOutput(acceptanceSessionId, '情绪盲读与目标比较结果', emotion)
     if (!emotion.passed) {
-      alert(`正文已落库并保留旧版本，但情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}\n\n章节保持待同步状态，请修订后再次点击「验收并提交」。`)
-      return
+      if (!acceptEmotionDebt) {
+        await updateAcceptanceSession(acceptanceSessionId, 2, 'error', '情绪门禁未通过')
+        await completeAcceptanceSession(acceptanceSessionId, false, '情绪门禁未通过')
+        alert(`正文已落库并保留旧版本，但情绪门禁未通过（${emotion.score}分，${emotion.failure_layer}层）：\n${emotion.blocking_issues.join('\n') || emotion.repair_instruction}\n\n可选择「AI 修复情绪问题」，或明确接受当前情绪问题后继续提交。`)
+        return
+      }
+      pendingEmotionDebt = emotion
+      await appendAcceptanceOutput(acceptanceSessionId, '用户验收决策', {
+        decision: 'accept_emotion_debt',
+        score: emotion.score,
+        failureLayer: emotion.failure_layer,
+        blockingIssues: emotion.blocking_issues,
+        repairInstruction: emotion.repair_instruction
+      })
+      await updateAcceptanceSession(acceptanceSessionId, 2, 'done', '用户接受当前情绪问题，继续后续硬门禁')
+    } else {
+      await updateAcceptanceSession(acceptanceSessionId, 2, 'done')
     }
-    const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value) as ConsistencyGateResult
+    await updateAcceptanceSession(acceptanceSessionId, 3, 'running')
+    const gate = await window.anovel.invoke('consistency:gate', props.workId, ch.id, result.value, acceptanceSessionId) as ConsistencyGateResult
     gateResult.value = gate
+    await appendAcceptanceOutput(acceptanceSessionId, '章节执行与连续性核验结果', gate)
     if (!gate.passed) {
       const msg = ['正文已落库并保留旧版本，但 consistency 门禁未通过：', ...gate.blockers].join('\n')
       if (gate.execution) {
+        await updateAcceptanceSession(acceptanceSessionId, 3, 'error', '章节执行门禁未通过')
+        await completeAcceptanceSession(acceptanceSessionId, false, '章节执行门禁未通过')
         alert(`${msg}\n\n长篇章节的情节点覆盖与章际衔接属于硬门禁；章节保持待同步状态，请先修复正文。`)
         return
       }
-      if (!confirm(`${msg}\n\n是否仍要继续提交叙事记忆？`)) return
+      if (!confirm(`${msg}\n\n是否仍要继续提交叙事记忆？`)) {
+        await completeAcceptanceSession(acceptanceSessionId, false, '用户未继续提交叙事记忆')
+        return
+      }
     } else if (gate.warnings.length > 0) {
       const msg = gate.warnings.slice(0, 5).join('\n')
-      if (!confirm(`正文已保存，后续提交前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续提交叙事记忆？`)) return
+      if (!confirm(`正文已保存，后续提交前发现 ${gate.warnings.length} 条警告：\n${msg}\n\n继续提交叙事记忆？`)) {
+        await completeAcceptanceSession(acceptanceSessionId, false, '用户未继续提交叙事记忆')
+        return
+      }
     }
+    await updateAcceptanceSession(acceptanceSessionId, 3, 'done')
 
-    emotionAssessment.value = await window.anovel.invoke(
-      'emotion:assessChapter', props.workId, ch.id, result.value, true, true
-    ) as EmotionBlindAssessment
+    await updateAcceptanceSession(acceptanceSessionId, 4, 'running')
+    emotionAssessment.value = pendingEmotionDebt
+      ? await window.anovel.invoke(
+          'emotion:acceptDeferredOutcome',
+          props.workId,
+          ch.id,
+          result.value,
+          toPlainForIpc(pendingEmotionDebt),
+          acceptanceSessionId
+        ) as EmotionBlindAssessment
+      : await window.anovel.invoke(
+          'emotion:assessChapter', props.workId, ch.id, result.value, true, true, acceptanceSessionId
+        ) as EmotionBlindAssessment
+    await appendAcceptanceOutput(acceptanceSessionId, '情绪状态账本提交结果', emotionAssessment.value)
+    await updateAcceptanceSession(acceptanceSessionId, 4, 'done')
 
     const fp = await window.anovel.invoke('fingerprint:checkDeviation', props.workId, ch.id, result.value) as {
       success?: boolean
@@ -1540,6 +1680,7 @@ async function saveToChapter() {
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
+    if (acceptanceSessionId) await completeAcceptanceSession(acceptanceSessionId, false, message)
     showToast('error', bodyPersisted
       ? `正文已保存，但后续处理失败：${message}`
       : `保存失败：${message}`)
@@ -1551,7 +1692,8 @@ async function saveToChapter() {
   if (workType.value === 'novel') {
     let synced = false
     try {
-      synced = await extractNarrativeMemory(ch.id, result.value)
+      if (acceptanceSessionId) await updateAcceptanceSession(acceptanceSessionId, 5, 'running')
+      synced = await extractNarrativeMemory(ch.id, result.value, acceptanceSessionId ?? undefined)
     } catch (e) {
       memoryExtractMsg.value = `叙事记忆更新失败：${e instanceof Error ? e.message : String(e)}`
     }
@@ -1559,8 +1701,22 @@ async function saveToChapter() {
       await window.anovel.invoke('chapter:update', ch.id, { status: 'completed' })
       const index = chapters.value.findIndex(chapter => chapter.id === ch.id)
       if (index >= 0) chapters.value[index] = { ...chapters.value[index], status: 'completed' }
-      showToast('success', '正文、章节合同与最终叙事记忆已提交')
+      if (acceptanceSessionId) {
+        await appendAcceptanceOutput(acceptanceSessionId, '叙事记忆提交结果', { status: 'completed' })
+        await updateAcceptanceSession(acceptanceSessionId, 5, 'done')
+        await completeAcceptanceSession(acceptanceSessionId, true)
+      }
+      showToast(
+        pendingEmotionDebt ? 'warning' : 'success',
+        pendingEmotionDebt
+          ? '正文已提交；当前情绪问题已记录，可继续下一章'
+          : '正文、章节合同与最终叙事记忆已提交'
+      )
     } else {
+      if (acceptanceSessionId) {
+        await updateAcceptanceSession(acceptanceSessionId, 5, 'error', memoryExtractMsg.value || '叙事记忆更新失败')
+        await completeAcceptanceSession(acceptanceSessionId, false, memoryExtractMsg.value || '叙事记忆更新失败')
+      }
       showToast('error', '正文已保存为待同步状态；叙事记忆成功前不会允许生成下一章')
     }
     return
@@ -1572,6 +1728,7 @@ async function saveToChapter() {
   if (updateMemory) {
     await extractNarrativeMemory(ch.id, result.value)
   }
+  if (acceptanceSessionId) await completeAcceptanceSession(acceptanceSessionId, true)
 }
 
 async function updateGeneratedContent(content: string) {
@@ -1647,6 +1804,7 @@ function resetBodyEditorDiagnostics() {
   qualityAiReport.value = ''
   qualityAiMetrics.value = null
   emotionAssessment.value = null
+  resetEmotionRepair()
   worldviewViolations.value = []
   gateResult.value = null
   executionRepairMsg.value = ''
@@ -2022,7 +2180,7 @@ function generatePreviewReport() {
               </button>
               <button
                 class="btn btn-outline btn-primary btn-sm gap-1"
-                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate"
+                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate || repairingEmotion"
                 title="只保存正文、字数和版本，不调用 AI 验收"
                 @click="saveDraftOnly"
               >
@@ -2035,9 +2193,9 @@ function generatePreviewReport() {
               </button>
               <button
                 class="btn btn-primary btn-sm gap-1"
-                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate"
+                :disabled="!selectedChapter || savingDraft || savingChapter || extractingMemory || repairingExecutionGate || repairingEmotion"
                 title="保存正文并运行情绪、执行合同、一致性和叙事记忆验收"
-                @click="saveToChapter"
+                @click="saveToChapter(false)"
               >
                 <font-awesome-icon
                   :icon="savingChapter || extractingMemory ? 'spinner' : 'clipboard-check'"
@@ -2448,10 +2606,16 @@ function generatePreviewReport() {
                 <div
                   v-if="emotionAssessment"
                   class="rounded-lg border p-3 text-xs space-y-1"
-                  :class="emotionAssessment.passed ? 'border-success/40 bg-success/5' : 'border-error/40 bg-error/5'"
+                  :class="emotionAssessment.passed || emotionDeferredAccepted
+                    ? 'border-success/40 bg-success/5'
+                    : 'border-error/40 bg-error/5'"
                 >
-                  <p class="font-medium" :class="emotionAssessment.passed ? 'text-success' : 'text-error'">
+                  <p
+                    class="font-medium"
+                    :class="emotionAssessment.passed || emotionDeferredAccepted ? 'text-success' : 'text-error'"
+                  >
                     情绪盲读 {{ emotionAssessment.score }} 分 · {{ emotionAssessment.failure_layer }}层
+                    <span v-if="emotionDeferredAccepted"> · 已接受当前问题</span>
                   </p>
                   <p>读者在乎：{{ emotionAssessment.reader_cares_about || '未建立' }}</p>
                   <p>希望：{{ emotionAssessment.reader_hopes || '未形成' }}</p>
@@ -2461,6 +2625,40 @@ function generatePreviewReport() {
                   </p>
                   <p v-if="!emotionAssessment.passed && emotionAssessment.repair_instruction" class="text-base-content/60">
                     修订：{{ emotionAssessment.repair_instruction }}
+                  </p>
+                  <div
+                    v-if="workType === 'novel' && !emotionAssessment.passed && !emotionDeferredAccepted"
+                    class="flex flex-wrap gap-2 mt-2"
+                  >
+                    <button
+                      type="button"
+                      class="btn btn-error btn-outline btn-xs gap-1"
+                      :disabled="repairingEmotion || savingChapter || !result.trim()"
+                      @click="repairBlockedEmotion"
+                    >
+                      <font-awesome-icon
+                        :icon="repairingEmotion ? 'spinner' : 'wrench'"
+                        :spin="repairingEmotion"
+                        class="w-3 h-3"
+                      />
+                      {{ repairingEmotion ? '情绪修复并复验中...' : 'AI 修复情绪问题' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-warning btn-outline btn-xs gap-1"
+                      :disabled="repairingEmotion || savingChapter || !result.trim()"
+                      @click="acceptCurrentEmotionAndSubmit"
+                    >
+                      <font-awesome-icon icon="forward" class="w-3 h-3" />
+                      接受当前问题并继续
+                    </button>
+                  </div>
+                  <p
+                    v-if="emotionRepairMsg"
+                    class="mt-2"
+                    :class="emotionAssessment.passed || emotionDeferredAccepted ? 'text-success' : 'text-warning'"
+                  >
+                    {{ emotionRepairMsg }}
                   </p>
                 </div>
                 <div v-if="worldviewViolations.length" class="space-y-1">

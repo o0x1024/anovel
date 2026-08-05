@@ -1,29 +1,71 @@
 import assert from 'node:assert/strict'
 import {
   buildStoryCandidateContextSource,
-  canStartStoryFallbackEpoch,
   deriveRequiredStorySettingResolutions,
   detectStorySettingContradictions,
   detectStoryTextIntegrityIssues,
   derivedMemoryFailureDisposition,
   isStructuralStoryCandidateRejection,
+  repairDeterministicStoryCandidate,
   repairDeterministicStoryQuotes,
   repairDeterministicStorySentences,
   detectStoryDeadlineArithmeticIssues,
   resolveStoryModelCapability,
   shouldBlockStoryAntiAi,
   stableStoryHash,
+  storyCandidateDefectSignature,
   storyHarnessIssueKey,
   storyHarnessBudgetBlockers
 } from '../src/shared/story-harness'
 import { requireGoalTurnLimit } from '../src/shared/goal-turn-limit'
+import {
+  validateStoryBoundaryContracts,
+  validateStoryContinuityContracts
+} from '../src/shared/story-hard-guards'
+import {
+  recognizeStoryQualityHardFail,
+  type StoryQualityAiScoreBreakdown
+} from '../src/shared/story-quality-score'
 
 assert.equal(requireGoalTurnLimit(200), 200)
 assert.throws(() => requireGoalTurnLimit(0), /大于等于 1 的整数/)
 assert.throws(() => requireGoalTurnLimit(1.5), /大于等于 1 的整数/)
 assert.throws(() => requireGoalTurnLimit('200'), /大于等于 1 的整数/)
-assert.equal(canStartStoryFallbackEpoch(0), true)
-assert.equal(canStartStoryFallbackEpoch(1), false)
+const closedBoundary = [
+  {
+    continuity_contract: {
+      entry_boundary: 'START',
+      exit_boundary: '医院病房/林微微仍在楼上',
+      time_anchor: '上午十点',
+      start_location: '医院病房',
+      end_location: '医院病房',
+      entry_facts: ['主角在病房'],
+      exit_facts: ['林微微仍在楼上']
+    },
+    tension_plan: { payoff_type: 'partial' }
+  },
+  {
+    continuity_contract: {
+      entry_boundary: '医院病房/林微微仍在楼上',
+      exit_boundary: 'END',
+      time_anchor: '十分钟后',
+      elapsed_from_previous: '十分钟',
+      start_location: '医院病房',
+      end_location: '医院病房',
+      entry_facts: ['林微微仍在楼上'],
+      exit_facts: ['冲突结束']
+    },
+    tension_plan: { payoff_type: 'major' }
+  }
+]
+assert.deepEqual(validateStoryBoundaryContracts(closedBoundary), [])
+assert.equal(validateStoryContinuityContracts(closedBoundary).length, 0)
+const brokenBoundary = [
+  { continuity_contract: { entry_boundary: 'START', exit_boundary: '医院病房/林微微仍在楼上' } },
+  { continuity_contract: { entry_boundary: '医院大厅/刚遇到林微微', exit_boundary: 'END' } }
+]
+assert.equal(validateStoryBoundaryContracts(brokenBoundary)[0]?.leftIndex, 0)
+assert.match(validateStoryContinuityContracts(brokenBoundary)[0] ?? '', /不相等/)
 const candidateContextA = buildStoryCandidateContextSource({ acceptedBody: '', outline: '旧节拍' })
 const candidateContextB = buildStoryCandidateContextSource({ acceptedBody: '', outline: '新节拍' })
 assert.notEqual(candidateContextA, candidateContextB)
@@ -56,6 +98,20 @@ assert.deepEqual(deterministicSentenceRepair.repairs, [
   { before: '四颇为钟', after: '四十分钟' }
 ])
 assert.equal(repairDeterministicStorySentences('会议持续四十分钟。').repairs.length, 0)
+const liveCandidateRepair = repairDeterministicStoryCandidate(
+  '第一段要一小时五颇为钟，第二段四颇为钟，第三段一小时二颇为钟，最后二颇为钟。“时间没错。'
+)
+assert.equal(
+  liveCandidateRepair.content,
+  '第一段要一小时五十分钟，第二段四十分钟，第三段一小时二十分钟，最后二十分钟。“时间没错。”'
+)
+assert.equal(liveCandidateRepair.repairCount, 5)
+assert.deepEqual(liveCandidateRepair.sentenceRepairs.map(item => item.after), [
+  '五十分钟',
+  '四十分钟',
+  '二十分钟',
+  '二十分钟'
+])
 assert.equal(
   detectStoryDeadlineArithmeticIssues('现在是上午十点，十二个小时后就是下午四点。', 7)[0]?.code,
   'DEADLINE_ARITHMETIC_CONTRADICTION'
@@ -130,6 +186,46 @@ assert.deepEqual(storyHarnessBudgetBlockers(
 ), ['同一问题已达到修复上限', '当前节拍候选已达到上限', '整篇审计已达到上限'])
 assert.equal(stableStoryHash('同一正文'), stableStoryHash('同一正文'))
 assert.notEqual(stableStoryHash('正文甲'), stableStoryHash('正文乙'))
+const qualityBreakdown: StoryQualityAiScoreBreakdown = {
+  scoreTotal: 55,
+  hardFail: true,
+  items: [],
+  failedRules: ['通篇像流水账：缺少目标、阻力、选择和后果'],
+  topIssues: [{ id: 'issue-1', evidence: '她只是按顺序完成了所有手续', fixHint: '加入选择与代价' }],
+  anchorAlignment: []
+}
+assert.equal(
+  recognizeStoryQualityHardFail(
+    qualityBreakdown,
+    '她只是按顺序完成了所有手续，然后回家。'
+  ).recognized,
+  true
+)
+assert.equal(
+  recognizeStoryQualityHardFail(
+    qualityBreakdown,
+    '她当众拒绝签字，并承担失去工作的代价。'
+  ).recognized,
+  false,
+  '无法在原文定位的 hard_fail 不得获得正文改写许可'
+)
+assert.equal(
+  recognizeStoryQualityHardFail(
+    { ...qualityBreakdown, failedRules: ['总体感觉不够精彩'] },
+    '她只是按顺序完成了所有手续，然后回家。'
+  ).recognized,
+  false,
+  '不受支持的主观规则不得升级为硬失败'
+)
+const defectIssues = detectStoryTextIntegrityIssues('老师讲了四颇为钟的课。')
+assert.equal(
+  storyCandidateDefectSignature(7, '老师讲了四颇为钟的课。', defectIssues),
+  storyCandidateDefectSignature(7, '老师讲了四颇为钟的课。', defectIssues)
+)
+assert.notEqual(
+  storyCandidateDefectSignature(7, '老师讲了四颇为钟的课。', defectIssues),
+  storyCandidateDefectSignature(7, '老师讲了五颇为钟的课。', detectStoryTextIntegrityIssues('老师讲了五颇为钟的课。'))
+)
 assert.equal(
   storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'engine', chapterIds: [2, 1], evidence: [], message: '时间冲突', expectedResult: '修复' }),
   storyHarnessIssueKey({ code: 'TIMELINE_CONTRADICTION', severity: 'blocker', scope: 'cluster', chapterIds: [1, 2], evidence: [], message: '同一时间冲突', expectedResult: '修复' })

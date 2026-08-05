@@ -12,6 +12,8 @@ interface StepModelOverride {
   thinkingEnabled?: boolean
 }
 
+type ThinkingMode = 'inherit' | 'enabled' | 'disabled'
+
 const props = withDefaults(defineProps<{
   highlightSteps?: string[]
 }>(), {
@@ -25,10 +27,13 @@ const globalDefault = ref<{ provider: string | null; modelName: string | null }>
 })
 const loading = ref(true)
 const dirty = ref(false)
+const saveState = ref<'idle' | 'saving' | 'saved' | 'error'>('idle')
+const saveError = ref('')
 const collapsedGroups = ref<Set<string>>(new Set())
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let reloadTimer: ReturnType<typeof setTimeout> | null = null
+let saveRevision = 0
 
 function providerLabel(option: AssistantModelOption): string {
   return option.provider_label ?? ASSISTANT_MODEL_LABELS[option.model_type] ?? option.model_type
@@ -98,7 +103,8 @@ function setStepProvider(step: string, providerType: string) {
       modelName: existing?.provider === providerType && existing?.modelName?.trim()
         ? existing.modelName
         : models[0],
-      thinkingEnabled: existing?.thinkingEnabled
+      // 新建步骤配置必须写入明确策略；AI 诊断等短结构化步骤默认不启用深度思考。
+      thinkingEnabled: existing?.thinkingEnabled ?? false
     }
   }
   scheduleSave()
@@ -114,14 +120,29 @@ function setStepModel(step: string, modelName: string) {
   scheduleSave()
 }
 
-function setStepThinking(step: string, enabled: boolean) {
+function stepThinkingMode(step: string): ThinkingMode {
+  const enabled = stepOverride(step)?.thinkingEnabled
+  if (enabled === true) return 'enabled'
+  if (enabled === false) return 'disabled'
+  return 'inherit'
+}
+
+function setStepThinkingMode(step: string, mode: ThinkingMode) {
   const existing = overrides.value[step]
   if (!existing) return
+  const { thinkingEnabled: _thinkingEnabled, ...base } = existing
   overrides.value = {
     ...overrides.value,
-    [step]: { ...existing, thinkingEnabled: enabled }
+    [step]: mode === 'inherit'
+      ? base
+      : { ...base, thinkingEnabled: mode === 'enabled' }
   }
-  scheduleSave()
+  // 深度思考会直接改变下一次模型请求，不能与普通表单编辑共用防抖写入。
+  // 立即发送 IPC，保证随后触发的诊断在主进程按同一消息顺序读到新配置。
+  dirty.value = true
+  saveState.value = 'saving'
+  saveError.value = ''
+  void persistOverrides(++saveRevision)
 }
 
 function clearStep(step: string) {
@@ -140,7 +161,7 @@ function batchSetGroup(group: StepModelGroupDef, providerType: string) {
   const modelName = models[0]
   const copy = { ...overrides.value }
   for (const s of group.steps) {
-    copy[s.step] = { provider: providerType, modelName }
+    copy[s.step] = { provider: providerType, modelName, thinkingEnabled: false }
   }
   overrides.value = copy
   scheduleSave()
@@ -190,6 +211,8 @@ async function loadData() {
   try {
     await Promise.all([loadProviderData(), loadOverrideData()])
     dirty.value = false
+    saveState.value = 'idle'
+    saveError.value = ''
   } finally {
     loading.value = false
   }
@@ -197,8 +220,11 @@ async function loadData() {
 
 function scheduleSave() {
   dirty.value = true
+  saveState.value = 'saving'
+  saveError.value = ''
+  const revision = ++saveRevision
   if (saveTimer) clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => { void persistOverrides() }, 300)
+  saveTimer = setTimeout(() => { void persistOverrides(revision) }, 300)
 }
 
 function overridesPayload(): Record<string, StepModelOverride> {
@@ -217,7 +243,7 @@ function overridesPayload(): Record<string, StepModelOverride> {
   return clean
 }
 
-async function persistOverrides() {
+async function persistOverrides(revision = saveRevision): Promise<boolean> {
   if (saveTimer) {
     clearTimeout(saveTimer)
     saveTimer = null
@@ -225,12 +251,27 @@ async function persistOverrides() {
   try {
     const payload = overridesPayload()
     const saved = await window.anovel.invoke('model:setStepModelOverrides', payload) as Record<string, StepModelOverride>
+    if (revision !== saveRevision) return false
     overrides.value = saved ?? payload
     dirty.value = false
+    saveState.value = 'saved'
+    return true
   } catch (e) {
+    if (revision !== saveRevision) return false
+    saveState.value = 'error'
+    saveError.value = e instanceof Error ? e.message : String(e)
     console.error('[StepModelOverrides] save failed:', e)
+    return false
   }
 }
+
+async function saveNow(): Promise<boolean> {
+  saveState.value = 'saving'
+  saveError.value = ''
+  return persistOverrides(++saveRevision)
+}
+
+defineExpose({ saveNow })
 
 function scheduleReload() {
   if (reloadTimer) clearTimeout(reloadTimer)
@@ -250,7 +291,7 @@ onUnmounted(() => {
   if (saveTimer) {
     clearTimeout(saveTimer)
     saveTimer = null
-    void persistOverrides()
+    void persistOverrides(++saveRevision)
   }
   if (reloadTimer) clearTimeout(reloadTimer)
 })
@@ -280,6 +321,11 @@ watch(() => props.highlightSteps, (steps) => {
     <div class="flex items-center gap-2 text-xs text-base-content/50 mb-1">
       <font-awesome-icon icon="info-circle" class="w-3 h-3 shrink-0" />
       <span>未配置的步骤将使用全局默认：<strong class="text-base-content/70">{{ globalDefaultLabel() }}</strong></span>
+      <span v-if="saveState === 'saving'" class="flex items-center gap-1 text-primary">
+        <span class="loading loading-spinner loading-xs"></span>正在保存模型分配…
+      </span>
+      <span v-else-if="saveState === 'saved'" class="text-success">已保存并生效</span>
+      <span v-else-if="saveState === 'error'" class="text-error" :title="saveError">保存失败</span>
     </div>
 
     <div
@@ -384,19 +430,22 @@ watch(() => props.highlightSteps, (steps) => {
           </select>
           <span v-else class="flex-1 text-base-content/30 truncate">—</span>
 
-          <!-- thinking toggle -->
+          <!-- thinking mode: inheritance must never look like an explicit off state -->
           <label
             v-if="stepOverride(s.step)"
             class="flex items-center gap-1 cursor-pointer shrink-0"
-            title="思考模式"
+            title="深度思考模式"
           >
             <font-awesome-icon icon="brain" class="w-3 h-3 text-base-content/40" />
-            <input
-              type="checkbox"
-              class="toggle toggle-primary toggle-xs"
-              :checked="stepOverride(s.step)?.thinkingEnabled ?? false"
-              @change="(e: Event) => setStepThinking(s.step, (e.target as HTMLInputElement).checked)"
-            />
+            <select
+              :value="stepThinkingMode(s.step)"
+              class="select select-bordered select-xs h-7 min-h-0 w-28 text-[11px]"
+              @change="setStepThinkingMode(s.step, ($event.target as HTMLSelectElement).value as ThinkingMode)"
+            >
+              <option value="inherit">跟随提供商</option>
+              <option value="enabled">强制开启</option>
+              <option value="disabled">强制关闭</option>
+            </select>
           </label>
 
           <!-- clear button -->

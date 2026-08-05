@@ -3,6 +3,7 @@ import { Readable } from 'node:stream'
 import axios from 'axios'
 import { appLogger } from '../src/main/logger/app-logger'
 import { OpenAICompatibleAdapter } from '../src/main/model/adapters'
+import { buildPromptJsonSchemaInstruction } from '../src/shared/prompt-json-schema'
 
 type AxiosPost = typeof axios.post
 
@@ -36,20 +37,82 @@ async function main(): Promise<void> {
       }
     }) as AxiosPost
 
-    const recovered = await adapter.chat({
+    const incompatibleStructured = await adapter.chat({
       prompt: 'repair',
       step: 'story_repair_blueprint',
       responseSchema: {
         name: 'story_structural_repair',
         schema: { type: 'object' }
-      }
+      },
+      structuredOutputMode: 'native_json_schema',
+      requireResponseSchema: true
     }, 'test-key', 'https://example.invalid/v1', 'test-model', { stream: false })
 
-    assert.equal(recovered.success, true)
-    assert.equal(recovered.content, '{"chapters":[]}')
-    assert.equal(call, 2)
+    assert.equal(incompatibleStructured.success, false)
+    assert.match(incompatibleStructured.error ?? '', /UPSTREAM_EMPTY|structured output unavailable/)
+    assert.equal(call, 1)
     assert.ok(bodies[0].response_format)
-    assert.equal(bodies[1].response_format, undefined)
+
+    call = 0
+    axios.post = (async () => {
+      call++
+      const error = new Error('request failed') as Error & {
+        response?: { status: number; data: { error: { message: string } } }
+      }
+      error.response = {
+        status: 400,
+        data: { error: { message: 'This response_format type is unavailable now' } }
+      }
+      throw error
+    }) as AxiosPost
+
+    const strictSchemaFailure = await adapter.chat({
+      prompt: 'state transaction',
+      step: 'emotion_state_extract',
+      responseSchema: {
+        name: 'emotion_ledger',
+        schema: { type: 'object' }
+      },
+      structuredOutputMode: 'native_json_schema',
+      requireResponseSchema: true
+    }, 'test-key', 'https://example.invalid/v1', 'test-model', { stream: false })
+
+    assert.equal(strictSchemaFailure.success, false)
+    assert.match(strictSchemaFailure.error ?? '', /MODEL_CAPABILITY_UNSUPPORTED/)
+    assert.match(strictSchemaFailure.error ?? '', /情绪状态提取/)
+    assert.match(strictSchemaFailure.error ?? '', /test-model/)
+    assert.match(strictSchemaFailure.error ?? '', /This response_format type is unavailable now/)
+    assert.equal(call, 1)
+
+    const promptSchema = {
+      name: 'prompt_json_test',
+      schema: {
+        type: 'object',
+        required: ['ok'],
+        properties: { ok: { type: 'boolean' } }
+      }
+    }
+    assert.match(buildPromptJsonSchemaInstruction(promptSchema), /required/)
+
+    call = 0
+    axios.post = (async (_url: string, body: Record<string, unknown>) => {
+      call++
+      bodies.push(structuredClone(body))
+      return {
+        status: 200,
+        data: {
+          choices: [{ message: { content: '{"ok":true}' }, finish_reason: 'stop' }]
+        }
+      }
+    }) as AxiosPost
+    const promptJson = await adapter.chat({
+      prompt: 'prompt-only json',
+      responseSchema: promptSchema,
+      structuredOutputMode: 'prompt_json'
+    }, 'test-key', 'https://example.invalid/v1', 'deepseek-v4-flash', { stream: false })
+    assert.equal(promptJson.success, true)
+    assert.equal(call, 1)
+    assert.equal(bodies.at(-1)?.response_format, undefined)
 
     call = 0
     axios.post = (async () => {
@@ -72,8 +135,8 @@ async function main(): Promise<void> {
     }, 'test-key', 'https://example.invalid/v1', 'test-model', { stream: false })
 
     assert.equal(rejected.success, false)
-    assert.match(rejected.error ?? '', /upstream route returned no candidate/)
-    assert.equal(call, 2)
+    assert.match(rejected.error ?? '', /choices=0/)
+    assert.equal(call, 1)
 
     call = 0
     axios.post = (async () => {
@@ -90,7 +153,7 @@ async function main(): Promise<void> {
     )
     assert.equal(plainEmpty.success, false)
     assert.match(plainEmpty.error ?? '', /choices=0/)
-    assert.equal(call, 2)
+    assert.equal(call, 1)
 
     call = 0
     axios.post = (async (_url: string, body: Record<string, unknown>) => {
@@ -116,19 +179,59 @@ async function main(): Promise<void> {
           }
     }) as AxiosPost
 
-    const recoveredPlain = await adapter.chat(
+    const emptyReasoningOnly = await adapter.chat(
       { prompt: 'plain retry', thinkingEnabled: false },
       'test-key',
       'https://example.invalid/v1',
       'deepseek/deepseek-v4-flash',
       { stream: false }
     )
-    assert.equal(recoveredPlain.success, true)
-    assert.equal(recoveredPlain.content, 'recovered plain text')
-    assert.equal(call, 2)
-    const retryBodies = bodies.slice(-2)
-    assert.deepEqual(retryBodies[0].thinking, { type: 'disabled' })
-    assert.deepEqual(retryBodies[1].thinking, { type: 'disabled' })
+    assert.equal(emptyReasoningOnly.success, false)
+    assert.match(emptyReasoningOnly.error ?? '', /正文为空|未返回正文|finishReason=length/)
+    assert.equal(call, 1)
+    assert.deepEqual(bodies.at(-1)?.thinking, { type: 'disabled' })
+
+    axios.post = (async (_url: string, body: Record<string, unknown>) => {
+      bodies.push(structuredClone(body))
+      return {
+        status: 200,
+        data: {
+          choices: [{
+            message: {
+              content: '{"score_total":88}',
+              reasoning_content: 'quality diagnosis reasoning'
+            },
+            finish_reason: 'stop'
+          }],
+          usage: { prompt_tokens: 20, completion_tokens: 10 }
+        }
+      }
+    }) as AxiosPost
+
+    let diagnosisThinking = ''
+    const thinkingEnabledDiagnosis = await adapter.chat(
+      {
+        prompt: 'quality diagnosis',
+        thinkingEnabled: true,
+        temperature: 0.1,
+        deepseekOptions: {
+          thinkingEnabled: false,
+          reasoningEffort: 'max'
+        }
+      },
+      'test-key',
+      'https://example.invalid/v1',
+      'deepseek-v4-pro',
+      {
+        stream: false,
+        onThinkingDelta: delta => { diagnosisThinking += delta }
+      }
+    )
+    assert.equal(thinkingEnabledDiagnosis.success, true)
+    assert.deepEqual(bodies.at(-1)?.thinking, { type: 'enabled' })
+    assert.equal(bodies.at(-1)?.reasoning_effort, 'max')
+    assert.equal(bodies.at(-1)?.temperature, undefined)
+    assert.equal(diagnosisThinking, 'quality diagnosis reasoning')
 
     axios.post = (async () => ({
       status: 200,
@@ -169,6 +272,31 @@ async function main(): Promise<void> {
     )
     assert.equal(emptyStream.success, false)
     assert.match(emptyStream.error ?? '', /流式响应结束但未返回正文/)
+
+    let observedTimeout: number | undefined
+    axios.post = (async (
+      _url: string,
+      _body: Record<string, unknown>,
+      config?: { timeout?: number }
+    ) => {
+      observedTimeout = config?.timeout
+      return {
+        status: 200,
+        data: {
+          choices: [{ message: { content: '{"score_total":88}' }, finish_reason: 'stop' }]
+        }
+      }
+    }) as AxiosPost
+
+    const bounded = await adapter.chat(
+      { prompt: 'bounded evaluator', timeoutMs: 120_000 },
+      'test-key',
+      'https://example.invalid/v1',
+      'test-model',
+      { stream: false }
+    )
+    assert.equal(bounded.success, true)
+    assert.equal(observedTimeout, 120_000)
 
     console.log('OpenAI compatible adapter response validation tests passed')
   } finally {

@@ -7,16 +7,18 @@ import { registerV26IpcHandlers } from './ipc-v26'
 import { registerV27IpcHandlers } from './ipc-v27'
 import { registerLogIpcHandlers } from './ipc-log'
 import { registerAiIpcHandlers } from './ai/register-ai-ipc'
+import { aiSessionManager } from './ai/ai-session-manager'
 import { registerAssistantIpcHandlers } from './ipc-assistant'
 import { registerLabIpcHandlers } from './ipc-lab'
 import { registerNamesIpcHandlers } from './ipc-names'
 import { registerKnowledgeBaseIpcHandlers } from './ipc-knowledge-base'
+import { registerNarrativeV2IpcHandlers } from './narrative-app/ipc'
 import { safeIpcHandle } from './ipc/ipc-safe'
 import {
   workDAO, volumeChapterDAO, writingStyleDAO,
   modelConfigDAO, anchorDAO, ideaFragmentDAO, aiFavoriteDAO,
   generationLogDAO, coreSettingDAO, appPreferenceDAO, imageDAO, storyHarnessDAO, causalNovelDAO,
-  storyStateDAO, emotionalStateDAO, goalRoutineDAO
+  storyStateDAO, emotionalStateDAO, goalRoutineDAO, getDatabase
 } from './db'
 import type { StyleCreateInput, AnchorCreateInput } from './db'
 import { modelService, ModelRequest } from './model'
@@ -69,13 +71,7 @@ import {
   type Phase
 } from './context/goal-routine/story-goal-routine'
 import { runNovelGoalLoop, cancelNovelGoalLoop, isNovelGoalLoopRunning } from './context/goal-routine/novel-goal-routine'
-import {
-  runCausalNovelGoalLoop,
-  cancelCausalNovelGoalLoop,
-  isCausalNovelGoalLoopRunning
-} from './context/goal-routine/causal-novel-routine'
 import { isGoalRoutinePhase } from '../shared/goal-routine-phases'
-import { goalRoutineDAO } from './db'
 import { detectAnchorConflicts } from './context/anchor-conflict'
 import { exportWorkContent } from './context/export-content'
 import { exportWorkBundle, importWorkBundle } from './backup/work-backup'
@@ -102,46 +98,76 @@ import {
 } from './context/memory-cleanup'
 import { getWorkBodyText } from './context/assistant/work-reference'
 import { ensureChapterEmotionContract } from './context/goal-routine/emotion-engine'
-import { assessChapterEmotion } from './context/goal-routine/emotion-gate'
+import {
+  assessChapterEmotion,
+  persistDeferredEmotionOutcome
+} from './context/goal-routine/emotion-gate'
 import {
   invalidateNovelGoalStateAfterVolumeDeletion,
+  readNovelGoalState,
   reconcileNovelWorkflowState,
   resetNovelGoalStateFromVolumePlan
 } from './context/goal-routine/novel-outline-pipeline'
+import {
+  getNovelChapterAcceptanceSummary,
+  recoverLegacyNovelChapterAcceptance
+} from './context/goal-routine/novel-chapter-acceptance-ledger'
 import { getChapterPlanningDetails } from './context/chapter-planning-details'
+import {
+  previewNovelReplanReset,
+  restartNovelPlanning,
+  type NovelReplanSettingsMode
+} from './context/goal-routine/novel-replan-reset'
 
 /**
  * 注册所有 IPC 处理器，桥接渲染进程与数据库层
  */
 export function registerIpcHandlers(): void {
+  for (const run of goalRoutineDAO.listAll()) {
+    if (run.workflow_type === 'novel' && run.status === 'paused') {
+      try {
+        recoverLegacyNovelChapterAcceptance(run.work_id)
+      } catch (error) {
+        appLogger.error('goal_routine', '旧版章节验收终态迁移失败', {
+          workId: run.work_id,
+          runId: run.id,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      }
+    }
+  }
+
   const assertCausalChapterDirectMutationAllowed = (chapterId: number, action: string): void => {
     const workId = volumeChapterDAO.getWorkIdForChapter(chapterId)
-    if (workId == null || workDAO.getById(workId)?.work_type !== 'causal_novel') return
-    if (isCausalNovelGoalLoopRunning(workId)) {
-      throw new Error(`滚动因果正在运行，请暂停后再${action}`)
-    }
     const decision = causalNovelDAO.getDecision(chapterId)
+    if (workId == null || !decision) return
+    if (isNovelGoalLoopRunning(workId)) {
+      throw new Error(`小说目标循环正在运行，请暂停后再${action}`)
+    }
     if (decision?.status === 'committed') {
       throw new Error('已提交章节已冻结；如只调整表达，请使用“AI 按当前文风重写”。涉及事实的修改必须通过因果重放流程')
     }
   }
   const assertCausalVolumeDirectMutationAllowed = (volumeId: number, action: string): void => {
     const volume = volumeChapterDAO.getVolume(volumeId)
-    if (!volume || workDAO.getById(volume.work_id)?.work_type !== 'causal_novel') return
-    if (isCausalNovelGoalLoopRunning(volume.work_id)) throw new Error(`滚动因果正在运行，请暂停后再${action}`)
-    throw new Error('因果小说的“滚动正文”由权威状态管理，不能通过通用分卷入口修改')
+    if (!volume) return
+    const hasAuthorityTransactions = volumeChapterDAO.listChapters(volumeId)
+      .some(chapter => Boolean(causalNovelDAO.getDecision(chapter.id)))
+    if (!hasAuthorityTransactions) return
+    if (isNovelGoalLoopRunning(volume.work_id)) throw new Error(`小说目标循环正在运行，请暂停后再${action}`)
+    throw new Error('该分卷已有权威章节事务，不能直接修改分卷结构')
   }
   const assertCausalChapterStructuralMutationAllowed = (chapterId: number, action: string): void => {
     const workId = volumeChapterDAO.getWorkIdForChapter(chapterId)
-    if (workId == null || workDAO.getById(workId)?.work_type !== 'causal_novel') return
-    if (isCausalNovelGoalLoopRunning(workId)) throw new Error(`滚动因果正在运行，请暂停后再${action}`)
-    throw new Error('因果小说的章节顺序由状态修订号决定，不能直接移动或重排')
+    if (workId == null || !causalNovelDAO.getDecision(chapterId)) return
+    if (isNovelGoalLoopRunning(workId)) throw new Error(`小说目标循环正在运行，请暂停后再${action}`)
+    throw new Error('该章节已进入权威事务，顺序由状态修订号决定，不能直接移动或重排')
   }
 
   // ==================== 作品 ====================
   ipcMain.handle('work:list', (_e, workType?: string) => workDAO.list(workType))
   ipcMain.handle('work:get', (_e, id: number) => workDAO.getById(id))
-  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; workType?: string; genre?: string; tags?: string }) => {
+  ipcMain.handle('work:create', (_e, input: { title: string; description?: string; novelLength?: NovelLength; targetTotalWords?: number; targetChapters?: number; wordsPerChapter?: number; workType?: 'novel' | 'story'; genre?: string; tags?: string }) => {
     const id = workDAO.create(input)
     initWritingPlanForWork(id, {
       novelLength: input.novelLength ?? 'medium',
@@ -199,6 +225,13 @@ export function registerIpcHandlers(): void {
 
   // ==================== 分卷 & 章节 ====================
   ipcMain.handle('volume:list', (_e, workId: number) => volumeChapterDAO.listVolumes(workId))
+  ipcMain.handle('novel:previewReplanReset', (_e, workId: number) =>
+    previewNovelReplanReset(workId))
+  ipcMain.handle('novel:restartPlanning', (_e, input: {
+    workId: number
+    confirmationTitle: string
+    settingsMode: NovelReplanSettingsMode
+  }) => restartNovelPlanning(input))
   ipcMain.handle('volume:create', (_e, workId: number, name: string, desc?: string) =>
     volumeChapterDAO.createVolume(workId, name, desc))
   ipcMain.handle('volume:update', (_e, id: number, fields: Record<string, unknown>) => {
@@ -214,10 +247,31 @@ export function registerIpcHandlers(): void {
     }
     return deleted
   })
-  ipcMain.handle('volume:batchUpsert', (_e, workId: number, items: { name: string; description?: string }[], mode?: 'append' | 'replace') => {
-    if (workDAO.getById(workId)?.work_type === 'causal_novel') {
-      throw new Error('因果小说不支持通用分卷批量写入')
+  ipcMain.handle('volume:batchDelete', (_e, ids: number[]) => {
+    const uniqueIds = [...new Set(ids.filter(id => Number.isInteger(id) && id > 0))]
+    if (uniqueIds.length === 0) return 0
+    const volumes = uniqueIds.map(id => {
+      const volume = volumeChapterDAO.getVolume(id)
+      if (!volume) throw new Error(`分卷不存在（id=${id}），请刷新后重试`)
+      return volume
+    })
+    if (new Set(volumes.map(volume => volume.work_id)).size !== 1) {
+      throw new Error('批量删除只能作用于同一部作品')
     }
+    for (const volume of volumes) assertCausalVolumeDirectMutationAllowed(volume.id, '删除分卷')
+    return getDatabase().transaction(() => {
+      let deleted = 0
+      for (const volume of volumes) {
+        if (volumeChapterDAO.deleteVolume(volume.id)) deleted++
+      }
+      const workId = volumes[0].work_id
+      if (workDAO.getById(workId)?.work_type !== 'story') {
+        for (const volume of volumes) invalidateNovelGoalStateAfterVolumeDeletion(workId, volume.name)
+      }
+      return deleted
+    })()
+  })
+  ipcMain.handle('volume:batchUpsert', (_e, workId: number, items: { name: string; description?: string }[], mode?: 'append' | 'replace') => {
     const resolvedMode = mode ?? 'append'
     const ids = volumeChapterDAO.batchUpsertVolumes(workId, items, resolvedMode)
     if (resolvedMode === 'replace' && workDAO.getById(workId)?.work_type !== 'story') {
@@ -233,10 +287,6 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:getPlanningDetails', (_e, workId: number, chapterId: number) =>
     getChapterPlanningDetails(workId, chapterId))
   ipcMain.handle('chapter:create', (_e, volumeId: number, title: string, outline?: string) => {
-    const volume = volumeChapterDAO.getVolume(volumeId)
-    if (volume && workDAO.getById(volume.work_id)?.work_type === 'causal_novel') {
-      throw new Error('因果小说不能通过通用章节入口新增正文，请使用因果章节管理中的“新增非权威草稿”')
-    }
     return volumeChapterDAO.createChapter(volumeId, title, outline)
   })
   ipcMain.handle('chapter:update', (_e, id: number, fields: Record<string, unknown>) => {
@@ -269,10 +319,6 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('chapter:getVersion', (_e, versionId: number, chapterId: number) =>
     volumeChapterDAO.getVersion(versionId, chapterId))
   ipcMain.handle('chapter:batchCreate', (_e, volumeId: number, items: { title: string; outline?: string }[], mode?: 'append' | 'replace') => {
-    const volume = volumeChapterDAO.getVolume(volumeId)
-    if (volume && workDAO.getById(volume.work_id)?.work_type === 'causal_novel') {
-      throw new Error('因果小说不支持通用章节批量写入')
-    }
     return volumeChapterDAO.batchCreateChapters(volumeId, items, mode ?? 'append')
   })
   ipcMain.handle('chapter:clearVolumeBodies', (_e, volumeId: number) => {
@@ -637,25 +683,42 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('antiai:autoRewriteBody', (_e, content: string) =>
     autoRewriteBody(content))
 
-  ipcMain.handle('emotion:ensureContract', async (_e, workId: number, chapterId: number, goal = '') =>
-    ensureChapterEmotionContract(workId, chapterId, goal))
+  ipcMain.handle('emotion:ensureContract', async (e, workId: number, chapterId: number, goal = '', sessionId?: string) =>
+    ensureChapterEmotionContract(workId, chapterId, goal, aiSessionManager.getHandle(sessionId ?? '', e.sender)?.getSignal()))
   ipcMain.handle('emotion:assessChapter', async (
-    _e,
+    e,
     workId: number,
     chapterId: number,
     content: string,
     persistLedger = false,
-    persistAssessment = true
-  ) => assessChapterEmotion(workId, chapterId, content, undefined, persistLedger, persistAssessment))
+    persistAssessment = true,
+    sessionId?: string
+  ) => assessChapterEmotion(
+    workId,
+    chapterId,
+    content,
+    aiSessionManager.getHandle(sessionId ?? '', e.sender)?.getSignal(),
+    persistLedger,
+    persistAssessment
+  ))
+  ipcMain.handle('emotion:acceptDeferredOutcome', async (
+    e,
+    workId: number,
+    chapterId: number,
+    content: string,
+    assessment: import('../shared/emotion-contract').EmotionBlindAssessment,
+    sessionId?: string
+  ) => persistDeferredEmotionOutcome(
+    workId,
+    chapterId,
+    content,
+    assessment,
+    aiSessionManager.getHandle(sessionId ?? '', e.sender)?.getSignal()
+  ))
 
   // ==================== 目标循环（goal routine）====================
   function isNovelWork(workId: number): boolean {
-    const workType = workDAO.getById(workId)?.work_type
-    return workType === 'novel' || workType === 'causal_novel'
-  }
-
-  function isCausalNovelWork(workId: number): boolean {
-    return workDAO.getById(workId)?.work_type === 'causal_novel'
+    return workDAO.getById(workId)?.work_type === 'novel'
   }
 
   function resolveGoalForcePhase(config?: Record<string, unknown>): { forcePhase?: Phase; cfg: Record<string, unknown> } {
@@ -667,9 +730,7 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('goal:start', (e, workId: number, config?: Record<string, unknown>) => {
     const { forcePhase, cfg } = resolveGoalForcePhase(config)
-    const runner = isCausalNovelWork(workId)
-      ? runCausalNovelGoalLoop(workId, cfg, e.sender, false)
-      : isNovelWork(workId)
+    const runner = isNovelWork(workId)
       ? runNovelGoalLoop(workId, cfg, e.sender, false, forcePhase)
       : runStoryGoalLoop(workId, cfg, e.sender, false, forcePhase)
     void runner.catch((err) => {
@@ -680,16 +741,20 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:resume', (e, workId: number, options?: Record<string, unknown> | string) => {
     let forcePhase: Phase | undefined
     let config: Record<string, unknown> = {}
+    let expectedRunId: number | undefined
     if (typeof options === 'string') {
       forcePhase = isGoalRoutinePhase(options) ? options : undefined
     } else if (options) {
-      const { forcePhase: fp, ...rest } = options
+      const { forcePhase: fp, expectedRunId: expected, ...rest } = options
       forcePhase = typeof fp === 'string' && isGoalRoutinePhase(fp) ? fp : undefined
+      expectedRunId = typeof expected === 'number' && Number.isInteger(expected) ? expected : undefined
       config = rest
     }
-    const runner = isCausalNovelWork(workId)
-      ? runCausalNovelGoalLoop(workId, config, e.sender, true)
-      : isNovelWork(workId)
+    const currentRun = goalRoutineDAO.getByWork(workId)
+    if (expectedRunId != null && currentRun?.id !== expectedRunId) {
+      throw new Error(`断点已变化：界面运行 #${expectedRunId}，当前运行 #${currentRun?.id ?? '不存在'}；请刷新后重试`)
+    }
+    const runner = isNovelWork(workId)
       ? runNovelGoalLoop(workId, config, e.sender, true, forcePhase)
       : runStoryGoalLoop(workId, config, e.sender, true, forcePhase)
     void runner.catch((err) => {
@@ -698,9 +763,7 @@ export function registerIpcHandlers(): void {
     return true
   })
   ipcMain.handle('goal:cancel', (_e, workId: number) => {
-    return isCausalNovelWork(workId)
-      ? cancelCausalNovelGoalLoop(workId)
-      : isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
+    return isNovelWork(workId) ? cancelNovelGoalLoop(workId) : cancelGoalLoop(workId)
   })
   ipcMain.handle('goal:selectTitleHook', (_e, workId: number, candidateIndex: number) => {
     if (isNovelWork(workId)) throw new Error('小说目标循环暂不支持此书名导语确认流程')
@@ -709,8 +772,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('goal:getState', (_e, workId: number) => {
     const state = goalRoutineDAO.getByWork(workId)
     const turns = goalRoutineDAO.listTurns(workId, 30)
-    const harnessIssues = isNovelWork(workId) ? [] : storyHarnessDAO.listIssues(workId)
-    return { state: state ?? null, turns, harnessIssues }
+    const steps = goalRoutineDAO.listSteps(workId, 20)
+    const novelWork = isNovelWork(workId)
+    const visibleState = state && novelWork
+      ? { ...state, state_json: JSON.stringify(readNovelGoalState(workId)) }
+      : state
+    const harnessIssues = novelWork ? [] : storyHarnessDAO.listIssues(workId)
+    const chapterAcceptance = novelWork ? getNovelChapterAcceptanceSummary(workId) : null
+    return { state: visibleState ?? null, turns, steps, harnessIssues, chapterAcceptance }
   })
   ipcMain.handle('causal:getState', (_e, workId: number) => ({
     state: causalNovelDAO.getState(workId),
@@ -734,7 +803,7 @@ export function registerIpcHandlers(): void {
     }))
   }))
   ipcMain.handle('causal:listStateRevisions', (_e, workId: number, limit = 100) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
     return causalNovelDAO.listStateRevisions(workId, limit).map(item => ({
       revision: item.revision,
       sourceChapterId: item.sourceChapterId,
@@ -744,21 +813,21 @@ export function registerIpcHandlers(): void {
     }))
   })
   ipcMain.handle('causal:getStateRevision', (_e, workId: number, revision: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
     return causalNovelDAO.getStateRevision(workId, revision)
   })
   ipcMain.handle('causal:createChapter', (_e, workId: number, rawTitle: string) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
     void rawTitle
-    throw new Error('因果小说正文只能由“候选决策 → 正文门禁 → 状态提交”事务创建，不支持手动新增章节')
+    throw new Error('事务章节只能由“宏观合同 → 候选决策 → 正文门禁 → 状态提交”创建')
   })
   ipcMain.handle('causal:updateChapter', (_e, workId: number, chapterId: number, input: {
     title?: string
     content?: string
     expectedUpdateTime?: string
   }) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前小说')
     assertCausalChapterDirectMutationAllowed(chapterId, '修改章节')
     const current = volumeChapterDAO.getChapter(chapterId)
     if (!current) throw new Error('章节不存在')
@@ -790,8 +859,8 @@ export function registerIpcHandlers(): void {
     candidateContent: string
     editKind: CausalManualEditKind
   }) => {
-    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再编辑章节')
+    if (!isNovelWork(input.workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(input.workId)) throw new Error('小说目标循环正在运行，请暂停后再编辑章节')
     return previewCausalChapterEdit(input)
   })
   ipcMain.handle('causal:applyChapterEdit', (_e, input: {
@@ -803,17 +872,17 @@ export function registerIpcHandlers(): void {
     expectedUpdateTime: string
     validationToken: string
   }) => {
-    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再编辑章节')
+    if (!isNovelWork(input.workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(input.workId)) throw new Error('小说目标循环正在运行，请暂停后再编辑章节')
     return applyCausalChapterEdit(input)
   })
   ipcMain.handle('causal:listReplayJobs', (_e, workId: number, limit = 50) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
     return causalNovelDAO.listReplayJobs(workId, limit)
   })
   ipcMain.handle('causal:retryReplay', (_e, workId: number, replayJobId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请先暂停')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(workId)) throw new Error('小说目标循环正在运行，请先暂停')
     const job = causalNovelDAO.getReplayJob(replayJobId)
     if (!job || job.workId !== workId) throw new Error('因果重放任务不存在')
     if (job.status !== 'blocked') throw new Error('只有冲突停止的重放任务可以重试')
@@ -821,19 +890,19 @@ export function registerIpcHandlers(): void {
     return true
   })
   ipcMain.handle('causal:cancelReplay', (_e, workId: number, replayJobId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请先暂停')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(workId)) throw new Error('小说目标循环正在运行，请先暂停')
     return cancelCausalChapterReplay(workId, replayJobId)
   })
   ipcMain.handle('causal:deleteChapter', (_e, workId: number, chapterId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前小说')
     assertCausalChapterDirectMutationAllowed(chapterId, '删除章节')
     return volumeChapterDAO.deleteChapter(chapterId)
   })
   ipcMain.handle('causal:rewriteChapterPreview', async (_e, workId: number, chapterId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(workId)) throw new Error('滚动因果正在运行，请暂停后再重写章节')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(workId)) throw new Error('小说目标循环正在运行，请暂停后再重写章节')
     return generateCausalStyleRewritePreview(workId, chapterId)
   })
   ipcMain.handle('causal:applyChapterRewrite', (_e, input: {
@@ -843,13 +912,13 @@ export function registerIpcHandlers(): void {
     expectedUpdateTime: string
     validationToken: string
   }) => {
-    if (!isCausalNovelWork(input.workId)) throw new Error('该作品不是因果小说')
-    if (isCausalNovelGoalLoopRunning(input.workId)) throw new Error('滚动因果正在运行，请暂停后再应用重写')
+    if (!isNovelWork(input.workId)) throw new Error('该作品不是小说')
+    if (isNovelGoalLoopRunning(input.workId)) throw new Error('小说目标循环正在运行，请暂停后再应用重写')
     return applyCausalStyleRewrite(input)
   })
   ipcMain.handle('causal:getChapterDetail', (_e, workId: number, chapterId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前小说')
     const chapter = volumeChapterDAO.getChapter(chapterId)
     if (!chapter) throw new Error('章节不存在')
     const parseJson = (value: string | null): unknown => {
@@ -910,8 +979,8 @@ export function registerIpcHandlers(): void {
     }
   })
   ipcMain.handle('causal:getChapterVersion', (_e, workId: number, chapterId: number, versionId: number) => {
-    if (!isCausalNovelWork(workId)) throw new Error('该作品不是因果小说')
-    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+    if (!isNovelWork(workId)) throw new Error('该作品不是小说')
+    if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前小说')
     const version = volumeChapterDAO.getVersion(versionId, chapterId)
     if (!version) throw new Error('章节版本不存在')
     return {
@@ -928,7 +997,13 @@ export function registerIpcHandlers(): void {
     const work = workDAO.getById(workId)
     let runtime: Record<string, unknown> = {}
     let config: Record<string, unknown> = {}
-    try { runtime = state?.state_json ? JSON.parse(state.state_json) as Record<string, unknown> : {} } catch { /* ignore */ }
+    try {
+      runtime = isNovelWork(workId)
+        ? readNovelGoalState(workId) as Record<string, unknown>
+        : state?.state_json
+          ? JSON.parse(state.state_json) as Record<string, unknown>
+          : {}
+    } catch { /* ignore */ }
     try { config = state?.goal_config_json ? JSON.parse(state.goal_config_json) as Record<string, unknown> : {} } catch { /* ignore */ }
     return {
       schemaVersion: 1,
@@ -942,14 +1017,46 @@ export function registerIpcHandlers(): void {
         : {
             issues: storyHarnessDAO.listIssues(workId),
             candidates: storyHarnessDAO.listCandidatesByWork(workId, 200),
-            releaseSnapshots: storyHarnessDAO.listReleaseSnapshots(workId)
+            releaseSnapshots: storyHarnessDAO.listReleaseSnapshots(workId),
+            readerFeedback: storyHarnessDAO.listReaderFeedback(workId),
+            readerCalibration: storyHarnessDAO.getReaderCalibration(workId)
           }
     }
   })
+  ipcMain.handle('goal:recordReaderFeedback', (_e, workId: number, input: {
+    releaseSnapshotId: number
+    source: string
+    impressions: number
+    openedReads: number
+    previewCompletions: number
+    completions: number
+    likes?: number
+    comments?: number
+    shares?: number
+    follows?: number
+    avgReadSeconds?: number | null
+    notes?: string | null
+    collectedAt: string
+  }) => {
+    if (isNovelWork(workId)) throw new Error('发布后读者校准当前只适用于短故事')
+    if (!input || Number.isNaN(Date.parse(input.collectedAt))) {
+      throw new Error('读者数据采集时间无效')
+    }
+    return {
+      id: storyHarnessDAO.recordReaderFeedback({
+        workId,
+        ...input
+      }),
+      calibration: storyHarnessDAO.getReaderCalibration(workId)
+    }
+  })
+  ipcMain.handle('goal:getReaderFeedback', (_e, workId: number) => ({
+    rows: storyHarnessDAO.listReaderFeedback(workId),
+    calibration: storyHarnessDAO.getReaderCalibration(workId),
+    releaseSnapshots: storyHarnessDAO.listReleaseSnapshots(workId)
+  }))
   ipcMain.handle('goal:isRunning', (_e, workId: number) => {
-    return isCausalNovelWork(workId)
-      ? isCausalNovelGoalLoopRunning(workId)
-      : isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)
+    return isNovelWork(workId) ? isNovelGoalLoopRunning(workId) : isGoalLoopRunning(workId)
   })
 
   ipcMain.handle('goal:listAllStates', () => {
@@ -1047,5 +1154,8 @@ export function registerIpcHandlers(): void {
 
   // ==================== 知识库 ====================
   registerKnowledgeBaseIpcHandlers()
+
+  // ==================== Narrative V2 独立自动化小说 ====================
+  registerNarrativeV2IpcHandlers()
 
 }

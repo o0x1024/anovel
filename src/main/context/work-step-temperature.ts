@@ -83,6 +83,7 @@ export function resolveTemperatureGroup(step: string | undefined): WorkTemperatu
 
   if (
     normalized === 'critique_dual_channel' ||
+    normalized === 'goal_novel_release_window_audit' ||
     normalized === 'goal_novel_volume_evaluation' ||
     normalized === 'goal_novel_whole_evaluation' ||
     normalized === 'emotion_engine_gate' ||

@@ -23,6 +23,9 @@ export function resolveNovelPreparationPhase(input: {
   hasChapters: boolean
 }): string {
   const guardedPhases = new Set([
+    'generate_character_cards',
+    'emotion_engine_gate',
+    'overall_self_check',
     'generate_volumes',
     'generate_beats',
     'generate_title_hook',
@@ -51,32 +54,43 @@ export function isTerminalNovelRepairError(errorCode: string): boolean {
 export function shouldPauseForNovelConstructionOutputFailure(input: {
   phase: string
   errorCode: string
+  message?: string
 }): boolean {
-  return input.phase === 'generate_beats' && input.errorCode === 'OUTPUT_TRUNCATED'
+  if (input.phase !== 'generate_beats') return false
+  if (input.errorCode === 'CHAPTER_SKELETON_PROTOCOL_EXHAUSTED') return true
+  if (input.errorCode === 'OUTPUT_TRUNCATED') return true
+  return input.errorCode === 'RESPONSE_PROTOCOL_EXHAUSTED'
 }
 
-/** 分卷生成中的修复边界只能停止改写，不能停止整本生成。 */
-export function shouldContinueNovelAfterVolumeRepairBoundary(input: {
-  phase: string
+export function classifyNovelConstructionOutputTerminal(input: {
   errorCode: string
-  hasVolumeCheckpoint: boolean
-}): boolean {
-  return input.phase === 'generate_beats'
-    && input.hasVolumeCheckpoint
-    && (input.errorCode === 'REPAIR_STALL' || input.errorCode === 'REPAIR_BOUNDARY')
+  message?: string
+}): {
+  action: 'output_truncation_terminal' | 'chapter_skeleton_contract_terminal'
+  progress: string
+} {
+  if (input.errorCode === 'OUTPUT_TRUNCATED') {
+    return {
+      action: 'output_truncation_terminal',
+      progress: '章节骨架动态 Token 重试仍被截断，已保留检查点并暂停'
+    }
+  }
+  return {
+    action: 'chapter_skeleton_contract_terminal',
+    progress: '章节骨架状态操作连续不满足合同，已保留检查点并暂停'
+  }
 }
 
-/** 用户要求整本连续生成时，施工阶段不能因为阶段轮次数量大于章节数而提前停机。 */
-export function shouldExtendNovelConstructionBudget(input: {
-  turn: number
-  maxTurns: number
-  expectedChapters: number
-  outlinedChapters: number
-  completedBodies: number
-}): boolean {
-  return input.turn >= input.maxTurns
-    && input.expectedChapters > 0
-    && (input.outlinedChapters < input.expectedChapters || input.completedBodies < input.expectedChapters)
+export function isNovelChapterCheckpointFailure(errorCode: string): boolean {
+  return errorCode.startsWith('EMOTION_LEDGER_')
+    || errorCode.startsWith('MEMORY_EXTRACT_')
+}
+
+export function isNovelHardBudgetExhausted(turn: number, maxTurns: number): boolean {
+  return Number.isFinite(turn)
+    && Number.isFinite(maxTurns)
+    && maxTurns > 0
+    && turn >= maxTurns
 }
 
 function normalizedNovelFailureKind(message: string): string {
@@ -92,8 +106,13 @@ function normalizedNovelFailureKind(message: string): string {
  * 熔断签名只能由稳定的阶段、子任务和错误码组成，禁止混入模型自由文本。
  * 否则模型每次换一种问题表述都会把连续失败计数重置为 1。
  */
-export function novelPhaseFailureSignature(phase: string, errorCode: string, message: string): string {
-  let stage = 'phase'
+export function novelPhaseFailureSignature(
+  phase: string,
+  errorCode: string,
+  message: string,
+  persistedStep?: string
+): string {
+  let stage = persistedStep ?? 'phase'
   if (phase === 'generate_beats') {
     const window = message.match(/第\s*(\d+)\s*-\s*(\d+)\s*章窗口门禁/)
     if (window) stage = `volume_gate_window_${window[1]}_${window[2]}`
@@ -103,7 +122,20 @@ export function novelPhaseFailureSignature(phase: string, errorCode: string, mes
   } else if (phase === 'generate_volumes') {
     stage = 'volume_contract_generation'
   } else if (phase === 'draft_body') {
-    if (/章节执行合同|CONTRACT_INVALID|合同冲突/.test(message)) stage = 'chapter_contract'
+    if (persistedStep === 'chapter_decision') stage = 'chapter_decision'
+    else if (/章节执行合同|CONTRACT_INVALID|合同冲突/.test(message)) stage = 'chapter_contract'
+    else if (
+      errorCode.startsWith('EMOTION_LEDGER_')
+      || /情绪账本批次|情绪账本完整性/.test(message)
+    ) stage = 'emotion_ledger'
+    else if (
+      errorCode.startsWith('MEMORY_EXTRACT_')
+    ) stage = 'memory_extraction'
+    else if (
+      errorCode === 'QUALITY_EVALUATOR_UNAVAILABLE'
+      || errorCode === 'QUALITY_EVALUATOR_PROTOCOL'
+      || /质量评估器/.test(message)
+    ) stage = 'quality_evaluator'
     else if (errorCode === 'EVALUATOR_PROTOCOL' || /评估器.*(?:证据协议|逐项验证|精确证据)|门禁证据协议/.test(message)) stage = 'execution_evaluator'
     else if (/泛白类模板反应|泛白类身体反应/.test(message)) stage = 'anti_ai_repair'
     else if (/章节情节点覆盖|章节执行门禁未通过|章际衔接/.test(message)) stage = 'execution_gate'

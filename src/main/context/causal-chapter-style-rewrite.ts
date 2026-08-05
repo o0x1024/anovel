@@ -13,6 +13,7 @@ import type { CausalChapterDecisionRecord } from '../../shared/causal-novel-type
 import { buildStyleRewriteSystemPrompt } from './anti-ai-rules'
 import { extractJsonText } from './parse-json-extract'
 import { withGoalLoopModelOptions } from './goal-routine/story-goal-model'
+import { countWords as wordCount } from '../../shared/body-word-target'
 
 export interface CausalStyleRewritePreview {
   chapterId: number
@@ -38,15 +39,12 @@ const REWRITE_AUDIT_SCHEMA: Record<string, unknown> = {
   }
 }
 
-function wordCount(value: string): number {
-  return value.replace(/\s/g, '').length
-}
-
 function evidenceValues(value: unknown, parentKey = ''): string[] {
   if (typeof value === 'string') {
     return /evidence|source[_A-Z]?event/i.test(parentKey) ? [value.trim()] : []
   }
   if (Array.isArray(value)) {
+    if (/evidenceIds$/i.test(parentKey)) return []
     if (/evidence/i.test(parentKey)) {
       return value.filter((item): item is string => typeof item === 'string').map(item => item.trim())
     }
@@ -121,7 +119,7 @@ function parseAudit(content: string): { passed: boolean; reasons: string[] } {
 }
 
 function assertChapter(workId: number, chapterId: number) {
-  if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前因果小说')
+  if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) throw new Error('章节不属于当前小说')
   const chapter = volumeChapterDAO.getChapter(chapterId)
   if (!chapter?.content?.trim()) throw new Error('当前章节没有可重写的正文')
   return { ...chapter, content: chapter.content }
@@ -196,6 +194,7 @@ export async function auditCausalManualExpressionEdit(
       maxTokens: 1600,
       forceThinkingDisabled: true,
       responseSchema: { name: 'causal_manual_edit_audit', schema: REWRITE_AUDIT_SCHEMA, strict: true },
+      structuredOutputMode: 'prompt_json',
       systemPrompt: [
         '你是因果小说人工编辑一致性审计器，只判断新正文是否与已提交事实完全等价。',
         '人物行动、事件顺序、选择、代价、资源、伤势、认知、压力、承诺、情绪余波、章末状态或下一章衔接有任何变化，必须 passed=false。',
@@ -277,6 +276,7 @@ export async function generateCausalStyleRewritePreview(
       maxTokens: 1600,
       forceThinkingDisabled: true,
       responseSchema: { name: 'causal_style_rewrite_audit', schema: REWRITE_AUDIT_SCHEMA, strict: true },
+      structuredOutputMode: 'prompt_json',
       systemPrompt: [
         '你是因果小说重写一致性审计器。只判断候选正文是否与冻结的情节、事实和章后状态完全等价。',
         '任何事件增删、顺序改变、人物选择/代价变化、事实漂移、提前揭示、章末状态改变或与下一章冲突，都必须 passed=false。',
@@ -348,11 +348,13 @@ export function applyCausalStyleRewrite(input: {
       emotion_assessment_json: chapter.emotion_assessment_json
     }, { model_type: 'causal_style_rewrite', style_id: styleId ?? undefined })
     if (!updated) throw new Error('章节已被其他操作修改，请重新生成重写候选')
+    const persisted = volumeChapterDAO.getChapter(input.chapterId)
+    if (!persisted?.content?.trim()) throw new Error('文风重写后的持久化正文为空')
     const targetVersion = causalNovelDAO.createContentVersion({
       workId: input.workId,
       chapterId: input.chapterId,
       parentVersionId: sourceVersion.id,
-      content: input.candidateContent,
+      content: persisted.content,
       source: 'ai_style_rewrite',
       editKind: 'expression',
       status: 'candidate'

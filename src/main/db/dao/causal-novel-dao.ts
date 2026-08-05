@@ -235,6 +235,38 @@ export class CausalNovelDAO extends BaseDAO {
     return row ? this.parseBinding(row) : null
   }
 
+  assertCommittedBindingCurrent(workId: number, chapterId: number): void {
+    const decision = this.getDecision(chapterId)
+    if (!decision || decision.workId !== workId || decision.status !== 'committed') {
+      throw new Error('章节没有可验证的已提交权威决策')
+    }
+    const chapter = this.get<{ content: string | null }>(
+      'SELECT content FROM chapters WHERE id = ?',
+      [chapterId]
+    )
+    const binding = this.getChapterBinding(chapterId)
+    const version = binding ? this.getContentVersion(binding.contentVersionId) : null
+    if (!chapter?.content?.trim() || !binding || !version) {
+      throw new Error('已提交章节缺少正文版本或权威绑定，禁止视为已完成')
+    }
+    const bodyHash = this.bodyHash(chapter.content)
+    const blockers = [
+      binding.workId !== workId ? '作品不匹配' : '',
+      binding.bindingStatus !== 'active' ? `绑定状态=${binding.bindingStatus}` : '',
+      binding.decisionStatus !== 'committed' ? `决策状态=${binding.decisionStatus}` : '',
+      binding.stateBeforeRevision !== decision.stateRevision ? '提交前修订号不匹配' : '',
+      binding.stateAfterRevision !== decision.stateRevision + 1 ? '提交后修订号不匹配' : '',
+      version.bodyHash !== bodyHash ? '正文哈希不匹配' : '',
+      version.content !== chapter.content ? '正文内容不匹配' : ''
+    ].filter(Boolean)
+    if (blockers.length > 0) {
+      throw new Error(
+        `已提交章节正文已偏离权威哈希绑定（${blockers.join('、')}）；`
+        + '必须完成因果重放后才能继续'
+      )
+    }
+  }
+
   activateContentVersion(input: {
     workId: number; chapterId: number; contentVersionId: number
     stateBeforeRevision: number | null; stateAfterRevision: number | null
@@ -424,9 +456,37 @@ export class CausalNovelDAO extends BaseDAO {
   cancelReplay(id: number): void {
     const job = this.getReplayJob(id)
     if (!job) throw new Error('因果重放任务不存在')
+    const sourceVersion = this.getContentVersion(job.sourceVersionId)
+    const decision = this.getDecision(job.chapterId)
+    if (
+      !sourceVersion
+      || sourceVersion.workId !== job.workId
+      || sourceVersion.chapterId !== job.chapterId
+      || !decision
+      || decision.workId !== job.workId
+      || decision.status !== 'committed'
+      || decision.stateRevision !== job.baseStateRevision
+    ) {
+      throw new Error('因果重放缺少可验证的源版本与权威决策，禁止取消为不一致状态')
+    }
     this.transaction(() => {
       this.updateReplayStatus(id, 'cancelled')
       this.run(`UPDATE causal_replay_conflicts SET resolved = 1 WHERE replay_job_id = ?`, [id])
+      this.run(
+        `UPDATE chapters
+         SET content = ?, word_count = ?, status = 'completed', update_time = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [sourceVersion.content, sourceVersion.wordCount, job.chapterId]
+      )
+      this.activateContentVersion({
+        workId: job.workId,
+        chapterId: job.chapterId,
+        contentVersionId: sourceVersion.id,
+        stateBeforeRevision: decision.stateRevision,
+        stateAfterRevision: decision.stateRevision + 1,
+        decisionStatus: 'committed',
+        bindingStatus: 'active'
+      })
       if (job.affectedChapterIds.length) {
         const placeholders = job.affectedChapterIds.map(() => '?').join(',')
         this.run(
@@ -639,6 +699,109 @@ export class CausalNovelDAO extends BaseDAO {
     )
   }
 
+  attachDecisionToExistingChapter(input: {
+    workId: number
+    chapterId: number
+    stateRevision: number
+    plan: CausalChapterPlan
+    decisionCard: string
+  }): void {
+    this.transaction(() => {
+      const chapter = this.get<{
+        outline: string | null
+        outline_diagnosis: string | null
+      }>(
+        `SELECT c.outline, c.outline_diagnosis
+         FROM chapters c
+         JOIN volumes v ON v.id = c.volume_id
+         WHERE c.id = ? AND v.work_id = ?`,
+        [input.chapterId, input.workId]
+      )
+      if (!chapter) throw new Error('宏观规划章节不存在或不属于当前小说')
+      if (this.getDecision(input.chapterId)) throw new Error('该章节已经绑定权威因果决策')
+      let diagnosis: Record<string, unknown> = {}
+      try {
+        const parsed = chapter.outline_diagnosis
+          ? JSON.parse(chapter.outline_diagnosis) as unknown
+          : null
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          diagnosis = parsed as Record<string, unknown>
+        }
+      } catch {
+        throw new Error('章节大纲诊断不是有效 JSON，不能绑定权威事务')
+      }
+      const macroOutline = chapter.outline?.trim() ?? ''
+      const macroOutlineHash = createHash('sha256').update(macroOutline).digest('hex')
+      const decision = input.plan.decision
+      this.run(
+        `UPDATE chapters
+         SET outline_diagnosis = ?, emotion_contract_json = ?,
+             next_hook = ?, update_time = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [
+          JSON.stringify({
+            ...diagnosis,
+            authority_transaction: {
+              protocol: 'unified_novel_v2',
+              state_revision: input.stateRevision,
+              selected_candidate_id: input.plan.selectedCandidateId,
+              macro_outline_hash: macroOutlineHash,
+              execution_contract: {
+                opening_state: decision.openingState,
+                required_outcomes: decision.mustCover.map(description => ({
+                  kind: 'event',
+                  description
+                })),
+                forbidden_events: decision.forbiddenEvents,
+                ending_state: decision.endingState,
+                continuity_constraints: decision.continuityConstraints
+              }
+            }
+          }),
+          JSON.stringify(input.plan.emotionContract),
+          input.plan.decision.newQuestion,
+          input.chapterId
+        ]
+      )
+      this.createDecision(input)
+    })
+  }
+
+  discardPlannedDecision(chapterId: number): void {
+    this.transaction(() => {
+      const decision = this.getDecision(chapterId)
+      if (!decision) return
+      if (decision.status !== 'planned') {
+        throw new Error('只有尚未提交的章节决策可以废弃；已提交章节必须通过因果重放修改')
+      }
+      this.invalidateCheckpoints(decision.workId, chapterId)
+      const chapter = this.get<{ outline: string | null; outline_diagnosis: string | null }>(
+        'SELECT outline, outline_diagnosis FROM chapters WHERE id = ?',
+        [chapterId]
+      )
+      const macroOutline = (chapter?.outline ?? '').split('## 章级权威因果合同', 1)[0].trim()
+      let diagnosis: Record<string, unknown> = {}
+      try {
+        const parsed = chapter?.outline_diagnosis ? JSON.parse(chapter.outline_diagnosis) as unknown : null
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          diagnosis = parsed as Record<string, unknown>
+        }
+      } catch { /* 损坏诊断会在下一次合同编译时被明确拒绝 */ }
+      delete diagnosis.authority_transaction
+      this.run(
+        `UPDATE chapters SET outline = ?, outline_diagnosis = ?,
+         quality_assessment_json = NULL, emotion_assessment_json = NULL,
+         update_time = CURRENT_TIMESTAMP WHERE id = ?`,
+        [macroOutline, JSON.stringify(diagnosis), chapterId]
+      )
+      this.run('DELETE FROM causal_chapter_bindings WHERE chapter_id = ?', [chapterId])
+      this.run(
+        'DELETE FROM causal_chapter_decisions WHERE chapter_id = ? AND status = ?',
+        [chapterId, 'planned']
+      )
+    })
+  }
+
   createPlannedChapter(input: {
     workId: number
     stateRevision: number
@@ -770,11 +933,15 @@ export class CausalNovelDAO extends BaseDAO {
     return next
   }
 
-  createReleaseSnapshot(workId: number, label = 'causal_release_ready'): number {
+  createReleaseSnapshot(
+    workId: number,
+    label = 'causal_release_ready',
+    releaseProof?: unknown
+  ): number {
     return this.transaction(() => {
       const state = this.getState(workId)
       if (!state?.completed || state.completionStatus !== 'completed') {
-        throw new Error('因果小说尚未确认完结，禁止创建发布快照')
+        throw new Error('小说权威状态尚未确认完结，禁止创建发布快照')
       }
       const unfinished = this.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM causal_chapter_decisions
@@ -806,6 +973,7 @@ export class CausalNovelDAO extends BaseDAO {
       }
       const snapshot = JSON.stringify({
         protocol: 'causal_novel_release_v1',
+        releaseProof: releaseProof ?? null,
         work,
         chapters,
         state,

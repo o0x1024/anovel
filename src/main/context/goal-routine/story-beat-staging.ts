@@ -142,6 +142,41 @@ export function compactBeatSkeletons(chapters: ParsedChapter[]): Array<Record<st
   }))
 }
 
+/**
+ * 相邻拍边界是同一个状态交接，不应由两个独立模型调用各写一份再比较文本。
+ *
+ * 已完成的左拍离场状态是权威值；右拍入场只引用该值。这里不补造缺失的左侧
+ * exit_boundary，缺失时仍交给确定性门禁阻塞，也不改写 entry_facts/exit_facts，
+ * 因而事实、证据、地点冲突仍会被连续性门禁发现。
+ */
+export function synchronizeStoryBoundaryPairs(chapters: ParsedChapter[]): ParsedChapter[] {
+  const synchronized = chapters.map(chapter => ({
+    ...chapter,
+    continuity_contract: chapter.continuity_contract
+      ? { ...chapter.continuity_contract }
+      : chapter.continuity_contract
+  }))
+  for (let index = 0; index < synchronized.length - 1; index++) {
+    const current = synchronized[index].continuity_contract
+    const next = synchronized[index + 1].continuity_contract
+    const authoritativeExit = current?.exit_boundary?.trim()
+    if (!authoritativeExit || !next) continue
+    next.entry_boundary = authoritativeExit
+  }
+  return synchronized
+}
+
+export function storyDeterministicRepairTargets(
+  targetChapterIds: number[],
+  allChapterIds: number[],
+  boundaryLevel: boolean
+): number[] {
+  if (boundaryLevel) {
+    return targetChapterIds.length > 0 ? [...new Set(targetChapterIds)] : [...allChapterIds]
+  }
+  return targetChapterIds.length > 0 ? [...new Set(targetChapterIds)].slice(0, 2) : []
+}
+
 export function mergeStagedBeat(
   skeleton: ParsedChapter,
   enriched: ParsedChapter,

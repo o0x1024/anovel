@@ -1,4 +1,5 @@
 import { coreSettingDAO, volumeChapterDAO, ideaFragmentDAO } from '../db'
+import { countWords } from '../../shared/body-word-target'
 
 export type IdeaMergeTarget =
   | { kind: 'setting'; type: string }
@@ -42,8 +43,7 @@ export function mergeIdeaToTarget(ideaId: number, target: string): void {
       volumeChapterDAO.updateChapter(parsed.chapterId, { outline: next })
     } else {
       const next = chapter.content ? `${chapter.content}${block}` : idea.content
-      const wordCount = next.replace(/\s/g, '').length
-      volumeChapterDAO.updateChapter(parsed.chapterId, { content: next, word_count: wordCount })
+      volumeChapterDAO.updateChapter(parsed.chapterId, { content: next, word_count: countWords(next) })
     }
   }
 

@@ -40,6 +40,60 @@ export interface NovelWholeAssessment {
   systemicIssues: NovelSystemIssue[]
 }
 
+const VOLUME_ASSESSMENT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'structureScore', 'escalationScore', 'payoffScore', 'continuityScore',
+    'repetitionScore', 'issues', 'weakChapters', 'summary'
+  ],
+  properties: {
+    structureScore: { type: 'integer', minimum: 0, maximum: 100 },
+    escalationScore: { type: 'integer', minimum: 0, maximum: 100 },
+    payoffScore: { type: 'integer', minimum: 0, maximum: 100 },
+    continuityScore: { type: 'integer', minimum: 0, maximum: 100 },
+    repetitionScore: { type: 'integer', minimum: 0, maximum: 100 },
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['problem', 'chapterTitles', 'evidence', 'requiredFix'],
+        properties: {
+          problem: { type: 'string' },
+          chapterTitles: { type: 'array', items: { type: 'string' } },
+          evidence: { type: 'array', items: { type: 'string' } },
+          requiredFix: { type: 'string' }
+        }
+      }
+    },
+    weakChapters: { type: 'array', items: { type: 'string' } },
+    summary: { type: 'string' }
+  }
+}
+
+const NOVEL_WHOLE_ASSESSMENT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'goalMatchScore', 'goalMatchReason', 'overallStoryScore', 'overallStoryReason',
+    'previewHookScore', 'previewHookReason', 'proseReadScore', 'proseReadReason',
+    'weakChapterTitles', 'issues'
+  ],
+  properties: {
+    goalMatchScore: { type: 'integer', minimum: 0, maximum: 100 },
+    goalMatchReason: { type: 'string' },
+    overallStoryScore: { type: 'integer', minimum: 0, maximum: 100 },
+    overallStoryReason: { type: 'string' },
+    previewHookScore: { type: 'integer', minimum: 0, maximum: 100 },
+    previewHookReason: { type: 'string' },
+    proseReadScore: { type: 'integer', minimum: 0, maximum: 100 },
+    proseReadReason: { type: 'string' },
+    weakChapterTitles: { type: 'array', items: { type: 'string' } },
+    issues: { type: 'array', items: { type: 'string' } }
+  }
+}
+
 function clampScore(value: unknown): number {
   const n = Number(value)
   return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : 0
@@ -210,6 +264,7 @@ async function assessVolumeWindow(
     label: `${volumeName}第${windowIndex + 1}窗口终审`,
     attempts: 2,
     signal,
+    schema: VOLUME_ASSESSMENT_SCHEMA,
     request: (attempt, lastError) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId,
@@ -218,6 +273,12 @@ async function assessVolumeWindow(
         enrichNarrativeMemory: false,
         maxTokens: attempt === 1 ? 1800 : 3600,
         forceThinkingDisabled: true,
+        responseSchema: {
+          name: 'novel_volume_window_evaluation',
+          schema: VOLUME_ASSESSMENT_SCHEMA,
+          strict: true
+        },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是长篇网文分卷终审编辑。根据章节合同、大纲和正文首尾抽样，检查本卷是否形成因果闭环、压力升级、阶段兑现和进入下一卷的新债务。',
           '同时识别重复任务结构、反派送人头、无代价获胜、连续水章、关系线停滞和伏笔久拖不决。',
@@ -278,6 +339,7 @@ export async function assessNovelVolume(
     label: `${volumeName}聚合终审`,
     attempts: 2,
     signal,
+    schema: VOLUME_ASSESSMENT_SCHEMA,
     request: (attempt, lastError) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId,
@@ -286,6 +348,12 @@ export async function assessNovelVolume(
         enrichNarrativeMemory: false,
         maxTokens: attempt === 1 ? 2200 : 4200,
         forceThinkingDisabled: true,
+        responseSchema: {
+          name: 'novel_volume_aggregate_evaluation',
+          schema: VOLUME_ASSESSMENT_SCHEMA,
+          strict: true
+        },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是长篇小说分卷聚合终审。依据全部连续窗口报告和卷首卷末证据，判断整卷闭环；不得用局部高分掩盖任一窗口的阻断问题。',
           '必须检查阶段目标、must-resolve承诺、高潮因果、不可逆代价、对手状态变化、允许跨卷债务和禁止新增一级主线后的收束。',
@@ -344,22 +412,9 @@ export async function assessWholeNovel(
     throw new Error('小说正文尚未完整，不能执行整书终审')
   }
 
-  const volumeNames = [...new Set(chapters.map(chapter => chapter.volume_name))]
-  const volumeAssessments: VolumeAssessment[] = []
-  for (const volumeName of volumeNames) {
-    if (signal?.aborted) throw new Error('已取消')
-    volumeAssessments.push(await assessNovelVolume(
-      workId,
-      volumeName,
-      chapters.filter(chapter => chapter.volume_name === volumeName),
-      signal
-    ))
-  }
-
   const rhythmIssues = deterministicRhythmIssues(chapters)
   const systemic = assessNovelSystemics(workId, { requireFingerprints: true, includeProseScan: true })
-  const hardVolumeIssues = volumeAssessments.flatMap(assessment => volumeAssessmentIssues(assessment, chapters))
-  const allSystemicIssues = [...systemic.issues, ...hardVolumeIssues]
+  const allSystemicIssues = systemic.issues
   const systemicIssueMessages = allSystemicIssues.map(issue => `${issue.code}：${issue.message}（${issue.evidence.join('；')}）`)
   const sampleIndexes = new Set([
     0, 1, 2,
@@ -375,6 +430,7 @@ export async function assessWholeNovel(
     label: '小说整书终审',
     attempts: 2,
     signal,
+    schema: NOVEL_WHOLE_ASSESSMENT_SCHEMA,
     request: (attempt, lastError) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId,
@@ -383,8 +439,14 @@ export async function assessWholeNovel(
         enrichNarrativeMemory: false,
         maxTokens: attempt === 1 ? 2200 : 4200,
         forceThinkingDisabled: true,
+        responseSchema: {
+          name: 'novel_whole_evaluation',
+          schema: NOVEL_WHOLE_ASSESSMENT_SCHEMA,
+          strict: true
+        },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
-          '你是长篇小说整书终审。综合各卷报告与黄金前三章/四分之一/中点/四分之三/结局盲读样本评分。',
+          '你是长篇小说整书独立编辑审读。只审读黄金前三章/四分之一/中点/四分之三/结局固定样本。',
           '黄金前三章必须联合检查“第一章立钩子、第二章扩大承诺、第三章首次兑现并打开长线目标”，任一缺失都要列入 issues 和 weakChapterTitles。',
           '重点判断：用户目标是否贯穿、主线是否升级、高潮是否由前文因果触发、结局是否兑现、正文是否有追读感和人味。',
           retentionEvaluationRules('novel'),
@@ -392,11 +454,10 @@ export async function assessWholeNovel(
         ].join('\n'),
         prompt: [
           `【用户创作目标】\n${goalDescription.trim() || '无额外目标，以作品既定设定为准'}`,
-          `【分卷终审】\n${JSON.stringify(volumeAssessments, null, 2)}`,
           rhythmIssues.length ? `【确定性节奏问题】\n${rhythmIssues.join('\n')}` : '',
           systemicIssueMessages.length ? `【确定性跨章状态与模式问题 - blocker不得被综合分抵消】\n${systemicIssueMessages.join('\n')}` : '',
           `【跨阶段正文盲读样本】\n${proseSamples.join('\n\n').slice(0, 30000)}`,
-          attempt > 1 ? `【格式重试】${lastError}。缩短原因和问题列表并返回完整 JSON。` : ''
+          lastError ? `【协议错误】${lastError}` : ''
         ].filter(Boolean).join('\n\n')
       }),
       { stream: false, signal }
@@ -412,7 +473,7 @@ export async function assessWholeNovel(
     proseReadScore: clampScore(parsed.proseReadScore),
     proseReadReason: String(parsed.proseReadReason ?? '').trim(),
     weakChapterTitles: stringArray(parsed.weakChapterTitles),
-    issues: [...new Set([...rhythmIssues, ...systemicIssueMessages, ...volumeAssessments.flatMap(item => item.issues), ...stringArray(parsed.issues)])],
+    issues: [...new Set([...rhythmIssues, ...systemicIssueMessages, ...stringArray(parsed.issues)])],
     systemicIssues: allSystemicIssues
   }
 }

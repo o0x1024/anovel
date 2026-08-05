@@ -255,17 +255,44 @@ function resourceMatches(a: string, b: string): boolean {
   return a === b || a.includes(b) || b.includes(a)
 }
 
+const NUMERIC_RESOURCE_SIGNAL = /(?:回收当量|兑换当量|系统积分|积分余额|金币|银币|铜币|贡献点|兑换点|经验值|生命值|体力值|能量值|库存(?:量|余额)|账户余额|剩余(?:点数|次数|额度))/u
+
+export function chapterRequiresResourceLedger(chapter: {
+  title?: string | null
+  outline?: string | null
+  content?: string | null
+}): boolean {
+  return NUMERIC_RESOURCE_SIGNAL.test([
+    chapter.title ?? '',
+    chapter.outline ?? '',
+    chapter.content ?? ''
+  ].join('\n'))
+}
+
 export function runResourceConstraintGate(workId: number, chapterId: number): ResourceGateResult {
   const budgets = resourceLedgerDAO.listBudgetsByChapter(workId, chapterId)
-  if (budgets.length === 0) return { passed: true, blockers: [], warnings: [] }
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const ledgerRequired = chapters.some(chapter => chapterRequiresResourceLedger(chapter))
+  if (budgets.length === 0) {
+    return ledgerRequired
+      ? {
+          passed: false,
+          blockers: ['作品存在量化资源玩法，但本章没有开章/章末资源预算，禁止把未知账目视为平衡'],
+          warnings: []
+        }
+      : { passed: true, blockers: [], warnings: [] }
+  }
   const blockers: string[] = []
   const warnings: string[] = []
   const snapshots = characterSnapshotDAO.listByWork(workId)
     .filter(s => s.chapter_id === chapterId)
     .sort((a, b) => b.chapter_id - a.chapter_id || b.id - a.id)
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const chapterOrdinal = chapters.findIndex(chapter => chapter.id === chapterId) + 1
   const constraints = resourceLedgerDAO.listConstraints(workId)
+  const hasHardResourceRules = constraints.length > 0
+  if (!hasHardResourceRules) {
+    warnings.push('章节已有资源预算，但全书资源硬规则为空；本章预算仅作为合同记录，不升级为硬门禁')
+  }
 
   for (const budget of budgets) {
     const matched = snapshots.find(s => {
@@ -273,6 +300,10 @@ export function runResourceConstraintGate(workId: number, chapterId: number): Re
       return parseNumericStats(s.numeric_stats).some(st => resourceMatches(st.name, budget.resource))
     })
     if (!matched) {
+      if (!hasHardResourceRules) {
+        warnings.push(`${budget.resource}：未提取到章末快照；因缺少全书硬规则，保留预算记录并延后核验`)
+        continue
+      }
       const unchangedAllowed = budget.start_min != null
         && budget.start_max != null
         && budget.end_min != null
@@ -290,6 +321,7 @@ export function runResourceConstraintGate(workId: number, chapterId: number): Re
     }
     const stat = parseNumericStats(matched.numeric_stats).find(st => resourceMatches(st.name, budget.resource))
     if (!stat) continue
+    if (!hasHardResourceRules) continue
     if (budget.end_min != null && stat.value < budget.end_min) {
       blockers.push(`${budget.resource}=${stat.value}${stat.unit || budget.unit || ''} 低于本章预算下限 ${budget.end_min}${budget.unit || ''}`)
     }

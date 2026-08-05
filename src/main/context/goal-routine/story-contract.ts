@@ -4,6 +4,11 @@ import { extractJsonText } from '../parse-json-extract'
 import { parseJsonObjectWithRepairs } from '../../../shared/model-json-repair'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { GoalPhaseExhaustedError } from './goal-phase-error'
+import { requestStructuredModelOutput } from './structured-model-output'
+import {
+  requestQualityEvaluatorEvidence,
+  requireQualityEvaluatorEvidence
+} from './quality-evaluator-policy'
 
 export interface StoryContract {
   core_question: string
@@ -97,13 +102,9 @@ function parseStoryContract(content: string): StoryContract {
     },
     opponent_countermoves: strings(raw.opponent_countermoves),
     climax_mechanism: String(raw.climax_mechanism ?? '').trim(),
-    ending_mode: ['closed', 'bittersweet', 'open_aftertaste'].includes(ending)
-      ? ending as StoryContract['ending_mode']
-      : 'closed',
+    ending_mode: ending as StoryContract['ending_mode'],
     must_resolve: strings(raw.must_resolve),
-    forbidden_final_threads: strings(raw.forbidden_final_threads).length > 0
-      ? strings(raw.forbidden_final_threads)
-      : ['未经铺垫的新反派', '新的主线任务', '续集式威胁'],
+    forbidden_final_threads: strings(raw.forbidden_final_threads),
     fair_clues: strings(raw.fair_clues),
     rule_proofs: records(raw.rule_proofs).map(row => ({
       rule: String(row.rule ?? '').trim(),
@@ -131,7 +132,9 @@ function parseStoryContract(content: string): StoryContract {
     !contract.protagonist_plan.failure_risk && 'protagonist_plan.failure_risk',
     contract.opponent_countermoves.length === 0 && 'opponent_countermoves',
     !contract.climax_mechanism && 'climax_mechanism',
+    !['closed', 'bittersweet', 'open_aftertaste'].includes(ending) && 'ending_mode',
     contract.must_resolve.length === 0 && 'must_resolve',
+    contract.forbidden_final_threads.length === 0 && 'forbidden_final_threads',
     contract.climax_evidence_chain.length === 0 && 'climax_evidence_chain',
     contract.climax_evidence_chain.some(row => Object.values(row).some(value => !value)) && 'climax_evidence_chain.*',
     contract.rule_proofs.some(row => Object.values(row).some(value => !value)) && 'rule_proofs.*'
@@ -168,35 +171,43 @@ async function auditStoryContract(
   source: string,
   signal?: AbortSignal
 ): Promise<string[]> {
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_contract_semantic_audit',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 1400,
-      forceThinkingDisabled: true,
-      responseSchema: { name: 'short_story_contract_audit', schema: STORY_CONTRACT_AUDIT_SCHEMA, strict: false },
-      systemPrompt: [
-        '你是独立短故事合同审计员，不参与生成，只否决承重因果不成立的合同。',
-        '逐条审查 rule_proofs：制定者是否真有权限，触发条件与证据能否支持后果，主角是否可以轻易拒绝或正常申诉绕开。题材夸张可以，但制度不能自相矛盾或只为打脸临时发明。',
-        '逐条审查 climax_evidence_chain：决定性事实必须提前出现、来源和持有人稳定，并由人物行动触发；自动弹文件、恰好群发消息、临时权威背书、反派主动送证据均为 blocker。',
-        '高潮必须由主角或对手的选择造成，不得依赖双方此前都不知道的新事实。',
-        '只输出 JSON：{"blockers":["具体冲突与需要重建的字段"]}；无硬伤返回空数组。'
-      ].join('\n\n'),
-      prompt: `【上游设定】\n${source}\n\n【候选故事合同】\n${JSON.stringify(contract, null, 2)}`
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(response.error || '故事合同独立语义审计无返回')
-  }
-  const json = extractJsonText(response.content.trim(), { allowEmptyArrays: true })
-    ?? response.content.trim()
-  const parsed = parseJsonObjectWithRepairs<{ blockers?: unknown }>(json).value
-  if (!Array.isArray(parsed.blockers)) throw new Error('故事合同独立语义审计缺少 blockers 数组')
-  return parsed.blockers.map(String).map(item => item.trim()).filter(Boolean).slice(0, 6)
+  const result = await requestQualityEvaluatorEvidence<string[]>({
+    workId,
+    label: '故事合同独立语义审计',
+    signal,
+    request: (attempt, lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_contract_semantic_audit',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1400,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'short_story_contract_audit', schema: STORY_CONTRACT_AUDIT_SCHEMA, strict: true },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是独立短故事合同审计员，不参与生成，只否决承重因果不成立的合同。',
+          '逐条审查 rule_proofs：制定者是否真有权限，触发条件与证据能否支持后果，主角是否可以轻易拒绝或正常申诉绕开。题材夸张可以，但制度不能自相矛盾或只为打脸临时发明。',
+          '逐条审查 climax_evidence_chain：决定性事实必须提前出现、来源和持有人稳定，并由人物行动触发；自动弹文件、恰好群发消息、临时权威背书、反派主动送证据均为 blocker。',
+          '高潮必须由主角或对手的选择造成，不得依赖双方此前都不知道的新事实。',
+          '只输出 JSON：{"blockers":["具体冲突与需要重建的字段"]}；无硬伤返回空数组。'
+        ].join('\n\n'),
+        prompt: [
+          `【上游设定】\n${source}\n\n【候选故事合同】\n${JSON.stringify(contract, null, 2)}`,
+          attempt > 1 ? `【上次取证协议错误】\n${lastError}` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    parse: content => {
+      const json = extractJsonText(content.trim(), { allowEmptyArrays: true }) ?? content.trim()
+      const parsed = parseJsonObjectWithRepairs<{ blockers?: unknown }>(json).value
+      if (!Array.isArray(parsed.blockers)) throw new Error('故事合同独立语义审计缺少 blockers 数组')
+      return parsed.blockers.map(String).map(item => item.trim()).filter(Boolean).slice(0, 6)
+    }
+  })
+  return requireQualityEvaluatorEvidence(result, '故事合同独立语义审计')
 }
 
 export async function ensureStoryContract(
@@ -213,8 +224,14 @@ export async function ensureStoryContract(
   for (let round = 1; round <= 4; round++) {
     if (signal?.aborted) throw new Error('已取消')
     onProgress?.(`正在固化全篇故事合同（第 ${round}/4 轮）`)
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
+    const contract = await requestStructuredModelOutput<StoryContract>({
+      workId,
+      label: `故事合同第${round}轮`,
+      attempts: 2,
+      signal,
+      schema: STORY_CONTRACT_RESPONSE_SCHEMA,
+      request: (attempt, lastError) => modelService.chat(
+        withGoalLoopModelOptions(workId, {
         workId,
         step: 'story_contract_gate',
         enrichWorkContext: false,
@@ -222,7 +239,8 @@ export async function ensureStoryContract(
         temperature: 0.1,
         maxTokens: 3000,
         forceThinkingDisabled: true,
-        responseSchema: { name: 'short_story_contract', schema: STORY_CONTRACT_RESPONSE_SCHEMA, strict: false },
+        responseSchema: { name: 'short_story_contract', schema: STORY_CONTRACT_RESPONSE_SCHEMA, strict: true },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是短故事总架构师。把已有设定固化为全篇唯一事实合同，后续所有节拍和正文必须服从它。',
           '若 story_engine.setting_resolutions 非空，它是对上游含糊或互斥表述的权威口径；合同必须采用该口径，不得把旧冲突重新写回。',
@@ -237,38 +255,28 @@ export async function ensureStoryContract(
           `【作品】${work?.title || '未命名短故事'}`,
           `【创作目标】${goal.trim() || '高完读率、人物可信、因果完整的短故事'}`,
           `【现有设定】\n${sourceContext(workId)}`,
-          feedback ? `【必须修复的问题】\n${feedback}` : ''
+          feedback ? `【必须修复的问题】\n${feedback}` : '',
+          attempt > 1 ? `【上次结构化协议错误】\n${lastError}` : ''
         ].filter(Boolean).join('\n\n')
-      }),
-      { stream: false, signal }
+        }),
+        { stream: false, signal }
+      ),
+      validate: parsed => parseStoryContract(JSON.stringify(parsed))
+    })
+    const blockers = await auditStoryContract(workId, contract, sourceContext(workId), signal)
+    if (blockers.length > 0) {
+      feedback = `独立合同审计未通过：${blockers.join('；')}`
+      onProgress?.(`故事合同因果审计未通过（第 ${round}/4 轮），正在重建`)
+      continue
+    }
+    coreSettingDAO.upsertStructured(
+      workId,
+      'story_contract',
+      `# 全篇故事合同\n\n${JSON.stringify(contract, null, 2)}`,
+      JSON.stringify(contract)
     )
-    if (!response.success || !response.content?.trim()) {
-      feedback = `模型调用失败：${response.error || '故事合同生成无返回'}。请重新输出完整合同。`
-      continue
-    }
-    if (response.finishReason === 'length') {
-      feedback = '上一轮合同输出达到长度上限。必须压缩 chronology 和数组项并重新输出完整 JSON。'
-      continue
-    }
-    try {
-      const contract = parseStoryContract(response.content)
-      const blockers = await auditStoryContract(workId, contract, sourceContext(workId), signal)
-      if (blockers.length > 0) {
-        feedback = `独立合同审计未通过：${blockers.join('；')}`
-        onProgress?.(`故事合同因果审计未通过（第 ${round}/4 轮），正在重建`)
-        continue
-      }
-      coreSettingDAO.upsertStructured(
-        workId,
-        'story_contract',
-        `# 全篇故事合同\n\n${JSON.stringify(contract, null, 2)}`,
-        JSON.stringify(contract)
-      )
-      onProgress?.('全篇故事合同已固化')
-      return contract
-    } catch (error) {
-      feedback = error instanceof Error ? error.message : String(error)
-    }
+    onProgress?.('全篇故事合同已固化')
+    return contract
   }
   throw new GoalPhaseExhaustedError(`全篇故事合同连续4轮未通过：${feedback}`)
 }

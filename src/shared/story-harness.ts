@@ -85,6 +85,13 @@ export interface DeterministicStorySentenceRepair {
   repairs: Array<{ before: string; after: string }>
 }
 
+export interface DeterministicStoryCandidateRepair {
+  content: string
+  quoteChanged: boolean
+  sentenceRepairs: Array<{ before: string; after: string }>
+  repairCount: number
+}
+
 /**
  * 原位修复已知、无歧义的坏词片段。只允许替换命中的短片段，不能借机重写句子。
  *
@@ -104,6 +111,22 @@ export function repairDeterministicStorySentences(text: string): DeterministicSt
     }
   )
   return { content, repairs }
+}
+
+/**
+ * 候选进入任何门禁或持久化之前的唯一确定性归一化入口。
+ * 这里只修复能够从原文字面唯一恢复的损坏，不允许润色、扩写或改动叙事含义。
+ */
+export function repairDeterministicStoryCandidate(text: string): DeterministicStoryCandidateRepair {
+  const quoteRepaired = repairDeterministicStoryQuotes(text)
+  const sentenceResult = repairDeterministicStorySentences(quoteRepaired)
+  const quoteChanged = quoteRepaired !== text
+  return {
+    content: sentenceResult.content,
+    quoteChanged,
+    sentenceRepairs: sentenceResult.repairs,
+    repairCount: sentenceResult.repairs.length + (quoteChanged ? 1 : 0)
+  }
 }
 
 const STORY_HOUR_DIGITS: Record<string, number> = {
@@ -160,14 +183,6 @@ export function detectStoryDeadlineArithmeticIssues(
   }
   return issues
 }
-export const STORY_HARNESS_MAX_AUTOMATION_EPOCHS = 2
-
-export function canStartStoryFallbackEpoch(currentEpoch: number): boolean {
-  return Number.isInteger(currentEpoch)
-    && currentEpoch >= 0
-    && currentEpoch + 1 < STORY_HARNESS_MAX_AUTOMATION_EPOCHS
-}
-
 export interface StoryCandidateContextInput {
   acceptedBody?: string | null
   outline?: string | null
@@ -314,6 +329,26 @@ export function stableStoryHash(text: string): string {
     hash = Math.imul(hash, 16777619)
   }
   return `${text.length}:${(hash >>> 0).toString(16)}`
+}
+
+/**
+ * 熔断身份必须绑定具体候选与具体证据。不同正文即使触发同类门禁，也不是同一次失败。
+ */
+export function storyCandidateDefectSignature(
+  chapterId: number,
+  content: string,
+  issues: StoryHarnessIssue[]
+): string {
+  const evidenceIdentity = issues
+    .map(item => `${item.code}:${stableStoryHash(item.evidence.join('\n'))}`)
+    .sort()
+    .join('|')
+  return [
+    'BODY_TEXT_INTEGRITY',
+    `chapter:${chapterId}`,
+    `candidate:${stableStoryHash(content)}`,
+    `evidence:${stableStoryHash(evidenceIdentity)}`
+  ].join(':')
 }
 
 function nonEmptyLines(text: string): string[] {

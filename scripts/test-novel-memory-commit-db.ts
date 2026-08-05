@@ -4,13 +4,27 @@ import Database from 'better-sqlite3'
 async function main(): Promise<void> {
   const { closeDatabase, getDatabase, injectDatabaseForTest } = await import('../src/main/db/connection')
   injectDatabaseForTest(new Database(':memory:'))
-  const { initSchema, workDAO, volumeChapterDAO } = await import('../src/main/db')
+  const {
+    chapterEmotionCheckpointDAO,
+    emotionalStateDAO,
+    goalRoutineDAO,
+    initSchema,
+    novelChapterAcceptanceDAO,
+    workDAO,
+    volumeChapterDAO
+  } = await import('../src/main/db')
   initSchema()
-  const { commitPreparedNarrativeMemory } = await import(
+  const { commitPreparedNarrativeMemory, NarrativeMemoryCommitGateError } = await import(
     '../src/main/context/goal-routine/story-goal-doer'
   )
   const { runConsistencyGate } = await import('../src/main/context/consistency-gate')
   const { parseMemoryExtract } = await import('../src/main/context/memory-extract')
+  const { recoverNarrativeMemoryCommitGate } = await import(
+    '../src/main/context/goal-routine/novel-autonomous-control'
+  )
+  const { novelChapterContentHash } = await import(
+    '../src/main/context/goal-routine/novel-chapter-acceptance-policy'
+  )
 
   try {
     const workId = workDAO.create({ title: '原子记忆测试', workType: 'novel' })
@@ -75,17 +89,75 @@ async function main(): Promise<void> {
     }))
     assert.equal(placeholderTime.timeline_events?.[0]?.relative_time, '本章内')
 
-    assert.throws(
-      () => commitPreparedNarrativeMemory(workId, chapterId, prepared, {
+    let gateError: unknown
+    try {
+      commitPreparedNarrativeMemory(workId, chapterId, prepared, {
         markChapterCompleted: true,
         validate: () => ['注入的资源门禁失败']
-      }),
-      /注入的资源门禁失败/
-    )
+      })
+    } catch (error) {
+      gateError = error
+    }
+    assert.ok(gateError instanceof NarrativeMemoryCommitGateError)
+    assert.equal(gateError.code, 'NARRATIVE_MEMORY_GATE_REPAIR_REQUIRED')
+    assert.equal(gateError.chapterId, chapterId)
+    assert.deepEqual(gateError.blockers, ['注入的资源门禁失败'])
 
     const db = getDatabase()
     const count = (table: string): number => Number(
       (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n
+    )
+
+    const recoveryChapterId = volumeChapterDAO.createChapter(
+      volumeId,
+      '第二章',
+      '重复钩子恢复测试'
+    )
+    const recoveryContent = '陈凉没有重复上一章的钩子，她把目标改成封住楼梯口。'
+    volumeChapterDAO.updateChapter(recoveryChapterId, {
+      content: recoveryContent,
+      word_count: recoveryContent.length,
+      status: 'draft'
+    })
+    const recoveryRun = goalRoutineDAO.beginRun({
+      workId,
+      workflowType: 'novel',
+      resume: false,
+      maxTurns: 30,
+      currentPhase: 'draft_body',
+      goalConfigJson: '{}'
+    })
+    const recoveryHash = novelChapterContentHash(recoveryContent)
+    const recoveryEpisode = novelChapterAcceptanceDAO.createEpisode({
+      episodeKey: `memory-recovery:${recoveryChapterId}:${recoveryHash}`,
+      workId,
+      chapterId: recoveryChapterId,
+      runId: recoveryRun.id,
+      baseContentHash: recoveryHash,
+      contractHash: 'memory-recovery-contract',
+      protocolVersion: 3,
+      maxAssessments: 1,
+      maxRepairs: 1
+    })
+    const recoveryCandidate = novelChapterAcceptanceDAO.addCandidate({
+      episodeId: recoveryEpisode.id,
+      contentHash: recoveryHash,
+      sourceKind: 'baseline',
+      content: recoveryContent,
+      wordCount: recoveryContent.length
+    })
+    novelChapterAcceptanceDAO.setBestCandidate(recoveryEpisode.id, recoveryCandidate.id)
+    novelChapterAcceptanceDAO.finish(recoveryEpisode.id, { status: 'accepted' })
+    const recoveryPlan = recoverNarrativeMemoryCommitGate({
+      workId,
+      chapterId: recoveryChapterId,
+      blockers: ['跨章状态/模式[REPEATED_HOOK]：重复章末钩子']
+    })
+    assert.equal(recoveryPlan.action, 'cluster')
+    assert.equal(
+      novelChapterAcceptanceDAO.getEpisode(recoveryEpisode.id)?.status,
+      'superseded',
+      '普通正文的已接受候选必须能直接路由到记忆域结构修复'
     )
     assert.equal(count('foreshadowing'), 0)
     assert.equal(count('character_snapshots'), 0)
@@ -119,6 +191,82 @@ async function main(): Promise<void> {
     assert.equal(committed.timelineEvents, 1)
     assert.equal(committed.patternFingerprint, true)
     assert.equal(volumeChapterDAO.getChapter(chapterId)?.status, 'completed')
+
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash: 'emotion-hash-v3',
+      stage: 'blind_read',
+      payload: { score: 88 }
+    })
+    chapterEmotionCheckpointDAO.fail({
+      workId,
+      chapterId,
+      contentHash: 'emotion-hash-v3',
+      stage: 'ledger_batch',
+      batchKey: '001:陈凉',
+      failureCode: 'EMOTION_LEDGER_TRUNCATED',
+      failureMessage: 'finishReason=length'
+    })
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash: 'emotion-hash-v3',
+      stage: 'ledger_batch',
+      batchKey: '000:陈凉',
+      payload: [{ character_name: '陈凉' }]
+    })
+    assert.equal(
+      chapterEmotionCheckpointDAO.find(chapterId, 'emotion-hash-v3', 'blind_read')?.status,
+      'completed'
+    )
+    assert.equal(
+      chapterEmotionCheckpointDAO.find(chapterId, 'emotion-hash-v3', 'ledger_batch', '001:陈凉')?.attempt_count,
+      1
+    )
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash: 'emotion-hash-v3',
+      stage: 'ledger_batch',
+      batchKey: '001:陈凉',
+      payload: [{ character_name: '陈凉' }]
+    })
+    assert.equal(
+      chapterEmotionCheckpointDAO.listCompleted(
+        chapterId,
+        'emotion-hash-v3',
+        'ledger_batch'
+      ).length,
+      2
+    )
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash: 'stale-emotion-hash',
+      stage: 'blind_read',
+      payload: { score: 1 }
+    })
+    assert.equal(chapterEmotionCheckpointDAO.deleteStale(chapterId, 'emotion-hash-v3'), 1)
+    assert.equal(
+      chapterEmotionCheckpointDAO.find(chapterId, 'emotion-hash-v3', 'blind_read')?.status,
+      'completed'
+    )
+    emotionalStateDAO.replaceChapterOutcome(chapterId, [{
+      work_id: workId,
+      chapter_id: chapterId,
+      character_name: '陈凉',
+      felt_state: '警惕',
+      displayed_state: '沉默',
+      unresolved_emotion: '担心追兵',
+      protective_strategy: '先观察',
+      behavioral_aftereffect: '下一章会先确认退路',
+      beliefs_json: '[]',
+      relationships_json: '[]',
+      source_event: '离开废墟'
+    }], JSON.stringify({ passed: true }), 6)
+    assert.equal(count('chapter_emotion_checkpoints'), 0)
+    assert.equal(count('emotional_state_ledger'), 1)
 
     const replacement = {
       ...prepared,

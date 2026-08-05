@@ -40,10 +40,9 @@ const route = useRoute()
 const router = useRouter()
 const workId = computed(() => Number(route.params.id))
 
-/** 路由即产品边界：传统小说、因果小说和短故事互不混用运行链。 */
+/** 产品边界只区分小说与短故事；小说工作台同时展示宏观规划和权威因果事务。 */
 const isStory = computed(() => route.name === 'story-editor')
-const isCausalNovel = computed(() => route.name === 'causal-novel-editor')
-const backRoute = computed(() => isStory.value ? '/stories' : isCausalNovel.value ? '/causal-novels' : '/')
+const backRoute = computed(() => isStory.value ? '/stories' : '/')
 
 interface WorkInfo {
   id: number
@@ -79,8 +78,10 @@ const evolutionSaving = ref(false)
 const quickIdeaTrigger = ref(0)
 
 const showStepModelDialog = ref(false)
+const stepModelOverridesEditor = ref<InstanceType<typeof StepModelOverridesEditor> | null>(null)
+const completingStepModelDialog = ref(false)
 
-const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : isCausalNovel.value ? 'causal_novel' : 'novel'))
+const exportLabels = computed(() => workUnitLabels(isStory.value ? 'story' : 'novel'))
 const showExportModal = ref(false)
 const exportFormat = ref<'markdown' | 'txt' | 'html'>('markdown')
 const exportContentMode = ref<'full' | 'body'>('full')
@@ -91,6 +92,19 @@ const exportChapterId = ref<number | null>(null)
 const exportVolumes = ref<{ id: number; name: string }[]>([])
 const exportChapters = ref<{ id: number; title: string; volume_id: number }[]>([])
 const exporting = ref(false)
+
+async function completeStepModelDialog() {
+  if (completingStepModelDialog.value) return
+  completingStepModelDialog.value = true
+  try {
+    const saved = await stepModelOverridesEditor.value?.saveNow()
+    if (saved !== false) {
+      showStepModelDialog.value = false
+    }
+  } finally {
+    completingStepModelDialog.value = false
+  }
+}
 
 // 创作步骤：小说含「分卷大纲」，短故事用扁平「节拍大纲」
 const workflowSteps = computed<StepDef[]>(() => {
@@ -104,19 +118,14 @@ const workflowSteps = computed<StepDef[]>(() => {
       { key: 'ideas', label: '灵感收集', icon: 'brain' }
     ]
   }
-  if (isCausalNovel.value) {
-    return [
-      { key: 'causal', label: '滚动因果', icon: 'project-diagram' },
-      { key: 'causal_chapters', label: '章节管理', icon: 'book-open' },
-      { key: 'ideas', label: '灵感收集', icon: 'brain' }
-    ]
-  }
   return [
     { key: 'incubator', label: '大岗孵化', icon: 'lightbulb' },
     { key: 'settings', label: '核心设定', icon: 'sliders' },
     { key: 'volumes', label: '分卷大纲', icon: 'book' },
     { key: 'chapters', label: '章节大纲', icon: 'list-ol' },
     { key: 'generate', label: '正文生成', icon: 'pen-nib' },
+    { key: 'causal', label: '权威因果状态', icon: 'project-diagram' },
+    { key: 'causal_chapters', label: '事务章节', icon: 'book-open' },
     { key: 'anchors', label: '锚点管理', icon: 'anchor' },
     { key: 'ideas', label: '灵感收集', icon: 'brain' }
   ]
@@ -140,7 +149,7 @@ const utilitySteps = computed<StepDef[]>(() => {
 
 const steps = computed<StepDef[]>(() => [...workflowSteps.value, ...utilitySteps.value])
 
-const currentStep = ref<StepKey>(isCausalNovel.value ? 'causal' : 'incubator')
+const currentStep = ref<StepKey>('incubator')
 
 // 短故事不暴露分卷面板，但映射保留无害（短故事永远不会导航到 volumes）
 const panelComponents = {
@@ -173,21 +182,15 @@ const boundStyleName = computed(() =>
 )
 
 async function refreshProgress() {
-  if (isCausalNovel.value) {
-    stepProgress.value = null
-    return
-  }
   stepProgress.value = await window.anovel.invoke('work:getStepProgress', workId.value) as WorkStepProgress
 }
 
 async function refreshWork() {
   work.value = await window.anovel.invoke('work:get', workId.value) as WorkInfo
   const actualType = work.value?.work_type
-  if (actualType === 'causal_novel' && !isCausalNovel.value) {
-    await router.replace(`/causal-novel/${workId.value}`)
-  } else if (actualType === 'story' && !isStory.value) {
+  if (actualType === 'story' && !isStory.value) {
     await router.replace(`/story/${workId.value}`)
-  } else if (actualType === 'novel' && (isStory.value || isCausalNovel.value)) {
+  } else if (actualType === 'novel' && isStory.value) {
     await router.replace(`/novel/${workId.value}`)
   }
 }
@@ -381,7 +384,7 @@ async function doExport() {
           {{ work?.title || '加载中...' }}
         </h3>
         <p class="text-xs font-bold text-base-content/30 uppercase tracking-wider mt-0.5">创作工作台</p>
-        <div v-if="stepProgress && !isCausalNovel" class="mt-3">
+        <div v-if="stepProgress" class="mt-3">
           <div class="flex items-center justify-between text-xs text-base-content/50 mb-1">
             <span>创作进度</span>
             <span>{{ stepProgress.completionPercent }}%</span>
@@ -510,7 +513,7 @@ async function doExport() {
             <component
               :is="activePanel"
               :work-id="workId"
-              :work-type="isStory ? 'story' : isCausalNovel ? 'causal_novel' : 'novel'"
+              :work-type="isStory ? 'story' : 'novel'"
             />
           </KeepAlive>
         </div>
@@ -584,14 +587,21 @@ async function doExport() {
       <h3 class="font-bold text-lg mb-1">模型分配</h3>
       <p class="text-xs text-base-content/50 mb-4">为不同创作步骤指定独立的 AI 模型</p>
       <div class="overflow-y-auto max-h-[calc(80vh-10rem)] pr-1">
-        <StepModelOverridesEditor />
+        <StepModelOverridesEditor ref="stepModelOverridesEditor" />
       </div>
       <div class="modal-action">
-        <button type="button" class="btn btn-sm btn-primary" @click="showStepModelDialog = false">完成</button>
+        <button
+          type="button"
+          class="btn btn-sm btn-primary"
+          :disabled="completingStepModelDialog"
+          @click="completeStepModelDialog"
+        >
+          {{ completingStepModelDialog ? '保存中…' : '完成' }}
+        </button>
       </div>
     </div>
     <form method="dialog" class="modal-backdrop">
-      <button type="button" @click="showStepModelDialog = false">close</button>
+      <button type="button" :disabled="completingStepModelDialog" @click="completeStepModelDialog">close</button>
     </form>
   </dialog>
 
@@ -603,11 +613,11 @@ async function doExport() {
           <label class="text-xs text-base-content/50">导出范围</label>
           <select v-model="exportScope" class="select select-bordered select-sm w-full mt-1">
             <option value="work">{{ exportLabels.exportWhole }}</option>
-            <option v-if="!isStory && !isCausalNovel" value="volume">单卷</option>
+            <option v-if="!isStory" value="volume">单卷</option>
             <option value="chapter">{{ exportLabels.exportSingleUnit }}</option>
           </select>
         </div>
-        <div v-if="exportScope === 'volume' && !isStory && !isCausalNovel">
+        <div v-if="exportScope === 'volume' && !isStory">
           <label class="text-xs text-base-content/50">选择分卷</label>
           <select v-model="exportVolumeId" class="select select-bordered select-sm w-full mt-1">
             <option v-for="v in exportVolumes" :key="v.id" :value="v.id">{{ v.name }}</option>

@@ -33,7 +33,7 @@ export interface WorkCreateInput {
   targetTotalWords?: number
   targetChapters?: number
   wordsPerChapter?: number
-  workType?: string
+  workType?: 'novel' | 'story'
   status?: string
   genre?: string
   tags?: string
@@ -87,6 +87,10 @@ export class WorkDAO extends BaseDAO {
 
   /** 创建新作品 */
   create(input: WorkCreateInput): number {
+    const workType = input.workType ?? 'novel'
+    if (workType !== 'novel' && workType !== 'story') {
+      throw new Error(`不支持的作品类型：${String(workType)}`)
+    }
     return this.insert(
       `INSERT INTO works (
         title, description, cover_image, novel_length, target_total_words,
@@ -94,7 +98,7 @@ export class WorkDAO extends BaseDAO {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [input.title, input.description ?? null, input.cover_image ?? null,
         input.novelLength ?? 'medium', input.targetTotalWords ?? null, input.targetChapters ?? null,
-        input.wordsPerChapter ?? null, input.workType ?? 'novel', input.genre ?? null, input.tags ?? null]
+        input.wordsPerChapter ?? null, workType, input.genre ?? null, input.tags ?? null]
     )
   }
 
@@ -110,7 +114,13 @@ export class WorkDAO extends BaseDAO {
     if (input.targetTotalWords !== undefined) { fields.push('target_total_words = ?'); values.push(input.targetTotalWords) }
     if (input.targetChapters !== undefined) { fields.push('target_chapters = ?'); values.push(input.targetChapters) }
     if (input.wordsPerChapter !== undefined) { fields.push('words_per_chapter = ?'); values.push(input.wordsPerChapter) }
-    if (input.workType !== undefined) { fields.push('work_type = ?'); values.push(input.workType) }
+    if (input.workType !== undefined) {
+      if (input.workType !== 'novel' && input.workType !== 'story') {
+        throw new Error(`不支持的作品类型：${String(input.workType)}`)
+      }
+      fields.push('work_type = ?')
+      values.push(input.workType)
+    }
     if (input.status !== undefined) { fields.push('status = ?'); values.push(input.status) }
     if (input.genre !== undefined) { fields.push('genre = ?'); values.push(input.genre) }
     if (input.tags !== undefined) { fields.push('tags = ?'); values.push(input.tags) }

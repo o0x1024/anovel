@@ -4,15 +4,54 @@ import type {
   EmotionLedgerRelationshipChange,
   EmotionLedgerState
 } from '../../../shared/emotion-contract'
+import {
+  isModelCapabilityUnsupported,
+  MODEL_CAPABILITY_UNSUPPORTED
+} from '../../../shared/model-capability-error'
 
-export class EmotionLedgerParseError extends Error {
+export type EmotionLedgerFailureCode =
+  | 'EMOTION_LEDGER_TRUNCATED'
+  | 'EMOTION_LEDGER_PROTOCOL'
+  | 'EMOTION_LEDGER_TRANSPORT'
+  | 'MODEL_CAPABILITY_UNSUPPORTED'
+
+export class EmotionLedgerPipelineError extends Error {
   constructor(
+    public readonly code: EmotionLedgerFailureCode,
     message: string,
     public readonly outputExcerpt: string
   ) {
     super(message)
-    this.name = 'EMOTION_LEDGER_PARSE_FAILED'
+    this.name = code
   }
+}
+
+export class EmotionLedgerParseError extends EmotionLedgerPipelineError {
+  constructor(
+    message: string,
+    outputExcerpt: string,
+    code: Exclude<
+      EmotionLedgerFailureCode,
+      'EMOTION_LEDGER_TRANSPORT' | 'MODEL_CAPABILITY_UNSUPPORTED'
+    > = 'EMOTION_LEDGER_PROTOCOL'
+  ) {
+    super(code, message, outputExcerpt)
+  }
+}
+
+export function classifyEmotionLedgerFailure(
+  message: string,
+  finishReason?: string
+): EmotionLedgerFailureCode {
+  if (isModelCapabilityUnsupported(message)) return MODEL_CAPABILITY_UNSUPPORTED
+  if (
+    finishReason === 'length'
+    || /Unexpected end of JSON|Unterminated string|finishReason=length|截断/i.test(message)
+  ) return 'EMOTION_LEDGER_TRUNCATED'
+  if (/timeout|timed out|ECONNRESET|ECONNABORTED|network|网络/i.test(message)) {
+    return 'EMOTION_LEDGER_TRANSPORT'
+  }
+  return 'EMOTION_LEDGER_PROTOCOL'
 }
 
 function text(value: unknown): string {
@@ -66,9 +105,13 @@ export function parseEmotionLedgerResponse(content: string): EmotionLedgerState[
   try {
     parsed = JSON.parse(raw) as unknown
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
     throw new EmotionLedgerParseError(
-      `情绪账本JSON语法无效：${error instanceof Error ? error.message : String(error)}`,
-      excerptAroundError(raw, error)
+      `情绪账本JSON语法无效：${message}`,
+      excerptAroundError(raw, error),
+      classifyEmotionLedgerFailure(message) === 'EMOTION_LEDGER_TRUNCATED'
+        ? 'EMOTION_LEDGER_TRUNCATED'
+        : 'EMOTION_LEDGER_PROTOCOL'
     )
   }
   const root = record(parsed)
@@ -101,5 +144,99 @@ export function parseEmotionLedgerResponse(content: string): EmotionLedgerState[
     return state
   })
   if (states.length === 0) throw new EmotionLedgerParseError('情绪账本 states 不得为空', raw.slice(0, 240))
+  if (states.length > 2) {
+    throw new EmotionLedgerParseError(`情绪账本单批最多 2 个角色，实际 ${states.length} 个`, raw.slice(0, 240))
+  }
+  for (const [index, state] of states.entries()) {
+    const textLimits: Array<[keyof EmotionLedgerState, number]> = [
+      ['character_name', 40],
+      ['felt_state', 160],
+      ['displayed_state', 160],
+      ['unresolved_emotion', 160],
+      ['protective_strategy', 160],
+      ['behavioral_aftereffect', 180],
+      ['source_event', 180]
+    ]
+    for (const [key, limit] of textLimits) {
+      const value = state[key]
+      if (typeof value === 'string' && value.length > limit) {
+        throw new EmotionLedgerParseError(
+          `states[${index}].${key} 超过 ${limit} 字`,
+          value.slice(0, 240)
+        )
+      }
+    }
+    if (state.belief_changes.length > 3) {
+      throw new EmotionLedgerParseError(`states[${index}].belief_changes 最多 3 项`, JSON.stringify(state.belief_changes).slice(0, 240))
+    }
+    if (state.relationship_changes.length > 3) {
+      throw new EmotionLedgerParseError(`states[${index}].relationship_changes 最多 3 项`, JSON.stringify(state.relationship_changes).slice(0, 240))
+    }
+    for (const [beliefIndex, change] of state.belief_changes.entries()) {
+      if (change.belief.length > 100 || change.change.length > 160) {
+        throw new EmotionLedgerParseError(
+          `states[${index}].belief_changes[${beliefIndex}] 字段过长`,
+          JSON.stringify(change).slice(0, 240)
+        )
+      }
+    }
+    for (const [relationshipIndex, change] of state.relationship_changes.entries()) {
+      if (change.character.length > 40 || change.state.length > 160) {
+        throw new EmotionLedgerParseError(
+          `states[${index}].relationship_changes[${relationshipIndex}] 字段过长`,
+          JSON.stringify(change).slice(0, 240)
+        )
+      }
+    }
+  }
   return states
+}
+
+export function validateEmotionLedgerBatch(
+  states: EmotionLedgerState[],
+  expectedCharacters: string[]
+): EmotionalStateBatchValidation {
+  const actual = states.map(state => state.character_name)
+  const duplicates = actual.filter((name, index) => actual.indexOf(name) !== index)
+  const missing = expectedCharacters.filter(name => !actual.includes(name))
+  const unexpected = actual.filter(name => !expectedCharacters.includes(name))
+  return {
+    valid: duplicates.length === 0 && missing.length === 0 && unexpected.length === 0,
+    duplicates: [...new Set(duplicates)],
+    missing,
+    unexpected
+  }
+}
+
+export interface EmotionalStateBatchValidation {
+  valid: boolean
+  duplicates: string[]
+  missing: string[]
+  unexpected: string[]
+}
+
+export function selectAffectedEmotionCharacters(input: {
+  configuredCharacters: string[]
+  povCharacter: string
+  content: string
+}): string[] {
+  const pov = input.povCharacter.trim()
+  const mentioned = input.configuredCharacters
+    .map(name => name.trim())
+    .filter(name => name && (name === pov || input.content.includes(name)))
+  return [...new Set([pov, ...mentioned].filter(Boolean))]
+}
+
+export function planEmotionLedgerBatches(
+  characters: string[],
+  batchSize = 2
+): string[][] {
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 2) {
+    throw new Error('情绪账本批次大小必须为 1-2')
+  }
+  const batches: string[][] = []
+  for (let index = 0; index < characters.length; index += batchSize) {
+    batches.push(characters.slice(index, index + batchSize))
+  }
+  return batches
 }

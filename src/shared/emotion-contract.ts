@@ -120,7 +120,7 @@ export interface EmotionBlindAssessment {
   }
 }
 
-export const EMOTION_LEDGER_SCHEMA_VERSION = 2
+export const EMOTION_LEDGER_SCHEMA_VERSION = 3
 
 export interface EmotionLedgerBeliefChange {
   belief: string
@@ -153,6 +153,7 @@ export const EMOTION_LEDGER_JSON_SCHEMA: Record<string, unknown> = {
     states: {
       type: 'array',
       minItems: 1,
+      maxItems: 2,
       items: {
         type: 'object',
         additionalProperties: false,
@@ -162,27 +163,35 @@ export const EMOTION_LEDGER_JSON_SCHEMA: Record<string, unknown> = {
           'relationship_changes', 'source_event'
         ],
         properties: {
-          character_name: { type: 'string', minLength: 1 },
-          felt_state: { type: 'string', minLength: 1 },
-          displayed_state: { type: 'string' },
-          unresolved_emotion: { type: 'string' },
-          protective_strategy: { type: 'string' },
-          behavioral_aftereffect: { type: 'string', minLength: 1 },
+          character_name: { type: 'string', minLength: 1, maxLength: 40 },
+          felt_state: { type: 'string', minLength: 1, maxLength: 160 },
+          displayed_state: { type: 'string', maxLength: 160 },
+          unresolved_emotion: { type: 'string', maxLength: 160 },
+          protective_strategy: { type: 'string', maxLength: 160 },
+          behavioral_aftereffect: { type: 'string', minLength: 1, maxLength: 180 },
           belief_changes: {
             type: 'array',
+            maxItems: 3,
             items: {
               type: 'object', additionalProperties: false, required: ['belief', 'change'],
-              properties: { belief: { type: 'string' }, change: { type: 'string' } }
+              properties: {
+                belief: { type: 'string', maxLength: 100 },
+                change: { type: 'string', maxLength: 140 }
+              }
             }
           },
           relationship_changes: {
             type: 'array',
+            maxItems: 3,
             items: {
               type: 'object', additionalProperties: false, required: ['character', 'state'],
-              properties: { character: { type: 'string' }, state: { type: 'string' } }
+              properties: {
+                character: { type: 'string', maxLength: 40 },
+                state: { type: 'string', maxLength: 140 }
+              }
             }
           },
-          source_event: { type: 'string', minLength: 1 }
+          source_event: { type: 'string', minLength: 1, maxLength: 180 }
         }
       }
     }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import Database from 'better-sqlite3'
 import {
   CAUSAL_NOVEL_SCHEMA_VERSION,
@@ -7,6 +8,7 @@ import {
   type CausalChapterPlan,
   type CausalNarrativeState
 } from '../src/shared/causal-novel-types'
+import { CAUSAL_OUTCOME_PROTOCOL_VERSION } from '../src/shared/causal-outcome-protocol'
 import { ensureIncrementalMigrations } from '../src/main/db/migrations'
 
 async function main(): Promise<void> {
@@ -32,15 +34,50 @@ async function main(): Promise<void> {
     collectCausalRewriteEvidenceAnchors,
     validateCausalRewriteCandidate
   } = await import('../src/main/context/causal-chapter-style-rewrite')
+  const {
+    causalOutcomeFailurePolicy,
+    registerCausalOutcomeFailure
+  } = await import('../src/main/context/goal-routine/causal-outcome-failure-policy')
+  const { repairCausalBodyContract } = await import(
+    '../src/main/context/goal-routine/causal-body-contract-repair'
+  )
+  const { adoptCausalBaselineChapters } = await import(
+    '../src/main/context/goal-routine/causal-baseline-migration'
+  )
+  const {
+    causalPlanStageInputHash,
+    readCausalPlanStage,
+    saveCausalPlanStage
+  } = await import('../src/main/context/goal-routine/causal-plan-stage-cache')
   initSchema()
 
   try {
     const workId = workDAO.create({
-      title: '因果作品', workType: 'causal_novel', description: '寿命可以交易', genre: '悬疑'
+      title: '统一小说', workType: 'novel', description: '寿命可以交易', genre: '悬疑'
     })
-    assert.equal(workDAO.list('causal_novel').length, 1)
-    assert.equal(workDAO.list('novel').length, 0)
+    assert.equal(workDAO.list('causal_novel').length, 0)
+    assert.equal(workDAO.list('novel').length, 1)
     assert.equal(workDAO.getById(workId)?.genre, '悬疑')
+    const planningInputHash = causalPlanStageInputHash({ revision: 0, chapterId: 1 })
+    saveCausalPlanStage({
+      workId,
+      stateRevision: 0,
+      stage: 'candidate_generation_v2',
+      inputHash: planningInputHash,
+      content: '{"candidates":[]}'
+    })
+    assert.equal(
+      readCausalPlanStage(workId, 0, 'candidate_generation_v2', planningInputHash),
+      '{"candidates":[]}'
+    )
+    assert.equal(readCausalPlanStage(workId, 0, 'candidate_generation_v2', 'stale'), null)
+    assert.throws(
+      () => workDAO.create({
+        title: '禁止的新双轨作品',
+        workType: 'causal_novel' as never
+      }),
+      /不支持的作品类型/
+    )
 
     const state: CausalNarrativeState = {
       schemaVersion: CAUSAL_NOVEL_SCHEMA_VERSION,
@@ -149,11 +186,26 @@ async function main(): Promise<void> {
         expectedIrreversibleChange: `确认线索${offset + 1}`, replanningTrigger: '黑市压力发生变化'
       }))
     }
-    const chapterId = causalNovelDAO.createPlannedChapter({
-      workId, stateRevision: 0, plan, decisionCard: formatCausalDecisionCard(plan)
+    const volumeId = volumeChapterDAO.createVolume(workId, '第一卷', '追查寿命黑市')
+    const chapterId = volumeChapterDAO.createChapter(volumeId, '潜入黑市', '林舟按全书规划第一次进入黑市')
+    causalNovelDAO.attachDecisionToExistingChapter({
+      workId,
+      chapterId,
+      stateRevision: 0,
+      plan,
+      decisionCard: formatCausalDecisionCard(plan)
     })
-    assert.equal(volumeChapterDAO.listVolumes(workId)[0].name, '滚动正文')
+    assert.equal(volumeChapterDAO.listVolumes(workId)[0].name, '第一卷')
     assert.equal(causalNovelDAO.getDecision(chapterId)?.status, 'planned')
+    assert.match(volumeChapterDAO.getChapter(chapterId)?.outline ?? '', /林舟按全书规划第一次进入黑市/)
+    assert.doesNotMatch(volumeChapterDAO.getChapter(chapterId)?.outline ?? '', /章级权威因果合同/)
+    const authority = JSON.parse(volumeChapterDAO.getChapter(chapterId)?.outline_diagnosis ?? '{}')
+      .authority_transaction
+    assert.equal(authority.protocol, 'unified_novel_v2')
+    assert.deepEqual(
+      authority.execution_contract.required_outcomes.map((item: { description: string }) => item.description),
+      plan.decision.mustCover
+    )
     assert.match(volumeChapterDAO.getChapter(chapterId)?.emotion_contract_json ?? '', /grounding_refs/)
     assert.equal(loadChapterEmotionContract(chapterId)?.pov_character, '林舟')
 
@@ -188,6 +240,25 @@ async function main(): Promise<void> {
 
     const outcome: CausalChapterOutcome = {
       summary: '林舟进入黑市。', eventSignature: '林舟潜入黑市', evidenceQuotes: ['林舟进入黑市'],
+      evidenceRefs: [{ id: 'e_test', text: '林舟进入黑市' }],
+      mutations: [
+        {
+          id: 'm_test_core', kind: 'core_summary', subject: 'chapter',
+          claim: '林舟进入黑市', evidenceIds: ['e_test'], required: true
+        },
+        {
+          id: 'm_test_promise', kind: 'promise_advance', subject: 'q1',
+          claim: '推进黑市承诺', evidenceIds: ['e_test'], required: true
+        },
+        ...(['reader_effect', 'trigger', 'choice', 'cost', 'residue'] as const).map(subject => ({
+          id: `m_test_emotion_${subject}`,
+          kind: 'emotion_result' as const,
+          subject,
+          claim: `情绪结果 ${subject}`,
+          evidenceIds: ['e_test'],
+          required: true
+        }))
+      ],
       advancedPromiseIds: ['q1'], resolvedPromiseIds: [], newPromises: [], actorUpdates: [],
       newActors: [], pressureUpdates: [], newPressures: [], arcUpdates: [],
       emotionalOutcome: {
@@ -235,6 +306,105 @@ async function main(): Promise<void> {
       content: originalBody,
       word_count: originalBody.replace(/\s/g, '').length
     })
+    const failureVersion = causalNovelDAO.ensureCurrentContentVersion(
+      workId, chapterId, 'failure_policy_test', 'generated'
+    )
+    causalNovelDAO.saveCheckpoint({
+      workId,
+      chapterId,
+      contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash,
+      protocolVersion: CAUSAL_OUTCOME_PROTOCOL_VERSION - 1,
+      stage: 'protocol_isolation',
+      status: 'completed',
+      payload: { legacy: true }
+    })
+    assert.equal(
+      causalNovelDAO.getCheckpoint(
+        chapterId,
+        failureVersion.id,
+        'protocol_isolation',
+        CAUSAL_OUTCOME_PROTOCOL_VERSION
+      ),
+      null
+    )
+    const transportFailure1 = registerCausalOutcomeFailure({
+      workId, chapterId, contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash, stateRevision: 1,
+      code: 'OUTCOME_TRANSPORT', message: 'timeout A'
+    })
+    const transportFailure2 = registerCausalOutcomeFailure({
+      workId, chapterId, contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash, stateRevision: 1,
+      code: 'OUTCOME_TRANSPORT', message: 'timeout B'
+    })
+    const transportFailure3 = registerCausalOutcomeFailure({
+      workId, chapterId, contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash, stateRevision: 1,
+      code: 'OUTCOME_TRANSPORT', message: 'timeout C'
+    })
+    assert.equal(transportFailure1.count, 1)
+    assert.equal(transportFailure2.count, 2)
+    assert.equal(transportFailure3.count, 3)
+    assert.equal(transportFailure3.shouldPause, true)
+    assert.deepEqual(causalOutcomeFailurePolicy('OUTCOME_EVIDENCE_ID'), {
+      disposition: 'deterministic_pause',
+      maxAttempts: 1
+    })
+    assert.deepEqual(causalOutcomeFailurePolicy('OUTCOME_ATOMIZATION_REQUIRED'), {
+      disposition: 'deterministic_pause',
+      maxAttempts: 1
+    })
+    assert.deepEqual(causalOutcomeFailurePolicy('OUTCOME_BODY_CONTRACT'), {
+      disposition: 'body_contract_repair',
+      maxAttempts: 1
+    })
+    const atomizationFailure = registerCausalOutcomeFailure({
+      workId,
+      chapterId,
+      contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash,
+      stateRevision: 1,
+      code: 'OUTCOME_ATOMIZATION_REQUIRED',
+      message: 'core.primaryEvent.evidenceIds 实际包含 10 个正文证据 ID，单条原子结论上限为 4；需要拆分结论'
+    })
+    assert.equal(atomizationFailure.shouldPause, true)
+    const atomizationCheckpoint = causalNovelDAO.getCheckpoint(
+      chapterId,
+      failureVersion.id,
+      'failure_atomization_required',
+      CAUSAL_OUTCOME_PROTOCOL_VERSION
+    )
+    assert.deepEqual(
+      (atomizationCheckpoint?.payload as { issues?: unknown[] })?.issues,
+      [{ path: 'core.primaryEvent.evidenceIds', actualCount: 10, max: 4 }]
+    )
+    causalNovelDAO.saveCheckpoint({
+      workId, chapterId, contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash,
+      protocolVersion: CAUSAL_OUTCOME_PROTOCOL_VERSION,
+      stage: 'outcome_body_contract', status: 'failed',
+      payload: {
+        stateRevision: 1,
+        claims: [{
+          id: 'm_required_test', kind: 'emotion_result', subject: 'trigger',
+          evidencePath: 'emotion.trigger.evidenceIds', claim: '正文兑现情绪触发',
+          evidenceIds: ['e_test'], required: true, repairable: false
+        }]
+      }
+    })
+    causalNovelDAO.saveCheckpoint({
+      workId, chapterId, contentVersionId: failureVersion.id,
+      bodyHash: failureVersion.bodyHash,
+      protocolVersion: CAUSAL_OUTCOME_PROTOCOL_VERSION,
+      stage: 'body_contract_repair', status: 'completed',
+      payload: { inheritedRepairGuard: true }
+    })
+    const guardedRepair = await repairCausalBodyContract({
+      workId, chapterId, contentVersionId: failureVersion.id, bodyHash: failureVersion.bodyHash
+    })
+    assert.equal(guardedRepair.repaired, false)
+    assert.match(guardedRepair.reason, /已经完成过合同修复/)
     const committedDecision = causalNovelDAO.getDecision(chapterId)
     const evidenceAnchors = collectCausalRewriteEvidenceAnchors({
       decision: committedDecision,
@@ -244,6 +414,36 @@ async function main(): Promise<void> {
     assert.deepEqual(evidenceAnchors, ['林舟进入黑市'])
     assert.equal(validateCausalRewriteCandidate(originalBody, rewrittenBody, evidenceAnchors).passed, true)
     assert.equal(validateCausalRewriteCandidate(originalBody, '林舟去了别处。', evidenceAnchors).passed, false)
+
+    const baselineWorkId = workDAO.create({ title: '既有正文迁移', workType: 'novel' })
+    const baselineVolumeId = volumeChapterDAO.createVolume(baselineWorkId, '旧卷', '既有历史')
+    const baselineBody = '林舟已经穿过旧城，并把钥匙交给守门人。'
+    const baselineChapterId = volumeChapterDAO.createChapter(
+      baselineVolumeId,
+      '已经发生的一章',
+      '林舟穿过旧城'
+    )
+    volumeChapterDAO.updateChapter(baselineChapterId, {
+      content: baselineBody,
+      word_count: baselineBody.length,
+      status: 'draft'
+    })
+    causalNovelDAO.createState(baselineWorkId, { ...state, revision: 0 })
+    coreSettingDAO.upsert(baselineWorkId, 'causal_baseline_manifest', JSON.stringify({
+      protocol: 'unified_novel_baseline_v1',
+      generatedAt: new Date().toISOString(),
+      chapters: [{
+        chapterId: baselineChapterId,
+        title: '已经发生的一章',
+        bodyHash: createHash('sha256').update(baselineBody).digest('hex'),
+        factCount: 1,
+        fingerprint: true
+      }]
+    }))
+    assert.equal(adoptCausalBaselineChapters(baselineWorkId), 1)
+    assert.equal(volumeChapterDAO.getChapter(baselineChapterId)?.status, 'completed')
+    assert.equal(causalNovelDAO.getChapterBinding(baselineChapterId)?.decisionStatus, 'baseline')
+
     const chapterBeforeRewrite = volumeChapterDAO.getChapter(chapterId)!
     const validationToken = buildCausalRewriteValidationToken({
       workId,
@@ -271,6 +471,19 @@ async function main(): Promise<void> {
     assert.equal(rewriteBinding?.bindingStatus, 'active')
     assert.equal(rewriteBinding?.stateBeforeRevision, 0)
     assert.equal(rewriteBinding?.stateAfterRevision, 1)
+    assert.doesNotThrow(() => causalNovelDAO.assertCommittedBindingCurrent(workId, chapterId))
+    volumeChapterDAO.updateChapter(chapterId, {
+      content: `${rewrittenBody}这是一段绕过权威事务的越权修改。`
+    })
+    assert.throws(
+      () => causalNovelDAO.assertCommittedBindingCurrent(workId, chapterId),
+      /正文已偏离权威哈希绑定/
+    )
+    volumeChapterDAO.updateChapter(chapterId, {
+      content: rewrittenBody,
+      word_count: rewrittenBody.replace(/\s/g, '').length
+    })
+    assert.doesNotThrow(() => causalNovelDAO.assertCommittedBindingCurrent(workId, chapterId))
     const immutableVersions = causalNovelDAO.listContentVersions(chapterId)
     assert.ok(immutableVersions.length >= 2)
     assert.equal(immutableVersions[0].source, 'ai_style_rewrite')
@@ -298,12 +511,20 @@ async function main(): Promise<void> {
     assert.equal(replay.status, 'pending')
     assert.equal(causalNovelDAO.getPendingReplay(workId)?.targetVersionId, factualCandidate.id)
     assert.equal(causalNovelDAO.getChapterBinding(chapterId)?.bindingStatus, 'pending_replay')
+    volumeChapterDAO.updateChapter(chapterId, {
+      content: factualCandidate.content,
+      word_count: factualCandidate.wordCount
+    })
     causalNovelDAO.blockReplay(replay.id, chapterId, '后续章节证据冲突')
     assert.equal(causalNovelDAO.getPendingReplay(workId)?.status, 'blocked')
     causalNovelDAO.retryReplay(replay.id)
     assert.equal(causalNovelDAO.getPendingReplay(workId)?.status, 'pending')
     causalNovelDAO.cancelReplay(replay.id)
     assert.equal(causalNovelDAO.getReplayJob(replay.id)?.status, 'cancelled')
+    assert.equal(causalNovelDAO.getChapterBinding(chapterId)?.bindingStatus, 'active')
+    assert.equal(causalNovelDAO.getChapterBinding(chapterId)?.contentVersionId, immutableVersions[0].id)
+    assert.equal(volumeChapterDAO.getChapter(chapterId)?.content, immutableVersions[0].content)
+    assert.doesNotThrow(() => causalNovelDAO.assertCommittedBindingCurrent(workId, chapterId))
 
     const beforeProposal = causalNovelDAO.getState(workId)!
     const proposedState: CausalNarrativeState = {
@@ -340,18 +561,17 @@ async function main(): Promise<void> {
     assert.equal(causalNovelDAO.getState(workId)?.revision, 4)
     assert.equal(causalNovelDAO.getState(workId)?.completionStatus, 'proposed')
     causalNovelDAO.cancelReplay(atomicityReplay.id)
-    causalNovelDAO.activateContentVersion({
-      workId,
-      chapterId,
-      contentVersionId: immutableVersions[0].id,
-      stateBeforeRevision: 0,
-      stateAfterRevision: 1,
-      decisionStatus: 'committed',
-      bindingStatus: 'active'
-    })
     const releaseResult = getDatabase().transaction(() => {
       const completed = causalNovelDAO.confirmCompletion(workId, 4, '独立终审确认完成')
-      const snapshotId = causalNovelDAO.createReleaseSnapshot(workId)
+      const snapshotId = causalNovelDAO.createReleaseSnapshot(
+        workId,
+        'causal_release_ready',
+        {
+          protocol: 'unified_novel_release_proof_v1',
+          authorityRevision: 4,
+          chapterBindings: [{ chapterId, bodyHash: immutableVersions[0].bodyHash }]
+        }
+      )
       return { completed, snapshotId }
     })()
     const { completed } = releaseResult
@@ -365,6 +585,7 @@ async function main(): Promise<void> {
     assert.equal(releaseSnapshot.is_frozen, 1)
     assert.equal(releaseSnapshot.content_hash.length, 64)
     assert.match(releaseSnapshot.snapshot_json, /causal_novel_release_v1/)
+    assert.match(releaseSnapshot.snapshot_json, /unified_novel_release_proof_v1/)
     assert.match(releaseSnapshot.snapshot_json, /activeContentVersions/)
 
     coreSettingDAO.upsert(workId, 'emotion_engine', '错误传统情绪发动机第一版')
@@ -372,9 +593,10 @@ async function main(): Promise<void> {
     assert.ok(coreSettingDAO.getByType(workId, 'emotion_engine'))
     assert.equal(loadEmotionEngine(workId), null)
 
-    const legacyWorkId = workDAO.create({
-      title: '旧因果草稿', workType: 'causal_novel', description: '用于迁移测试'
-    })
+    const legacyWorkId = Number(getDatabase().prepare(
+      `INSERT INTO works (title, work_type, description)
+       VALUES ('旧因果草稿', 'causal_novel', '用于迁移测试')`
+    ).run().lastInsertRowid)
     const legacyVolumeId = volumeChapterDAO.createVolume(legacyWorkId, '滚动正文')
     const legacyChapterId = volumeChapterDAO.createChapter(legacyVolumeId, '旧决策')
     getDatabase().prepare(
@@ -382,18 +604,30 @@ async function main(): Promise<void> {
         chapter_id, work_id, state_revision, status, plan_json
       ) VALUES (?, ?, 0, 'planned', '{}')`
     ).run(legacyChapterId, legacyWorkId)
+    getDatabase().prepare(
+      `INSERT INTO workflow_runs (
+        work_id, run_seq, workflow_type, status, desired_state, max_turns
+      ) VALUES (?, 1, 'causal_novel', 'paused', 'paused', 60)`
+    ).run(legacyWorkId)
     await assert.rejects(
       () => ensureChapterEmotionContract(legacyWorkId, legacyChapterId),
-      /禁止回退到传统全书情绪发动机/
+      /禁止改用全书情绪发动机补写/
     )
 
     getDatabase().exec('DROP TABLE causal_state_revisions')
     ensureIncrementalMigrations(getDatabase())
     assert.equal(causalNovelDAO.listStateRevisions(workId).length, 1)
     assert.equal(causalNovelDAO.getStateRevision(workId, 5)?.transitionType, 'legacy_snapshot')
-    assert.equal(coreSettingDAO.getByType(workId, 'emotion_engine'), undefined)
-    assert.equal(coreSettingDAO.listVersions(workId, 'emotion_engine').length, 0)
-    assert.equal(volumeChapterDAO.getChapter(legacyChapterId), undefined)
+    assert.equal(coreSettingDAO.getByType(workId, 'emotion_engine')?.content, '错误传统情绪发动机第二版')
+    assert.equal(coreSettingDAO.listVersions(workId, 'emotion_engine').length, 1)
+    assert.equal(volumeChapterDAO.getChapter(legacyChapterId)?.title, '旧决策')
+    assert.equal(workDAO.getById(legacyWorkId)?.work_type, 'novel')
+    assert.equal(
+      (getDatabase().prepare(
+        'SELECT workflow_type FROM workflow_runs WHERE work_id = ?'
+      ).get(legacyWorkId) as { workflow_type: string }).workflow_type,
+      'novel'
+    )
   } finally {
     closeDatabase()
   }

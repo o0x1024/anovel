@@ -10,6 +10,10 @@ import {
   type NovelLength,
   type PresetNovelLength
 } from '../../shared/writing-plan-presets'
+import {
+  readNovelPersistentState,
+  resetNovelAuthorityState
+} from './goal-routine/novel-authority-state'
 
 export const WRITING_PLAN_TYPE = 'writing_plan'
 
@@ -197,6 +201,7 @@ export function saveWritingPlan(workId: number, input: Partial<WritingPlan>): Wr
         goal_met: false,
         state_json: JSON.stringify(evaluationHistory ? { evaluationHistory } : {})
       })
+      resetNovelAuthorityState(workId)
     }
   }
   return plan
@@ -224,13 +229,8 @@ function hydrateFrozenVolumeRanges(workId: number, volumes: VolumeRow[]): Volume
   const missing = volumes.some(volume =>
     volume.planned_start_chapter == null || volume.planned_end_chapter == null)
   if (!missing) return volumes
-  const raw = goalRoutineDAO.getByWork(workId)?.state_json
-  if (!raw) return volumes
   try {
-    const state = JSON.parse(raw) as {
-      volumePlanChecked?: boolean
-      novelOutline?: { volumePlan?: Array<{ name: string; startChapter: number; endChapter: number }> }
-    }
+    const state = readNovelPersistentState(workId)
     if (!state.volumePlanChecked || !Array.isArray(state.novelOutline?.volumePlan)) return volumes
     for (const contract of state.novelOutline.volumePlan) {
       const volume = volumes.find(item => item.name === contract.name)

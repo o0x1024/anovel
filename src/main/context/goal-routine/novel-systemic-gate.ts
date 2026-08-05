@@ -141,7 +141,7 @@ function addRepeatedWindowIssue(
 }
 
 function repeatedProseIssues(chapters: WorkChapter[]): NovelSystemIssue[] {
-  if (chapters.length < 8) return []
+  if (chapters.length < 4) return []
   const grams = new Map<string, Set<number>>()
   for (const chapter of chapters) {
     const text = (chapter.content ?? '').replace(/[\s\p{P}\p{S}\d]/gu, '')
@@ -157,18 +157,22 @@ function repeatedProseIssues(chapters: WorkChapter[]): NovelSystemIssue[] {
       grams.set(gram, ids)
     }
   }
-  const threshold = Math.max(6, Math.ceil(chapters.length * 0.3))
+  const threshold = chapters.length <= 10
+    ? Math.max(3, Math.ceil(chapters.length * 0.6))
+    : Math.max(5, Math.ceil(chapters.length * 0.3))
   const repeated = [...grams.entries()]
     .filter(([, ids]) => ids.size >= threshold)
     .sort((a, b) => b[1].size - a[1].size)
     .slice(0, 5)
-  if (repeated.length === 0) return []
+  // 单个固定专名或世界观术语不足以证明模板复用；至少三个相邻八字片段
+  // 跨越同一批章节，才视为正文生产模式没有变化。
+  if (repeated.length < 3) return []
   return [issue({
-    code: 'PROSE_TEMPLATE_REPETITION', scope: 'sentence', severity: 'warning',
+    code: 'PROSE_TEMPLATE_REPETITION', scope: 'sentence', severity: 'blocker',
     chapterIds: [...new Set(repeated.flatMap(([, ids]) => [...ids]))],
     evidence: repeated.map(([gram, ids]) => `“${gram}”跨${ids.size}章重复`),
     message: '正文存在跨章节高频模板短语',
-    recommendedAction: '只改写有证据的重复表达，保留情节事实和人物状态'
+    recommendedAction: '从首次重复处重构解决机制和行动链；不能只替换措辞，且必须保留已提交事实和人物状态'
   })]
 }
 

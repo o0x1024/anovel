@@ -538,7 +538,7 @@ onUnmounted(() => {
     <div v-else-if="chapters.length === 0" class="card bg-base-200 border border-base-300 p-10 text-center space-y-2">
       <font-awesome-icon icon="book-open" class="text-3xl text-base-content/20" />
       <p class="font-semibold">尚无章节</p>
-      <p class="text-xs text-base-content/50">初始化滚动因果后，可以自动运行，也可以在这里手动新增。</p>
+      <p class="text-xs text-base-content/50">章节由宏观规划创建，进入写作时绑定权威决策；这里负责查看版本、结果与重放。</p>
     </div>
 
     <div

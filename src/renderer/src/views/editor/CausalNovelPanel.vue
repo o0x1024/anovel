@@ -155,9 +155,9 @@ onActivated(load)
         <font-awesome-icon icon="project-diagram" class="text-lg" />
       </div>
       <div class="min-w-0">
-        <h3 class="text-lg font-bold">滚动因果状态</h3>
+        <h3 class="text-lg font-bold">权威因果状态</h3>
         <p class="text-xs text-base-content/50 leading-relaxed mt-1">
-          这里仅展示权威状态、决策与审计记录。世界起点、启动、继续、停止和运行日志统一在“目标循环”中管理。
+          宏观规划规定方向；这里展示逐章决策、已发生事实、资源后果和审计修订。启动、继续与停止统一在“目标循环”中管理。
         </p>
       </div>
       <span v-if="state" class="badge badge-sm ml-auto" :class="state.completed ? 'badge-success' : state.completionStatus === 'proposed' ? 'badge-warning' : 'badge-primary'">

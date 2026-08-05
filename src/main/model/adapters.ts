@@ -3,6 +3,11 @@ import { ModelAdapter, ModelRequest, ModelResponse, AdapterChatOptions } from '.
 import type { ProviderProtocol } from '../../shared/model-providers'
 import { buildOpenAICompatibleBody } from '../../shared/kimi-api-params'
 import { openAICompatibleAuthHeaders } from '../../shared/mimo-api-params'
+import {
+  isNativeJsonSchemaUnavailable,
+  nativeJsonSchemaCapabilityError
+} from '../../shared/model-capability-error'
+import { getStepLabel } from '../../shared/step-model-config'
 import { appLogger } from '../logger/app-logger'
 import { consumeSseStream, isAbortError, parseAxiosErrorMessage } from './stream-utils'
 
@@ -163,7 +168,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       }
 
       const body = buildOpenAICompatibleBody(resolvedModel, messages, request, { stream: false })
-      if (request.responseSchema) {
+      if (request.responseSchema && request.structuredOutputMode === 'native_json_schema') {
         body.response_format = {
           type: 'json_schema',
           json_schema: {
@@ -176,45 +181,11 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
 
       const requestOptions = {
           headers: openAICompatibleAuthHeaders(options?.modelType ?? 'openai', apiKey),
-          timeout: 240000,
+          timeout: request.timeoutMs ?? 240000,
           signal: options?.signal
       }
-      let response
-      let schemaEnabled = !!request.responseSchema
-      try {
-        response = await axios.post(url, body, requestOptions)
-      } catch (error: unknown) {
-        const status = (error as { response?: { status?: number } }).response?.status
-        if (!request.responseSchema || (status !== 400 && status !== 422)) throw error
-        delete body.response_format
-        schemaEnabled = false
-        appLogger.warn('model', '提供商拒绝 JSON Schema，移除 response_format 后有限重试', {
-          step: request.step,
-          workId: request.workId,
-          status
-        })
-        response = await axios.post(url, body, requestOptions)
-      }
-
-      let payload: OpenAICompatiblePayload
-      try {
-        payload = parseOpenAICompatiblePayload(response.data, response.status)
-      } catch (error) {
-        const retryingWithoutSchema = schemaEnabled
-        if (retryingWithoutSchema) {
-          delete body.response_format
-          schemaEnabled = false
-        }
-        appLogger.warn('model', retryingWithoutSchema
-          ? '结构化响应为空或不兼容，移除 JSON Schema 后有限重试'
-          : 'OpenAI 兼容响应为空或不兼容，进行一次有限重试', {
-          step: request.step,
-          workId: request.workId,
-          reason: error instanceof Error ? error.message : String(error)
-        })
-        response = await axios.post(url, body, requestOptions)
-        payload = parseOpenAICompatiblePayload(response.data, response.status)
-      }
+      const response = await axios.post(url, body, requestOptions)
+      const payload = parseOpenAICompatiblePayload(response.data, response.status)
 
       if (payload.reasoning) {
         options?.onThinkingDelta?.(payload.reasoning)
@@ -243,12 +214,21 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
       const errMsg = axiosError.response?.data?.error?.message
         ?? axiosError.message
         ?? '未知错误'
+      const normalizedError = request.requireResponseSchema
+        && request.responseSchema
+        && isNativeJsonSchemaUnavailable(errMsg)
+        ? nativeJsonSchemaCapabilityError({
+            modelName: resolvedModel,
+            stepLabel: getStepLabel(request.step ?? request.responseSchema.name),
+            upstreamMessage: errMsg
+          })
+        : errMsg
 
       return {
         success: false,
         content: '',
         modelType: this.protocol,
-        error: errMsg,
+        error: normalizedError,
         durationMs: Date.now() - startTime
       }
     }
@@ -277,7 +257,7 @@ export class OpenAICompatibleAdapter implements ModelAdapter {
         {
           headers: openAICompatibleAuthHeaders(options?.modelType ?? 'openai', apiKey),
           responseType: 'stream',
-          timeout: 240000,
+          timeout: request.timeoutMs ?? 240000,
           signal: options?.signal
         }
       )
@@ -399,7 +379,7 @@ function buildGeminiRequestBody(
     temperature: request.temperature ?? 0.7
   }
   if (request.topP != null) genConfig.topP = request.topP
-  if (request.responseSchema) {
+    if (request.responseSchema && request.structuredOutputMode === 'native_json_schema') {
     genConfig.responseMimeType = 'application/json'
     genConfig.responseJsonSchema = request.responseSchema.schema
   }
@@ -446,28 +426,23 @@ export class GeminiAdapter implements ModelAdapter {
 
     try {
       if (useStream) {
-        return await this.chatStream(model, apiKey, body, startTime, options)
+        return await this.chatStream(
+          model,
+          apiKey,
+          body,
+          startTime,
+          request.timeoutMs ?? 240000,
+          options
+        )
       }
 
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
       const requestOptions = {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 240000,
+        timeout: request.timeoutMs ?? 240000,
         signal: options?.signal
       }
-      let response
-      try {
-        response = await axios.post(url, body, requestOptions)
-      } catch (error: unknown) {
-        const status = (error as { response?: { status?: number } }).response?.status
-        if (!request.responseSchema || (status !== 400 && status !== 422)) throw error
-        const generationConfig = body.generationConfig as Record<string, unknown> | undefined
-        if (generationConfig) {
-          delete generationConfig.responseMimeType
-          delete generationConfig.responseJsonSchema
-        }
-        response = await axios.post(url, body, requestOptions)
-      }
+      const response = await axios.post(url, body, requestOptions)
 
       const data = response.data
       let content = ''
@@ -515,6 +490,7 @@ export class GeminiAdapter implements ModelAdapter {
     apiKey: string,
     body: Record<string, unknown>,
     startTime: number,
+    timeoutMs: number,
     options?: AdapterChatOptions
   ): Promise<ModelResponse> {
     let content = ''
@@ -525,7 +501,7 @@ export class GeminiAdapter implements ModelAdapter {
       const response = await axios.post(url, body, {
         headers: { 'Content-Type': 'application/json' },
         responseType: 'stream',
-        timeout: 240000,
+        timeout: timeoutMs,
         signal: options?.signal
       })
 
@@ -621,12 +597,19 @@ export class AnthropicAdapter implements ModelAdapter {
 
     try {
       if (useStream) {
-        return await this.chatStream(url, body, headers, startTime, options)
+        return await this.chatStream(
+          url,
+          body,
+          headers,
+          startTime,
+          request.timeoutMs ?? 240000,
+          options
+        )
       }
 
       const response = await axios.post(url, body, {
         headers,
-        timeout: 240000,
+        timeout: request.timeoutMs ?? 240000,
         signal: options?.signal
       })
 
@@ -681,6 +664,7 @@ export class AnthropicAdapter implements ModelAdapter {
     body: Record<string, unknown>,
     headers: Record<string, string>,
     startTime: number,
+    timeoutMs: number,
     options?: AdapterChatOptions
   ): Promise<ModelResponse> {
     let content = ''
@@ -692,7 +676,7 @@ export class AnthropicAdapter implements ModelAdapter {
       const response = await axios.post(url, { ...body, stream: true }, {
         headers,
         responseType: 'stream',
-        timeout: 240000,
+        timeout: timeoutMs,
         signal: options?.signal
       })
 

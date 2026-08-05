@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { emotionalStateDAO, volumeChapterDAO } from '../../db'
+import { chapterEmotionCheckpointDAO, emotionalStateDAO, volumeChapterDAO } from '../../db'
 import type { EmotionalStateLedgerInput } from '../../db'
 import { modelService } from '../../model'
 import {
@@ -11,9 +11,18 @@ import {
 } from '../../../shared/emotion-contract'
 import { loadChapterEmotionContract } from './emotion-engine'
 import { withGoalLoopModelOptions } from './story-goal-model'
-import { EmotionLedgerParseError, parseEmotionLedgerResponse } from './emotion-ledger'
+import {
+  EmotionLedgerParseError,
+  EmotionLedgerPipelineError,
+  classifyEmotionLedgerFailure,
+  planEmotionLedgerBatches,
+  parseEmotionLedgerResponse,
+  selectAffectedEmotionCharacters,
+  validateEmotionLedgerBatch
+} from './emotion-ledger'
 import { appLogger } from '../../logger/app-logger'
 import { requestStructuredModelOutput } from './structured-model-output'
+import { countWords } from '../../../shared/body-word-target'
 
 interface BlindReadResult {
   attachmentScore: number
@@ -32,7 +41,7 @@ interface BlindReadResult {
 
 const EMOTION_PASS_SCORE = 80
 const EMOTION_HARD_FLOOR = 65
-const EMOTION_LEDGER_MAX_ATTEMPTS = 3
+const EMOTION_LEDGER_MAX_ATTEMPTS = 2
 const EMOTION_BLIND_READ_SCHEMA = {
   type: 'object',
   required: [
@@ -61,6 +70,13 @@ export function emotionContentHash(content: string): string {
   return createHash('sha256').update(content).digest('hex')
 }
 
+export function emotionAssessmentMatchesContent(
+  assessment: EmotionBlindAssessment,
+  content: string
+): boolean {
+  return assessment.outcome_meta?.content_hash === emotionContentHash(content)
+}
+
 export function parseStoredEmotionAssessment(raw: string | null | undefined): EmotionBlindAssessment | null {
   if (!raw) return null
   try {
@@ -81,6 +97,7 @@ export function isEmotionOutcomeComplete(
   raw: string | null | undefined
 ): boolean {
   const assessment = parseStoredEmotionAssessment(raw)
+  if (!assessment) return false
   if (!isEmotionAssessmentAcceptedForTransition(assessment)) return false
   if (assessment.outcome_meta?.ledger_complete === false) return false
   if (assessment.outcome_meta?.content_hash
@@ -89,7 +106,7 @@ export function isEmotionOutcomeComplete(
 }
 
 /**
- * 持久化“原始评估未完全通过、但无硬伤并允许延后验收”的最终决策。
+ * 持久化用户明确接受当前情绪问题的最终决策。
  * 原始 passed 保持不变；accepted_deferred 只代表工作流可以带债务推进。
  */
 export async function persistDeferredEmotionOutcome(
@@ -102,6 +119,9 @@ export async function persistDeferredEmotionOutcome(
   const latest = volumeChapterDAO.getChapter(chapterId)
   if (!latest?.content?.trim() || latest.content !== content) {
     throw new Error('候选正文已变化，拒绝提交过期的延后情绪验收')
+  }
+  if (!emotionAssessmentMatchesContent(assessment, content)) {
+    throw new Error('情绪问题报告与当前正文不匹配，请重新验收后再决定是否接受')
   }
   const contract = loadChapterEmotionContract(chapterId)
   if (!contract) throw new Error('章节缺少 emotion_contract，禁止提交延后情绪验收')
@@ -171,8 +191,9 @@ async function blindRead(
     request: (attempt, error) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId, chapterId, step: 'emotion_blind_read', enrichWorkContext: false, enrichNarrativeMemory: false,
-        temperature: 0, maxTokens: 2800, forceThinkingDisabled: true,
+        temperature: 0, maxTokens: 2800, timeoutMs: 120_000, forceThinkingDisabled: true,
         responseSchema: { name: 'emotion_blind_read', schema: EMOTION_BLIND_READ_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是目标读者盲读员。你看不到标题、大纲、情绪计划和作者意图，只能根据原文报告自己实际产生的读者情绪。',
           '严格区分：人物声称的情绪、你从行为推断的情绪、你作为读者实际感受到的情绪。刺激词、哭喊、心跳和反转数量不能直接加分。',
@@ -231,15 +252,39 @@ async function compareTarget(
   blind: BlindReadResult,
   signal?: AbortSignal
 ): Promise<{ score: number; failureLayer: EmotionFailureLayer; issues: string[]; repairInstruction: string }> {
-  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+  return requestStructuredModelOutput({
     workId,
     label: '情绪目标比较',
     signal,
+    schema: EMOTION_TARGET_COMPARE_SCHEMA,
+    validate: value => {
+      const score = Number(value.target_alignment_score)
+      if (!Number.isFinite(score) || score < 0 || score > 100) {
+        throw new Error('target_alignment_score 必须是 0-100 分')
+      }
+      const layer = value.failure_layer
+      if (typeof layer !== 'string'
+        || !['attachment', 'arc', 'scene', 'continuity', 'prose', 'none'].includes(layer)) {
+        throw new Error('failure_layer 不在允许枚举内')
+      }
+      if (!Array.isArray(value.blocking_issues)) throw new Error('blocking_issues 必须是数组')
+      const repairInstruction = typeof value.repair_instruction === 'string'
+        ? value.repair_instruction.trim()
+        : ''
+      if (!repairInstruction) throw new Error('repair_instruction 不能为空')
+      return {
+        score: normalizePercentScore(score),
+        failureLayer: layer as EmotionFailureLayer,
+        issues: list(value.blocking_issues),
+        repairInstruction
+      }
+    },
     request: (attempt, error) => modelService.chat(
       withGoalLoopModelOptions(workId, {
         workId, chapterId, step: 'emotion_target_compare', enrichWorkContext: false, enrichNarrativeMemory: false,
-        temperature: 0, maxTokens: 1800, forceThinkingDisabled: true,
+        temperature: 0, maxTokens: 1800, timeoutMs: 120_000, forceThinkingDisabled: true,
         responseSchema: { name: 'emotion_target_compare', schema: EMOTION_TARGET_COMPARE_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是情绪目标差异审计员。只比较预定 emotion_contract 与独立盲读结果，不重新想象原文。',
           'failure_layer 只能是 attachment/arc/scene/continuity/prose/none。选择需要返工的最高层级。',
@@ -254,13 +299,202 @@ async function compareTarget(
       }), { stream: false, signal }
     )
   })
-  const layer = String(parsed.failure_layer ?? 'scene') as EmotionFailureLayer
-  const validLayer: EmotionFailureLayer = ['attachment', 'arc', 'scene', 'continuity', 'prose', 'none'].includes(layer) ? layer : 'scene'
-  return {
-    score: normalizePercentScore(parsed.target_alignment_score),
-    failureLayer: validLayer,
-    issues: list(parsed.blocking_issues),
-    repairInstruction: String(parsed.repair_instruction ?? '').trim()
+}
+
+function parseCheckpointPayload<T>(payload: string | null | undefined): T | null {
+  if (!payload) return null
+  try {
+    return JSON.parse(payload) as T
+  } catch {
+    return null
+  }
+}
+
+function chapterEmotionCharacters(
+  chapterId: number,
+  content: string,
+  contract: EmotionContract
+): string[] {
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  let configured: string[] = []
+  try {
+    const parsed = JSON.parse(chapter?.characters ?? '[]') as unknown
+    if (Array.isArray(parsed)) {
+      configured = parsed.map(String).map(name => name.trim()).filter(Boolean)
+    }
+  } catch {
+    configured = (chapter?.characters ?? '')
+      .split(/[、,，/]/)
+      .map(name => name.trim())
+      .filter(Boolean)
+  }
+  return selectAffectedEmotionCharacters({
+    configuredCharacters: configured,
+    povCharacter: contract.pov_character,
+    content
+  })
+}
+
+function ledgerBatchKey(index: number, characters: string[]): string {
+  return `${String(index + 1).padStart(3, '0')}:${characters.join('|')}`
+}
+
+function ledgerRowsFromStates(
+  workId: number,
+  chapterId: number,
+  states: ReturnType<typeof parseEmotionLedgerResponse>
+): EmotionalStateLedgerInput[] {
+  return states.map(state => ({
+    work_id: workId,
+    chapter_id: chapterId,
+    character_name: state.character_name,
+    felt_state: state.felt_state,
+    displayed_state: state.displayed_state,
+    unresolved_emotion: state.unresolved_emotion,
+    protective_strategy: state.protective_strategy,
+    behavioral_aftereffect: state.behavioral_aftereffect,
+    beliefs_json: JSON.stringify(state.belief_changes),
+    relationships_json: JSON.stringify(state.relationship_changes),
+    source_event: state.source_event
+  }))
+}
+
+async function extractEmotionLedgerBatch(input: {
+  workId: number
+  chapterId: number
+  content: string
+  contentHash: string
+  contract: EmotionContract
+  characters: string[]
+  batchKey: string
+  signal?: AbortSignal
+}): Promise<EmotionalStateLedgerInput[]> {
+  const cached = chapterEmotionCheckpointDAO.find(
+    input.chapterId,
+    input.contentHash,
+    'ledger_batch',
+    input.batchKey
+  )
+  const cachedRows = cached?.status === 'completed'
+    ? parseCheckpointPayload<EmotionalStateLedgerInput[]>(cached.payload_json)
+    : null
+  if (cachedRows) return cachedRows
+
+  let lastError: EmotionLedgerPipelineError | null = null
+  try {
+    const states = await requestStructuredModelOutput({
+      workId: input.workId,
+      label: `情绪账本批次-${input.batchKey}`,
+      attempts: EMOTION_LEDGER_MAX_ATTEMPTS,
+      signal: input.signal,
+      schema: EMOTION_LEDGER_JSON_SCHEMA,
+      request: (attempt, error) => modelService.chat(
+        withGoalLoopModelOptions(input.workId, {
+          workId: input.workId,
+          chapterId: input.chapterId,
+          step: 'emotion_state_extract',
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          temperature: 0,
+          maxTokens: 1600,
+          timeoutMs: 120_000,
+          forceThinkingDisabled: true,
+          responseSchema: {
+            name: 'emotion_ledger',
+            schema: EMOTION_LEDGER_JSON_SCHEMA,
+            strict: true
+          },
+          structuredOutputMode: 'prompt_json',
+          systemPrompt: [
+            '你是跨章情绪状态提取器，只输出一个符合 JSON Schema 的对象。',
+            `本批只能输出这些角色，且每个角色恰好一条：${input.characters.join('、')}。禁止输出其他角色。`,
+            '只保留正文结尾仍会影响后续选择、语言、注意、回避、关系或信念的状态。',
+            '字段必须简短。不得复述剧情，不得写心理分析报告，不得使用正文中无法验证的未来事件。',
+            'behavioral_aftereffect 只能描述下一章可观察的倾向；belief_changes 和 relationship_changes 各最多 3 项。',
+            `Schema：${JSON.stringify(EMOTION_LEDGER_JSON_SCHEMA)}`,
+            attempt > 1
+              ? `上一轮失败：${error}。重新生成完整短 JSON，不得复制截断内容。`
+              : ''
+          ].filter(Boolean).join('\n\n'),
+          prompt: [
+            `【本批角色】${input.characters.join('、')}`,
+            `【情绪契约】\n${JSON.stringify(input.contract)}`,
+            `【正文】\n${input.content}`
+          ].join('\n\n')
+        }),
+        { stream: false, signal: input.signal }
+      ),
+      validate: value => {
+        const states = parseEmotionLedgerResponse(JSON.stringify(value))
+        const validation = validateEmotionLedgerBatch(states, input.characters)
+        if (!validation.valid) {
+          throw new EmotionLedgerParseError(
+            `情绪账本角色集合不匹配：缺少 ${validation.missing.join('、') || '无'}`
+            + `；多余 ${validation.unexpected.join('、') || '无'}`
+            + `；重复 ${validation.duplicates.join('、') || '无'}`,
+            JSON.stringify(value).slice(0, 240)
+          )
+        }
+        return states
+      },
+      onAttemptFailure: ({ attempt, error, response }) => {
+        const code = classifyEmotionLedgerFailure(error, response?.finishReason)
+        const outputExcerpt = response?.content
+          ? (code === 'EMOTION_LEDGER_TRUNCATED'
+              ? response.content.slice(-240)
+              : response.content.slice(0, 240))
+          : ''
+        const pipelineError = new EmotionLedgerPipelineError(
+          code,
+          error,
+          outputExcerpt
+        )
+        lastError = pipelineError
+        const persistedAttempts = chapterEmotionCheckpointDAO.fail({
+          workId: input.workId,
+          chapterId: input.chapterId,
+          contentHash: input.contentHash,
+          stage: 'ledger_batch',
+          batchKey: input.batchKey,
+          failureCode: pipelineError.code,
+          failureMessage: pipelineError.message
+        })
+        appLogger.warn('emotion_ledger', '情绪账本批次输出无效', {
+          workId: input.workId,
+          chapterId: input.chapterId,
+          batchKey: input.batchKey,
+          attempt,
+          persistedAttempts,
+          errorCode: pipelineError.code,
+          error: pipelineError.message,
+          excerpt: pipelineError.outputExcerpt
+        })
+      }
+    })
+    const rows = ledgerRowsFromStates(input.workId, input.chapterId, states)
+    chapterEmotionCheckpointDAO.complete({
+      workId: input.workId,
+      chapterId: input.chapterId,
+      contentHash: input.contentHash,
+      stage: 'ledger_batch',
+      batchKey: input.batchKey,
+      payload: rows
+    })
+    return rows
+  } catch (error) {
+    if (input.signal?.aborted) throw error
+    const finalError = lastError ?? (error instanceof EmotionLedgerPipelineError
+      ? error
+      : new EmotionLedgerPipelineError(
+          classifyEmotionLedgerFailure(error instanceof Error ? error.message : String(error)),
+          error instanceof Error ? error.message : String(error),
+          ''
+        ))
+    throw new EmotionLedgerPipelineError(
+      finalError.code,
+      `情绪账本批次 ${input.batchKey} 连续 ${EMOTION_LEDGER_MAX_ATTEMPTS} 次失败：${finalError.message}`,
+      finalError.outputExcerpt
+    )
   }
 }
 
@@ -271,64 +505,126 @@ async function extractEmotionalLedgerRows(
   contract: EmotionContract,
   signal?: AbortSignal
 ): Promise<EmotionalStateLedgerInput[]> {
-  let lastError: Error | null = null
-  let lastExcerpt = ''
-  for (let attempt = 1; attempt <= EMOTION_LEDGER_MAX_ATTEMPTS; attempt++) {
-    if (signal?.aborted) throw new Error('已取消')
-    const retryHint = lastError
-      ? `\n\n上一次输出无效：${lastError.message}。必须重新输出完整JSON，不得解释或复制错误片段。`
-      : ''
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId, chapterId, step: 'emotion_state_extract', enrichWorkContext: false, enrichNarrativeMemory: false,
-        temperature: 0, maxTokens: 1800,
-        responseSchema: { name: 'emotion_ledger', schema: EMOTION_LEDGER_JSON_SCHEMA, strict: true },
-        systemPrompt: [
-          '你是跨章情绪状态提取器。只提取正文结尾仍会影响后续的真实状态，不把一闪而过的表情当作持续状态。',
-          '只输出符合给定JSON Schema的单个JSON对象。所有属性名必须使用英文固定字段，文本内的双引号必须正确转义。',
-          '每个本章核心角色必须有一条；behavioral_aftereffect 必须是下一章可观察的注意、语言、回避、风险偏好或选择变化。',
-          'belief_changes 只允许 [{"belief":"","change":""}]；relationship_changes 只允许 [{"character":"","state":""}]。无变化时输出空数组。',
-          `Schema：${JSON.stringify(EMOTION_LEDGER_JSON_SCHEMA)}`,
-          retryHint
-        ].filter(Boolean).join('\n\n'),
-        prompt: `【情绪契约】\n${JSON.stringify(contract, null, 2)}\n\n【正文】\n${content}`
-      }), { stream: false, signal }
+  const contentHash = emotionContentHash(content)
+  chapterEmotionCheckpointDAO.deleteStale(chapterId, contentHash)
+  const characters = chapterEmotionCharacters(chapterId, content, contract)
+  if (characters.length === 0) {
+    throw new EmotionLedgerPipelineError(
+      'EMOTION_LEDGER_PROTOCOL',
+      '无法确定本章需要提交情绪状态的角色',
+      ''
     )
-    if (!response.success || !response.content?.trim()) {
-      lastError = new Error(response.error || '情绪账本提取无返回')
-    } else {
-      try {
-        return parseEmotionLedgerResponse(response.content).map(state => ({
-          work_id: workId,
-          chapter_id: chapterId,
-          character_name: state.character_name,
-          felt_state: state.felt_state,
-          displayed_state: state.displayed_state,
-          unresolved_emotion: state.unresolved_emotion,
-          protective_strategy: state.protective_strategy,
-          behavioral_aftereffect: state.behavioral_aftereffect,
-          beliefs_json: JSON.stringify(state.belief_changes),
-          relationships_json: JSON.stringify(state.relationship_changes),
-          source_event: state.source_event
-        }))
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error))
-        lastExcerpt = error instanceof EmotionLedgerParseError ? error.outputExcerpt : response.content.slice(0, 240)
-      }
-    }
-    appLogger.warn('emotion_ledger', '情绪账本输出无效，局部重试', {
-      workId, chapterId, attempt, error: lastError.message, excerpt: lastExcerpt
-    })
   }
-  const finalError = new EmotionLedgerParseError(
-    `情绪账本连续 ${EMOTION_LEDGER_MAX_ATTEMPTS} 次解析或校验失败：${lastError?.message ?? '未知错误'}`
-      + (lastExcerpt ? `；错误片段：${lastExcerpt}` : ''),
-    lastExcerpt
+  const rows: EmotionalStateLedgerInput[] = []
+  const batches = planEmotionLedgerBatches(characters)
+  for (const [index, batch] of batches.entries()) {
+    rows.push(...await extractEmotionLedgerBatch({
+      workId,
+      chapterId,
+      content,
+      contentHash,
+      contract,
+      characters: batch,
+      batchKey: ledgerBatchKey(index, batch),
+      signal
+    }))
+  }
+  const actualCharacters = rows.map(row => row.character_name)
+  const missing = characters.filter(name => !actualCharacters.includes(name))
+  const duplicates = actualCharacters.filter((name, index) => actualCharacters.indexOf(name) !== index)
+  if (missing.length > 0 || duplicates.length > 0) {
+    throw new EmotionLedgerPipelineError(
+      'EMOTION_LEDGER_PROTOCOL',
+      `情绪账本完整性失败：缺少 ${missing.join('、') || '无'}；重复 ${[...new Set(duplicates)].join('、') || '无'}`,
+      ''
+    )
+  }
+  return rows
+}
+
+async function checkpointedBlindRead(
+  workId: number,
+  chapterId: number,
+  content: string,
+  contentHash: string,
+  signal?: AbortSignal
+): Promise<BlindReadResult> {
+  const checkpoint = chapterEmotionCheckpointDAO.find(
+    chapterId,
+    contentHash,
+    'blind_read'
   )
-  appLogger.error('emotion_ledger', '情绪账本提取终止', {
-    workId, chapterId, error: finalError.message, excerpt: lastExcerpt
-  })
-  throw finalError
+  const cached = checkpoint?.status === 'completed'
+    ? parseCheckpointPayload<BlindReadResult>(checkpoint.payload_json)
+    : null
+  if (cached) return cached
+  try {
+    const result = await blindRead(workId, chapterId, content, signal)
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash,
+      stage: 'blind_read',
+      payload: result
+    })
+    return result
+  } catch (error) {
+    if (signal?.aborted) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    const code = classifyEmotionLedgerFailure(message)
+    chapterEmotionCheckpointDAO.fail({
+      workId,
+      chapterId,
+      contentHash,
+      stage: 'blind_read',
+      failureCode: code,
+      failureMessage: message
+    })
+    throw new EmotionLedgerPipelineError(code, `情绪盲读失败：${message}`, '')
+  }
+}
+
+async function checkpointedTargetCompare(
+  workId: number,
+  chapterId: number,
+  contentHash: string,
+  contract: EmotionContract,
+  blind: BlindReadResult,
+  signal?: AbortSignal
+): Promise<Awaited<ReturnType<typeof compareTarget>>> {
+  const checkpoint = chapterEmotionCheckpointDAO.find(
+    chapterId,
+    contentHash,
+    'target_compare'
+  )
+  const cached = checkpoint?.status === 'completed'
+    ? parseCheckpointPayload<Awaited<ReturnType<typeof compareTarget>>>(checkpoint.payload_json)
+    : null
+  if (cached) return cached
+  try {
+    const result = await compareTarget(workId, chapterId, contract, blind, signal)
+    chapterEmotionCheckpointDAO.complete({
+      workId,
+      chapterId,
+      contentHash,
+      stage: 'target_compare',
+      payload: result
+    })
+    return result
+  } catch (error) {
+    if (signal?.aborted) throw error
+    const message = error instanceof Error ? error.message : String(error)
+    const code = classifyEmotionLedgerFailure(message)
+    chapterEmotionCheckpointDAO.fail({
+      workId,
+      chapterId,
+      contentHash,
+      stage: 'target_compare',
+      failureCode: code,
+      failureMessage: message
+    })
+    throw new EmotionLedgerPipelineError(code, `情绪目标比较失败：${message}`, '')
+  }
 }
 
 export async function assessChapterEmotion(
@@ -341,8 +637,17 @@ export async function assessChapterEmotion(
 ): Promise<EmotionBlindAssessment> {
   const contract = loadChapterEmotionContract(chapterId)
   if (!contract) throw new Error('章节缺少 emotion_contract，禁止情绪验收')
-  const blind = await blindRead(workId, chapterId, content, signal)
-  const compared = await compareTarget(workId, chapterId, contract, blind, signal)
+  const contentHash = emotionContentHash(content)
+  chapterEmotionCheckpointDAO.deleteStale(chapterId, contentHash)
+  const blind = await checkpointedBlindRead(workId, chapterId, content, contentHash, signal)
+  const compared = await checkpointedTargetCompare(
+    workId,
+    chapterId,
+    contentHash,
+    contract,
+    blind,
+    signal
+  )
   const scores = [blind.attachmentScore, blind.causalEarnednessScore, blind.inferabilityScore,
     blind.povImmediacyScore, blind.subtextScore, blind.modulationScore, blind.residueScore, compared.score]
   const score = Math.round(scores.reduce((sum, item) => sum + item, 0) / scores.length)
@@ -369,7 +674,12 @@ export async function assessChapterEmotion(
     reader_fears: blind.readerFears,
     failure_layer: compared.failureLayer,
     blocking_issues: [...new Set(blockers)],
-    repair_instruction: compared.repairInstruction
+    repair_instruction: compared.repairInstruction,
+    outcome_meta: {
+      content_hash: contentHash,
+      ledger_complete: false,
+      ledger_schema_version: EMOTION_LEDGER_SCHEMA_VERSION
+    }
   }
   const averageArousal = blind.actualReaderCurve.length > 0
     ? blind.actualReaderCurve.reduce((sum, point) => sum + point.arousal, 0) / blind.actualReaderCurve.length
@@ -388,11 +698,6 @@ export async function assessChapterEmotion(
         chapterId, ledgerRows, JSON.stringify(assessment), emotionIntensity
       )
     } else {
-      assessment.outcome_meta = {
-        content_hash: emotionContentHash(content),
-        ledger_complete: false,
-        ledger_schema_version: EMOTION_LEDGER_SCHEMA_VERSION
-      }
       emotionalStateDAO.replaceAssessmentWithoutLedger(
         chapterId, JSON.stringify(assessment), emotionIntensity
       )
@@ -449,6 +754,53 @@ export function emotionRepairHint(assessment: EmotionBlindAssessment): string {
     assessment.repair_instruction ? `定向修订：${assessment.repair_instruction}` : '',
     '禁止仅增加哭泣、心跳、身体反应或直接心理解释。必须修复关切、事件意义、表里冲突、选择代价或余波中的真实缺口。'
   ].filter(Boolean).join('\n')
+}
+
+/** 只生成情绪修复候选，不写入正文、情绪评估或跨章账本。 */
+export async function repairEmotionCandidate(
+  workId: number,
+  chapterId: number,
+  content: string,
+  assessment: EmotionBlindAssessment,
+  signal?: AbortSignal
+): Promise<{ success: boolean; content: string; error?: string }> {
+  const trimmed = content.trim()
+  if (!trimmed) return { success: false, content, error: '当前章节没有可修订正文' }
+  const contract = loadChapterEmotionContract(chapterId)
+  if (!contract) return { success: false, content, error: '章节缺少 emotion_contract，无法定向修复' }
+
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      workId,
+      chapterId,
+      step: 'emotion_repair',
+      enrichWorkContext: false,
+      enrichNarrativeMemory: true,
+      temperature: 0.3,
+      maxTokens: Math.max(6000, Math.min(12000, Math.ceil(countWords(trimmed) * 2))),
+      systemPrompt: [
+        '你是长篇小说情绪因果修复编辑。只输出修复后的完整正文，不要解释、标题或 Markdown。',
+        '只修复盲读报告指出的情绪因果缺口，保留未被问题证据涉及的情节、事实、人物状态和有效表达。',
+        '禁止用哭泣、心跳、身体反应、直接心理解释或堆叠形容词冒充情绪修复。',
+        '必须通过可观察的主动选择、阻力、代价、表里冲突和事件余波建立读者关切。',
+        '不得改变章节大纲、提前兑现后续情节、增加新支线或改写既有世界观事实。'
+      ].join('\n'),
+      prompt: [
+        `【本章情绪合同】\n${JSON.stringify(contract, null, 2)}`,
+        `【盲读失败报告】\n${emotionRepairHint(assessment)}`,
+        `【当前正文】\n${trimmed}`
+      ].join('\n\n')
+    }),
+    { stream: false, signal }
+  )
+
+  if (!response.success || !response.content?.trim()) {
+    return { success: false, content, error: response.error || '情绪定向修复失败' }
+  }
+  if (response.finishReason === 'length') {
+    return { success: false, content, error: '情绪定向修复输出被截断，候选正文未应用' }
+  }
+  return { success: true, content: response.content.trim() }
 }
 
 export const EMOTION_GATE_MIN_SCORE = EMOTION_PASS_SCORE

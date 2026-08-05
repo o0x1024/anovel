@@ -35,24 +35,43 @@ export interface ContextBudgetReport {
   continuityMode: 'full' | 'tail' | 'none'
 }
 
+export interface ModelResponseSchema {
+  name: string
+  schema: Record<string, unknown>
+  strict?: boolean
+}
+
+type StructuredOutputRequest =
+  | {
+      responseSchema?: undefined
+      structuredOutputMode?: undefined
+      requireResponseSchema?: undefined
+    }
+  | {
+      responseSchema: ModelResponseSchema
+      structuredOutputMode: 'prompt_json'
+      requireResponseSchema?: false | undefined
+    }
+  | {
+      responseSchema: ModelResponseSchema
+      structuredOutputMode: 'native_json_schema'
+      /** 原生 Schema 是显式能力合同，提供商拒绝时直接停止。 */
+      requireResponseSchema: true
+    }
+
 /** 模型调用请求 */
-export interface ModelRequest {
+export type ModelRequest = {
   prompt: string
   systemPrompt?: string
   modelType?: ModelType           // 不指定则按优先级自动选择
   modelName?: string              // 指定具体模型 ID（覆盖提供商默认 model_name）
   maxTokens?: number
+  /** 单次请求截止时间；短结构化评估不得继承正文生成的长等待窗口。 */
+  timeoutMs?: number
   temperature?: number
   thinkingEnabled?: boolean
   /** 严格结构化短输出可强制关闭思考，优先级高于全局/步骤模型设置。 */
   forceThinkingDisabled?: boolean
-  /** 请求提供商原生 JSON Schema 结构化输出；不支持时适配器自动降级。 */
-  responseSchema?: {
-    name: string
-    schema: Record<string, unknown>
-    strict?: boolean
-  }
-
   /** 频率惩罚：惩罚已出现 token 的重复使用，增加词汇多样性 (-2~2) */
   frequencyPenalty?: number
   /** 存在惩罚：惩罚任何已出现过的 token，鼓励引入新话题 (-2~2) */
@@ -85,7 +104,7 @@ export interface ModelRequest {
   enrichNarrativeMemory?: boolean
   chapterId?: number
   volumeId?: number
-}
+} & StructuredOutputRequest
 
 /** 模型调用响应 */
 export interface ModelResponse {

@@ -17,10 +17,13 @@ import {
   mergeStoryBlueprintDiagnosis,
   mergeStagedBeat,
   sanitizeBeatSkeleton,
-  storyBeatStageKey
+  storyBeatStageKey,
+  storyDeterministicRepairTargets,
+  synchronizeStoryBoundaryPairs
 } from '../src/main/context/goal-routine/story-beat-staging'
 import { normalizeTensionPlanForBeat } from '../src/main/context/goal-routine/story-genre-policy'
 import { normalizeEmotionContract, validateEmotionContract } from '../src/shared/emotion-contract'
+import { validateStoryBoundaryContracts } from '../src/shared/story-hard-guards'
 
 function emotionContract(overrides: Record<string, unknown> = {}) {
   return normalizeEmotionContract({
@@ -138,6 +141,72 @@ assert.equal(beatGateRecoveryForFailureCount(5), 'retry_beats')
 assert.equal(storyBeatStageKey('同一合同', 5), storyBeatStageKey('同一合同', 5))
 assert.notEqual(storyBeatStageKey('合同A', 5), storyBeatStageKey('合同B', 5))
 assert.notEqual(storyBeatStageKey('同一合同', 4), storyBeatStageKey('同一合同', 5))
+
+const unsynchronizedBoundaries: ParsedChapter[] = [
+  {
+    title: '第一拍',
+    outline: '第一拍事件',
+    continuity_contract: {
+      exit_boundary: '主角在医院拿到冻结裁定，手机与录音均由主角持有',
+      exit_facts: ['冻结裁定已经送达', '手机与录音均由主角持有']
+    }
+  },
+  {
+    title: '第二拍',
+    outline: '第二拍事件',
+    continuity_contract: {
+      entry_boundary: '主角刚到医院，尚未拿到裁定',
+      entry_facts: ['冻结裁定已经送达', '手机与录音均由主角持有'],
+      exit_boundary: '主角完成证据公证'
+    }
+  },
+  {
+    title: '第三拍',
+    outline: '第三拍事件',
+    continuity_contract: {
+      entry_boundary: '主角准备进行证据公证'
+    }
+  }
+]
+const synchronizedBoundaries = synchronizeStoryBoundaryPairs(unsynchronizedBoundaries)
+assert.equal(
+  synchronizedBoundaries[1].continuity_contract?.entry_boundary,
+  synchronizedBoundaries[0].continuity_contract?.exit_boundary
+)
+assert.equal(
+  synchronizedBoundaries[2].continuity_contract?.entry_boundary,
+  synchronizedBoundaries[1].continuity_contract?.exit_boundary
+)
+assert.deepEqual(validateStoryBoundaryContracts(synchronizedBoundaries), [])
+assert.equal(
+  unsynchronizedBoundaries[1].continuity_contract?.entry_boundary,
+  '主角刚到医院，尚未拿到裁定',
+  '共享边界投影不得原地改写模型候选'
+)
+const missingAuthoritativeExit = synchronizeStoryBoundaryPairs([
+  { title: '第一拍', outline: '第一拍', continuity_contract: { exit_facts: ['状态已改变'] } },
+  { title: '第二拍', outline: '第二拍', continuity_contract: { entry_boundary: '模型自填边界' } }
+])
+assert.equal(
+  validateStoryBoundaryContracts(missingAuthoritativeExit)[0]?.message,
+  '第1拍 exit_boundary 与第2拍 entry_boundary 必须同时存在',
+  '左拍缺失权威离场边界时禁止补造'
+)
+assert.deepEqual(
+  storyDeterministicRepairTargets([11, 12, 13, 14, 15], [11, 12, 13, 14, 15], true),
+  [11, 12, 13, 14, 15],
+  '共享边界修复必须保留全部受影响节拍，禁止截断为两个目标'
+)
+assert.deepEqual(
+  storyDeterministicRepairTargets([], [11, 12, 13, 14, 15], true),
+  [11, 12, 13, 14, 15],
+  '边界问题缺少精确章节映射时必须重建完整边界链'
+)
+assert.deepEqual(
+  storyDeterministicRepairTargets([11, 12, 13], [11, 12, 13], false),
+  [11, 12],
+  '非边界局部问题仍限制最小修复作用域'
+)
 
 const normalizedEmotion = emotionContract()
 assert.ok(normalizedEmotion)

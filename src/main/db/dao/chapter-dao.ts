@@ -236,6 +236,7 @@ export class VolumeChapterDAO extends BaseDAO {
       const changed = this.run(sql, vals).changes > 0
       if (changed && fields.content !== undefined) {
         this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [id])
+        this.run('DELETE FROM chapter_emotion_checkpoints WHERE chapter_id = ?', [id])
       }
       return changed
     })

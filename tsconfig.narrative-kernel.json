@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/main/narrative-kernel/**/*.ts",
+    "src/main/narrative-app/application.ts",
+    "src/main/narrative-app/config.ts",
+    "src/main/narrative-app/index.ts",
+    "scripts/test-narrative-kernel-v2.ts",
+    "scripts/test-narrative-event-store-v2.ts",
+    "scripts/test-narrative-chapter-pipeline-v2.ts",
+    "scripts/test-automated-chapter-runner-v2.ts",
+    "scripts/test-automated-novel-runner-v2.ts",
+    "scripts/test-automated-novel-fixed-gateway-v2.ts",
+    "scripts/test-fixed-model-gateway-v2.ts",
+    "scripts/test-narrative-application-v2.ts"
+  ],
+  "exclude": ["node_modules", "out"]
+}

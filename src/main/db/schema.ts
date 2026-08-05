@@ -273,6 +273,30 @@ export function initSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_story_release_work
       ON story_release_snapshots(work_id, create_time);
 
+    CREATE TABLE IF NOT EXISTS story_reader_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      release_snapshot_id INTEGER NOT NULL,
+      source VARCHAR(50) NOT NULL,
+      impressions INTEGER NOT NULL,
+      opened_reads INTEGER NOT NULL,
+      preview_completions INTEGER NOT NULL,
+      completions INTEGER NOT NULL,
+      likes INTEGER NOT NULL DEFAULT 0,
+      comments INTEGER NOT NULL DEFAULT 0,
+      shares INTEGER NOT NULL DEFAULT 0,
+      follows INTEGER NOT NULL DEFAULT 0,
+      avg_read_seconds REAL,
+      notes TEXT,
+      collected_at DATETIME NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (release_snapshot_id) REFERENCES story_release_snapshots(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_story_reader_feedback_work
+      ON story_reader_feedback(work_id, release_snapshot_id, collected_at);
+
     CREATE TABLE IF NOT EXISTS story_lead_versions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       work_id INTEGER NOT NULL,
@@ -284,6 +308,65 @@ export function initSchema(): void {
 
     CREATE INDEX IF NOT EXISTS idx_story_lead_versions_work
       ON story_lead_versions(work_id, id);
+
+    -- ============================================
+    -- 长篇小说首发窗口：每八章全量审读 / 问题账本 / 发布快照（V5.1）
+    -- ============================================
+    CREATE TABLE IF NOT EXISTS novel_release_window_audits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      start_chapter_id INTEGER NOT NULL,
+      end_chapter_id INTEGER NOT NULL,
+      start_index INTEGER NOT NULL,
+      end_index INTEGER NOT NULL,
+      source_hash VARCHAR(64) NOT NULL,
+      authority_revision INTEGER NOT NULL,
+      protocol_version INTEGER NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'running',
+      overall_score INTEGER,
+      scores_json TEXT NOT NULL DEFAULT '{}',
+      blocker_count INTEGER NOT NULL DEFAULT 0,
+      summary TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (start_chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      FOREIGN KEY (end_chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_novel_release_window_lookup
+      ON novel_release_window_audits(work_id, start_index, end_index, source_hash, status);
+
+    CREATE TABLE IF NOT EXISTS novel_release_window_issues (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      audit_id INTEGER NOT NULL,
+      code VARCHAR(80) NOT NULL,
+      severity VARCHAR(20) NOT NULL,
+      chapter_ids_json TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      message TEXT NOT NULL,
+      required_fix TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (audit_id) REFERENCES novel_release_window_audits(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_novel_release_window_issue_audit
+      ON novel_release_window_issues(audit_id, severity, status);
+
+    CREATE TABLE IF NOT EXISTS novel_release_window_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      audit_id INTEGER NOT NULL UNIQUE,
+      work_id INTEGER NOT NULL,
+      source_hash VARCHAR(64) NOT NULL,
+      proof_json TEXT NOT NULL,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (audit_id) REFERENCES novel_release_window_audits(id) ON DELETE CASCADE,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_novel_release_window_snapshot_work
+      ON novel_release_window_snapshots(work_id, id DESC);
 
     -- ============================================
     -- 伏笔追踪表（V1.5）
@@ -339,6 +422,27 @@ export function initSchema(): void {
 
     CREATE INDEX IF NOT EXISTS idx_emotional_state_work_character
       ON emotional_state_ledger(work_id, character_name, chapter_id);
+
+    CREATE TABLE IF NOT EXISTS chapter_emotion_checkpoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      work_id INTEGER NOT NULL,
+      chapter_id INTEGER NOT NULL,
+      content_hash VARCHAR(80) NOT NULL,
+      stage VARCHAR(30) NOT NULL,
+      batch_key VARCHAR(160) NOT NULL DEFAULT '',
+      status VARCHAR(20) NOT NULL,
+      payload_json TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      failure_code VARCHAR(80),
+      failure_message TEXT,
+      create_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      update_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (work_id) REFERENCES works(id) ON DELETE CASCADE,
+      FOREIGN KEY (chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+      UNIQUE(chapter_id, content_hash, stage, batch_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chapter_emotion_checkpoint_lookup
+      ON chapter_emotion_checkpoints(chapter_id, content_hash, stage, status);
 
     -- ============================================
     -- 通用故事状态账本与章节模式指纹（V4.1）

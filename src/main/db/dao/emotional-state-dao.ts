@@ -106,6 +106,7 @@ class EmotionalStateDAO extends BaseDAO {
         [assessmentJson, emotionIntensity, chapterId]
       ).changes
       if (updated !== 1) throw new Error('情绪验收持久化失败：章节不存在')
+      this.run('DELETE FROM chapter_emotion_checkpoints WHERE chapter_id = ?', [chapterId])
     })
   }
 
@@ -122,7 +123,10 @@ class EmotionalStateDAO extends BaseDAO {
   }
 
   deleteByChapter(chapterId: number): number {
-    return this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapterId]).changes
+    return this.transaction(() => {
+      this.run('DELETE FROM chapter_emotion_checkpoints WHERE chapter_id = ?', [chapterId])
+      return this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapterId]).changes
+    })
   }
 }
 

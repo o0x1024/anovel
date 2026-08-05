@@ -104,7 +104,7 @@ export function mergeOutlinePlanningWorkContextOptions(
   volumeId?: number,
   chapterVolumeId?: number
 ): WorkContextOptions {
-  if (!isOutlinePlanningStep(step)) return options
+  if (!step || !isOutlinePlanningStep(step)) return options
 
   const currentVolumeId =
     options.currentVolumeId ?? volumeId ?? chapterVolumeId
@@ -183,7 +183,10 @@ export function resolveWorkContextOptionsForStep(
   volumeId?: number,
   chapterVolumeId?: number
 ): WorkContextOptions {
-  let merged = { ...options, includeIncubator: options.includeIncubator ?? false }
+  let merged: WorkContextOptions = {
+    ...options,
+    includeIncubator: options.includeIncubator ?? false
+  }
 
   if (isOutlinePlanningStep(step)) {
     merged = mergeOutlinePlanningWorkContextOptions(step, merged, volumeId, chapterVolumeId)
@@ -195,12 +198,12 @@ export function resolveWorkContextOptionsForStep(
     merged = mergeCoreSettingsFlowWorkContextOptions(merged)
   } else if (isIncubatorStep(step)) {
     merged = {
-      includeIdea: true,
+      ...merged,
+      includeIdea: merged.includeIdea ?? true,
       includeIncubator: false,
       includeCoreSettings: false,
       includeVolumes: false,
-      includeQualityIssues: false,
-      ...merged
+      includeQualityIssues: false
     }
   } else {
     merged = mergeDefaultEnrichedWorkContextOptions(merged)

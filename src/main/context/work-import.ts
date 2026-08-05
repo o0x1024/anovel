@@ -4,6 +4,7 @@ import { readFileSync } from 'fs'
 import { workDAO, volumeChapterDAO } from '../db'
 import { initWritingPlanForWork } from './writing-plan'
 import { extractTextFromDocx, isDocxFileName } from './assistant/docx-extract'
+import { countWords } from '../../shared/body-word-target'
 
 export interface ManuscriptImportResult {
   success: boolean
@@ -39,10 +40,6 @@ function splitManuscript(text: string): ParsedChapter[] {
     chapters.push({ title: title || '未命名章节', content })
   }
   return chapters.length ? chapters : [{ title: '正文', content: normalized.trim() }]
-}
-
-function countWords(s: string): number {
-  return s.replace(/\s/g, '').length
 }
 
 /**

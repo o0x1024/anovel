@@ -1,7 +1,8 @@
 import { app } from 'electron'
 import path from 'path'
-import { copyFileSync, existsSync, mkdirSync } from 'fs'
-import { closeDatabase } from '../db/connection'
+import { copyFileSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'fs'
+import Database from 'better-sqlite3'
+import { closeDatabase, getDatabase } from '../db/connection'
 import {
   workDAO, coreSettingDAO, volumeChapterDAO, anchorDAO, ideaFragmentDAO,
   foreshadowingDAO, timelineDAO, aiFavoriteDAO, storyStateDAO
@@ -137,10 +138,11 @@ export function exportWorkBundle(workId: number): WorkBackupBundle {
 }
 
 export function importWorkBundle(bundle: WorkBackupBundle): number {
+  const workType = bundle.work.work_type === 'story' ? 'story' : 'novel'
   const workId = workDAO.create({
     title: `${bundle.work.title}（导入）`,
     description: bundle.work.description ?? undefined,
-    workType: bundle.work.work_type ?? 'novel'
+    workType
   })
 
   for (const s of bundle.settings) {
@@ -256,7 +258,10 @@ export function restoreDatabase(srcPath: string): void {
 }
 
 export function ensureBackupDir(): string {
-  const dir = path.join(app.getPath('userData'), 'backups')
+  const testDir = process.env.ELECTRON_RUN_AS_NODE === '1'
+    ? process.env.ANOVEL_TEST_BACKUP_DIR?.trim()
+    : undefined
+  const dir = testDir || path.join(app.getPath('userData'), 'backups')
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
   return dir
 }
@@ -266,5 +271,37 @@ export function createAutoBackup(): string {
   const name = `anovel-${Date.now()}.db`
   const dest = path.join(dir, name)
   backupDatabase(dest)
+  return dest
+}
+
+function safeBackupLabel(value: string): string {
+  return value.trim().replace(/[^\p{L}\p{N}._-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'work'
+}
+
+export async function createConsistentAutoBackup(label = 'anovel'): Promise<string> {
+  const dir = ensureBackupDir()
+  const dest = path.join(dir, `${safeBackupLabel(label)}-${Date.now()}.db`)
+  await getDatabase().backup(dest)
+  const backup = new Database(dest, { readonly: true, fileMustExist: true })
+  try {
+    const integrity = backup.pragma('integrity_check', { simple: true })
+    if (integrity !== 'ok') throw new Error(`备份完整性校验失败：${String(integrity)}`)
+  } finally {
+    backup.close()
+  }
+  return dest
+}
+
+export function createWorkBundleBackup(workId: number, label: string): string {
+  const dir = ensureBackupDir()
+  const dest = path.join(dir, `${safeBackupLabel(label)}-${Date.now()}.json`)
+  const temporary = `${dest}.tmp`
+  try {
+    writeFileSync(temporary, JSON.stringify(exportWorkBundle(workId), null, 2), 'utf8')
+    renameSync(temporary, dest)
+  } catch (error) {
+    if (existsSync(temporary)) unlinkSync(temporary)
+    throw error
+  }
   return dest
 }

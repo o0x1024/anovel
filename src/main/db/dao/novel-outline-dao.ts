@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { BaseDAO } from './base-dao'
 import type { ChapterResourceBudgetInput } from './resource-ledger-dao'
 import type { EmotionContract } from '../../../shared/emotion-contract'
@@ -27,6 +28,10 @@ export class NovelOutlineDAO extends BaseDAO {
     volumeEndChapter: number
     chapterStartSort: number
     items: NovelOutlineBatchItem[]
+    authorityStateUpdate?: {
+      expectedRevision: number
+      stateJson: string
+    }
   }): number[] {
     return this.transaction(() => {
       let volume = this.get<{ id: number; description: string | null }>(
@@ -102,6 +107,26 @@ export class NovelOutlineDAO extends BaseDAO {
               budget.reason ?? null
             ]
           )
+        }
+      }
+      if (input.authorityStateUpdate) {
+        const stateHash = createHash('sha256').update(input.authorityStateUpdate.stateJson).digest('hex')
+        const result = this.run(
+          `UPDATE novel_authority_states
+           SET revision = revision + 1,
+               state_hash = ?,
+               state_json = ?,
+               update_time = CURRENT_TIMESTAMP
+           WHERE work_id = ? AND revision = ?`,
+          [
+            stateHash,
+            input.authorityStateUpdate.stateJson,
+            input.workId,
+            input.authorityStateUpdate.expectedRevision
+          ]
+        )
+        if (result.changes !== 1) {
+          throw new Error(`作品 ${input.workId} 的章节批次权威状态修订冲突`)
         }
       }
       return ids

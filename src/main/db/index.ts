@@ -23,6 +23,41 @@ export { aiFavoriteDAO } from './dao/favorite-dao'
 export type { AiFavoriteRow } from './dao/favorite-dao'
 export { generationLogDAO } from './dao/generation-log-dao'
 export type { GenerationLogRow } from './dao/generation-log-dao'
+export { modelCallAttemptDAO } from './dao/model-call-attempt-dao'
+export type {
+  ModelCallAttemptInput,
+  ModelCallAttemptFinish
+} from './dao/model-call-attempt-dao'
+export { workflowModelContractDAO } from './dao/workflow-model-contract-dao'
+export type {
+  FrozenModelSelection,
+  WorkflowModelContract
+} from './dao/workflow-model-contract-dao'
+export { novelAuthorityStateDAO } from './dao/novel-authority-state-dao'
+export type {
+  NovelAuthorityStateRow,
+  LegacyNovelStateRow
+} from './dao/novel-authority-state-dao'
+export { novelChapterAcceptanceDAO } from './dao/novel-chapter-acceptance-dao'
+export type {
+  NovelChapterAcceptanceStatus,
+  NovelChapterAcceptanceEpisodeRow,
+  NovelChapterAcceptanceCandidateRow,
+  NovelChapterAcceptanceAssessmentRow
+} from './dao/novel-chapter-acceptance-dao'
+export { novelChapterGateDAO } from './dao/novel-chapter-gate-dao'
+export type {
+  NovelChapterGateType,
+  NovelChapterGateStatus,
+  NovelChapterGateStateRow,
+  NovelChapterGateDecisionRow
+} from './dao/novel-chapter-gate-dao'
+export { novelReleaseWindowDAO } from './dao/novel-release-window-dao'
+export type {
+  NovelReleaseWindowStatus,
+  NovelReleaseWindowAuditRow,
+  NovelReleaseWindowIssueInput
+} from './dao/novel-release-window-dao'
 export { coreSettingDAO } from './dao/core-setting-dao'
 export type { CoreSettingRow, CoreSettingType, CoreSettingVersionRow } from './dao/core-setting-dao'
 export { foreshadowingDAO } from './dao/foreshadowing-dao'
@@ -30,6 +65,7 @@ export type { ForeshadowingRow, ForeshadowingStatus } from './dao/foreshadowing-
 export { characterSnapshotDAO } from './dao/character-snapshot-dao'
 export type { CharacterSnapshotRow } from './dao/character-snapshot-dao'
 export { emotionalStateDAO } from './dao/emotional-state-dao'
+export { chapterEmotionCheckpointDAO } from './dao/chapter-emotion-checkpoint-dao'
 export type { EmotionalStateLedgerRow, EmotionalStateLedgerInput } from './dao/emotional-state-dao'
 export { storyStateDAO } from './dao/story-state-dao'
 export { causalNovelDAO } from './dao/causal-novel-dao'
@@ -73,7 +109,9 @@ export type {
   GoalRoutineStatus,
   GoalRoutineStateRow,
   GoalRoutineTurnRow,
-  GoalStateUpdate
+  GoalStateUpdate,
+  WorkflowStepRow,
+  WorkflowType
 } from './dao/goal-routine-dao'
 export { resourceLedgerDAO }
   from './dao/resource-ledger-dao'

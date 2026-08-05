@@ -5,9 +5,8 @@ import { initSchema, workDAO, goalRoutineDAO } from './db'
 import { seedBuiltinStyles } from './db/seed'
 import { seedBuiltinMaterials } from './db/seed-materials'
 import { seedAssistantRoles } from './db/assistant-seed'
-import { cancelAllGoalLoops } from './context/goal-routine/story-goal-routine'
-import { cancelAllNovelGoalLoops } from './context/goal-routine/novel-goal-routine'
-import { cancelAllCausalNovelGoalLoops } from './context/goal-routine/causal-novel-routine'
+import { runStoryGoalLoop } from './context/goal-routine/story-goal-routine'
+import { runNovelGoalLoop } from './context/goal-routine/novel-goal-routine'
 import { registerIpcHandlers } from './ipc'
 import { appLogger } from './logger/app-logger'
 import { cleanupDuplicateNarrativeMemoryForAllWorks } from './context/memory-cleanup'
@@ -16,6 +15,18 @@ import { registerLocalFileScheme, setupLocalFileProtocol } from './protocol/loca
 registerLocalFileScheme()
 
 let mainWindow: BrowserWindow | null = null
+const ownsSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!ownsSingleInstanceLock) {
+  app.quit()
+}
+
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
 
 function resolveAppIconPath(): string | undefined {
   const candidates = [
@@ -106,25 +117,77 @@ function registerGlobalShortcuts(): void {
   })
 }
 
+function recoverPersistedWorkflow(run: ReturnType<typeof goalRoutineDAO.listRecoverable>[number]): void {
+  let config: Record<string, unknown>
+  try {
+    const parsed = run.goal_config_json ? JSON.parse(run.goal_config_json) as unknown : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('goal_config_json 必须是 JSON 对象')
+    }
+    config = parsed as Record<string, unknown>
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    goalRoutineDAO.update(run.work_id, { status: 'error' })
+    goalRoutineDAO.appendTurn({
+      work_id: run.work_id,
+      turn_no: run.turn_count,
+      phase: run.current_phase,
+      action: 'recovery_config_corrupt',
+      summary: `启动恢复失败：持久化配置损坏（${message}）`
+    })
+    appLogger.error('workflow_recovery', '持久化运行配置损坏，已隔离该运行', {
+      runId: run.id,
+      workId: run.work_id,
+      error: message
+    })
+    return
+  }
+
+  try {
+    const task = run.workflow_type === 'novel'
+      ? runNovelGoalLoop(run.work_id, config, undefined, true)
+      : runStoryGoalLoop(run.work_id, config, undefined, true)
+    appLogger.info('workflow_recovery', '启动自动恢复持久化运行', {
+      runId: run.id,
+      workId: run.work_id,
+      workflowType: run.workflow_type,
+      phase: run.current_phase,
+      recoveryCount: run.recovery_count
+    })
+    void task.catch(error => {
+      goalRoutineDAO.update(run.work_id, { status: 'error' })
+      appLogger.error('workflow_recovery', '持久化运行自动恢复失败', {
+        runId: run.id,
+        workId: run.work_id,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    })
+  } catch (error) {
+    goalRoutineDAO.update(run.work_id, { status: 'error' })
+    appLogger.error('workflow_recovery', '持久化运行恢复调度失败', {
+      runId: run.id,
+      workId: run.work_id,
+      error: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
+
 function bootstrapApp(): void {
   setupLocalFileProtocol()
   appLogger.startup()
 
   initSchema()
 
-  // 目标循环：启动时将中断的 running 态重置为 paused，避免 LLM 自动续跑失控（需用户手动恢复）
-  try {
-    const reset = goalRoutineDAO.resetRunningToPaused()
-    if (reset > 0) appLogger.info('goal_routine', '启动 reconcile：running→paused', { count: reset })
-  } catch (e) {
-    appLogger.warn('goal_routine', '启动 reconcile 失败', { error: String(e) })
-  }
+  const recoverableRuns = goalRoutineDAO.markInterruptedForRecovery()
 
   const workIds = workDAO.list().map(w => w.id)
   if (workIds.length > 0) {
     const cleaned = cleanupDuplicateNarrativeMemoryForAllWorks(workIds)
     if (cleaned.snapshotsRemoved > 0 || cleaned.foreshadowingRemoved > 0) {
-      appLogger.info('memory', 'startup cleanup narrative duplicates', cleaned)
+      appLogger.info('memory', 'startup cleanup narrative duplicates', {
+        snapshotsRemoved: cleaned.snapshotsRemoved,
+        foreshadowingRemoved: cleaned.foreshadowingRemoved
+      })
     }
   }
 
@@ -133,38 +196,35 @@ function bootstrapApp(): void {
   seedAssistantRoles()
   registerIpcHandlers()
   registerGlobalShortcuts()
+
+  for (const run of recoverableRuns) recoverPersistedWorkflow(run)
 }
 
-app.whenReady().then(() => {
-  applyDockIcon()
-  createWindow()
+if (ownsSingleInstanceLock) {
+  void app.whenReady().then(() => {
+    applyDockIcon()
+    createWindow()
 
-  try {
-    bootstrapApp()
-  } catch (err) {
-    const message = err instanceof Error ? err.stack ?? err.message : String(err)
-    console.error('[boot] FATAL startup error:', message)
-    appLogger.error('app', 'startup failed', { message })
-    dialog.showErrorBox('ANovel 启动失败', message)
-  }
+    try {
+      bootstrapApp()
+    } catch (err) {
+      const message = err instanceof Error ? err.stack ?? err.message : String(err)
+      console.error('[boot] FATAL startup error:', message)
+      appLogger.error('app', 'startup failed', { message })
+      dialog.showErrorBox('ANovel 启动失败', message)
+    }
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
-    else mainWindow?.show()
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      else mainWindow?.show()
+    })
   })
-})
+}
 
 app.on('window-all-closed', () => {
   globalShortcut.unregisterAll()
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  try {
-    cancelAllGoalLoops()
-    cancelAllNovelGoalLoops()
-    cancelAllCausalNovelGoalLoops()
-  } catch (e) {
-    appLogger.warn('goal_routine', '关闭时中止目标循环失败', { error: String(e) })
-  }
-})
+// 不在 before-quit 中把运行改为 paused。主进程退出后保留 running，
+// 下次启动由持久化租约恢复器接管精确步骤。

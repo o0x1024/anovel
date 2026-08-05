@@ -7,6 +7,7 @@ import {
   type CausalEditKind
 } from '../db'
 import { auditCausalManualExpressionEdit } from './causal-chapter-style-rewrite'
+import { countWords as wordCount } from '../../shared/body-word-target'
 
 export type CausalManualEditKind = Extract<CausalEditKind, 'expression' | 'factual'>
 
@@ -34,10 +35,6 @@ export interface CausalChapterEditApplyResult {
 
 const approvedEditTokens = new Map<string, { workId: number; chapterId: number; expiresAt: number }>()
 
-function wordCount(value: string): number {
-  return value.replace(/\s/g, '').length
-}
-
 export function buildCausalChapterEditToken(input: {
   workId: number
   chapterId: number
@@ -51,7 +48,7 @@ export function buildCausalChapterEditToken(input: {
 
 function loadEditContext(workId: number, chapterId: number) {
   if (volumeChapterDAO.getWorkIdForChapter(chapterId) !== workId) {
-    throw new Error('章节不属于当前因果小说')
+    throw new Error('章节不属于当前小说')
   }
   const chapter = volumeChapterDAO.getChapter(chapterId)
   const decision = causalNovelDAO.getDecision(chapterId)
@@ -114,7 +111,7 @@ export async function previewCausalChapterEdit(input: {
   return {
     chapterId: input.chapterId,
     editKind,
-    decisionStatus: context.decision.status,
+    decisionStatus: context.decision.status as 'planned' | 'committed',
     currentVersionId: context.currentVersion.id,
     affectedChapterIds: context.affected.map(item => item.id),
     affectedChapterTitles: context.affected.map(item => item.title),
@@ -159,21 +156,23 @@ export function applyCausalChapterEdit(input: {
   }
   const affectedChapterIds = context.affected.map(item => item.id)
   return getDatabase().transaction(() => {
-    const targetVersion = causalNovelDAO.createContentVersion({
-      workId: input.workId,
-      chapterId: input.chapterId,
-      parentVersionId: context.currentVersion.id,
-      content: input.candidateContent,
-      source: 'manual',
-      editKind: input.editKind,
-      status: 'candidate'
-    })
     const updated = volumeChapterDAO.updateChapterWithVersion(input.chapterId, {
       content: input.candidateContent,
       word_count: wordCount(input.candidateContent),
       expectedUpdateTime: input.expectedUpdateTime
     }, { model_type: `causal_manual_${input.editKind}` })
     if (!updated) throw new Error('章节已被其他操作修改，请重新预览影响')
+    const persisted = volumeChapterDAO.getChapter(input.chapterId)
+    if (!persisted?.content?.trim()) throw new Error('编辑后的持久化正文为空')
+    const targetVersion = causalNovelDAO.createContentVersion({
+      workId: input.workId,
+      chapterId: input.chapterId,
+      parentVersionId: context.currentVersion.id,
+      content: persisted.content,
+      source: 'manual',
+      editKind: input.editKind,
+      status: 'candidate'
+    })
 
     const requiresReplay = context.decision.status === 'committed' && input.editKind === 'factual'
     causalNovelDAO.activateContentVersion({

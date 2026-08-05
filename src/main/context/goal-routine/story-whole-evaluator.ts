@@ -6,6 +6,7 @@ import { withGoalLoopModelOptions } from './story-goal-model'
 import { formatGenrePolicy, resolveStoryGenrePolicy } from './story-genre-policy'
 import { detectStoryMetaResidues } from './story-continuity-gate'
 import { formatStoryContractForPrompt } from './story-contract'
+import { requestQualityEvaluatorEvidence } from './quality-evaluator-policy'
 import { requestStructuredModelOutput } from './structured-model-output'
 
 export type StoryWeakestLayer = 'storyline' | 'beat' | 'scene' | 'paragraph'
@@ -21,6 +22,7 @@ export interface StoryForensicIssue {
   message: string
   repairable: boolean
   recommendedAction: string
+  evaluatorFailureCode?: 'QUALITY_EVALUATOR_UNAVAILABLE' | 'QUALITY_EVALUATOR_PROTOCOL'
 }
 
 export interface StoryWholeAssessment {
@@ -51,16 +53,18 @@ interface StoryChunkSummary {
   promises: string[]
   payoffs: string[]
   issues: string[]
+  evidenceQuotes: string[]
 }
 
 const CHUNK_CHAR_LIMIT = 12_000
 const DIRECT_BODY_CHAR_LIMIT = 18_000
 const STORY_CHUNK_SUMMARY_SCHEMA = {
   type: 'object',
-  required: ['summary', 'promises', 'payoffs', 'issues'],
+  required: ['summary', 'promises', 'payoffs', 'issues', 'evidence_quotes'],
   properties: {
     summary: { type: 'string' }, promises: { type: 'array' },
-    payoffs: { type: 'array' }, issues: { type: 'array' }
+    payoffs: { type: 'array' }, issues: { type: 'array' },
+    evidence_quotes: { type: 'array' }
   }
 }
 const STORY_PROSE_BLIND_SCHEMA = {
@@ -128,6 +132,16 @@ function clampScore(value: unknown): number {
 function stringList(value: unknown, limit = 8): string[] {
   if (!Array.isArray(value)) return []
   return value.map(item => String(item).trim()).filter(Boolean).slice(0, limit)
+}
+
+function normalizedEvidence(value: string): string {
+  return value.replace(/\s+/g, '').replace(/[“”"'‘’]/g, '')
+}
+
+function evidenceExists(source: string, quote: string): boolean {
+  const normalizedQuote = normalizedEvidence(quote)
+  return normalizedQuote.length >= 4
+    && normalizedEvidence(source).includes(normalizedQuote)
 }
 
 function normalizeLayer(value: unknown): StoryWeakestLayer {
@@ -200,49 +214,48 @@ async function summarizeChunk(
   chunk: { range: string; text: string },
   signal?: AbortSignal
 ): Promise<StoryChunkSummary> {
-  let parsed: Record<string, unknown>
-  try {
-    parsed = await requestStructuredModelOutput<Record<string, unknown>>({
-      workId,
-      label: `整篇评审分段摘要 ${chunk.range}`,
-      signal,
-      request: (attempt, error) => modelService.chat(
-        withGoalLoopModelOptions(workId, {
-          workId,
-          step: 'story_whole_chunk_summary',
-          enrichWorkContext: false,
-          enrichNarrativeMemory: false,
-          temperature: 0,
-          maxTokens: 1800,
-          forceThinkingDisabled: true,
-          responseSchema: { name: 'story_chunk_summary', schema: STORY_CHUNK_SUMMARY_SCHEMA, strict: false },
-          systemPrompt: [
-            '你是短故事整篇评审的证据提取员。只提取文本中实际发生的内容，不补写，不给虚高评价。',
-            '只输出 JSON：{"summary":"因果剧情摘要","promises":["读者承诺/悬念"],"payoffs":["已兑现内容"],"issues":["结构或连续性问题"]}'
-          ].join('\n'),
-          prompt: [
-            `【范围】${chunk.range}\n\n【正文】\n${chunk.text}`,
-            attempt > 1 ? `【格式重试】${error}。缩短摘要并返回完整 JSON。` : ''
-          ].filter(Boolean).join('\n\n')
-        }),
-        { stream: false, signal }
-      )
-    })
-  } catch (error) {
-    return {
-      range: chunk.range,
-      summary: `${chunk.text.slice(0, 900)}\n…\n${chunk.text.slice(-900)}`,
-      promises: [],
-      payoffs: [],
-      issues: [`分段摘要评估器失败，已保留首尾原文证据：${error instanceof Error ? error.message : String(error)}`]
-    }
-  }
+  const parsed = await requestStructuredModelOutput<Record<string, unknown>>({
+    workId,
+    label: `整篇评审分段摘要 ${chunk.range}`,
+    signal,
+    validate: value => {
+      const evidenceQuotes = stringList(value.evidence_quotes, 12)
+      if (evidenceQuotes.some(quote => !evidenceExists(chunk.text, quote))) {
+        throw new Error('分段摘要包含无法在当前分段定位的证据')
+      }
+      return value
+    },
+    request: (attempt, error) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_whole_chunk_summary',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1800,
+        forceThinkingDisabled: true,
+        responseSchema: { name: 'story_chunk_summary', schema: STORY_CHUNK_SUMMARY_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是短故事整篇评审的证据提取员。只提取文本中实际发生的内容，不补写，不给虚高评价。',
+          'evidence_quotes 必须逐字摘录当前分段，用于后续核验承诺、兑现和问题，不得改写或概括。',
+          '只输出 JSON：{"summary":"因果剧情摘要","promises":["读者承诺/悬念"],"payoffs":["已兑现内容"],"issues":["结构或连续性问题"],"evidence_quotes":["原文短引文"]}'
+        ].join('\n'),
+        prompt: [
+          `【范围】${chunk.range}\n\n【正文】\n${chunk.text}`,
+          attempt > 1 ? `【格式重试】${error}。缩短摘要并返回完整 JSON。` : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    )
+  })
   return {
     range: chunk.range,
     summary: String(parsed.summary ?? '').trim(),
     promises: stringList(parsed.promises),
     payoffs: stringList(parsed.payoffs),
-    issues: stringList(parsed.issues)
+    issues: stringList(parsed.issues),
+    evidenceQuotes: stringList(parsed.evidence_quotes, 12)
   }
 }
 
@@ -274,12 +287,72 @@ function continuityBoundaryEvidence(blocks: Array<{ title: string; text: string 
   }).join('\n\n')
 }
 
+const STORY_FORENSIC_CODES = new Set([
+  'TIMELINE_CONTRADICTION', 'SPATIAL_JUMP', 'DUPLICATED_EVENT',
+  'EVIDENCE_STATE_REGRESSION', 'KNOWLEDGE_REGRESSION', 'OBSTACLE_BYPASS',
+  'DEUS_EX_MACHINA', 'UNPAYED_CORE_PROMISE', 'UNFORESHADOWED_NEW_ARC',
+  'META_RESIDUE', 'BROKEN_CLIMAX_MECHANISM', 'OTHER_HARD_BLOCKER'
+])
+
+export function parseForensicEvidence(
+  content: string,
+  blocks: Array<{ title: string; text: string }>,
+  mergedBody: string
+): StoryForensicIssue[] {
+  const parsed = parseJsonObject(content)
+  if (!parsed || !Array.isArray(parsed.hard_blockers)) {
+    throw new Error('整篇法医审计缺少 hard_blockers 数组')
+  }
+  const titles = new Set(blocks.map(block => block.title))
+  return parsed.hard_blockers.slice(0, 12).map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`整篇法医审计第 ${index + 1} 项不是结构化问题对象`)
+    }
+    const row = raw as Record<string, unknown>
+    const code = String(row.code ?? '').trim()
+    const claimKey = String(row.claim_key ?? '').trim()
+    const rawScope = String(row.scope ?? '')
+    const chapterTitles = stringList(row.chapter_titles, blocks.length)
+    const repairChapterTitles = stringList(row.repair_chapter_titles, blocks.length)
+    const evidence = stringList(row.evidence, 6)
+    const message = String(row.message ?? '').trim()
+    const recommendedAction = String(row.recommended_action ?? '').trim()
+    if (!STORY_FORENSIC_CODES.has(code)) throw new Error(`法医问题 code 无效：${code || '缺失'}`)
+    if (!/^[A-Z0-9_]{6,120}$/.test(claimKey)) throw new Error(`法医问题 claim_key 无效：${claimKey || '缺失'}`)
+    if (!['sentence', 'scene', 'beat_cluster', 'story_engine'].includes(rawScope)) {
+      throw new Error(`法医问题 scope 无效：${rawScope || '缺失'}`)
+    }
+    if (chapterTitles.length === 0 || chapterTitles.some(title => !titles.has(title))) {
+      throw new Error(`法医问题包含未知证据节拍：${chapterTitles.join('、') || '缺失'}`)
+    }
+    if (repairChapterTitles.length === 0 || repairChapterTitles.some(title => !titles.has(title))) {
+      throw new Error(`法医问题包含未知修复节拍：${repairChapterTitles.join('、') || '缺失'}`)
+    }
+    if (evidence.length === 0 || evidence.some(quote => !evidenceExists(mergedBody, quote))) {
+      throw new Error(`法医问题缺少可在原文定位的证据：${code}`)
+    }
+    if (!message || !recommendedAction) throw new Error(`法医问题说明或修复动作缺失：${code}`)
+    return {
+      code,
+      claimKey,
+      scope: rawScope as StoryForensicScope,
+      chapterTitles,
+      repairChapterTitles,
+      evidence,
+      message,
+      repairable: rawScope !== 'story_engine',
+      recommendedAction
+    }
+  })
+}
+
 async function assessStoryForensics(
   workId: number,
   blocks: Array<{ title: string; outline: string; text: string }>,
   mergedBody: string,
   extractedEvidence: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
 ): Promise<StoryForensicIssue[]> {
   const deterministic: StoryForensicIssue[] = blocks.flatMap(block =>
     detectStoryMetaResidues(block.text).map(message => ({
@@ -293,107 +366,78 @@ async function assessStoryForensics(
       recommendedAction: '只改写生成提示残留，保留剧情事实'
     }))
   )
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_forensic_audit',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      temperature: 0,
-      maxTokens: 1800,
-      responseSchema: { name: 'story_forensic_audit', schema: STORY_FORENSIC_JSON_SCHEMA, strict: true },
-      systemPrompt: [
-        '你是短故事整篇法医审计员。只报告有原文证据、足以否决成稿的硬伤，不评价文笔，不用小瑕疵凑数。',
-        '硬伤包括：时间线互相矛盾；人物或道具空间无过渡跳变；同一关键事件重复发生；证据状态/人物知识倒退；前文制造的关键阻碍被后文直接跳过；主角胜利依赖反派降智、临时权威、巧合或终局新证据；核心承诺未回收；结尾突然开启未经铺垫的新主线；生成提示残留。',
-        '证据流程略有戏剧化可以接受，但若证据本身无法证明主张，或处理结果无任何已铺垫依据，属于硬伤。',
-        '逐项核对故事合同 rule_proofs：正文中的制度执行者、触发条件、所需证据和后果必须一致；若核心压迫只靠一条现实中无法执行、主角可轻易拒绝或申诉绕开的规则，属于 BROKEN_CLIMAX_MECHANISM。',
-        '逐项核对 climax_evidence_chain：证据必须按约定来源和持有人提前出现，并由人物动作触发。自动弹文件、恰好群发短信、临时权威背书、主角此前不知道的新证据均属于 DEUS_EX_MACHINA。',
-        'code 必须从以下固定集合选择：TIMELINE_CONTRADICTION、SPATIAL_JUMP、DUPLICATED_EVENT、EVIDENCE_STATE_REGRESSION、KNOWLEDGE_REGRESSION、OBSTACLE_BYPASS、DEUS_EX_MACHINA、UNPAYED_CORE_PROMISE、UNFORESHADOWED_NEW_ARC、META_RESIDUE、BROKEN_CLIMAX_MECHANISM、OTHER_HARD_BLOCKER。',
-        'scope 只允许 sentence/scene/beat_cluster/story_engine。chapter_titles 是证据位置，repair_chapter_titles 是实际必须修改的最小节拍集。',
-        'claim_key 是同码同章内具体因果故障的稳定英文大写标识，格式为“对象_缺失链路”，两次独立审计遇到同一事实必须返回同一个值，例如 LIU_PROFESSOR_UNSEEDED_INTERVENTION；不同巧合不得共用 claim_key。',
-        '单句时间/数字错误用sentence；单场证据或知情断裂用scene；需要“前面铺垫+后面兑现”联动用beat_cluster；合同或高潮机制本身不可行才用story_engine。',
-        '只输出 JSON：{"hard_blockers":[{"code":"TIMELINE_CONTRADICTION","claim_key":"DEADLINE_CLOCK_MISMATCH","scope":"sentence","chapter_titles":["原样标题"],"repair_chapter_titles":["原样标题"],"evidence":["证据A","证据B"],"message":"硬伤说明","repairable":true,"recommended_action":"最小修复动作"}]}。无硬伤输出空数组。'
-      ].join('\n\n'),
-      prompt: [
-        formatStoryContractForPrompt(workId),
-        `【节拍蓝图】\n${JSON.stringify(blocks.map((block, index) => ({
-          ref: block.title === '导语' ? '导语' : `第${index + (blocks[0]?.title === '导语' ? 0 : 1)}拍`,
-          title: block.title,
-          outline: block.outline
-        })), null, 2)}`,
-        extractedEvidence,
-        continuityBoundaryEvidence(blocks),
-        `【全篇结尾】\n${mergedBody.slice(-5200)}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  const evaluatorError = (message: string): StoryForensicIssue => ({
-    code: 'FORENSIC_EVALUATOR_ERROR', claimKey: 'FORENSIC_EVALUATOR_ERROR', scope: 'story_engine', chapterTitles: [], repairChapterTitles: [],
-    evidence: [message], message: '整篇法医审计结果无法验证', repairable: false,
-    recommendedAction: '重试审计，不得因评估器失败删除正文'
+  const evidenceResult = await requestQualityEvaluatorEvidence({
+    workId,
+    label: '短故事整篇法医审计',
+    signal,
+    request: (_attempt, _lastError) => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'story_forensic_audit',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 1800,
+        responseSchema: { name: 'story_forensic_audit', schema: STORY_FORENSIC_JSON_SCHEMA, strict: true },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是短故事整篇法医审计员。只报告有原文证据、足以否决成稿的硬伤，不评价文笔，不用小瑕疵凑数。',
+          '硬伤包括：时间线互相矛盾；人物或道具空间无过渡跳变；同一关键事件重复发生；证据状态/人物知识倒退；前文制造的关键阻碍被后文直接跳过；主角胜利依赖反派降智、临时权威、巧合或终局新证据；核心承诺未回收；结尾突然开启未经铺垫的新主线；生成提示残留。',
+          '证据流程略有戏剧化可以接受，但若证据本身无法证明主张，或处理结果无任何已铺垫依据，属于硬伤。',
+          '逐项核对故事合同 rule_proofs：正文中的制度执行者、触发条件、所需证据和后果必须一致；若核心压迫只靠一条现实中无法执行、主角可轻易拒绝或申诉绕开的规则，属于 BROKEN_CLIMAX_MECHANISM。',
+          '逐项核对 climax_evidence_chain：证据必须按约定来源和持有人提前出现，并由人物动作触发。自动弹文件、恰好群发短信、临时权威背书、主角此前不知道的新证据均属于 DEUS_EX_MACHINA。',
+          'code 必须从以下固定集合选择：TIMELINE_CONTRADICTION、SPATIAL_JUMP、DUPLICATED_EVENT、EVIDENCE_STATE_REGRESSION、KNOWLEDGE_REGRESSION、OBSTACLE_BYPASS、DEUS_EX_MACHINA、UNPAYED_CORE_PROMISE、UNFORESHADOWED_NEW_ARC、META_RESIDUE、BROKEN_CLIMAX_MECHANISM、OTHER_HARD_BLOCKER。',
+          'scope 只允许 sentence/scene/beat_cluster/story_engine。chapter_titles 是证据位置，repair_chapter_titles 是实际必须修改的最小节拍集。',
+          'claim_key 是同码同章内具体因果故障的稳定英文大写标识，格式为“对象_缺失链路”，两次独立审计遇到同一事实必须返回同一个值，例如 LIU_PROFESSOR_UNSEEDED_INTERVENTION；不同巧合不得共用 claim_key。',
+          '单句时间/数字错误用sentence；单场证据或知情断裂用scene；需要“前面铺垫+后面兑现”联动用beat_cluster；合同或高潮机制本身不可行才用story_engine。',
+          '只输出 JSON：{"hard_blockers":[{"code":"TIMELINE_CONTRADICTION","claim_key":"DEADLINE_CLOCK_MISMATCH","scope":"sentence","chapter_titles":["原样标题"],"repair_chapter_titles":["原样标题"],"evidence":["证据A","证据B"],"message":"硬伤说明","repairable":true,"recommended_action":"最小修复动作"}]}。无硬伤输出空数组。'
+        ].join('\n\n'),
+        prompt: [
+          formatStoryContractForPrompt(workId),
+          `【节拍蓝图】\n${JSON.stringify(blocks.map((block, index) => ({
+            ref: block.title === '导语' ? '导语' : `第${index + (blocks[0]?.title === '导语' ? 0 : 1)}拍`,
+            title: block.title,
+            outline: block.outline
+          })), null, 2)}`,
+          extractedEvidence,
+          continuityBoundaryEvidence(blocks),
+          `【全篇结尾】\n${mergedBody.slice(-5200)}`
+        ].join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    parse: content => parseForensicEvidence(content, blocks, mergedBody),
+    onRetry: retry => {
+      const label = retry.failureKind === 'protocol' ? '证据协议无效' : '模型服务不可用'
+      onProgress?.(
+        `目标验收：法医审计${label}，正在进行第 ${retry.attempt + 1}/${retry.maxAttempts} 次独立取证`
+      )
+    }
   })
-  if (!response.success || !response.content?.trim()) {
-    return [...deterministic, evaluatorError(response.error || '整篇法医审计无返回')]
+  const evaluatorError = (
+    code: 'QUALITY_EVALUATOR_UNAVAILABLE' | 'QUALITY_EVALUATOR_PROTOCOL',
+    message: string,
+    attempts: number
+  ): StoryForensicIssue => ({
+    code: 'FORENSIC_EVALUATOR_ERROR', claimKey: 'FORENSIC_EVALUATOR_ERROR', scope: 'story_engine', chapterTitles: [], repairChapterTitles: [],
+    evidence: [message],
+    message: `整篇法医审计连续 ${attempts} 次无法完成独立取证：${message}`,
+    repairable: false,
+    recommendedAction: '恢复评估器后重试审计，不得因评估器失败删除正文',
+    evaluatorFailureCode: code
+  })
+  if (!evidenceResult.success) {
+    return [
+      ...deterministic,
+      evaluatorError(evidenceResult.code, evidenceResult.message, evidenceResult.attempts)
+    ]
   }
-  try {
-    const parsed = parseJsonObject(response.content)
-    if (!parsed) throw new Error('整篇法医审计返回格式无效')
-    if (!Array.isArray(parsed.hard_blockers)) throw new Error('整篇法医审计缺少 hard_blockers 数组')
-    const rawIssues = parsed.hard_blockers.slice(0, 12)
-    const storyBlocks = blocks.filter(block => block.title !== '导语')
-    const resolveTitles = (value: unknown): string[] => {
-      const values = Array.isArray(value) ? value.map(String) : []
-      return [...new Set(values.flatMap(item => {
-        const exact = blocks.find(block => block.title === item.trim())
-        if (exact) return [exact.title]
-        const ordinal = /第(\d+)拍/.exec(item)?.[1]
-        if (ordinal) return [storyBlocks[Number(ordinal) - 1]?.title].filter(Boolean) as string[]
-        return blocks.filter(block => block.title.includes(item) || item.includes(block.title)).map(block => block.title)
-      }))]
-    }
-    const aiIssues = rawIssues.map((item, index): StoryForensicIssue | null => {
-      if (typeof item === 'string') {
-        const titles = resolveTitles([item])
-        return {
-          code: `FORENSIC_${index + 1}`, claimKey: `LEGACY_FORENSIC_${index + 1}`, scope: 'beat_cluster', chapterTitles: titles,
-          repairChapterTitles: titles, evidence: [item], message: item, repairable: true,
-          recommendedAction: '修复定位节拍及必要铺垫，再做整篇复验'
-        }
-      }
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return null
-      const row = item as Record<string, unknown>
-      const rawScope = String(row.scope ?? '')
-      const scope: StoryForensicScope = ['sentence', 'scene', 'beat_cluster', 'story_engine'].includes(rawScope)
-        ? rawScope as StoryForensicScope : 'beat_cluster'
-      const chapterTitles = resolveTitles(row.chapter_titles)
-      const repairTitles = resolveTitles(row.repair_chapter_titles)
-      const message = String(row.message ?? '').trim()
-      if (!message) return null
-      return {
-        code: String(row.code ?? `FORENSIC_${index + 1}`).trim() || `FORENSIC_${index + 1}`,
-        claimKey: String(row.claim_key ?? '').trim()
-          || `${String(row.code ?? `FORENSIC_${index + 1}`).trim()}:${repairTitles.join('|') || chapterTitles.join('|')}`,
-        scope,
-        chapterTitles,
-        repairChapterTitles: repairTitles.length > 0 ? repairTitles : chapterTitles,
-        evidence: stringList(row.evidence, 6),
-        message,
-        // 是否需要发动机级重建由 scope 决定，避免模型把可局部修复的问题误标成不可修复。
-        repairable: scope !== 'story_engine',
-        recommendedAction: String(row.recommended_action ?? '').trim() || '按最小作用域修复并整篇复验'
-      }
-    }).filter((item): item is StoryForensicIssue => item != null)
-    if (aiIssues.length !== rawIssues.length) throw new Error('整篇法医审计包含无效问题项')
-    const unique = new Map<string, StoryForensicIssue>()
-    for (const item of [...deterministic, ...aiIssues]) {
-      const key = `${item.code}:${item.repairChapterTitles.join(',')}:${item.message}`
-      if (!unique.has(key)) unique.set(key, item)
-    }
-    return [...unique.values()]
-  } catch {
-    return [...deterministic, evaluatorError('整篇法医审计返回格式无效')]
+  const unique = new Map<string, StoryForensicIssue>()
+  for (const item of [...deterministic, ...evidenceResult.value]) {
+    const key = `${item.code}:${item.repairChapterTitles.join(',')}:${item.message}`
+    if (!unique.has(key)) unique.set(key, item)
   }
+  return [...unique.values()]
 }
 
 async function assessProseBlindRead(
@@ -420,6 +464,7 @@ async function assessProseBlindRead(
         maxTokens: 1800,
         forceThinkingDisabled: true,
         responseSchema: { name: 'story_prose_blind_read', schema: STORY_PROSE_BLIND_SCHEMA, strict: false },
+        structuredOutputMode: 'prompt_json',
         systemPrompt: [
           '你是独立短故事盲读编辑。你看不到标题、大纲、评分表和剧情摘要，只按普通读者阅读原文切片。',
           '重点识别：残句、错词、标点或对话边界破损、第一/第三人称漂移、重复心理和身体反应、解释过度、电报短句、模板化刺激、人物声音雷同、场景原地踏步、巧合和作者强行安排。',
@@ -520,7 +565,14 @@ export async function assessWholeStory(
   onProgress?.('目标验收：正在进行整篇原文盲读')
   const proseRead = await assessProseBlindRead(workId, mergedBody, genreText, signal)
   onProgress?.('目标验收：正在进行时间线、证据链与巧合法医审计')
-  const forensicIssues = await assessStoryForensics(workId, publishedBlocks, mergedBody, evidence, signal)
+  const forensicIssues = await assessStoryForensics(
+    workId,
+    publishedBlocks,
+    mergedBody,
+    evidence,
+    signal,
+    onProgress
+  )
   const hardBlockers = forensicIssues.map(issue =>
     `${issue.code}：${issue.message}${issue.evidence.length > 0 ? `（${issue.evidence.join('；')}）` : ''}`
   )
@@ -540,6 +592,7 @@ export async function assessWholeStory(
       maxTokens: 3200,
       forceThinkingDisabled: true,
       responseSchema: { name: 'story_whole_evaluation', schema: STORY_WHOLE_EVALUATION_SCHEMA, strict: false },
+      structuredOutputMode: 'prompt_json',
       systemPrompt: [
         '你是独立短故事终审主编。必须依据给出的正文或逐段证据评估整篇，而不是按局部文笔印象给分。',
         '重点检查：开篇承诺、因果升级、中段变化、人物选择、高潮兑现、伏笔回收、结局闭环与余味。',

@@ -63,6 +63,49 @@ export interface StoryQualityAiPatchResult {
   error?: string
 }
 
+const STORY_QUALITY_HARD_RULE_PATTERN =
+  /章末无悬念|平淡收尾|流水账|缺少(?:目标|阻力|选择|后果|不可逆变化)|主线状态没有变化|删掉.*不影响|AI播音腔|排比句泛滥|大纲节点严重丢失|违反.*(?:金手指|能力限制)|前300字未.*核心冲突/
+
+function normalizedStoryEvidence(value: string): string {
+  return value.replace(/\s+/g, '').replace(/[“”"'‘’]/g, '')
+}
+
+export function storyQualityEvidenceExists(content: string, evidence: string): boolean {
+  const normalizedEvidence = normalizedStoryEvidence(evidence.trim())
+  return normalizedEvidence.length >= 4
+    && normalizedStoryEvidence(content).includes(normalizedEvidence)
+}
+
+export interface StoryQualityHardFailEvidence {
+  recognized: boolean
+  failedRules: string[]
+  evidence: string[]
+}
+
+/**
+ * hard_fail 只有在同时给出受支持的规则和可在原文定位的引文时才成立。
+ * 单独的布尔值或低分不是正文重写许可。
+ */
+export function recognizeStoryQualityHardFail(
+  breakdown: StoryQualityAiScoreBreakdown,
+  content: string
+): StoryQualityHardFailEvidence {
+  if (!breakdown.hardFail) {
+    return { recognized: false, failedRules: [], evidence: [] }
+  }
+  const failedRules = breakdown.failedRules
+    .map(rule => rule.trim())
+    .filter(rule => STORY_QUALITY_HARD_RULE_PATTERN.test(rule))
+  const evidence = breakdown.topIssues
+    .map(issue => issue.evidence.trim())
+    .filter(item => storyQualityEvidenceExists(content, item))
+  return {
+    recognized: failedRules.length > 0 && evidence.length > 0,
+    failedRules,
+    evidence
+  }
+}
+
 export function extractStoryJsonText(report: string): string | null {
   // 1) 优先匹配 ```json 代码块
   const fenced = report.match(/```(?:json)?\s*([\s\S]*?)```/i)

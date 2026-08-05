@@ -1,4 +1,4 @@
-import { coreSettingDAO, emotionalStateDAO, volumeChapterDAO, workDAO } from '../../db'
+import { causalNovelDAO, coreSettingDAO, emotionalStateDAO, volumeChapterDAO, workDAO } from '../../db'
 import { modelService } from '../../model'
 import {
   type EmotionContract,
@@ -122,7 +122,6 @@ function sourceContext(workId: number): string {
 }
 
 export function loadEmotionEngine(workId: number): EmotionEngine | null {
-  if (workDAO.getById(workId)?.work_type === 'causal_novel') return null
   const setting = coreSettingDAO.getByType(workId, 'emotion_engine')
   const sources = [setting?.structured_content, setting?.content]
   for (const source of sources) {
@@ -145,9 +144,6 @@ export async function ensureEmotionEngine(
   signal?: AbortSignal,
   onProgress?: (message: string) => void
 ): Promise<{ score: number; rounds: number }> {
-  if (workDAO.getById(workId)?.work_type === 'causal_novel') {
-    throw new Error('因果小说禁止调用传统全书情绪发动机；情绪事务必须由当前权威状态随章节决策生成')
-  }
   const existing = loadEmotionEngine(workId)
   if (existing) return { score: 100, rounds: 0 }
   const source = sourceContext(workId)
@@ -166,6 +162,7 @@ export async function ensureEmotionEngine(
           workId, step: 'emotion_engine_gate', enrichWorkContext: false, enrichNarrativeMemory: false,
           temperature: 0.1, maxTokens: 3600, forceThinkingDisabled: true,
           responseSchema: { name: 'emotion_engine_gate', schema: EMOTION_ENGINE_RESPONSE_SCHEMA, strict: false },
+          structuredOutputMode: 'prompt_json',
           systemPrompt: [
             '你是小说情绪因果主编。设计的不是情绪词和刺激强度，而是读者为何在乎、人物如何评价事件、选择如何付出代价、情绪如何积累与兑现。',
             '若故事发动机含 setting_resolutions，必须把它视为上游冲突的权威口径，不得沿用被其覆盖的旧事实。',
@@ -239,8 +236,8 @@ export async function ensureChapterEmotionContract(
   const existing = loadChapterEmotionContract(chapterId)
   if (existing) return existing
   const work = workDAO.getById(workId)
-  if (work?.work_type === 'causal_novel') {
-    throw new Error('因果章节缺少随决策生成的情绪事务，禁止回退到传统全书情绪发动机')
+  if (causalNovelDAO.getDecision(chapterId)) {
+    throw new Error('权威章节事务缺少随决策冻结的情绪合同，禁止改用全书情绪发动机补写')
   }
   let engine = loadEmotionEngine(workId)
   if (!engine) {

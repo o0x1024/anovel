@@ -9,6 +9,7 @@ export type StructuralRepairFailureCode =
   | 'STRUCTURE_JSON_INVALID'
   | 'STRUCTURE_PATCH_EMPTY'
   | 'STRUCTURE_TARGET_MISMATCH'
+  | 'BOUNDARY_ATOMIC_MISMATCH'
 
 export class StructuralRepairError extends Error {
   constructor(
@@ -17,6 +18,16 @@ export class StructuralRepairError extends Error {
   ) {
     super(message)
     this.name = code
+  }
+}
+
+export class StoryCandidateFailureError extends Error {
+  constructor(
+    message: string,
+    public readonly failureSignature: string
+  ) {
+    super(message)
+    this.name = 'STORY_CANDIDATE_FAILURE'
   }
 }
 
@@ -61,10 +72,12 @@ export function classifyStructuralRepairParseFailure(input: {
 }
 
 export function routineFailureSignature(phase: string, error: unknown): string {
+  if (error instanceof StoryCandidateFailureError) {
+    return `${phase}:${error.failureSignature}`
+  }
   const name = error instanceof Error ? error.name : 'unknown'
   const message = error instanceof Error ? error.message : String(error)
   if (name.startsWith('STRUCTURE_')) return `${phase}:${name}`
-  if (/正文确定性门禁/.test(message)) return `${phase}:BODY_TEXT_INTEGRITY`
   if (/叙事记忆提取/.test(message)) return `${phase}:MEMORY_EXTRACTION`
   if (/候选.*(?:达到|生成).*个|停止继续抽卡/.test(message)) return `${phase}:CANDIDATE_BUDGET`
   if (/跨拍连续性|连续性修复/.test(message)) return `${phase}:CONTINUITY`

@@ -1,7 +1,16 @@
 import { ModelRequest, ModelResponse, ModelType, ChatOptions } from './types'
 import { getAdapterForProtocol } from './adapters'
 import { resolveProviderProtocol } from '../../shared/model-providers'
-import { modelConfigDAO, writingStyleDAO, generationLogDAO, appPreferenceDAO } from '../db'
+import {
+  modelConfigDAO,
+  writingStyleDAO,
+  generationLogDAO,
+  modelCallAttemptDAO,
+  appPreferenceDAO,
+  goalRoutineDAO,
+  workflowModelContractDAO,
+  type FrozenModelSelection
+} from '../db'
 import {
   collectPromptSections,
   assembleBudgetedPrompt,
@@ -23,8 +32,44 @@ import {
   isWorkScopedModelRequest,
   resolveWorkRequestTemperature
 } from '../context/work-step-temperature'
-import { stepAcceptsRequestModel } from '../../shared/step-model-config'
+import { getStepLabel, stepAcceptsRequestModel } from '../../shared/step-model-config'
 import { resolveGenerationMaxTokens } from './generation-token-budget'
+import { getWorkflowExecutionContext } from '../workflow/workflow-execution-context'
+import { classifyWorkflowError } from '../workflow/workflow-errors'
+import { buildPromptJsonSchemaInstruction } from '../../shared/prompt-json-schema'
+import { resolveWorkflowModelSelection } from '../workflow/workflow-model-contract'
+import { nativeJsonSchemaCapabilityError } from '../../shared/model-capability-error'
+import {
+  formatPromptJsonSchemaIssueValue,
+  PromptJsonSchemaValidationError,
+  validatePromptJsonSchema
+} from '../../shared/prompt-json-schema-validator'
+import { isFullProseOutputStep } from '../context/style-step-rules'
+
+function validateStructuredResponse(request: ModelRequest, response: ModelResponse): string | null {
+  if (
+    !response.success
+    || !request.structuredOutputMode
+    || !request.responseSchema
+  ) return null
+  if (response.finishReason === 'length') {
+    return 'OUTPUT_TRUNCATED: 结构化响应达到长度上限，拒绝进入业务校验'
+  }
+  const content = response.content?.trim() ?? ''
+  if (!content) return 'OUTPUT_INVALID: 结构化响应正文为空'
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/i.exec(content)?.[1]?.trim()
+  try {
+    const value = JSON.parse(fenced ?? content) as unknown
+    validatePromptJsonSchema(value, request.responseSchema.schema)
+    return null
+  } catch (error) {
+    const detail = error instanceof PromptJsonSchemaValidationError && error.issue
+      ? `${error.message}；actual=${formatPromptJsonSchemaIssueValue(error.issue.actual, 240)}`
+        + `${error.issue.allowed ? `；allowed=${formatPromptJsonSchemaIssueValue(error.issue.allowed, 600)}` : ''}`
+      : error instanceof Error ? error.message : String(error)
+    return `OUTPUT_INVALID: ${request.responseSchema.name} 本地 Schema 校验失败：${detail}`
+  }
+}
 
 /**
  * 模型服务 - 统一调用入口
@@ -38,6 +83,8 @@ export class ModelService {
   async chat(request: ModelRequest, options?: ChatOptions): Promise<ModelResponse> {
     const startTime = Date.now()
     const requestId = `llm-${startTime}-${Math.random().toString(36).slice(2, 8)}`
+    let attemptStarted = false
+    let attemptFinished = false
     let session: AiSessionHandle | null = options?.sessionHandle ?? null
     let ownsSession = false
 
@@ -51,6 +98,25 @@ export class ModelService {
     const streamEnabled = options?.stream !== false
 
     try {
+      if (request.responseSchema && !request.structuredOutputMode) {
+        return this.failResponse(
+          'MODEL_REQUEST_PROTOCOL_UNSPECIFIED: 结构化请求必须显式声明 prompt_json 或 native_json_schema',
+          startTime,
+          session,
+          ownsSession
+        )
+      }
+      if (
+        request.structuredOutputMode === 'native_json_schema'
+        && request.requireResponseSchema !== true
+      ) {
+        return this.failResponse(
+          'MODEL_REQUEST_PROTOCOL_INVALID: 原生 JSON Schema 请求必须显式声明 requireResponseSchema=true',
+          startTime,
+          session,
+          ownsSession
+        )
+      }
       if (session?.isCancelled()) {
         return this.cancelledResponse(startTime)
       }
@@ -59,21 +125,63 @@ export class ModelService {
         session.emitPhase('组装上下文', 'running')
       }
 
-      const { config, stepOverrideThinking } = this.selectModelWithStep(request.modelType, request.modelName, request.step)
+      const workflowContext = getWorkflowExecutionContext(request.workId)
+      const frozenSelection = workflowContext
+        ? resolveWorkflowModelSelection(workflowContext.runId, request.step)
+        : null
+      const {
+        config,
+        stepOverrideThinking,
+        providerProtocol
+      } = frozenSelection
+        ? this.selectFrozenModel(frozenSelection)
+        : this.selectModelWithStep(request.modelType, request.modelName, request.step)
       if (!config) {
         const error = '没有可用的模型配置，请先在设置中配置并启用至少一个模型'
         appLogger.error('model', error, { step: request.step, workId: request.workId })
         return this.failResponse(error, startTime, session, ownsSession)
       }
 
-      const protocol = resolveProviderProtocol(config.model_type, config.provider_protocol)
+      if (request.structuredOutputMode === 'native_json_schema') {
+        let nativeJsonSchemaSupported = false
+        try {
+          const options = JSON.parse(config.provider_options_json ?? '{}') as {
+            nativeJsonSchemaSupported?: unknown
+          }
+          nativeJsonSchemaSupported = options.nativeJsonSchemaSupported === true
+        } catch {
+          nativeJsonSchemaSupported = false
+        }
+        if (!nativeJsonSchemaSupported) {
+          return this.failResponse(
+            nativeJsonSchemaCapabilityError({
+              modelName: config.model_name ?? config.model_type,
+              stepLabel: getStepLabel(request.step ?? request.responseSchema.name),
+              upstreamMessage: '运行前能力合同未声明 nativeJsonSchemaSupported=true'
+            }),
+            startTime,
+            session,
+            ownsSession
+          )
+        }
+      }
+
+      const protocol = providerProtocol
+        ?? resolveProviderProtocol(config.model_type, config.provider_protocol)
       const adapter = getAdapterForProtocol(protocol)
 
       const maxContext = config.max_context_tokens && config.max_context_tokens > 0
         ? config.max_context_tokens
         : getMaxContextTokens(config.model_type)
 
-      const stepDefaults = getStepGenerationDefaults(request.step, request.workId)
+      const frozenGenerationParams = workflowContext
+        ? workflowModelContractDAO.get(workflowContext.runId)?.generationParams
+        : undefined
+      const stepDefaults = getStepGenerationDefaults(
+        request.step,
+        request.workId,
+        frozenGenerationParams
+      )
       const requestedMaxTokens = request.maxTokens ?? stepDefaults.maxTokens
       const globalMaxTokens = stepDefaults.maxTokens
       const resolvedMaxTokens = resolveGenerationMaxTokens(requestedMaxTokens, globalMaxTokens)
@@ -128,8 +236,18 @@ export class ModelService {
         presencePenalty: request.presencePenalty ?? stepDefaults.presencePenalty,
         topP: request.topP ?? stepDefaults.topP
       }
+      if (
+        enrichedRequest.structuredOutputMode === 'prompt_json'
+        && enrichedRequest.responseSchema
+      ) {
+        enrichedRequest.systemPrompt = [
+          enrichedRequest.systemPrompt ?? '',
+          buildPromptJsonSchemaInstruction(enrichedRequest.responseSchema)
+        ].filter(Boolean).join('\n\n')
+      }
 
-      if (request.forceThinkingDisabled) {
+      const proseOutputThinkingDisabled = isFullProseOutputStep(request.step)
+      if (request.forceThinkingDisabled || proseOutputThinkingDisabled) {
         enrichedRequest.thinkingEnabled = false
       } else if (stepOverrideThinking !== undefined) {
         enrichedRequest.thinkingEnabled = stepOverrideThinking
@@ -149,8 +267,26 @@ export class ModelService {
         }
       }
 
+      const thinkingSource = request.forceThinkingDisabled
+        ? 'forced_disabled'
+        : proseOutputThinkingDisabled
+          ? 'prose_output_policy'
+          : stepOverrideThinking !== undefined
+            ? 'step_override'
+            : request.thinkingEnabled !== undefined
+              ? 'request'
+              : isDeepSeekProvider(config.model_type) || isDoubaoProvider(config.model_type)
+                ? 'provider_default'
+                : 'model_default'
+      const resolvedThinkingEnabled = enrichedRequest.thinkingEnabled
+        ?? enrichedRequest.deepseekOptions?.thinkingEnabled
+        ?? enrichedRequest.doubaoOptions?.thinkingEnabled
+
       const tempLog: Record<string, unknown> = {
-        temperature: enrichedRequest.temperature ?? 0.7
+        temperature: enrichedRequest.temperature ?? 0.7,
+        thinkingRequested: request.thinkingEnabled ?? null,
+        thinkingResolved: resolvedThinkingEnabled ?? null,
+        thinkingSource
       }
       const styleSections = (report.sections || [])
         .filter(section => section.included && ['style', 'style_fewshot', 'style_anchor', 'anti_ai_rules'].includes(section.key))
@@ -178,6 +314,17 @@ export class ModelService {
         contextBudget: report
       })
 
+      modelCallAttemptDAO.start({
+        requestId,
+        runId: workflowContext?.runId,
+        stepInstanceId: workflowContext?.stepInstanceId,
+        workId: request.workId,
+        generationStep: request.step,
+        modelType: config.model_type,
+        modelName: config.model_name || undefined
+      })
+      attemptStarted = true
+
       if (session && !options?.suppressPhases) {
         session.emitPhase('调用模型', 'running')
         session.setModelInfo(config.model_type, config.model_name || undefined)
@@ -186,6 +333,14 @@ export class ModelService {
       }
 
       if (session?.isCancelled()) {
+        attemptFinished = true
+        modelCallAttemptDAO.finish(requestId, {
+          status: 'cancelled',
+          errorClass: 'cancelled',
+          errorCode: 'CANCELLED',
+          errorMessage: '已取消',
+          durationMs: Date.now() - startTime
+        })
         return this.cancelledResponse(startTime, report)
       }
 
@@ -213,11 +368,47 @@ export class ModelService {
         }
       )
 
+      const structuredResponseError = validateStructuredResponse(enrichedRequest, response)
+      if (structuredResponseError) {
+        if (workflowContext) {
+          goalRoutineDAO.recordStepArtifact(
+            workflowContext.stepInstanceId,
+            'structured_response_rejected',
+            {
+              generationStep: request.step ?? 'unknown',
+              schemaName: enrichedRequest.responseSchema?.name ?? null,
+              error: structuredResponseError,
+              finishReason: response.finishReason ?? null,
+              rawContent: response.content?.slice(0, 180_000) ?? ''
+            }
+          )
+        }
+        response.success = false
+        response.error = structuredResponseError
+      }
+
       if (response.cancelled) {
+        attemptFinished = true
+        modelCallAttemptDAO.finish(requestId, {
+          status: 'cancelled',
+          errorClass: 'cancelled',
+          errorCode: 'CANCELLED',
+          errorMessage: response.error || '已取消',
+          durationMs: response.durationMs ?? Date.now() - startTime,
+          finishReason: response.finishReason
+        })
         return { ...response, contextBudget: report }
       }
 
       if (response.success) {
+        attemptFinished = true
+        modelCallAttemptDAO.finish(requestId, {
+          status: 'success',
+          promptTokens: response.usage?.promptTokens ?? 0,
+          completionTokens: response.usage?.completionTokens ?? 0,
+          durationMs: response.durationMs ?? Date.now() - startTime,
+          finishReason: response.finishReason
+        })
         appLogger.info('llm', 'LLM 请求成功', {
           requestId,
           modelType: config.model_type,
@@ -250,6 +441,16 @@ export class ModelService {
       }
 
       const finalError = response.error || '模型调用失败'
+      const classified = classifyWorkflowError(new Error(finalError))
+      attemptFinished = true
+      modelCallAttemptDAO.finish(requestId, {
+        status: 'failed',
+        errorClass: classified.errorClass,
+        errorCode: classified.code,
+        errorMessage: finalError,
+        durationMs: response.durationMs ?? Date.now() - startTime,
+        finishReason: response.finishReason
+      })
       appLogger.error('model', finalError, {
         requestId,
         modelType: config.model_type,
@@ -271,11 +472,23 @@ export class ModelService {
       }
     } catch (err) {
       const message = String(err)
+      if (attemptStarted && !attemptFinished) {
+        attemptFinished = true
+        const classified = classifyWorkflowError(err)
+        modelCallAttemptDAO.finish(requestId, {
+          status: classified.errorClass === 'cancelled' ? 'cancelled' : 'failed',
+          errorClass: classified.errorClass,
+          errorCode: classified.code,
+          errorMessage: classified.message,
+          durationMs: Date.now() - startTime
+        })
+      }
       appLogger.error('llm', 'LLM 请求异常', {
         requestId,
         step: request.step,
         workId: request.workId,
-        error: message
+        error: message,
+        stack: err instanceof Error ? err.stack?.slice(0, 4000) : undefined
       })
       if (ownsSession && session) {
         session.complete(false, message)
@@ -323,7 +536,11 @@ export class ModelService {
     preferredType?: ModelType,
     preferredModelName?: string | null,
     step?: string
-  ): { config: ReturnType<typeof modelConfigDAO.getByType> | null; stepOverrideThinking?: boolean } {
+  ): {
+    config: ReturnType<typeof modelConfigDAO.getByType> | null
+    stepOverrideThinking?: boolean
+    providerProtocol?: 'openai' | 'gemini' | 'anthropic'
+  } {
     // 1. 步骤模型分配（设置页「模型分配」）
     if (step) {
       const overrides = appPreferenceDAO.getStepModelOverrides()
@@ -377,6 +594,27 @@ export class ModelService {
     return { config: allConfigs.find(c => c.is_enabled && c.api_key) ?? null }
   }
 
+  private selectFrozenModel(selection: FrozenModelSelection): {
+    config: ReturnType<typeof modelConfigDAO.getByType> | null
+    stepOverrideThinking?: boolean
+    providerProtocol?: 'openai' | 'gemini' | 'anthropic'
+  } {
+    const live = modelConfigDAO.getByType(selection.provider)
+    if (!live?.api_key) return { config: null }
+    return {
+      config: {
+        ...live,
+        model_name: selection.modelName,
+        api_base: selection.apiBase,
+        provider_protocol: selection.providerProtocol,
+        max_context_tokens: selection.maxContextTokens,
+        provider_options_json: selection.providerOptionsJson
+      },
+      stepOverrideThinking: selection.thinkingEnabled,
+      providerProtocol: selection.providerProtocol
+    }
+  }
+
   private withNormalizedBody(
     response: ModelResponse,
     step: string | undefined,
@@ -404,8 +642,12 @@ type StepGenerationDefaults = Partial<ModelRequest> & {
  * - 带 workId 的作品创作：temperature 由作品 8 组区间随机采样，忽略全局温度
  * - 其它场景：使用「设置 > AI 服务 > 高级配置」；润色类 step 仅微调 penalty/topP
  */
-function getStepGenerationDefaults(step?: string, workId?: number): StepGenerationDefaults {
-  const saved = appPreferenceDAO.getGenerationParams()
+function getStepGenerationDefaults(
+  step?: string,
+  workId?: number,
+  frozen?: ReturnType<typeof appPreferenceDAO.getGenerationParams>
+): StepGenerationDefaults {
+  const saved = frozen ?? appPreferenceDAO.getGenerationParams()
   const base: StepGenerationDefaults = {
     maxTokens: saved.maxTokens,
     frequencyPenalty: saved.frequencyPenalty,

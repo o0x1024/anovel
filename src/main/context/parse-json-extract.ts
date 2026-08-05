@@ -39,8 +39,8 @@ function pickBestJson(
   let best: { text: string; count: number } | null = null
   for (const text of candidates) {
     const stats = jsonArrayStats(text)
-    if (!stats || !stats.hasArray) continue
-    if (!options.allowEmptyArrays && stats.count <= 0) continue
+    if (!stats?.isContainer) continue
+    if (!options.allowEmptyArrays && (!stats.hasArray || stats.count <= 0)) continue
     if (!best || stats.count > best.count) {
       best = { text, count: stats.count }
     }
@@ -48,22 +48,33 @@ function pickBestJson(
   return best?.text ?? null
 }
 
-/** 统计 JSON 顶层数组中的最大元素数量（兼容 root array 和 {key:[...]} 形式） */
-function jsonArrayStats(jsonText: string): { hasArray: boolean; count: number } | null {
+/** 递归统计 JSON 容器中的最大数组元素数量，嵌套协议对象同样属于合法结构化响应。 */
+function jsonArrayStats(
+  jsonText: string
+): { isContainer: boolean; hasArray: boolean; count: number } | null {
   try {
     const parsed = JSON.parse(jsonText) as unknown
-    if (Array.isArray(parsed)) return { hasArray: true, count: parsed.length }
-    if (parsed && typeof parsed === 'object') {
+    const visit = (value: unknown): { hasArray: boolean; count: number } => {
+      if (Array.isArray(value)) {
+        let count = value.length
+        for (const item of value) count = Math.max(count, visit(item).count)
+        return { hasArray: true, count }
+      }
+      if (!value || typeof value !== 'object') return { hasArray: false, count: 0 }
       let hasArray = false
       let count = 0
-      for (const val of Object.values(parsed as Record<string, unknown>)) {
-        if (!Array.isArray(val)) continue
-        hasArray = true
-        count = Math.max(count, val.length)
+      for (const child of Object.values(value as Record<string, unknown>)) {
+        const stats = visit(child)
+        hasArray ||= stats.hasArray
+        count = Math.max(count, stats.count)
       }
       return { hasArray, count }
     }
-    return { hasArray: false, count: 0 }
+    const stats = visit(parsed)
+    return {
+      isContainer: Array.isArray(parsed) || (!!parsed && typeof parsed === 'object'),
+      ...stats
+    }
   } catch {
     return null
   }
@@ -135,8 +146,8 @@ function extractLegacyJsonTail(
   if (!balanced) return null
   const stats = jsonArrayStats(balanced)
   if (
-    stats?.hasArray
-    && (options.allowEmptyArrays || stats.count > 0)
+    stats?.isContainer
+    && (options.allowEmptyArrays || (stats.hasArray && stats.count > 0))
   ) return balanced
   return null
 }

@@ -1,4 +1,4 @@
-export type StoryContinuityEscalationMode = 'beat' | 'cluster' | 'contract' | 'engine' | 'storyline' | 'simplify'
+export type StoryContinuityEscalationMode = 'beat' | 'cluster' | 'contract' | 'engine' | 'storyline' | 'pause'
 
 export interface StoryContinuityEscalationState {
   fingerprint: string
@@ -52,7 +52,7 @@ export function routeStoryContinuityEscalation(
           ? 'engine'
           : count === 5
             ? 'storyline'
-            : 'simplify'
+            : 'pause'
   const targetChapterIds = mode === 'beat'
     ? [chapterId]
     : mode === 'cluster' || mode === 'contract'
@@ -68,7 +68,7 @@ export function routeStoryContinuityEscalation(
           ? '升级重建故事发动机与全篇合同，再修订全部节拍'
           : mode === 'storyline'
             ? '在新发动机约束下重写全篇节拍蓝图与正文'
-            : '进入自动降复杂度：压缩为单一倒计时、单一证据载体、最少必要人物和四拍闭环，再重写全篇'
+            : '耗尽连续性升级预算，冻结当前正文和全部候选并等待编辑决策'
   return {
     mode,
     targetChapterIds,
@@ -77,9 +77,6 @@ export function routeStoryContinuityEscalation(
     hint: [
       `同类连续性硬伤第 ${count} 次未在正文候选层收敛，${actionText}。`,
       ...blockers.map((blocker, i) => `${i + 1}. ${blocker}`),
-      ...(mode === 'simplify'
-        ? ['删除非必要身份反转和巧合式官方到场；每拍最多一次地点迁移和一次证据状态变化；结局只兑现核心冲突。']
-        : []),
       '必须选择唯一权威时间线；阻碍必须有铺垫过的解法与代价；官方处置只能由既有证据和正常程序推动。'
     ].join('\n')
   }

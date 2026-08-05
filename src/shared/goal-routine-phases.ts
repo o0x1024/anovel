@@ -12,6 +12,7 @@ export type GoalRoutinePhase =
   | 'generate_volumes'
   | 'generate_beats'
   | 'draft_body'
+  | 'release_window_audit'
   | 'goal_check'
   | 'repair_plan'
   | 'repair_execute'
@@ -41,20 +42,13 @@ export const NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
   'generate_beats',
   'generate_title_hook',
   'draft_body',
+  'release_window_audit',
   'goal_check',
   'repair_plan',
   'repair_execute'
 ]
 
-/** 因果小说只保留状态初始化、下一章决策、正文事务和终局验收。 */
-export const CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_ORDER: GoalRoutinePhase[] = [
-  'materialize_settings',
-  'generate_beats',
-  'draft_body',
-  'goal_check'
-]
-
-/** 向后兼容：默认导出短故事顺序 */
+/** 默认导出短故事顺序 */
 export const GOAL_ROUTINE_PHASE_ORDER = STORY_GOAL_ROUTINE_PHASE_ORDER
 
 /** 短故事阶段标签 */
@@ -71,6 +65,7 @@ export const STORY_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   generate_volumes: '分卷大纲',
   generate_beats: '节拍大纲',
   draft_body: '正文生成',
+  release_window_audit: '首发窗口审读',
   goal_check: '目标验收',
   repair_plan: '修复计划',
   repair_execute: '执行修复'
@@ -90,31 +85,22 @@ export const NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> =
   generate_volumes: '分卷大纲',
   generate_beats: '章节大纲',
   draft_body: '正文生成',
+  release_window_audit: '首发窗口审读',
   goal_check: '目标验收',
   repair_plan: '修复计划',
   repair_execute: '执行修复'
 }
 
-export const CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_LABELS: Record<GoalRoutinePhase, string> = {
-  ...NOVEL_GOAL_ROUTINE_PHASE_LABELS,
-  materialize_settings: '权威状态初始化',
-  generate_beats: '下一章因果决策',
-  draft_body: '正文与状态事务',
-  goal_check: '终止条件与整书验收'
-}
-
-/** 向后兼容：默认导出短故事标签 */
+/** 默认导出短故事标签 */
 export const GOAL_ROUTINE_PHASE_LABELS = STORY_GOAL_ROUTINE_PHASE_LABELS
 
 /** 按作品类型获取阶段顺序 */
 export function getGoalRoutinePhaseOrder(workType?: string | null): GoalRoutinePhase[] {
-  if (workType === 'causal_novel') return CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_ORDER
   return workType === 'novel' ? NOVEL_GOAL_ROUTINE_PHASE_ORDER : STORY_GOAL_ROUTINE_PHASE_ORDER
 }
 
 /** 按作品类型获取阶段标签 */
 export function getGoalRoutinePhaseLabels(workType?: string | null): Record<GoalRoutinePhase, string> {
-  if (workType === 'causal_novel') return CAUSAL_NOVEL_GOAL_ROUTINE_PHASE_LABELS
   return workType === 'novel' ? NOVEL_GOAL_ROUTINE_PHASE_LABELS : STORY_GOAL_ROUTINE_PHASE_LABELS
 }
 

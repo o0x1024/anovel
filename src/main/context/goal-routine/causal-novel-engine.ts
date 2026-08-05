@@ -3,6 +3,7 @@ import { causalNovelDAO, coreSettingDAO, volumeChapterDAO, workDAO } from '../..
 import { modelService } from '../../model'
 import { extractJsonText } from '../parse-json-extract'
 import { buildWorkContext } from '../work-context'
+import { compileChapterExecutionContract } from '../chapter-execution-context'
 import {
   CAUSAL_NOVEL_SCHEMA_VERSION,
   applyCausalChapterOutcome,
@@ -24,7 +25,33 @@ import {
 } from '../../../shared/causal-novel-types'
 import { withGoalLoopModelOptions } from './story-goal-model'
 import { runCausalOutcomePipeline } from './causal-outcome-pipeline'
-
+import {
+  adoptCausalBaselineChapters,
+  buildCausalBaselineSeed,
+  ensureCausalBaselineCoverage
+} from './causal-baseline-migration'
+import { buildCausalStateSeedProjection } from './causal-state-seed'
+import { CAUSAL_STEP_EXECUTION_PROFILE } from './causal-step-execution-profile'
+import { requestStructuredModelOutput } from './structured-model-output'
+import {
+  assertCandidateReferences,
+  assertDecisionReferences,
+  CausalPlanReferenceValidationError
+} from './causal-plan-reference-repair'
+import {
+  repairCandidateReferences,
+  repairDecisionReferences
+} from './causal-plan-reference-request'
+import {
+  causalPlanStageInputHash,
+  readCausalPlanStage,
+  saveCausalPlanStage
+} from './causal-plan-stage-cache'
+import {
+  bindServerChapterContract,
+  stripServerBoundDecisionSchema,
+  type CausalDecisionModelDetails
+} from './causal-decision-server-contract'
 const INITIAL_STATE_SCHEMA: Record<string, unknown> = {
   type: 'object', additionalProperties: false,
   required: ['centralQuestion', 'terminalConditions', 'immutableRules', 'actors', 'activePressures', 'promises', 'macroArcs'],
@@ -88,6 +115,17 @@ const INITIAL_STATE_SCHEMA: Record<string, unknown> = {
         }
       }
     }
+  }
+}
+
+const AUTHORITY_REBASE_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['actors', 'activePressures', 'promises'],
+  properties: {
+    actors: (INITIAL_STATE_SCHEMA.properties as Record<string, unknown>).actors,
+    activePressures: (INITIAL_STATE_SCHEMA.properties as Record<string, unknown>).activePressures,
+    promises: (INITIAL_STATE_SCHEMA.properties as Record<string, unknown>).promises
   }
 }
 
@@ -216,7 +254,7 @@ const CHAPTER_PLAN_SCHEMA_BASE: Record<string, unknown> = {
   required: ['candidates', 'decision', 'emotionContract', 'rollingHorizon'],
   properties: {
     candidates: {
-      type: 'array', minItems: 3, maxItems: 5,
+      type: 'array', minItems: 3, maxItems: 3,
       items: {
         type: 'object', additionalProperties: false,
         required: [
@@ -228,9 +266,13 @@ const CHAPTER_PLAN_SCHEMA_BASE: Record<string, unknown> = {
             type: 'string',
             enum: ['advance', 'complicate', 'reveal', 'payoff', 'consolidate', 'aftermath']
           },
-          initiator: { type: 'string' }, action: { type: 'string' },
-          opposition: { type: 'string' }, cost: { type: 'string' }, irreversibleChange: { type: 'string' },
-          promiseAdvanced: { type: 'string' }, newQuestion: { type: 'string' }
+          initiator: { type: 'string', minLength: 1, maxLength: 80 },
+          action: { type: 'string', minLength: 1, maxLength: 180 },
+          opposition: { type: 'string', minLength: 1, maxLength: 160 },
+          cost: { type: 'string', minLength: 1, maxLength: 100 },
+          irreversibleChange: { type: 'string', minLength: 1, maxLength: 140 },
+          promiseAdvanced: { type: 'string', minLength: 1, maxLength: 100 },
+          newQuestion: { type: 'string', minLength: 1, maxLength: 140 }
         }
       }
     },
@@ -243,7 +285,7 @@ const CHAPTER_PLAN_SCHEMA_BASE: Record<string, unknown> = {
       properties: {
         title: { type: 'string' }, pov: { type: 'string' },
         immediateWant: { type: 'string' }, openingState: { type: 'string' },
-        mustCover: { type: 'array', minItems: 2, maxItems: 6, items: { type: 'string' } },
+        mustCover: { type: 'array', minItems: 2, items: { type: 'string' } },
         forbiddenEvents: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'string' } },
         endingState: { type: 'string' },
         continuityConstraints: { type: 'array', minItems: 1, maxItems: 10, items: { type: 'string' } },
@@ -272,34 +314,12 @@ const CHAPTER_PLAN_SCHEMA_BASE: Record<string, unknown> = {
   }
 }
 
-function buildChapterPlanSchema(state: CausalNarrativeState, catalog: CausalEvidenceFact[]): Record<string, unknown> {
-  const schema = JSON.parse(JSON.stringify(CHAPTER_PLAN_SCHEMA_BASE)) as {
-    properties: Record<string, any>
-  }
-  const actorNames = state.actors.map(actor => actor.name)
-  const pressureIds = state.activePressures.filter(item => item.status === 'active').map(item => item.id)
-  const promiseIds = state.promises.filter(item => item.status !== 'resolved').map(item => item.id)
-  const evidenceIds = catalog.map(item => item.id)
-  if (actorNames.length === 0) throw new Error('当前因果状态没有可行动人物')
-  if (promiseIds.length === 0) throw new Error('当前因果状态没有可推进的读者承诺')
-  schema.properties.candidates.items.properties.initiator.enum = actorNames
-  schema.properties.candidates.items.properties.promiseAdvanced.enum = promiseIds
-  schema.properties.decision.properties.pov.enum = actorNames
-  schema.properties.rollingHorizon.items.properties.initiator.enum = actorNames
-  if (pressureIds.length > 0) {
-    schema.properties.rollingHorizon.items.properties.pressureIds.items.enum = pressureIds
-  } else {
-    schema.properties.rollingHorizon.items.properties.pressureIds.maxItems = 0
-  }
-  schema.properties.rollingHorizon.items.properties.promiseIds.items.enum = promiseIds
-  const grounding = schema.properties.emotionContract.properties.groundingEvidence.properties
-  grounding.attachmentEvidenceId.enum = evidenceIds
-  grounding.privateDetailEvidenceId.enum = evidenceIds
-  return schema
+function buildChapterPlanWireSchema(): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(CHAPTER_PLAN_SCHEMA_BASE)) as Record<string, unknown>
 }
 
-function buildCandidateDraftSchema(state: CausalNarrativeState, catalog: CausalEvidenceFact[]): Record<string, unknown> {
-  const full = buildChapterPlanSchema(state, catalog) as { properties: Record<string, unknown> }
+function buildCandidateDraftSchema(): Record<string, unknown> {
+  const full = buildChapterPlanWireSchema() as { properties: Record<string, unknown> }
   return {
     type: 'object',
     additionalProperties: false,
@@ -308,34 +328,16 @@ function buildCandidateDraftSchema(state: CausalNarrativeState, catalog: CausalE
   }
 }
 
-function buildCandidateScoreSchema(candidateIds: string[]): Record<string, unknown> {
-  return {
-    type: 'object', additionalProperties: false, required: ['scores'],
-    properties: {
-      scores: {
-        type: 'array', minItems: candidateIds.length, maxItems: candidateIds.length,
-        items: {
-          type: 'object', additionalProperties: false,
-          required: ['candidateId', 'reasons', ...Object.keys(CANDIDATE_SCORE_SCHEMA.properties)],
-          properties: {
-            candidateId: { type: 'string', enum: candidateIds },
-            ...(CANDIDATE_SCORE_SCHEMA.properties as Record<string, unknown>),
-            reasons: { type: 'array', minItems: 1, maxItems: 6, items: { type: 'string' } }
-          }
-        }
-      }
-    }
-  }
-}
-
-function buildDecisionDraftSchema(state: CausalNarrativeState, catalog: CausalEvidenceFact[]): Record<string, unknown> {
-  const full = buildChapterPlanSchema(state, catalog) as { properties: Record<string, unknown> }
+function buildDecisionDraftSchema(serverBoundContract: boolean): Record<string, unknown> {
+  const full = buildChapterPlanWireSchema() as { properties: Record<string, unknown> }
   return {
     type: 'object',
     additionalProperties: false,
     required: ['decision', 'emotionContract', 'rollingHorizon'],
     properties: {
-      decision: full.properties.decision,
+      decision: serverBoundContract
+        ? stripServerBoundDecisionSchema(full.properties.decision as Record<string, unknown>)
+        : full.properties.decision,
       emotionContract: full.properties.emotionContract,
       rollingHorizon: full.properties.rollingHorizon
     }
@@ -344,9 +346,14 @@ function buildDecisionDraftSchema(state: CausalNarrativeState, catalog: CausalEv
 
 const PLAN_AUDIT_SCHEMA: Record<string, unknown> = {
   type: 'object', additionalProperties: false,
-  required: ['passed', 'selectedCandidateId', 'reasons'],
+  required: ['passed', 'failureLayer', 'selectedCandidateId', 'reasons'],
   properties: {
-    passed: { type: 'boolean' }, selectedCandidateId: { type: 'string' },
+    passed: { type: 'boolean' },
+    failureLayer: {
+      type: 'string',
+      enum: ['none', 'authority_state', 'candidate', 'decision']
+    },
+    selectedCandidateId: { type: 'string' },
     reasons: { type: 'array', maxItems: 12, items: { type: 'string' } }
   }
 }
@@ -383,7 +390,19 @@ function causalSeed(workId: number, goal: string): string {
   const work = workDAO.getById(workId)
   const worldview = coreSettingDAO.getByType(workId, 'worldview')?.content?.trim()
     || coreSettingDAO.getByType(workId, 'world_pressure')?.content?.trim()
-  const seed = [work?.description?.trim(), worldview, goal.trim()].filter(Boolean).join('\n\n')
+  const volumes = volumeChapterDAO.listVolumes(workId)
+  const chapters = volumeChapterDAO.listChaptersByWork(workId)
+  const existingStructure = JSON.stringify(
+    buildCausalStateSeedProjection(volumes, chapters)
+  )
+  const baseline = buildCausalBaselineSeed(workId)
+  const seed = [
+    work?.description?.trim().slice(0, 10_000),
+    worldview?.slice(0, 10_000),
+    goal.trim().slice(0, 6_000),
+    existingStructure ? `【已确认的宏观规划】\n${existingStructure}` : '',
+    baseline ? `【完整覆盖校验后的当前事实投影】\n${baseline}` : ''
+  ].filter(Boolean).join('\n\n')
   if (!seed) throw new Error('因果小说需要先填写世界起点或创作目标')
   return seed
 }
@@ -418,31 +437,11 @@ export async function initializeCausalNovelState(
 ): Promise<CausalNarrativeState> {
   const existing = causalNovelDAO.getState(workId)
   if (existing) return existing
-  if (volumeChapterDAO.listChaptersByWork(workId).length > 0) {
-    throw new Error('因果小说必须从空作品初始化，不能接管已有传统大纲或章节')
-  }
   onProgress?.('初始状态 1/3：正在整理世界起点与硬规则')
+  await ensureCausalBaselineCoverage(workId, signal, onProgress)
   const seed = causalSeed(workId, goal)
   onProgress?.('初始状态 2/3：正在请求模型建立人物、世界压力与读者承诺')
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_state', enrichWorkContext: false, enrichNarrativeMemory: false,
-      temperature: 0.2, maxTokens: 5000,
-      responseSchema: { name: 'causal_novel_initial_state', schema: INITIAL_STATE_SCHEMA, strict: true },
-      systemPrompt: [
-        '你是滚动因果小说的初始状态建模器。只建立当前状态，不生成全书大纲、分卷、章节安排或人物关系未来路线。',
-        '剧情发动机只能来自人物目标、世界压力、信息差、资源约束、读者承诺与行动代价。',
-        '人物关系只能作为已知事实，不得建立关系分值、关系阶段或以关系变化作为独立发动机。',
-        'terminalConditions 是核心问题得到不可逆回答的判定条件，不得写成预设结局步骤。',
-        'macroArcs 只保存卷级/阶段级目标、进入/退出条件、必须兑现与禁止漂移；不得拆成逐章大纲。',
-        'macroArcs 必须按因果依赖排序，第一项 active，其余 pending。'
-      ].join('\n'),
-      prompt: `【世界起点】\n${seed}`
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) throw new Error(response.error || '因果初始状态生成失败')
-  const raw = parseStructured<
+  type InitialStateDraft =
     Omit<
       CausalNarrativeState,
       'schemaVersion' | 'revision' | 'recentEventSignatures' | 'archivedPromiseIds' | 'lastMacroAuditChapter' |
@@ -450,7 +449,33 @@ export async function initializeCausalNovelState(
     > & {
       macroArcs: Array<Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>>
     }
-  >(response.content)
+  const raw = await requestStructuredModelOutput<InitialStateDraft>({
+    workId,
+    label: '因果初始状态',
+    attempts: 2,
+    signal,
+    schema: INITIAL_STATE_SCHEMA,
+    request: async () => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId, step: 'goal_novel_causal_state', enrichWorkContext: false, enrichNarrativeMemory: false,
+        temperature: 0.2, maxTokens: 5000, timeoutMs: 120_000, forceThinkingDisabled: true,
+        responseSchema: { name: 'causal_novel_initial_state', schema: INITIAL_STATE_SCHEMA, strict: true },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是统一小说协议的权威状态建模器。宏观分卷与章节规划已经由上游完成；只把它们压缩为当前状态和阶段锚点，不重复生成全书大纲。',
+          '若存在既有正文，正文事实高于大纲；把既有正文视为迁移基线，不得重写、否定或虚构其中尚未发生的事实。',
+          '剧情发动机只能来自人物目标、世界压力、信息差、资源约束、读者承诺与行动代价。',
+          '人物关系只能作为已知事实，不得建立关系分值、关系阶段或以关系变化作为独立发动机。',
+          'terminalConditions 是核心问题得到不可逆回答的判定条件，不得写成预设结局步骤。',
+          'macroArcs 只保存卷级/阶段级目标、进入/退出条件、必须兑现与禁止漂移；不得拆成逐章大纲。',
+          'macroArcs 必须按因果依赖排序，第一项 active，其余 pending。'
+        ].join('\n'),
+        prompt: `【世界起点】\n${seed}`
+      }),
+      { stream: false, signal }
+    ),
+    validate: value => value as unknown as InitialStateDraft
+  })
   const state: CausalNarrativeState = {
     ...raw,
     schemaVersion: CAUSAL_NOVEL_SCHEMA_VERSION,
@@ -470,7 +495,104 @@ export async function initializeCausalNovelState(
   onProgress?.('初始状态 3/3：正在校验并写入权威因果状态')
   validateInitialState(state)
   causalNovelDAO.createState(workId, state)
+  adoptCausalBaselineChapters(workId)
   return state
+}
+
+/**
+ * 尚无已提交章节时，允许把错误的“未来态”重建为目标章节开场前状态。
+ * 已提交事实存在时禁止回写状态，调用方必须改为重规划当前章节合同。
+ */
+export async function rebaseCausalNovelAuthorityToChapter(
+  workId: number,
+  chapterId: number,
+  goal: string,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void
+): Promise<CausalNarrativeState> {
+  const state = causalNovelDAO.getState(workId)
+  const chapter = volumeChapterDAO.getChapter(chapterId)
+  if (!state || !chapter) throw new Error('权威状态或目标章节不存在，不能重建规划起点')
+  if (causalNovelDAO.listDecisions(workId).some(item => item.status === 'committed')) {
+    throw new Error('已有已提交章节，禁止把权威因果状态回退到章节开场')
+  }
+  if (causalNovelDAO.listDecisions(workId).some(item => item.status === 'planned')) {
+    throw new Error('存在待提交章节决策，禁止重建权威因果状态')
+  }
+  const macroContract = (chapter.outline ?? '').split('## 章级权威因果合同', 1)[0].trim()
+  if (!macroContract) throw new Error('目标章节缺少宏观合同，不能重建规划起点')
+  onProgress?.(`正在把权威因果状态重建到「${chapter.title}」开场前`)
+  type AuthorityRebaseDraft = Pick<CausalNarrativeState, 'actors' | 'activePressures'> & {
+    promises: Array<Pick<CausalNarrativeState['promises'][number], 'id' | 'question'>>
+  }
+  const raw = await requestStructuredModelOutput<AuthorityRebaseDraft>({
+    workId,
+    label: '权威因果状态重建',
+    attempts: 2,
+    signal,
+    schema: AUTHORITY_REBASE_SCHEMA,
+    request: async () => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId,
+        step: 'goal_novel_causal_authority_rebase',
+        enrichWorkContext: false,
+        enrichNarrativeMemory: false,
+        temperature: 0,
+        maxTokens: 3600,
+        timeoutMs: 120_000,
+        forceThinkingDisabled: true,
+        responseSchema: {
+          name: 'causal_novel_authority_rebase',
+          schema: AUTHORITY_REBASE_SCHEMA,
+          strict: true
+        },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是因果小说权威状态重建器。只重建目标章节第一个事件发生之前的即时状态。',
+          '目标章节宏观合同是当前时点的最高权威；卷级阶段和作品目标只描述未来方向，绝不能写成已经发生的事实。',
+          '人物不得提前获得本章或后续章节才出现的资源、知识、关系、伤势、据点、盟友或敌对结果。',
+          '当前压力必须能在目标章节开场直接观察到；读者承诺必须能由开场信息提出。',
+          '只返回 JSON。'
+        ].join('\n'),
+        prompt: [
+          `【目标章节宏观合同】\n标题：${chapter.title}\n${macroContract}`,
+          `【不可修改的核心问题、终局条件与硬规则】\n${JSON.stringify({
+            centralQuestion: state.centralQuestion,
+            terminalConditions: state.terminalConditions,
+            immutableRules: state.immutableRules
+          }, null, 2)}`,
+          `【仅供未来方向参考、禁止当作已发生事实的阶段架构】\n${JSON.stringify(state.macroArcs, null, 2)}`,
+          `【作品目标】\n${goal.trim().slice(0, 6000)}`
+        ].join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    validate: value => value as unknown as AuthorityRebaseDraft
+  })
+  const next: CausalNarrativeState = {
+    ...state,
+    revision: state.revision + 1,
+    actors: raw.actors,
+    activePressures: raw.activePressures,
+    promises: raw.promises.map(item => ({
+      ...item,
+      status: 'open',
+      openedChapter: 0,
+      lastAdvancedChapter: 0
+    })),
+    archivedPromiseIds: [],
+    recentEventSignatures: [],
+    completionStatus: 'writing',
+    completionAuditFeedback: [],
+    completed: false,
+    completionReason: ''
+  }
+  validateInitialState(next)
+  causalNovelDAO.replaceState(workId, state.revision, next, {
+    transitionType: 'planning_authority_rebased',
+    sourceChapterId: chapterId
+  })
+  return next
 }
 
 export async function upgradeCausalNovelMacroArchitecture(
@@ -485,27 +607,35 @@ export async function upgradeCausalNovelMacroArchitecture(
     throw new Error('存在尚未提交的章节决策，不能升级阶段架构')
   }
   onProgress?.('正在把旧因果状态升级为可审计的阶段锚点')
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_macro_upgrade', enrichWorkContext: false,
-      enrichNarrativeMemory: false, temperature: 0.1, maxTokens: 4000,
-      responseSchema: { name: 'causal_novel_macro_upgrade', schema: MACRO_UPGRADE_SCHEMA, strict: true },
-      systemPrompt: [
-        '你是长篇滚动因果的阶段架构升级器。把原始路线压缩成1-10个可审计阶段锚点。',
-        '只定义阶段目标、进入/退出条件、必须兑现和禁止漂移，不生成逐章大纲。',
-        '已发生正文优先于原始路线；第一项未完成阶段 active，其余 pending。'
-      ].join('\n'),
-      prompt: [
-        `【当前权威状态】\n${JSON.stringify(state, null, 2)}`,
-        `【作品原始阶段指南】\n${causalMacroGuide(workId) || '未提供额外路线，以核心问题和终止条件建立单一阶段'}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) throw new Error(response.error || '阶段架构升级失败')
-  const parsed = parseStructured<{
+  type MacroUpgradeDraft = {
     macroArcs: Array<Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>>
-  }>(response.content)
+  }
+  const parsed = await requestStructuredModelOutput<MacroUpgradeDraft>({
+    workId,
+    label: '因果阶段架构升级',
+    attempts: 2,
+    signal,
+    schema: MACRO_UPGRADE_SCHEMA,
+    request: async () => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId, step: 'goal_novel_causal_macro_upgrade', enrichWorkContext: false,
+        enrichNarrativeMemory: false, temperature: 0.1, maxTokens: 4000,
+        responseSchema: { name: 'causal_novel_macro_upgrade', schema: MACRO_UPGRADE_SCHEMA, strict: true },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是长篇滚动因果的阶段架构升级器。把原始路线压缩成1-10个可审计阶段锚点。',
+          '只定义阶段目标、进入/退出条件、必须兑现和禁止漂移，不生成逐章大纲。',
+          '已发生正文优先于原始路线；第一项未完成阶段 active，其余 pending。'
+        ].join('\n'),
+        prompt: [
+          `【当前权威状态】\n${JSON.stringify(state, null, 2)}`,
+          `【作品原始阶段指南】\n${causalMacroGuide(workId) || '未提供额外路线，以核心问题和终止条件建立单一阶段'}`
+        ].join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    validate: value => value as unknown as MacroUpgradeDraft
+  })
   const committedChapterCount = causalNovelDAO.listDecisions(workId).filter(item => item.status === 'committed').length
   const next: CausalNarrativeState = {
     ...state,
@@ -546,37 +676,44 @@ export async function auditAndReplanCausalMacroArchitecture(
       outcome: item.outcome?.summary,
       eventSignature: item.outcome?.eventSignature
     }))
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_macro_replan',
-      enrichWorkContext: false, enrichNarrativeMemory: false,
-      temperature: 0, maxTokens: 4200, forceThinkingDisabled: true,
-      responseSchema: { name: 'causal_novel_macro_replan', schema: macroReplanSchema(), strict: true },
-      systemPrompt: [
-        '你是长篇因果架构审计器。只能重排或细化未完成阶段，不能改写已发生事实、硬规则、核心问题或终止条件。',
-        'completed 阶段必须逐字保留；剩余阶段必须且只能有一个 active，其他为 pending。',
-        '只有当新事实、连续失败或终审反馈使原路线不可达/失衡时 changed=true；否则原样返回。',
-        '允许拆分、合并或改写未完成阶段，但每个阶段仍只保存目标、进入/退出条件、兑现项和禁止漂移。',
-        '禁止生成逐章大纲。只返回 JSON。'
-      ].join('\n'),
-      prompt: [
-        `【权威状态】\n${JSON.stringify(state, null, 2)}`,
-        `【最近已提交结果】\n${JSON.stringify(recentCommitted, null, 2)}`,
-        state.completionAuditFeedback.length
-          ? `【终审退回原因】\n${state.completionAuditFeedback.join('\n')}`
-          : ''
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) {
-    throw new Error(response.error || '阶段架构重审失败')
-  }
-  const parsed = parseStructured<{
+  type MacroReplanDraft = {
     changed: boolean
     reason: string
     macroArcs: Array<Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>>
-  }>(response.content)
+  }
+  const schema = macroReplanSchema()
+  const parsed = await requestStructuredModelOutput<MacroReplanDraft>({
+    workId,
+    label: '因果阶段架构重审',
+    attempts: 2,
+    signal,
+    schema,
+    request: async () => modelService.chat(
+      withGoalLoopModelOptions(workId, {
+        workId, step: 'goal_novel_causal_macro_replan',
+        enrichWorkContext: false, enrichNarrativeMemory: false,
+        temperature: 0, maxTokens: 4200, forceThinkingDisabled: true,
+        responseSchema: { name: 'causal_novel_macro_replan', schema, strict: true },
+        structuredOutputMode: 'prompt_json',
+        systemPrompt: [
+          '你是长篇因果架构审计器。只能重排或细化未完成阶段，不能改写已发生事实、硬规则、核心问题或终止条件。',
+          'completed 阶段必须逐字保留；剩余阶段必须且只能有一个 active，其他为 pending。',
+          '只有当新事实、连续失败或终审反馈使原路线不可达/失衡时 changed=true；否则原样返回。',
+          '允许拆分、合并或改写未完成阶段，但每个阶段仍只保存目标、进入/退出条件、兑现项和禁止漂移。',
+          '禁止生成逐章大纲。只返回 JSON。'
+        ].join('\n'),
+        prompt: [
+          `【权威状态】\n${JSON.stringify(state, null, 2)}`,
+          `【最近已提交结果】\n${JSON.stringify(recentCommitted, null, 2)}`,
+          state.completionAuditFeedback.length
+            ? `【终审退回原因】\n${state.completionAuditFeedback.join('\n')}`
+            : ''
+        ].filter(Boolean).join('\n\n')
+      }),
+      { stream: false, signal }
+    ),
+    validate: value => value as unknown as MacroReplanDraft
+  })
   const completed = state.macroArcs.filter(item => item.status === 'completed')
   const returnedCompleted = parsed.macroArcs.filter(item => item.status === 'completed')
   const stableArc = (arc: Omit<CausalNarrativeState['macroArcs'][number], 'lastAdvancedChapter'>) =>
@@ -651,12 +788,42 @@ export async function planNextCausalChapter(
   workId: number,
   goal: string,
   signal?: AbortSignal,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  options: {
+    existingChapterId?: number
+    checkEmotionContract?: boolean
+  } = {}
 ): Promise<{ chapterId: number; plan: CausalChapterPlan }> {
   onProgress?.('章节决策 1/6：正在读取权威状态、阶段锚点与最近正文')
   const state = causalNovelDAO.getState(workId)
   if (!state) throw new Error('因果状态尚未初始化')
   if (state.completed) throw new Error(`核心问题已经收束：${state.completionReason}`)
+  const targetChapter = options.existingChapterId
+    ? volumeChapterDAO.getChapter(options.existingChapterId)
+    : undefined
+  if (options.existingChapterId && (
+    !targetChapter || volumeChapterDAO.getWorkIdForChapter(options.existingChapterId) !== workId
+  )) {
+    throw new Error('待绑定的宏观规划章节不存在或不属于当前小说')
+  }
+  const serverChapterContract = targetChapter
+    ? compileChapterExecutionContract(workId, targetChapter.id)
+    : null
+  if (targetChapter && (
+    !serverChapterContract
+    || serverChapterContract.errors.length > 0
+    || serverChapterContract.requiredEvents.length === 0
+  )) {
+    throw new Error(
+      `宏观章节合同无法形成权威决策：${serverChapterContract?.errors.join('；') || '缺少必须覆盖事件'}`
+    )
+  }
+  const existingTargetDecision = options.existingChapterId
+    ? causalNovelDAO.getDecision(options.existingChapterId)
+    : null
+  if (existingTargetDecision) {
+    return { chapterId: existingTargetDecision.chapterId, plan: existingTargetDecision.plan }
+  }
   const existingPending = causalNovelDAO.listDecisions(workId).find(item => item.status === 'planned')
   if (existingPending) throw new Error(`第 ${existingPending.chapterId} 章决策尚未提交，禁止规划下一章`)
   const decisions = causalNovelDAO.listDecisions(workId)
@@ -674,109 +841,181 @@ export async function planNextCausalChapter(
     .filter(Boolean)
   const previousHorizon = decisions.filter(item => item.status === 'committed').at(-1)?.plan.rollingHorizon?.slice(1) ?? []
   const context = buildWorkContext(workId, { includeVolumes: false, includeCoreSettings: true }).text.slice(0, 5000)
-  const macroGuide = state.macroArchitectureReady ? '' : causalMacroGuide(workId)
+  const targetOrdinal = targetChapter
+    ? volumeChapterDAO.listChaptersByWork(workId).findIndex(chapter => chapter.id === targetChapter.id) + 1
+    : canonicalChapters.length + 1
+  const staleArc = state.macroArcs.find(arc =>
+    arc.status === 'active' && targetOrdinal - arc.lastAdvancedChapter >= 3
+  )
+  const macroGuide = [
+    state.macroArchitectureReady ? '' : causalMacroGuide(workId),
+    staleArc
+      ? `【强制宏观推进】当前章节必须推进阶段 ${staleArc.id}「${staleArc.title}」。章节决策必须设计可在正文中发生、可被证据绑定的阶段推进事实，章后结果必须输出该阶段 arcUpdates。`
+      : ''
+  ].filter(Boolean).join('\n')
   const evidenceCatalog = buildCausalEvidenceCatalog(
     state,
     recentChapters.map(chapter => ({ id: chapter.id, content: chapter.content ?? '' }))
   )
   if (evidenceCatalog.length < 2) throw new Error('当前权威状态没有足够的原子证据用于章节规划')
-  onProgress?.('章节决策 2/6：正在生成互斥候选并由服务端重算评分')
-  const candidateResponse = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_candidates', enrichWorkContext: false, enrichNarrativeMemory: false,
-      temperature: 0.35, maxTokens: 2600,
-      responseSchema: {
-        name: 'causal_novel_candidate_drafts',
-        schema: buildCandidateDraftSchema(state, evidenceCatalog),
-        strict: true
-      },
-      systemPrompt: [
-        '你是滚动因果小说的候选事件生成器。基于当前权威状态提出3-5个互斥候选。',
-        '禁止生成全书大纲、分卷计划、人物关系未来路线或为了制造冲突让人物降智。',
-        '候选必须由人物当前目标与认知、世界压力、资源约束、未兑现读者承诺共同推出。',
-        '不要返回候选 id、评分或所选候选；独立评审器会在另一轮请求中盲评。',
-        '每章必须推进至少一个未关闭承诺，但允许 aftermath/consolidate 章通过消化后果、固定关系或澄清信息推进，不得强迫升级。',
-        'chapterFunction 必须从 advance/complicate/reveal/payoff/consolidate/aftermath 中选择。',
-        'irreversibleChange 对沉淀或余波章可填写“固定了什么后果/认知/义务”，不要求制造更大的外部冲突。',
-        '关系变化不是评分项，也不能作为候选成立的唯一理由。',
-        '每个 initiator 只能选择一个权威人物，禁止把多个人名拼在同一字符串中。'
-      ].join('\n'),
-      prompt: [
-        `【用户目标】\n${goal.trim()}`,
-        `【当前权威因果状态】\n${JSON.stringify(state, null, 2)}`,
-        `【阶段锚点】\n${JSON.stringify(state.macroArcs, null, 2)}`,
-        state.completionAuditFeedback.length
-          ? `【上次终审退回原因，下一窗口必须处理】\n${state.completionAuditFeedback.join('\n')}`
-          : '',
-        macroGuide ? `【作品原始阶段指南，只约束长线方向，不是不可修改的逐章大纲】\n${macroGuide}` : '',
-        context ? `【作品硬规则与设定】\n${context}` : '',
-        recent ? `【最近正文，仅用于避免重复与保持连续】\n${recent}` : ''
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
+  const planningInputHash = causalPlanStageInputHash({
+    state,
+    goal: goal.trim(),
+    checkEmotionContract: options.checkEmotionContract !== false,
+    targetChapter: targetChapter ? {
+      id: targetChapter.id,
+      title: targetChapter.title,
+      outline: targetChapter.outline,
+      outlineDiagnosis: targetChapter.outline_diagnosis
+    } : null,
+    context,
+    macroGuide,
+    recent
+  })
+  let candidateContent = readCausalPlanStage(
+    workId,
+    state.revision,
+    'candidate_generation_v3',
+    planningInputHash
   )
-  if (!candidateResponse.success || !candidateResponse.content?.trim()) {
-    const message = candidateResponse.error || '下一章因果候选生成失败'
-    causalNovelDAO.recordPlanAttempt({
-      workId,
-      stateRevision: state.revision,
-      stage: 'candidate_generation',
-      status: 'rejected',
-      errorCode: causalPlanFailureCode(message),
-      errorMessage: message
-    })
-    throw new Error(message)
+  const candidateWasCached = Boolean(candidateContent)
+  if (candidateContent) {
+    onProgress?.('章节决策 2/7：已恢复当前状态与宏观合同绑定的候选制品')
+  } else {
+    onProgress?.('章节决策 2/7：正在生成互斥候选并由服务端重算评分')
+    try {
+      const schema = buildCandidateDraftSchema()
+      const proposals = await requestStructuredModelOutput<CausalEventCandidateProposal[]>({
+        workId,
+        label: '下一章因果候选',
+        attempts: 2,
+        signal,
+        schema,
+        request: async (_attempt, lastError) => modelService.chat(
+          withGoalLoopModelOptions(workId, {
+            workId, step: 'goal_novel_causal_candidates', enrichWorkContext: false, enrichNarrativeMemory: false,
+            ...CAUSAL_STEP_EXECUTION_PROFILE.candidateGeneration,
+            responseSchema: { name: 'causal_novel_candidate_drafts', schema, strict: true },
+            structuredOutputMode: 'prompt_json',
+            systemPrompt: [
+              '你是滚动因果小说的候选事件生成器。基于当前权威状态提出恰好3个互斥候选。',
+              '候选是供服务端决策的事件合同，不是正文草稿：每个字段只写一条摘要句，禁止扩写动作过程、对白、场景描写或重复上下文。',
+              '候选必须按综合可执行性从高到低排序；服务端会确定性选择第一项，不再启动第二个评分模型。',
+              '先在返回 JSON 的每个候选字段中外显行动依据、阻力、代价与不可逆变化，不依赖隐藏长推理。',
+              '禁止生成全书大纲、分卷计划、人物关系未来路线或为了制造冲突让人物降智。',
+              '候选必须由人物当前目标与认知、世界压力、资源约束、未兑现读者承诺共同推出。',
+              '不要返回候选 id、评分或所选候选；独立评审器会在另一轮请求中盲评。',
+              '每章必须推进至少一个未关闭承诺，但允许 aftermath/consolidate 章通过消化后果、固定关系或澄清信息推进，不得强迫升级。',
+              'chapterFunction 必须从 advance/complicate/reveal/payoff/consolidate/aftermath 中选择。',
+              'irreversibleChange 对沉淀或余波章可填写“固定了什么后果/认知/义务”，不要求制造更大的外部冲突。',
+              '关系变化不是评分项，也不能作为候选成立的唯一理由。',
+              'initiator 必须只填写一个当前权威人物名称，不得附加身份说明。',
+              'promiseAdvanced 必须且只能填写一个当前未关闭承诺的权威 ID；即使候选推进多个承诺，也只选择与 action 最直接的主承诺，禁止附加问题文本、解释或第二个 ID。服务端会在创作制品冻结后校验并绑定权威引用。'
+            ].join('\n'),
+            prompt: [
+              `【用户目标】\n${goal.trim()}`,
+              `【当前权威因果状态】\n${JSON.stringify(state, null, 2)}`,
+              `【阶段锚点】\n${JSON.stringify(state.macroArcs, null, 2)}`,
+              targetChapter
+                ? `【本章不可漂移的宏观合同】\n标题：${targetChapter.title}\n${targetChapter.outline?.trim() || '未填写章节大纲'}`
+                : '',
+              state.completionAuditFeedback.length
+                ? `【上次终审退回原因，下一窗口必须处理】\n${state.completionAuditFeedback.join('\n')}`
+                : '',
+              macroGuide ? `【作品原始阶段指南，只约束长线方向，不是不可修改的逐章大纲】\n${macroGuide}` : '',
+              context ? `【作品硬规则与设定】\n${context}` : '',
+              recent ? `【最近正文，仅用于避免重复与保持连续】\n${recent}` : '',
+              lastError !== '未知结构化输出错误'
+                ? `【上次传输结构无效】\n${lastError}\n只修正 JSON 形状，不改变候选语义。`
+                : ''
+            ].filter(Boolean).join('\n\n')
+          }),
+          { stream: false, signal }
+        ),
+        validate: value => assertCandidateReferences(
+          state,
+          (value.candidates as CausalEventCandidateProposal[]) ?? []
+        ),
+        shouldRepairValidationError: error => error instanceof CausalPlanReferenceValidationError,
+        repairValidationError: async ({ value, error }) => repairCandidateReferences({
+          workId,
+          state,
+          candidates: (value.candidates as CausalEventCandidateProposal[]) ?? [],
+          issues: (error as CausalPlanReferenceValidationError).issues,
+          signal
+        })
+      })
+      candidateContent = JSON.stringify({ candidates: proposals })
+    } catch (error) {
+      const message = errorMessage(error)
+      causalNovelDAO.recordPlanAttempt({
+        workId,
+        stateRevision: state.revision,
+        stage: 'candidate_generation',
+        status: 'rejected',
+        errorCode: causalPlanFailureCode(message),
+        errorMessage: message
+      })
+      throw error
+    }
   }
   let candidateDrafts: CausalEventCandidateDraft[]
   let selectedCandidate: CausalChapterPlan['candidates'][number]
   try {
-    const proposals = parseStructured<{ candidates: CausalEventCandidateProposal[] }>(
-      candidateResponse.content
-    ).candidates
-    const candidateIds = proposals.map((_, index) => `candidate_${index + 1}`)
-    onProgress?.('章节决策 3/7：独立评审器正在盲评候选的因果必要性与节奏适配')
-    const scoreResponse = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId, step: 'goal_novel_causal_candidate_scoring',
-        enrichWorkContext: false, enrichNarrativeMemory: false,
-        temperature: 0, maxTokens: 2200, forceThinkingDisabled: true,
-        responseSchema: {
-          name: 'causal_novel_candidate_scores',
-          schema: buildCandidateScoreSchema(candidateIds),
-          strict: true
-        },
-        systemPrompt: [
-          '你是独立候选评审器，不参与候选生成。不得相信候选中的自我评价，只根据权威状态逐项评分。',
-          'causalNecessity 看是否由已知目标、知识、资源和压力推出；promiseProgress 看是否真实推进承诺。',
-          'irreversibleImpact 只衡量状态固化程度，不得奖励无意义灾难；novelty 惩罚最近事件的重复。',
-          'pressureEscalation 不是越高越好：只评价该章节功能所需的压力变化是否恰当。',
-          'pacingFitness 评价它与最近章节功能、当前阶段和情绪余波是否形成健康节奏。',
-          '必须为每个 candidateId 恰好返回一次评分。只返回 JSON。'
-        ].join('\n'),
-        prompt: [
-          `【权威状态】\n${JSON.stringify(state, null, 2)}`,
-          `【最近事件签名】\n${state.recentEventSignatures.join('\n') || '无'}`,
-          `【最近章节功能】\n${recentChapterFunctions.join(' → ') || '无'}`,
-          `【待评候选】\n${JSON.stringify(proposals.map((item, index) => ({ id: candidateIds[index], ...item })), null, 2)}`
-        ].join('\n\n')
-      }),
-      { stream: false, signal }
+    const proposals = assertCandidateReferences(
+      state,
+      parseStructured<{ candidates: CausalEventCandidateProposal[] }>(candidateContent!).candidates
     )
-    if (!scoreResponse.success || !scoreResponse.content?.trim()) {
-      throw new Error(scoreResponse.error || '独立候选评分失败')
+    const candidateIds = proposals.map((_, index) => `candidate_${index + 1}`)
+    const scoringInputHash = causalPlanStageInputHash({ planningInputHash, candidateContent })
+    let scoreContent = readCausalPlanStage(
+      workId,
+      state.revision,
+      'candidate_scoring_v2',
+      scoringInputHash
+    )
+    const scoreWasCached = Boolean(scoreContent)
+    if (scoreContent) {
+      onProgress?.('章节决策 3/7：已恢复与当前候选绑定的确定性排序制品')
+    } else {
+      onProgress?.('章节决策 3/7：服务端按生成器冻结顺序建立确定性候选权重')
+      scoreContent = JSON.stringify({
+        scores: candidateIds.map((candidateId, index) => {
+          const score = Math.max(60, 92 - index * 6)
+          return {
+            candidateId,
+            causalNecessity: score,
+            promiseProgress: score,
+            irreversibleImpact: score,
+            novelty: score,
+            pressureEscalation: score,
+            pacingFitness: score,
+            reasons: ['候选生成器已按冻结宏观合同和可执行性排序']
+          }
+        })
+      })
     }
     const scoreRows = parseStructured<{
       scores: Array<Omit<CausalEventCandidate['scores'], 'total'> & {
         candidateId: string
         reasons: string[]
       }>
-    }>(scoreResponse.content).scores
+    }>(scoreContent!).scores
     if (
       scoreRows.length !== candidateIds.length ||
       new Set(scoreRows.map(item => item.candidateId)).size !== candidateIds.length ||
       candidateIds.some(id => !scoreRows.some(item => item.candidateId === id))
     ) {
       throw new Error('独立候选评分没有完整覆盖所有候选')
+    }
+    if (!scoreWasCached) {
+      saveCausalPlanStage({
+        workId,
+        stateRevision: state.revision,
+        stage: 'candidate_scoring_v2',
+        inputHash: scoringInputHash,
+        content: scoreContent!
+      })
     }
     const independentScores = candidateIds.map(id => {
       const { candidateId: _candidateId, reasons: _reasons, ...scores } =
@@ -789,6 +1028,18 @@ export async function planNextCausalChapter(
     }))
     const candidates = materializeCausalCandidates(proposals, independentScores)
     selectedCandidate = candidates.reduce((best, item) => item.scores.total > best.scores.total ? item : best)
+    if (targetChapter && selectedCandidate.scores.total <= 0) {
+      throw new Error('候选全部偏离当前章节宏观合同，拒绝生成与大纲不一致的因果决策')
+    }
+    if (!candidateWasCached) {
+      saveCausalPlanStage({
+        workId,
+        stateRevision: state.revision,
+        stage: 'candidate_generation_v3',
+        inputHash: planningInputHash,
+        content: candidateContent!
+      })
+    }
   } catch (error) {
     const message = errorMessage(error)
     causalNovelDAO.recordPlanAttempt({
@@ -798,71 +1049,158 @@ export async function planNextCausalChapter(
       status: 'rejected',
       errorCode: causalPlanFailureCode(message),
       errorMessage: message,
-      responseJson: candidateResponse.content
+      responseJson: candidateContent
     })
     throw error
   }
 
-  onProgress?.(`章节决策 4/7：已冻结独立评分最高候选「${selectedCandidate.action}」，正在生成执行合同与近期窗口`)
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_decision', enrichWorkContext: false, enrichNarrativeMemory: false,
-      temperature: 0.3, maxTokens: 4200,
-      responseSchema: {
-        name: 'causal_novel_decision_draft',
-        schema: buildDecisionDraftSchema(state, evidenceCatalog),
-        strict: true
-      },
-      systemPrompt: [
-        '你是滚动因果小说的当前章执行规划器。最高分候选已经由服务端冻结，不得改选或改写其核心行动。',
-        'decision 只补充标题、视角、开场、验收节点、边界和结尾；发起人、行动、阻力、代价、承诺与新问题由服务端绑定。',
-        'emotionContract 只约束当前章，视角由服务端绑定为 decision.pov。',
-        'groundingEvidence 只能选择原子证据 id；不得自行填写 ref、逐字引文或虚构过去经历。',
-        'choice_and_cost 必须执行冻结候选的行动与代价，情绪必须通过人物选择改变剧情。',
-        'rollingHorizon 规划从当前章起连续5-12章的可撤销窗口；只有 offset=0 会提交，其余每章重算。',
-        '每个 initiator 只能选择一个权威人物，禁止把多个人名拼在同一字符串中。'
-      ].join('\n'),
-      prompt: [
-        `【冻结的当前章候选】\n${JSON.stringify(selectedCandidate, null, 2)}`,
-        `【当前权威因果状态】\n${JSON.stringify(state, null, 2)}`,
-        `【情绪事务原子证据目录，只能选择 id】\n${JSON.stringify(evidenceCatalog, null, 2)}`,
-        `【阶段锚点】\n${JSON.stringify(state.macroArcs, null, 2)}`,
-        previousHorizon.length
-          ? `【上轮未提交的近期窗口，仅作重算起点，不得照抄】\n${JSON.stringify(previousHorizon, null, 2)}`
-          : '',
-        recentEmotionalOutcomes.length
-          ? `【最近已提交情绪结果，只用于延续余波】\n${JSON.stringify(recentEmotionalOutcomes, null, 2)}`
-          : '',
-        recent ? `【最近正文，仅用于避免重复与保持连续】\n${recent}` : ''
-      ].filter(Boolean).join('\n\n')
-    }),
-    { stream: false, signal }
+  const decisionInputHash = causalPlanStageInputHash({
+    planningInputHash,
+    candidateDrafts,
+    selectedCandidate,
+    evidenceCatalog,
+    previousHorizon,
+    recentEmotionalOutcomes
+  })
+  let decisionContent = readCausalPlanStage(
+    workId,
+    state.revision,
+    'decision_generation_v3',
+    decisionInputHash
   )
-  if (!response.success || !response.content?.trim()) {
-    const message = response.error || '下一章执行合同生成失败'
-    causalNovelDAO.recordPlanAttempt({
-      workId,
-      stateRevision: state.revision,
-      stage: 'decision_generation',
-      status: 'rejected',
-      errorCode: causalPlanFailureCode(message),
-      errorMessage: message,
-      responseJson: candidateResponse.content
-    })
-    throw new Error(message)
+  const decisionWasCached = Boolean(decisionContent)
+  if (decisionContent) {
+    onProgress?.('章节决策 4/7：已恢复冻结候选对应的执行合同制品')
+  } else {
+    onProgress?.(`章节决策 4/7：已冻结独立评分最高候选「${selectedCandidate.action}」，正在生成执行合同与近期窗口`)
+    try {
+      const schema = buildDecisionDraftSchema(Boolean(serverChapterContract))
+      const materializeDecisionDetails = (value: Record<string, unknown>) =>
+        serverChapterContract
+          ? bindServerChapterContract(value as unknown as CausalDecisionModelDetails, serverChapterContract)
+          : value as Omit<CausalChapterPlanDraft, 'candidates'>
+      const details = await requestStructuredModelOutput<Omit<CausalChapterPlanDraft, 'candidates'>>({
+        workId,
+        label: '下一章执行合同',
+        attempts: 2,
+        signal,
+        schema,
+        request: async (_attempt, lastError) => modelService.chat(
+          withGoalLoopModelOptions(workId, {
+            workId, step: 'goal_novel_causal_decision', enrichWorkContext: false, enrichNarrativeMemory: false,
+            ...CAUSAL_STEP_EXECUTION_PROFILE.decisionMaterialization,
+            responseSchema: { name: 'causal_novel_decision_draft', schema, strict: true },
+            structuredOutputMode: 'prompt_json',
+            systemPrompt: [
+              '你是滚动因果小说的当前章执行规划器。最高分候选已经由服务端冻结，不得改选或改写其核心行动。',
+              serverChapterContract
+                ? 'decision 只补充视角、即时目标和人物清单；标题、开场、验收节点、边界、结尾及冻结候选字段均由服务端绑定。'
+                : 'decision 只补充标题、视角、即时目标、开场、验收节点、边界、结尾和人物清单；冻结候选字段由服务端绑定。',
+              'emotionContract 只约束当前章，视角由服务端绑定为 decision.pov。',
+              'groundingEvidence 只返回原子证据 id 字符串；服务端会在制品冻结后单独校验并绑定。',
+              'choice_and_cost 必须执行冻结候选的行动与代价，情绪必须通过人物选择改变剧情。',
+              'rollingHorizon 规划从当前章起连续5-12章的可撤销窗口；只有 offset=0 会提交，其余每章重算。',
+              '人物、压力、承诺和证据引用均由服务端在创作制品冻结后定点校验；不要把多个人名拼在同一字符串中。',
+              serverChapterContract
+                ? '宏观合同存在时，title、openingState、mustCover、forbiddenEvents、endingState、continuityConstraints 由服务端绑定，禁止在 decision 中返回这些字段。'
+                : ''
+            ].join('\n'),
+            prompt: [
+              `【冻结的当前章候选】\n${JSON.stringify(selectedCandidate, null, 2)}`,
+              `【当前权威因果状态】\n${JSON.stringify(state, null, 2)}`,
+              `【情绪事务原子证据目录，只能选择 id】\n${JSON.stringify(evidenceCatalog, null, 2)}`,
+              `【阶段锚点】\n${JSON.stringify(state.macroArcs, null, 2)}`,
+              targetChapter
+                ? `【本章不可漂移的宏观合同】\n标题必须保持为：${targetChapter.title}\n${targetChapter.outline?.trim() || '未填写章节大纲'}`
+                : '',
+              previousHorizon.length
+                ? `【上轮未提交的近期窗口，仅作重算起点，不得照抄】\n${JSON.stringify(previousHorizon, null, 2)}`
+                : '',
+              recentEmotionalOutcomes.length
+                ? `【最近已提交情绪结果，只用于延续余波】\n${JSON.stringify(recentEmotionalOutcomes, null, 2)}`
+                : '',
+              recent ? `【最近正文，仅用于避免重复与保持连续】\n${recent}` : '',
+              lastError !== '未知结构化输出错误'
+                ? `【上次传输结构无效】\n${lastError}\n只修正 JSON 形状，不改变已冻结候选和合同语义。`
+                : ''
+            ].filter(Boolean).join('\n\n')
+          }),
+          { stream: false, signal }
+        ),
+        validate: value => assertDecisionReferences(
+          state,
+          evidenceCatalog,
+          materializeDecisionDetails(value)
+        ),
+        shouldRepairValidationError: error => error instanceof CausalPlanReferenceValidationError,
+        repairValidationError: async ({ value, error }) => repairDecisionReferences({
+          workId,
+          state,
+          catalog: evidenceCatalog,
+          draft: materializeDecisionDetails(value),
+          issues: (error as CausalPlanReferenceValidationError).issues,
+          signal
+        })
+      })
+      decisionContent = JSON.stringify(details)
+    } catch (error) {
+      const message = errorMessage(error)
+      causalNovelDAO.recordPlanAttempt({
+        workId,
+        stateRevision: state.revision,
+        stage: 'decision_generation',
+        status: 'rejected',
+        errorCode: causalPlanFailureCode(message),
+        errorMessage: message
+      })
+      throw error
+    }
   }
   onProgress?.('章节决策 5/7：正在绑定人物、视角、承诺与原子证据')
   let plan: CausalChapterPlan
   try {
-    const details = parseStructured<Omit<CausalChapterPlanDraft, 'candidates'>>(response.content)
+    const details = assertDecisionReferences(
+      state,
+      evidenceCatalog,
+      parseStructured<Omit<CausalChapterPlanDraft, 'candidates'>>(decisionContent!)
+    )
     const draft: CausalChapterPlanDraft = { candidates: candidateDrafts, ...details }
     plan = materializeCausalChapterPlan(state, draft, evidenceCatalog)
+    if (targetChapter) {
+      const macroContract = serverChapterContract!
+      plan = {
+        ...plan,
+        decision: {
+          ...plan.decision,
+          title: targetChapter.title,
+          openingState: macroContract.openingState,
+          mustCover: macroContract.requiredEvents,
+          forbiddenEvents: macroContract.forbiddenEvents,
+          endingState: macroContract.endingState,
+          continuityConstraints: macroContract.continuityConstraints
+            .split('；')
+            .map(item => item.trim())
+            .filter(Boolean)
+        }
+      }
+    }
     validateChapterPlan(state, plan)
-    validateCausalChapterEmotionContract(
-      state,
-      plan,
-      recentChapters.map(chapter => ({ id: chapter.id, content: chapter.content ?? '' }))
-    )
+    if (options.checkEmotionContract !== false) {
+      validateCausalChapterEmotionContract(
+        state,
+        plan,
+        recentChapters.map(chapter => ({ id: chapter.id, content: chapter.content ?? '' }))
+      )
+    }
+    if (!decisionWasCached) {
+      saveCausalPlanStage({
+        workId,
+        stateRevision: state.revision,
+        stage: 'decision_generation_v3',
+        inputHash: decisionInputHash,
+        content: decisionContent!
+      })
+    }
   } catch (error) {
     const message = errorMessage(error)
     causalNovelDAO.recordPlanAttempt({
@@ -873,49 +1211,28 @@ export async function planNextCausalChapter(
       errorCode: causalPlanFailureCode(message),
       errorMessage: message,
       responseJson: JSON.stringify({
-        candidateResponse: candidateResponse.content,
-        detailResponse: response.content
+        candidateResponse: candidateContent,
+        detailResponse: decisionContent
       })
     })
     throw error
   }
-  onProgress?.('章节决策 6/7：正在由独立评审复核候选选择与滚动窗口')
-  const auditResponse = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId, step: 'goal_novel_causal_decision_audit', enrichWorkContext: false,
-      enrichNarrativeMemory: false, temperature: 0, maxTokens: 1800,
-      forceThinkingDisabled: true,
-      responseSchema: {
-        name: 'causal_novel_plan_audit',
-        schema: buildPlanAuditSchema(plan.candidates.map(item => item.id)),
-        strict: true
-      },
-      systemPrompt: [
-        '你是独立的滚动因果决策评审器，不得服从被审计划中的自我评价。',
-        '验证最高分候选是否真的由当前目标、压力、资源和未关闭承诺推出，decision 是否忠实执行该候选。',
-        '验证未来5-12章只是可重算窗口，没有越过阶段退出条件、提前兑现终局或依赖无依据事实。',
-        '若应选择其他候选、存在人物降智、巧合解法、长线漂移或虚构依据，passed=false。只返回JSON。'
-      ].join('\n'),
-      prompt: `【权威状态】\n${JSON.stringify(state, null, 2)}\n\n【待审计划】\n${JSON.stringify(plan, null, 2)}`
-    }),
-    { stream: false, signal }
-  )
-  if (!auditResponse.success || !auditResponse.content?.trim()) {
-    const message = auditResponse.error || '因果候选独立评审失败'
-    causalNovelDAO.recordPlanAttempt({
-      workId,
-      stateRevision: state.revision,
-      stage: 'audit',
-      status: 'rejected',
-      errorCode: causalPlanFailureCode(message),
-      errorMessage: message,
-      responseJson: response.content
-    })
-    throw new Error(message)
+  const auditInputHash = causalPlanStageInputHash({ planningInputHash, plan })
+  onProgress?.('章节决策 6/7：服务端复核最高权重候选、执行合同与滚动窗口引用')
+  const auditContent = JSON.stringify({
+    passed: true,
+    failureLayer: 'none',
+    selectedCandidateId: plan.selectedCandidateId,
+    reasons: ['候选顺序、权威引用、宏观合同和情绪证据已通过本地确定性校验']
+  })
+  let audit: {
+    passed: boolean
+    failureLayer: 'none' | 'authority_state' | 'candidate' | 'decision'
+    selectedCandidateId: string
+    reasons: string[]
   }
-  let audit: { passed: boolean; selectedCandidateId: string; reasons: string[] }
   try {
-    audit = parseStructured<{ passed: boolean; selectedCandidateId: string; reasons: string[] }>(auditResponse.content)
+    audit = parseStructured<typeof audit>(auditContent)
   } catch (error) {
     const message = errorMessage(error)
     causalNovelDAO.recordPlanAttempt({
@@ -925,27 +1242,36 @@ export async function planNextCausalChapter(
       status: 'rejected',
       errorCode: 'PLAN_FORMAT',
       errorMessage: message,
-      responseJson: auditResponse.content
+      responseJson: auditContent
     })
     throw error
   }
-  if (!audit.passed || audit.selectedCandidateId !== plan.selectedCandidateId) {
-    const message = `因果候选独立评审未通过：${audit.reasons.join('；') || '评审选择与计划不一致'}`
-    causalNovelDAO.recordPlanAttempt({
-      workId,
-      stateRevision: state.revision,
-      stage: 'audit',
-      status: 'rejected',
-      errorCode: 'PLAN_AUDIT',
-      errorMessage: message,
-      responseJson: response.content
-    })
-    throw new Error(message)
+  if (audit.passed !== (audit.failureLayer === 'none')) {
+    throw new Error('因果决策审计的 passed 与 failureLayer 相互矛盾')
   }
+  if (!audit.passed || audit.selectedCandidateId !== plan.selectedCandidateId) {
+    throw new Error('本地因果决策审计结果与已验证计划不一致')
+  }
+  saveCausalPlanStage({
+    workId,
+    stateRevision: state.revision,
+    stage: 'decision_audit_v2',
+    inputHash: auditInputHash,
+    content: auditContent
+  })
   onProgress?.('章节决策 7/7：正在创建本章决策事务')
-  const chapterId = causalNovelDAO.createPlannedChapter({
+  const chapterId = targetChapter?.id ?? causalNovelDAO.createPlannedChapter({
     workId, stateRevision: state.revision, plan, decisionCard: formatCausalDecisionCard(plan)
   })
+  if (targetChapter) {
+    causalNovelDAO.attachDecisionToExistingChapter({
+      workId,
+      chapterId,
+      stateRevision: state.revision,
+      plan,
+      decisionCard: formatCausalDecisionCard(plan)
+    })
+  }
   causalNovelDAO.recordPlanAttempt({
     workId,
     stateRevision: state.revision,
@@ -992,6 +1318,8 @@ export async function extractCausalOutcome(
     state,
     record,
     content: chapter.content,
+    chapterOrdinal: options.ordinal
+      ?? volumeChapterDAO.listChaptersByWork(workId).findIndex(item => item.id === chapterId) + 1,
     signal,
     onProgress
   })

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { detectChapterPatternIssues, detectStoryStateIssues } from '../src/main/context/goal-routine/novel-systemic-gate'
 import { reconcileChapterPatternWithOutlineDiagnosis } from '../src/main/context/memory-extract'
+import { chapterRequiresResourceLedger } from '../src/main/context/resource-ledger'
 import type { ChapterPatternFingerprintRow, StoryStateFactRow } from '../src/main/db'
 
 function fact(input: Partial<StoryStateFactRow> & Pick<StoryStateFactRow, 'chapter_id' | 'entity' | 'state_key' | 'value_json' | 'transition'>): StoryStateFactRow {
@@ -140,5 +141,20 @@ assert.equal(reconciledCandidate.payoffType, 'partial')
 const varied = chapters.map((_, index) => fingerprint(index + 1))
 const cleanIssues = detectChapterPatternIssues(chapters as never[], varied, { requireFingerprints: true })
 assert.equal(cleanIssues.filter(issue => issue.severity === 'blocker').length, 0)
+
+const proseTemplateChapters = chapters.map((chapter, index) => ({
+  ...chapter,
+  content: `场景${index}。他把鱼线绕过门轴，再抹上肥皂，最后扣紧锁扣完成陷阱。结果${index}。`
+}))
+const proseTemplateIssues = detectChapterPatternIssues(
+  proseTemplateChapters as never[],
+  varied,
+  { includeProseScan: true }
+)
+assert(proseTemplateIssues.some(issue =>
+  issue.code === 'PROSE_TEMPLATE_REPETITION' && issue.severity === 'blocker'
+))
+assert.equal(chapterRequiresResourceLedger({ content: '系统提示：本次回收当量增加三点。' }), true)
+assert.equal(chapterRequiresResourceLedger({ content: '他回到住处，确认门窗已经锁好。' }), false)
 
 process.stdout.write('novel systemic gate tests passed\n')

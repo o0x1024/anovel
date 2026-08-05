@@ -26,8 +26,8 @@ assert.deepEqual(fourth.targetChapterIds, ids)
 const fifth = routeStoryContinuityEscalation(ids, 15, blockers, fourth)
 assert.equal(fifth.mode, 'storyline')
 const sixth = routeStoryContinuityEscalation(ids, 15, blockers, fifth)
-assert.equal(sixth.mode, 'simplify')
-assert.match(sixth.hint, /单一倒计时/)
+assert.equal(sixth.mode, 'pause')
+assert.match(sixth.hint, /冻结当前正文和全部候选/)
 
 assert.equal(
   storyContinuityFingerprint(15, ['时间矛盾：剩3天']),
@@ -37,6 +37,7 @@ assert.equal(
 const contractIssues = validateStoryContinuityContracts([
   {
     continuity_contract: {
+      entry_boundary: 'START', exit_boundary: '楼梯口/存根仍在地面',
       time_anchor: '当天上午', start_location: '一楼', end_location: '楼梯口',
       entry_facts: ['资料完整'], exit_facts: ['捐赠存根仍留在一楼地面，未捡拾转移']
     },
@@ -44,6 +45,7 @@ const contractIssues = validateStoryContinuityContracts([
   },
   {
     continuity_contract: {
+      entry_boundary: '楼梯口/存根仍在地面', exit_boundary: '三楼/主角拿到信封',
       time_anchor: '紧接上一拍', elapsed_from_previous: '立即', start_location: '楼梯口', end_location: '三楼',
       entry_facts: ['主角口袋里已经有捐赠存根'], exit_facts: ['主角拿到信封'],
       opponent_action: '停职教练', opponent_reasoning: '切断证据来源',
@@ -53,6 +55,7 @@ const contractIssues = validateStoryContinuityContracts([
   },
   {
     continuity_contract: {
+      entry_boundary: '三楼/主角拿到信封', exit_boundary: 'END',
       time_anchor: '当天中午', elapsed_from_previous: '一小时后', start_location: '三楼', end_location: '校门口',
       entry_facts: ['主角拿到信封'], exit_facts: ['主角离校']
     },

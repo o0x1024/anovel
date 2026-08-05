@@ -147,6 +147,12 @@ class AiSessionManagerImpl {
     return this.activeSessionId
   }
 
+  getHandle(sessionId: string, sender: WebContents): AiSessionHandle | null {
+    const record = this.sessions.get(sessionId)
+    if (!record || record.ended || record.sender !== sender) return null
+    return this.buildHandle(sessionId, record)
+  }
+
   private clearActive(sessionId: string) {
     if (this.activeSessionId === sessionId) {
       this.activeSessionId = null

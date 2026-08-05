@@ -1,48 +1,17 @@
-/**
- * 小说目标循环运行器 —— 复刻短故事目标循环到小说管理。
- *
- * 与短故事差异：
- * 1. 跳过短故事孵化器阶段（incubate_outline / incubator_gate / freeze_storyline），
- *    小说直接复用作品已有的分卷/章节结构或生成分卷大纲与章节大纲。
- * 2. 正文生成按「章」而非「拍」走 novel 正文 prompt。
- * 3. 验收逻辑复用 story-goal-checker（维度通用）。
- *
- * 状态机：
- *   materialize_settings → 沉淀核心设定
- *   generate_character_cards → 生成主角人设卡片
- *   generate_volumes → 生成、诊断并冻结全书分卷大纲
- *   generate_beats ⇄ draft_body → 按卷交错生成章节大纲与正文，卷末冻结后再开下一卷
- *   generate_title_hook → 首卷章节大纲冻结后生成爆款书名与导语
- *   overall_self_check → 核心设定整体自检
- *   goal_check → 全书只读终审；未通过时冻结正文并暂停
- *   repair_plan / repair_execute → 仅在用户显式继续时修复全书尾部安全窗口
- */
-import { BrowserWindow, type WebContents } from 'electron'
+import type { WebContents } from 'electron'
 import { appLogger } from '../../logger/app-logger'
-import { volumeChapterDAO, goalRoutineDAO, coreSettingDAO, storyStateDAO, workDAO } from '../../db'
-import { modelService } from '../../model'
-import { CHARACTER_CARDS_AI_PROMPT } from '../writing-techniques'
-import { buildWorkContext } from '../work-context'
 import {
-  loadCharacterCards,
-  parseCharacterCardsFromAi,
-  sanitizeCharacterCards,
-  saveCharacterCards,
-  validateCharacterCards
-} from '../character-cards'
-import { buildSettingsQualityInput, getSettingsQualityStatus, recordQualityCheck } from '../settings-quality'
-import { STORY_OVERALL_CHECK_SYSTEM_PROMPT } from '../story-settings-quality'
+  causalNovelDAO,
+  volumeChapterDAO,
+  goalRoutineDAO,
+  coreSettingDAO,
+  storyStateDAO,
+  workDAO
+} from '../../db'
+import { getSettingsQualityStatus } from '../settings-quality'
 import { loadWritingPlan } from '../writing-plan'
 import { bodyWordCountBounds } from '../../../shared/body-word-target'
-import {
-  CHAPTER_EXECUTION_CONTRACT_VERSION,
-  evaluateNovelQualityAcceptance,
-  formatChapterExecutionContract,
-  isBetterNovelBodyCandidate,
-  isRecognizedNovelHardFail
-} from '../../../shared/chapter-execution-contract'
-import { goldenFingerStructuredPromptSection } from '../../../shared/golden-finger-types'
-import { validateGoldenFinger } from '../golden-finger-validation'
+import { CHAPTER_EXECUTION_CONTRACT_VERSION } from '../../../shared/chapter-execution-contract'
 import { extractJsonText } from '../parse-json-extract'
 import {
   checkStoryGoal,
@@ -50,28 +19,11 @@ import {
   type StoryGoalConfig,
   type GoalCheckResult
 } from './story-goal-checker'
-import {
-  commitPreparedNarrativeMemory,
-  generateBeatBody,
-  prepareNarrativeMemoryAfterGeneration,
-  reviseBeatBody,
-  type BeatGenResult
-} from './story-goal-doer'
+import { generateBeatBody, NarrativeMemoryCommitGateError } from './story-goal-doer'
 import { incubateStoryline, runStorylineGate, freezeStoryline } from './story-goal-routine'
-import { diagnoseChapterQualityAi } from '../../ipc-v15'
-import { parseQualityAiScoreReport, type QualityAiMetricKey } from '../../../shared/quality-ai-score'
-import { normalizeModelBodyOutput, stripDeterministicAiPatterns } from '../../../shared/normalize-body-text'
-import { QUALITY_APPLY_FIXES_PROMPT } from '../chapter-quality'
-import { STYLE_REWRITE_INSTRUCTION, countEmDashes, stripEmDashes } from '../anti-ai-rules'
-import { runConsistencyGate } from '../consistency-gate'
-import { refreshResourceConstraints, runResourceConstraintGate } from '../resource-ledger'
+import { refreshResourceConstraints } from '../resource-ledger'
 import { clearChapterNarrativeMemory } from '../memory-cleanup'
-import {
-  bindGoalLoopModelOpts,
-  clearGoalLoopModelOpts,
-  getGoalLoopModelOpts,
-  withGoalLoopModelOptions
-} from './story-goal-model'
+import { bindGoalLoopModelOpts, clearGoalLoopModelOpts, getGoalLoopModelOpts, storyGoalModelOpts } from './story-goal-model'
 import {
   generateNextNovelOutlineBatch,
   reconcileNovelWorkflowState,
@@ -83,55 +35,113 @@ import {
   resolveNovelVolumeWorkflowCheckpoint,
   updateNovelGoalState,
 } from './novel-outline-pipeline'
-import { formatNovelScaleContract, validatePleasureEngineScale } from './novel-scale-contract'
-import { ensureEmotionEngine } from './emotion-engine'
-import {
-  assessChapterEmotion,
-  emotionRepairHint,
-  isEmotionOutcomeComplete,
-  parseStoredEmotionAssessment
-} from './emotion-gate'
-import { parseCachedQualityAssessment, serializeQualityAssessment } from './chapter-assessment-cache'
-import { retentionPackagingRules } from './reader-retention'
-import { assessNovelVolume } from './novel-whole-evaluator'
+import { parseStoredEmotionAssessment } from './emotion-gate'
+import { parseCachedQualityAssessment } from './chapter-assessment-cache'
 import { assessNovelSystemics } from './novel-systemic-gate'
 import {
-  compileChapterExecutionContract,
-  isChapterExecutionAccepted,
-  markChapterExecutionAccepted,
-  persistChapterExecutionContract
-} from '../chapter-execution-context'
-import {
-  assessNovelExecutionCandidate,
-  isNovelExecutionEvaluatorFailure,
-  repairNovelExecutionCandidate
-} from './novel-execution-gate'
-import {
-  MAX_AUTO_NOVEL_REPAIR_CHAPTERS,
   MAX_NOVEL_PHASE_FAILURES,
   MAX_NOVEL_REPAIR_STALLS,
-  capNovelAutomaticRepairTargets,
+  isNovelHardBudgetExhausted,
   isTerminalNovelRepairError,
+  isNovelChapterCheckpointFailure,
+  classifyNovelConstructionOutputTerminal,
   nextPhaseAfterNovelOutlineCheckpoint,
   novelPhaseFailureSignature,
   resolveNovelChapterRecoveryAction,
-  resolveNovelPreparationPhase,
-  shouldContinueNovelAfterVolumeRepairBoundary,
-  shouldPauseForNovelConstructionOutputFailure,
-  shouldExtendNovelConstructionBudget,
-  shouldRecoverNovelChapterExecutionProtocol,
-  shouldPauseForReadOnlyNovelAudit
+  shouldPauseForNovelConstructionOutputFailure
 } from './novel-goal-policy'
 import { requireGoalTurnLimit } from '../../../shared/goal-turn-limit'
-
 import {
-  NOVEL_GOAL_ROUTINE_PHASE_ORDER,
-  isGoalRoutinePhase,
-  type GoalRoutinePhase
-} from '../../../shared/goal-routine-phases'
-
+  invalidateDownstreamBodiesAfterAcceptedChapterRewrite,
+  isStrictCachedQualityReady,
+  nextPendingDraftChapter,
+  phaseAfterCurrentDraftWindow,
+  runChapterAcceptanceGate,
+  runChapterConvergenceGate,
+  strictChapterTransitionBlockers
+} from './novel-chapter-acceptance'
+import { buildNovelRepairPlan, type RepairPlan } from './novel-repair-plan'
+import { isResumableNovelGoalStatus } from './novel-goal-resume'
+import { repairEvidenceSnapshot, repairReasonSignature } from './novel-repair-evidence'
+import { assertNovelGoalNotAborted as assertNotAborted, countNovelWords as countWords } from './novel-runtime-utils'
+import { runNovelEmotionEnginePreparation, safeNovelPreparationPhase } from './novel-preparation'
+import {
+  commitUnifiedNovelChapter,
+  ensureUnifiedNovelDecision,
+  hasUnifiedNovelPrecommitArtifacts,
+  isUnifiedNovelDecisionReady,
+  prepareUnifiedNovelChapterCommit
+} from './unified-novel-chapter'
+import {
+  executeNovelRepairPlan,
+  NovelRepairGateError,
+  NovelRepairGenerationRequiredError,
+  NovelRepairRevalidationRequiredError,
+  runVolumeBodyCheckpoint
+} from './novel-repair-execution'
+import {
+  broadcastNovelGoalProgress,
+  cancelAllNovelGoalLoops,
+  cancelNovelGoalLoop,
+  isNovelGoalLoopRunning,
+  registerNovelGoalLoop,
+  unregisterNovelGoalLoop
+} from './novel-loop-lifecycle'
+import { generateNovelCharacterCards, generateNovelTitleHook } from './novel-packaging'
+import { freezeUnifiedNovelRelease, requireUnifiedNovelAuthorityCompletion } from './unified-novel-release'
+import { resolvePendingNovelReleaseWindow } from './novel-release-window-audit'
+import { runNovelReleaseWindowAuditPhase } from './novel-release-window-phase'
+import { classifyWorkflowError, waitForWorkflowRetry, type ClassifiedWorkflowError } from '../../workflow/workflow-errors'
+import {
+  leafFailureContinuationDelay,
+  shouldContinueNovelRunAfterLeafFailure
+} from './novel-run-continuation-policy'
+import { clearWorkflowExecutionContext, setWorkflowExecutionContext } from '../../workflow/workflow-execution-context'
+import { processPendingCausalReplay } from './causal-replay'
+import { ensureWorkflowModelContract } from '../../workflow/workflow-model-contract'
+import {
+  novelDraftWorkflowStepLabel,
+  resolveNovelDraftWorkflowStep,
+  type NovelDraftWorkflowStep
+} from './novel-draft-step'
+import { buildNovelWorkflowStepInput } from './novel-workflow-step-input'
+import { ensureNovelAuthorityState } from './novel-authority-state'
+import {
+  reconcileNovelChapterExecutionProtocol,
+  reconcileNovelWorkflowDefinition,
+  novelWorkflowStepProtocolVersion
+} from './novel-workflow-definition'
+import { initializeCausalNovelState } from './causal-novel-engine'
+import { recoverCausalPlanningAuthorityMismatch } from './causal-planning-recovery'
+import { getNovelChapterAcceptanceSummary, resolveNovelChapterAcceptanceIdentity } from './novel-chapter-acceptance-ledger'
+import { CHAPTER_ACCEPTANCE_PROTOCOL_VERSION } from './novel-chapter-acceptance-policy'
+import { stopNovelOnHardGate } from './novel-hard-gate-terminal'
+import {
+  repairNovelSettingsFromOverallCheck,
+  runNovelOverallSelfCheck
+} from './novel-overall-self-check'
+import { materializeNovelSettings } from './novel-settings-materialization'
+import {
+  buildAutonomousChapterRepairPlan,
+  clearAutonomousChapterEscalation,
+  markNovelAutonomousTerminal,
+  normalizeAutonomousMaxEpochs,
+  reconcileAutonomousRepairFromAcceptance,
+  handleNarrativeMemoryCommitGate,
+  recoverNovelBodyContractRevalidation,
+  buildExecutionContractStructuralReplan,
+  recoverInterruptedExecutionContractRepairOnResume,
+  recoverInterruptedNarrativeMemoryGateOnResume,
+  shouldRouteExecutionContractRepairToStructuralReplan,
+  shouldRouteLengthNormalizationToSemanticRepair
+} from './novel-autonomous-control'
+export { shouldResumeNovelGoalLoop } from './novel-goal-resume'
+export {
+  novelMemoryCommitBlockers,
+  runChapterAcceptanceGate
+} from './novel-chapter-acceptance'
+import { NOVEL_GOAL_ROUTINE_PHASE_ORDER, isGoalRoutinePhase, type GoalRoutinePhase } from '../../../shared/goal-routine-phases'
 export type Phase = GoalRoutinePhase
-
 export interface GoalProgressEvent {
   workId: number
   turn: number
@@ -141,1437 +151,9 @@ export interface GoalProgressEvent {
   check?: GoalCheckResult
   message: string
 }
-
-interface RepairPlan {
-  action: 'draft_missing' | 'expand' | 'compress' | 'deai' | 'quality' | 'emotion' | 'goal_align' | 'systemic' | 'cluster' | 'volume'
-  scope: 'sentence' | 'chapter' | 'cluster' | 'volume'
-  targetChapterIds: number[]
-  hint: string
-  issueCodes?: string[]
-  evidenceFingerprint?: string
-}
-
-interface TitleHookCandidate {
-  title: string
-  hook: string
-  summary?: string
-}
-
-const NOVEL_SETTING_TYPES = ['protagonist', 'golden_finger', 'world_pressure', 'conflict_engine', 'pleasure_engine', 'supporting_cast', 'main_plotline'] as const
-
-const NOVEL_SETTING_PROMPTS: Record<(typeof NOVEL_SETTING_TYPES)[number], string> = {
-  protagonist: '你是顶级长篇小说人设设计师。基于作品背景输出 Markdown：## 身份与核心动机 / ## 长期成长弧线 / ## 关系网络 / ## 关键决策模式 / ## 与反派的对抗姿态。',
-  golden_finger: [
-    '你是顶级长篇小说特殊机制设计师。修仙境界、灵力、寿命压力、身份信息差、重生或穿越身份本身不是金手指；只有作品明确存在独立于世界常规能力的特殊机制时才设计。',
-    '默认使用 narrative 模式，以阶段、触发条件、恢复条件、代价后果、场景边界和失效表现定义能力。只有用户明确要求系统面板、积分余额、属性点、数值经营或精确次数玩法时才能使用 numeric 模式。',
-    'narrative 模式禁止生成百分比成功率、固定点数消耗、精确次数、固定冷却时长、进度条和每章资源余额。',
-    '必须完整定义名称形态、核心规则、呈现形式、外人可见性、交互方式、有效能力、获取条件、来源性质、使用边界、失效场景、反噬、升级路径、信息差、副作用、禁用红线、暴露后果、番茄卖点和前三章爽点。',
-    goldenFingerStructuredPromptSection()
-  ].join('\n\n'),
-  world_pressure: '你是顶级长篇小说世界观设计师。输出 Markdown：## 世界基础规则 / ## 权力/势力结构 / ## 关键地点与时代 / ## 规则如何约束主角行动 / ## 压迫升级路径。',
-  conflict_engine: '你是顶级长篇小说冲突设计师。输出 Markdown：## 对立双方价值观冲突 / ## 不可调和点 / ## 三层赌注（个人/势力/世界） / ## 冲突升级机制 / ## 终局收束方式。',
-  pleasure_engine: '你是顶级长篇小说节奏与爽点设计师。输出 Markdown：## 开篇钩子 / ## 前期小高潮 / ## 中期大反转 / ## 后期终极清算。必须明确每个爽点对应的卷/章位置。',
-  supporting_cast: '你是顶级长篇小说配角设计师。输出 Markdown：## 核心反派与对手 / ## 盟友与导师 / ## 情感线对象 / ## 关系演变与情绪宣泄点。配角只写功能、冲突价值和记忆点。',
-  main_plotline: '你是顶级长篇小说主线架构师。基于全部已有设定，设计故事从开局到终局的发展轨迹。输出 Markdown：## 故事起点 / ## 核心发展线（3-5个关键阶段，每阶段标注触发事件、主角选择、状态变化）/ ## 关键转折点（至少2次预判外转向）/ ## 伏笔与回收布局 / ## 高潮设计 / ## 故事终点 / ## 各阶段递进逻辑。递进必须因果闭环，禁止"突然"跳跃。总字数 800-1500 字。'
-}
-
-const activeLoops = new Map<number, AbortController>()
-const MAX_SETTING_GENERATION_ROUNDS = 4
-const MAX_CHAPTER_QUALITY_ROUNDS = 4
-const MAX_CHAPTER_CONVERGENCE_ROUNDS = 3
 const MAX_REPAIR_STALL_ROUNDS = 3
-
-function safeNovelPreparationPhase(workId: number, requestedPhase: Phase, goal: string): Phase {
-  const mainline = coreSettingDAO.getByType(workId, 'main_plotline')?.content?.trim()
-    || coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
-    || ''
-  const requiredSettingTypes = shouldSkipGoldenFingerForNovel(goal, mainline)
-    ? NOVEL_SETTING_TYPES.filter(type => type !== 'golden_finger')
-    : [...NOVEL_SETTING_TYPES]
-  const settingsReady = requiredSettingTypes.every(type => Boolean(coreSettingDAO.getByType(workId, type)?.content?.trim()))
-  const cards = loadCharacterCards(workId)
-  const characterCardsReady = cards.length > 0 && validateCharacterCards(cards).valid
-  const emotionEngineReady = Boolean(coreSettingDAO.getByType(workId, 'emotion_engine')?.content?.trim())
-  const settingsGateReady = getSettingsQualityStatus(workId).canProceed
-  const targetChapters = loadWritingPlan(workId).targetChapters
-  const runtime = readNovelGoalState(workId)
-  const volumePlanReady = Boolean(
-    runtime.novelOutline
-    && runtime.novelOutline.targetChapters === targetChapters
-    && runtime.volumePlanChecked
-  )
-  const hasChapters = volumeChapterDAO.listChaptersByWork(workId).length > 0
-  return resolveNovelPreparationPhase({
-    requestedPhase,
-    settingsReady,
-    characterCardsReady,
-    emotionEngineReady,
-    settingsGateReady,
-    volumePlanReady,
-    hasChapters
-  }) as Phase
-}
-
-function shouldSkipGoldenFingerForNovel(goal: string, mainline: string): boolean {
-  const text = `${goal}\n${mainline}`.trim()
-  if (!text) return false
-
-  const explicitMechanism = /系统|属性面板|积分兑换|签到|抽奖|属性点|熟练度面板|随身空间|可调用空间|独立异能|超能力|金手指|外挂/.test(text)
-  return !explicitMechanism
-}
-
-export function isNovelGoalLoopRunning(workId: number): boolean {
-  return activeLoops.has(workId)
-}
-
-export function cancelNovelGoalLoop(workId: number): boolean {
-  const controller = activeLoops.get(workId)
-  if (!controller) return false
-  controller.abort()
-  return true
-}
-
-export function cancelAllNovelGoalLoops(): void {
-  for (const [workId, controller] of activeLoops) {
-    controller.abort()
-    try {
-      goalRoutineDAO.setStatus(workId, 'paused')
-    } catch { /* ignore */ }
-  }
-  activeLoops.clear()
-}
-
-function broadcastProgress(channel: string, payload: unknown): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (win.isDestroyed()) continue
-    try {
-      win.webContents.send(channel, payload)
-    } catch { /* 接收方已销毁 */ }
-  }
-}
-
-function assertNotAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw new Error('已取消')
-}
-
-function countWords(s: string): number {
-  return s.replace(/[\s\p{Z}]/gu, '').length
-}
-
-function repairReasonSignature(reasons: string[]): string {
-  return reasons
-    .map(reason => reason.replace(/\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim())
-    .sort()
-    .join('|')
-    .slice(0, 1000)
-}
-
-function repairEvidenceSnapshot(check: GoalCheckResult): { fingerprint: string; count: number } {
-  if ((check.systemicIssues ?? []).length > 0) {
-    return {
-      fingerprint: check.systemicIssues
-        .map(issue => `${issue.code}:${issue.chapterIds.join(',')}:${issue.evidence.join('|')}`)
-        .sort()
-        .join('\n')
-        .slice(0, 12000),
-      count: check.systemicIssues.length
-    }
-  }
-  const failingChapters = check.chapterDiagnostics
-    .filter(item => item.qualityHardFail || item.gateBlockers > 0 || item.antiAiViolations > 0 || item.emotionPassed === false)
-    .map(item => `${item.chapterId}:${item.qualityScore}:${item.gateBlockers}:${item.antiAiViolations}:${item.emotionScore}`)
-  return {
-    fingerprint: [check.reasons.join('\n'), ...failingChapters].join('\n').slice(0, 12000),
-    count: failingChapters.length || check.reasons.length
-  }
-}
-
-async function materializeNovelSettings(
-  workId: number,
-  goal: string,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<number> {
-  assertNotAborted(signal)
-  const existing = coreSettingDAO.listByWork(workId)
-  const mainline = coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
-    || buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true }).text.slice(0, 4000)
-  const shouldSkipGoldenFinger = shouldSkipGoldenFingerForNovel(goal, mainline)
-  const targetTypes = shouldSkipGoldenFinger
-    ? NOVEL_SETTING_TYPES.filter(t => t !== 'golden_finger')
-    : [...NOVEL_SETTING_TYPES]
-  const missing = targetTypes.filter(t => !existing.some(e => e.type === t && e.content?.trim()))
-  if (!validatePleasureEngineScale(workId).valid && !missing.includes('pleasure_engine')) {
-    missing.push('pleasure_engine')
-  }
-  if (targetTypes.includes('golden_finger') && !validateGoldenFinger(workId).valid && !missing.includes('golden_finger')) {
-    missing.push('golden_finger')
-  }
-
-  if (shouldSkipGoldenFinger) {
-    onProgress?.('检测为无特殊机制题材，跳过「金手指系统」生成')
-  }
-
-  if (missing.length === 0) {
-    onProgress?.('核心设定已存在，跳过')
-    return 0
-  }
-
-  let count = 0
-  for (const type of missing) {
-    for (let attempt = 1; attempt <= MAX_SETTING_GENERATION_ROUNDS; attempt++) {
-      assertNotAborted(signal)
-      onProgress?.(`正在生成核心设定「${type}」(${count + 1}/${missing.length}，第 ${attempt} 轮)`)
-      const existingText = targetTypes
-        .filter(t => t !== type)
-        .map(t => coreSettingDAO.getByType(workId, t)?.content?.trim() ? `## ${t}\n${coreSettingDAO.getByType(workId, t)?.content?.trim()}` : '')
-        .filter(Boolean)
-        .join('\n\n')
-      const res = await modelService.chat(
-        withGoalLoopModelOptions(workId, {
-          workId,
-          step: `settings_${type}`,
-          enrichWorkContext: false,
-          enrichNarrativeMemory: false,
-          systemPrompt: [
-            NOVEL_SETTING_PROMPTS[type],
-            type === 'pleasure_engine'
-              ? '爽点机制必须按全书阶段规划，并明确写出目标末章的终极清算；不得自行虚构更短的卷数或提前完结。'
-              : ''
-          ].filter(Boolean).join('\n\n'),
-          prompt: [
-            formatNovelScaleContract(workId),
-            goal.trim() ? `【用户创作目标】\n${goal.trim()}` : '',
-            `【长篇主线】\n${mainline}`,
-            existingText ? `【已生成设定】\n${existingText}` : ''
-          ].filter(Boolean).join('\n\n')
-        }),
-        { stream: false, signal }
-      )
-      if (!res.success || !res.content?.trim()) {
-        onProgress?.(`核心设定「${type}」第 ${attempt} 轮未返回有效内容${attempt < MAX_SETTING_GENERATION_ROUNDS ? '，正在重试' : ''}`)
-        continue
-      }
-      if (type === 'pleasure_engine') {
-        const scaleGate = validatePleasureEngineScale(workId, res.content.trim())
-        if (!scaleGate.valid) {
-          onProgress?.(`爽点机制规模门禁未通过：${scaleGate.reason}${attempt < MAX_SETTING_GENERATION_ROUNDS ? '，正在重新生成' : ''}`)
-          continue
-        }
-      }
-      coreSettingDAO.upsert(workId, type, res.content.trim())
-      count++
-      onProgress?.(`已回填核心设定「${type}」`)
-      break
-    }
-  }
-  const unresolved = targetTypes.filter(type => !coreSettingDAO.getByType(workId, type)?.content?.trim())
-  if (unresolved.length > 0) {
-    throw new Error(`核心设定生成不完整：${unresolved.join('、')}`)
-  }
-  const pleasureScaleGate = validatePleasureEngineScale(workId)
-  if (!pleasureScaleGate.valid) {
-    throw new NovelPipelineError('CONTRACT_INVALID', `爽点机制规模门禁未通过：${pleasureScaleGate.reason}`)
-  }
-  if (targetTypes.includes('golden_finger')) {
-    const goldenFinger = validateGoldenFinger(workId)
-    if (!goldenFinger.valid) {
-      throw new NovelPipelineError('PREREQUISITE_MISSING', `金手指设定不完整：${goldenFinger.issues.join('、')}`)
-    }
-  }
-  return count
-}
-
-async function generateNovelCharacterCards(workId: number, signal?: AbortSignal): Promise<number> {
-  assertNotAborted(signal)
-  const ctx = buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true })
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'character_cards_generate',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      systemPrompt: CHARACTER_CARDS_AI_PROMPT,
-      prompt: `请基于以下作品上下文，生成主角人设卡片。\n\n${ctx.text.slice(0, 8000)}`
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(`主角人设卡生成失败：${res.error || '模型未返回内容'}`)
-  const parsed = parseCharacterCardsFromAi(res.content.trim())
-  const sanitized = sanitizeCharacterCards(parsed)
-  if (!validateCharacterCards(sanitized.cards)) throw new Error('主角人设卡结构校验失败')
-  saveCharacterCards(workId, sanitized.cards)
-  return sanitized.cards.length
-}
-
-async function generateNovelTitleHook(workId: number, goal: string, signal?: AbortSignal): Promise<{
-  preferred: TitleHookCandidate
-  preferredIndex: number
-  candidates: TitleHookCandidate[]
-}> {
-  assertNotAborted(signal)
-  const ctx = buildWorkContext(workId, { includeVolumes: true, includeCoreSettings: true })
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'goal_title_hook',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      systemPrompt: [
-        '你是长篇小说书名与导语策划。根据已冻结的分卷和章节结构生成3套差异明显的候选，并给出推荐序号。只输出 JSON。',
-        '格式：{"preferredIndex":0,"candidates":[{"title":"...","hook":"...","summary":"..."}]}',
-        'title 要爆款吸睛；hook 为 80-150 字长篇导语，必须同时承诺开篇核心冲突、主角差异和前三章首次兑现方向，但不能提前剧透终局；summary 是 100 字以内核心卖点；三套候选不得只是同义替换。',
-        retentionPackagingRules('novel')
-      ].join('\n'),
-      prompt: [
-        `【用户创作目标】\n${goal.trim() || '请策划一部长篇小说。'}`,
-        `【作品上下文】\n${ctx.text.slice(0, 6000)}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) throw new Error(`书名导语生成失败：${res.error || '模型未返回内容'}`)
-  try {
-    const json = extractJsonText(res.content.trim()) ?? res.content.trim()
-    const parsed = JSON.parse(json) as { preferredIndex?: unknown; candidates?: unknown }
-    if (!Array.isArray(parsed.candidates) || parsed.candidates.length !== 3) throw new Error('必须返回3套 candidates')
-    const candidates = parsed.candidates.map((value, index) => {
-      if (!value || typeof value !== 'object') throw new Error(`第${index + 1}套候选不是对象`)
-      const row = value as Record<string, unknown>
-      const title = String(row.title ?? '').trim()
-      const hook = String(row.hook ?? '').trim()
-      if (!title || !hook) throw new Error(`第${index + 1}套候选缺少 title 或 hook`)
-      return { title, hook, summary: String(row.summary ?? '').trim() || undefined }
-    })
-    const preferredIndex = Number(parsed.preferredIndex)
-    if (!Number.isInteger(preferredIndex) || preferredIndex < 0 || preferredIndex >= candidates.length) {
-      throw new Error('preferredIndex 非法')
-    }
-    return { preferred: candidates[preferredIndex], preferredIndex, candidates }
-  } catch (error) {
-    throw new Error(`书名导语解析失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-}
-
-async function runNovelOverallSelfCheck(workId: number, signal?: AbortSignal): Promise<string> {
-  assertNotAborted(signal)
-  const prompt = buildSettingsQualityInput(workId)
-  if (!prompt.replace(/（尚未设定）|（无活跃锚点）/g, '').trim()) {
-    return '设定内容为空，跳过自检'
-  }
-  const res = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'settings_overall_check',
-      enrichWorkContext: false,
-      enrichNarrativeMemory: false,
-      systemPrompt: STORY_OVERALL_CHECK_SYSTEM_PROMPT,
-      prompt
-    }),
-    { stream: false, signal }
-  )
-  if (!res.success || !res.content?.trim()) return '自检未返回结果'
-  recordQualityCheck(workId, {
-    overall: { report: res.content, checkedAt: new Date().toISOString() }
-  })
-  return res.content.trim()
-}
-
-async function repairNovelSettingsFromOverallCheck(
-  workId: number,
-  report: string,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<number> {
-  const mainline = coreSettingDAO.getByType(workId, 'main_plotline')?.content?.trim()
-    || coreSettingDAO.getByType(workId, 'idea')?.content?.trim()
-    || ''
-  let revised = 0
-  for (const type of NOVEL_SETTING_TYPES) {
-    assertNotAborted(signal)
-    const current = coreSettingDAO.getByType(workId, type)?.content?.trim() ?? ''
-    const otherSettings = NOVEL_SETTING_TYPES
-      .filter(other => other !== type)
-      .map(other => {
-        const content = coreSettingDAO.getByType(workId, other)?.content?.trim()
-        return content ? `## ${other}\n${content}` : ''
-      })
-      .filter(Boolean)
-      .join('\n\n')
-    onProgress?.(`正在根据整体自检修订「${type}」`)
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId,
-        step: `settings_${type}_revise`,
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false,
-        systemPrompt: [
-          NOVEL_SETTING_PROMPTS[type],
-          '这是长篇设定门禁修订。保留已自洽内容，只修复报告指出的阻塞问题；输出完整修订后的 Markdown，不要解释。'
-        ].join('\n\n'),
-        prompt: [
-          `【长篇主线】\n${mainline}`,
-          `【当前 ${type}】\n${current || '（空）'}`,
-          otherSettings ? `【其他已确定设定】\n${otherSettings}` : '',
-          `【整体自检报告】\n${report}`
-        ].filter(Boolean).join('\n\n')
-      }),
-      { stream: false, signal }
-    )
-    if (!response.success || !response.content?.trim()) {
-      throw new Error(response.error || `整体自检修订 ${type} 失败`)
-    }
-    if (response.content.trim() !== current) {
-      coreSettingDAO.upsert(workId, type, response.content.trim())
-      revised++
-    }
-  }
-  return revised
-}
-
-interface PendingDraftChapter {
-  id: number
-  title: string
-  needsGeneration: boolean
-  needsAcceptance: boolean
-}
-
-function isStrictCachedQualityReady(
-  cached: ReturnType<typeof parseCachedQualityAssessment>
-): boolean {
-  if (!cached || cached.acceptedDeferred) return false
-  const report = parseQualityAiScoreReport(cached.report)
-  return !isRecognizedNovelHardFail(cached.hardFail, report?.failedRules ?? [])
-}
-
-function strictChapterTransitionBlockers(
-  workId: number,
-  chapterId: number,
-  config: StoryGoalConfig
-): string[] {
-  const chapter = volumeChapterDAO.getChapter(chapterId)
-  const content = chapter?.content?.trim() ?? ''
-  if (!chapter || !content) return ['最终正文为空']
-  const contract = compileChapterExecutionContract(workId, chapterId)
-  if (!contract || contract.errors.length > 0) {
-    return [`章节合同无效：${contract?.errors.join('；') || '无法编译'}`]
-  }
-  const blockers: string[] = []
-  const actualWordCount = countWords(content)
-  if (actualWordCount < contract.wordMin || actualWordCount > contract.wordMax) {
-    blockers.push(`章节字数 ${actualWordCount} 不在合同范围 ${contract.wordMin}-${contract.wordMax}`)
-  }
-  if (!isChapterExecutionAccepted(chapterId, content, contract.sourceOutlineHash)) {
-    blockers.push('最终正文缺少与当前合同、当前内容匹配的执行验收凭证')
-  }
-  if (config.diagnoseBodyAfterGeneration && config.qualityMin > 0) {
-    const cachedQuality = parseCachedQualityAssessment(chapter.quality_assessment_json, content)
-    if (!isStrictCachedQualityReady(cachedQuality)) {
-      blockers.push('质量门禁未严格通过或仍含明确硬失败项')
-    }
-  }
-  const storedEmotion = parseStoredEmotionAssessment(chapter.emotion_assessment_json)
-  if (
-    storedEmotion?.passed !== true
-    || storedEmotion.outcome_meta?.accepted_deferred === true
-    || !isEmotionOutcomeComplete(chapterId, content, chapter.emotion_assessment_json)
-  ) {
-    blockers.push('情绪门禁未严格通过或情绪账本不完整')
-  }
-  return blockers
-}
-
-function invalidateDownstreamBodiesAfterAcceptedChapterRewrite(
-  workId: number,
-  chapterId: number
-): number {
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const sourceIndex = chapters.findIndex(chapter => chapter.id === chapterId)
-  if (sourceIndex < 0) return 0
-  const invalidatedVolumeNames = new Set<string>()
-  let invalidated = 0
-  for (const chapter of chapters.slice(sourceIndex + 1)) {
-    if (!chapter.content?.trim()) continue
-    clearChapterNarrativeMemory(workId, chapter.id)
-    volumeChapterDAO.updateChapterWithVersion(chapter.id, {
-      content: '',
-      word_count: 0,
-      status: 'draft',
-      emotion_assessment_json: null,
-      quality_assessment_json: null
-    }, { model_type: 'upstream_reset' })
-    invalidatedVolumeNames.add(chapter.volume_name)
-    invalidated++
-  }
-  if (invalidated > 0) {
-    const state = readNovelGoalState(workId)
-    const invalidatedIds = new Set(chapters.slice(sourceIndex + 1).map(chapter => chapter.id))
-    updateNovelGoalState(workId, {
-      checkedBodyVolumes: (state.checkedBodyVolumes ?? [])
-        .filter(name => !invalidatedVolumeNames.has(name)),
-      chapterExecutionDeferredIssues: (state.chapterExecutionDeferredIssues ?? [])
-        .filter(item => !invalidatedIds.has(item.chapterId)),
-      chapterAcceptanceDeferredIssues: (state.chapterAcceptanceDeferredIssues ?? [])
-        .filter(item => !invalidatedIds.has(item.chapterId)),
-      finalAudit: undefined,
-      failure: undefined
-    })
-  }
-  return invalidated
-}
-
-function nextPendingDraftChapter(workId: number, config: StoryGoalConfig): PendingDraftChapter | null {
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const fingerprintChapterIds = new Set(storyStateDAO.listFingerprintsByWork(workId).map(row => row.chapter_id))
-  for (const ch of chapters) {
-    const content = ch.content?.trim() ?? ''
-    const cachedQuality = parseCachedQualityAssessment(ch.quality_assessment_json, content)
-    const qualityReady = !config.diagnoseBodyAfterGeneration
-      || config.qualityMin <= 0
-      || isStrictCachedQualityReady(cachedQuality)
-    const storedEmotion = parseStoredEmotionAssessment(ch.emotion_assessment_json)
-    const emotionReady = storedEmotion?.passed === true
-      && storedEmotion.outcome_meta?.accepted_deferred !== true
-      && isEmotionOutcomeComplete(ch.id, content, ch.emotion_assessment_json)
-    const memoryReady = fingerprintChapterIds.has(ch.id)
-    const contract = compileChapterExecutionContract(workId, ch.id)
-    const executionReady = Boolean(
-      content
-      && contract
-      && isChapterExecutionAccepted(ch.id, content, contract.sourceOutlineHash)
-    )
-    const action = resolveNovelChapterRecoveryAction({
-      hasContent: Boolean(content),
-      qualityReady,
-      emotionReady,
-      patternFingerprintReady: memoryReady
-    })
-    // 协议升级前已完成的章节沿用历史验收；新协议处理过的章节必须持有
-    // 与当前合同和当前正文同时匹配的验收指纹，正文改写后会自动失效。
-    const legacyCompleted = ch.status === 'completed' && !executionReady
-    if (action === 'complete' && (executionReady || legacyCompleted)) continue
-    return {
-      id: ch.id,
-      title: ch.title,
-      needsGeneration: action === 'generate',
-      needsAcceptance: action === 'generate' || action === 'acceptance' || !executionReady
-    }
-  }
-  return null
-}
-
-function phaseAfterCurrentDraftWindow(workId: number): Phase {
-  const expected = loadWritingPlan(workId).targetChapters
-  return expected > 0 && volumeChapterDAO.listChaptersByWork(workId).length < expected
-    ? 'generate_beats'
-    : 'goal_check'
-}
-
-async function diagnoseAndFixUntilPass(
-  workId: number,
-  chapterId: number,
-  qualityMin: number,
-  qualityMetricMins: Record<QualityAiMetricKey, number>,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<{ passed: boolean; deferred?: boolean; finalScore: number; rounds: number; failedMetrics: string[] }> {
-  let rounds = 0
-  let bestScore = -1
-  const failedMetrics: string[] = []
-  const contract = compileChapterExecutionContract(workId, chapterId)
-  if (!contract || contract.errors.length > 0) {
-    throw new Error(`章节执行合同无效：${contract?.errors.join('；') || '章节不存在'}`)
-  }
-  let bestCandidate: {
-    content: string
-    wordCount: number
-    scoreTotal: number
-    hardFail: boolean
-    blockingFailures: string[]
-    advisoryFailures: string[]
-    report?: string
-  } | null = null
-
-  while (rounds < MAX_CHAPTER_QUALITY_ROUNDS) {
-    assertNotAborted(signal)
-    rounds++
-    const ch = volumeChapterDAO.getChapter(chapterId)
-    if (!ch?.content?.trim()) throw new Error('待诊断正文不存在')
-
-    onProgress?.(`正在诊断「${ch.title}」第 ${rounds} 轮`)
-    const res = await diagnoseChapterQualityAi(workId, chapterId, ch.content, { thinkingEnabled: getGoalLoopModelOpts(workId).thinkingEnabled })
-    if (!res.success || typeof res.scoreTotal !== 'number') {
-      failedMetrics.push('诊断未返回分数')
-      onProgress?.(`「${ch.title}」第 ${rounds} 轮诊断未返回有效分数，正在重试`)
-      continue
-    }
-
-    const breakdown = res.report ? parseQualityAiScoreReport(res.report) : null
-    const recognizedHardFail = isRecognizedNovelHardFail(
-      Boolean(res.hardFail),
-      breakdown?.failedRules ?? []
-    )
-    const acceptance = breakdown
-      ? evaluateNovelQualityAcceptance({
-          scoreTotal: res.scoreTotal,
-          hardFail: recognizedHardFail,
-          items: breakdown.items,
-          actualWordCount: countWords(ch.content),
-          qualityMin,
-          qualityMetricMins,
-          contract
-        })
-      : {
-          passed: false,
-          acceptedWithinTolerance: false,
-          blockingFailures: ['诊断报告缺少结构化单项分'],
-          advisoryFailures: [] as string[],
-          acceptanceFloor: Math.max(65, qualityMin - 5)
-        }
-    failedMetrics.splice(0, failedMetrics.length, ...acceptance.blockingFailures)
-
-    const candidateRank = {
-      hardFail: recognizedHardFail,
-      blockingFailures: acceptance.blockingFailures.length,
-      scoreTotal: res.scoreTotal,
-      wordCount: countWords(ch.content),
-      targetWords: contract.wordTarget
-    }
-    const bestRank = bestCandidate
-      ? {
-          hardFail: bestCandidate.hardFail,
-          blockingFailures: bestCandidate.blockingFailures.length,
-          scoreTotal: bestCandidate.scoreTotal,
-          wordCount: bestCandidate.wordCount,
-          targetWords: contract.wordTarget
-        }
-      : null
-    if (isBetterNovelBodyCandidate(candidateRank, bestRank)) {
-      bestCandidate = {
-        content: ch.content,
-        wordCount: candidateRank.wordCount,
-        scoreTotal: res.scoreTotal,
-        hardFail: recognizedHardFail,
-        blockingFailures: [...acceptance.blockingFailures],
-        advisoryFailures: [...acceptance.advisoryFailures],
-        report: res.report
-      }
-    }
-    bestScore = Math.max(bestScore, res.scoreTotal)
-
-    if (acceptance.passed) {
-      volumeChapterDAO.updateChapter(chapterId, {
-        quality_assessment_json: serializeQualityAssessment({
-          content: ch.content,
-          scoreTotal: res.scoreTotal,
-          hardFail: false,
-          report: res.report
-        })
-      })
-      if (acceptance.acceptedWithinTolerance) {
-        onProgress?.(`「${ch.title}」承重门禁通过，质量 ${res.scoreTotal}/${qualityMin}，按弱模型软容差验收`)
-      }
-      return { passed: true, finalScore: res.scoreTotal, rounds, failedMetrics }
-    }
-
-    let repairSource = ch.content
-    let repairReport = res.report
-    let repairBlocking = acceptance.blockingFailures
-    let repairAdvisory = acceptance.advisoryFailures
-    if (bestCandidate && bestCandidate.content !== ch.content) {
-      volumeChapterDAO.updateChapterWithVersion(chapterId, {
-        content: bestCandidate.content,
-        word_count: bestCandidate.wordCount,
-        emotion_assessment_json: null,
-        quality_assessment_json: null
-      })
-      repairSource = bestCandidate.content
-      repairReport = bestCandidate.report
-      repairBlocking = bestCandidate.blockingFailures
-      repairAdvisory = bestCandidate.advisoryFailures
-      onProgress?.(`「${ch.title}」本轮评分退化，已回滚到最佳候选 ${bestCandidate.scoreTotal} 分后继续定点修复`)
-    }
-
-    onProgress?.(`正在修复「${ch.title}」第 ${rounds} 轮`)
-    const fixPrompt = [
-      formatChapterExecutionContract(contract),
-      `【原文】\n${repairSource}`,
-      `【本轮只修复这些阻塞项】\n${repairBlocking.join('；')}`,
-      repairAdvisory.length ? `【软质量参考，不得牺牲章节合同强行追分】\n${repairAdvisory.slice(0, 4).join('；')}` : '',
-      repairReport ? `【完整诊断报告】\n${repairReport}` : '',
-      QUALITY_APPLY_FIXES_PROMPT
-    ].filter(Boolean).join('\n\n')
-
-    const fixRes = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId,
-        step: 'goal_diagnose_fix',
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false,
-        temperature: 0.3,
-        maxTokens: Math.max(6000, Math.min(12000, contract.wordTarget * 2)),
-        systemPrompt: [
-          '你是资深网文定向编辑。只修复 user 消息中【本轮只修复这些阻塞项】，直接输出修改后的正文全文，不要解释。',
-          '章节执行合同优先；软质量参考不得驱使你增加无效对话、越过结尾、改变事实或删减已通过节点。',
-          '修改后须保持或改善其他已通过指标；无法同时改善时保留原文对应部分。',
-          STYLE_REWRITE_INSTRUCTION
-        ].join('\n'),
-        prompt: fixPrompt
-      }),
-      { stream: false, signal }
-    )
-
-    if (fixRes.success && fixRes.content?.trim()) {
-      let fixed = normalizeModelBodyOutput(fixRes.content.trim(), 'body_generation')
-      fixed = stripDeterministicAiPatterns(fixed)
-      volumeChapterDAO.updateChapterWithVersion(chapterId, {
-        content: fixed,
-        word_count: countWords(fixed),
-        emotion_assessment_json: null
-      })
-    } else {
-      failedMetrics.push('修复未返回有效正文')
-      onProgress?.(`「${ch.title}」第 ${rounds} 轮修复未返回有效正文，正在重新诊断`)
-    }
-  }
-  if (bestCandidate) {
-    const latest = volumeChapterDAO.getChapter(chapterId)
-    if (latest?.content !== bestCandidate.content) {
-      volumeChapterDAO.updateChapterWithVersion(chapterId, {
-        content: bestCandidate.content,
-        word_count: bestCandidate.wordCount,
-        emotion_assessment_json: null,
-        quality_assessment_json: null
-      })
-    }
-    failedMetrics.splice(0, failedMetrics.length, ...bestCandidate.blockingFailures)
-    bestScore = bestCandidate.scoreTotal
-  }
-  onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」连续 ${MAX_CHAPTER_QUALITY_ROUNDS} 轮未通过质量门禁`)
-  return { passed: false, finalScore: bestScore, rounds, failedMetrics: [...new Set(failedMetrics)] }
-}
-
-function cleanupEmDashesAfterPassedGate(
-  workId: number,
-  mode: 'comma' | 'remove' = 'comma',
-  onlyChapterIds?: number[]
-): { chapters: number; replaced: number } {
-  let chapters = 0
-  let replaced = 0
-  const allowed = onlyChapterIds ? new Set(onlyChapterIds) : null
-  const chaptersList = volumeChapterDAO.listChaptersByWork(workId)
-  for (const ch of chaptersList) {
-    if (allowed && !allowed.has(ch.id)) continue
-    if (!ch.content?.trim()) continue
-    const before = countEmDashes(ch.content)
-    if (before === 0) continue
-    const cleaned = mode === 'remove' ? stripEmDashes(ch.content) : ch.content.replace(/——/g, '，')
-    const after = countEmDashes(cleaned)
-    if (after !== before) {
-      volumeChapterDAO.updateChapterWithVersion(ch.id, {
-        content: cleaned,
-        word_count: countWords(cleaned),
-        emotion_assessment_json: null
-      })
-      chapters++
-      replaced += before - after
-    }
-  }
-  return { chapters, replaced }
-}
-
-export async function runChapterAcceptanceGate(
-  workId: number,
-  chapterId: number,
-  config: StoryGoalConfig,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<{
-  passed: boolean
-  deferred?: boolean
-  qualityScore: number
-  emotionScore?: number
-  rounds: number
-  failedMetrics: string[]
-}> {
-  let totalQualityRounds = 0
-  let qualityScore = -1
-  const failures: string[] = []
-
-  for (let convergenceRound = 1; convergenceRound <= MAX_CHAPTER_CONVERGENCE_ROUNDS; convergenceRound++) {
-    if (config.diagnoseBodyAfterGeneration && config.qualityMin > 0) {
-      const current = volumeChapterDAO.getChapter(chapterId)
-      const cachedQuality = parseCachedQualityAssessment(
-        current?.quality_assessment_json,
-        current?.content ?? ''
-      )
-      if (isStrictCachedQualityReady(cachedQuality)) {
-        qualityScore = cachedQuality.scoreTotal
-        onProgress?.(`「${current?.title ?? chapterId}」复用当前正文已通过的质量检查点 ${qualityScore} 分`)
-      } else {
-        const quality = await diagnoseAndFixUntilPass(
-          workId,
-          chapterId,
-          config.qualityMin,
-          config.qualityMetricMins,
-          signal,
-          onProgress
-        )
-        totalQualityRounds += quality.rounds
-        qualityScore = quality.finalScore
-        failures.push(...quality.failedMetrics)
-        if (!quality.passed) {
-          return { passed: false, qualityScore, rounds: totalQualityRounds, failedMetrics: [...new Set(failures)] }
-        }
-      }
-    }
-
-    const cleaned = cleanupEmDashesAfterPassedGate(workId, 'comma', [chapterId])
-    if (cleaned.replaced > 0) {
-      onProgress?.(`「${volumeChapterDAO.getChapter(chapterId)?.title ?? chapterId}」清理破折号后正在重新执行质量门禁`)
-      failures.push(`清理破折号 ${cleaned.replaced} 处后需复验`)
-      continue
-    }
-    const chapter = volumeChapterDAO.getChapter(chapterId)
-    const assessment = await assessChapterEmotion(workId, chapterId, chapter?.content ?? '', signal, true)
-    if (assessment.passed) {
-      onProgress?.(`「${chapter?.title ?? chapterId}」质量与情绪门禁均已通过`)
-      return {
-        passed: true,
-        deferred: false,
-        qualityScore,
-        emotionScore: assessment.score,
-        rounds: totalQualityRounds,
-        failedMetrics: []
-      }
-    }
-
-    failures.push(`情绪门禁 ${assessment.score}分/${assessment.failure_layer}层`)
-    if (convergenceRound === MAX_CHAPTER_CONVERGENCE_ROUNDS) break
-    onProgress?.(
-      `「${chapter?.title ?? chapterId}」情绪门禁未通过（${assessment.score}分），正在修订并重新执行质量门禁`
-    )
-    const revised = await reviseBeatBody(workId, chapterId, {
-      signal,
-      workType: 'novel',
-      deferNarrativeMemory: true,
-      instruction: emotionRepairHint(assessment)
-    })
-    if (!revised.success) {
-      failures.push(revised.error || '情绪定向修订失败')
-      break
-    }
-  }
-
-  return {
-    passed: false,
-    qualityScore,
-    emotionScore: undefined,
-    rounds: totalQualityRounds,
-    failedMetrics: [...new Set(failures)]
-  }
-}
-
-async function runChapterConvergenceGate(
-  workId: number,
-  chapterId: number,
-  config: StoryGoalConfig,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<Awaited<ReturnType<typeof runChapterAcceptanceGate>>> {
-  let lastAcceptance: Awaited<ReturnType<typeof runChapterAcceptanceGate>> | null = null
-  for (let round = 1; round <= MAX_CHAPTER_CONVERGENCE_ROUNDS; round++) {
-    const acceptance = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
-    lastAcceptance = acceptance
-    if (!acceptance.passed) return acceptance
-
-    const contract = persistChapterExecutionContract(workId, chapterId)
-    const chapter = volumeChapterDAO.getChapter(chapterId)
-    if (!contract || !chapter?.content?.trim()) {
-      return {
-        ...acceptance,
-        passed: false,
-        failedMetrics: [...acceptance.failedMetrics, '无法编译章节合同或最终正文为空']
-      }
-    }
-
-    onProgress?.(`「${chapter.title}」质量与情绪改写结束，正在执行最终章节合同复验（${round}/${MAX_CHAPTER_CONVERGENCE_ROUNDS}）`)
-    let gate = await assessNovelExecutionCandidate(workId, chapterId, chapter.content, contract, signal)
-    for (let retry = 1; isNovelExecutionEvaluatorFailure(gate.blockers) && retry <= 2; retry++) {
-      onProgress?.(`最终合同复验证据格式无效，正在重新取证（${retry}/2）`)
-      gate = await assessNovelExecutionCandidate(
-        workId,
-        chapterId,
-        chapter.content,
-        contract,
-        signal,
-        gate.evaluatorProtocolErrors ?? gate.blockers
-      )
-    }
-    if (isNovelExecutionEvaluatorFailure(gate.blockers)) {
-      throw new NovelPipelineError(
-        'EVALUATOR_PROTOCOL',
-        '最终章节合同评估器连续 3 次未返回有效证据；正文与版本均已保留'
-      )
-    }
-    if (gate.passed) {
-      markChapterExecutionAccepted(chapterId, chapter.content, contract.sourceOutlineHash)
-      onProgress?.(`「${chapter.title}」最终章节合同全部 covered，允许提交本章`)
-      return acceptance
-    }
-    if (round === MAX_CHAPTER_CONVERGENCE_ROUNDS) {
-      return {
-        ...acceptance,
-        passed: false,
-        failedMetrics: [...new Set([
-          ...acceptance.failedMetrics,
-          ...gate.blockers.map(item => `章节合同：${item}`)
-        ])]
-      }
-    }
-
-    onProgress?.(`「${chapter.title}」最终合同复验未通过，正在本章内定向修复；不会进入下一章`)
-    const repaired = await repairNovelExecutionCandidate(
-      workId,
-      chapterId,
-      chapter.content,
-      contract,
-      gate.blockers,
-      signal
-    )
-    if (!repaired.success || !repaired.content.trim()) {
-      return {
-        ...acceptance,
-        passed: false,
-        failedMetrics: [...acceptance.failedMetrics, repaired.error || '章节合同定向修复失败']
-      }
-    }
-    const normalized = stripDeterministicAiPatterns(
-      normalizeModelBodyOutput(repaired.content.trim(), 'body_generation')
-    )
-    clearChapterNarrativeMemory(workId, chapterId)
-    volumeChapterDAO.updateChapterWithVersion(chapterId, {
-      content: normalized,
-      word_count: countWords(normalized),
-      status: 'draft',
-      emotion_assessment_json: null,
-      quality_assessment_json: null
-    })
-  }
-  return lastAcceptance ?? {
-    passed: false,
-    qualityScore: -1,
-    rounds: 0,
-    failedMetrics: ['章节联合门禁未执行']
-  }
-}
-
-export async function finalizeNovelChapterMemory(
-  workId: number,
-  chapterId: number,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<NonNullable<BeatGenResult['memoryExtracted']>> {
-  const chapter = volumeChapterDAO.getChapter(chapterId)
-  if (!chapter?.content?.trim()) throw new Error('最终正文不存在，无法提交叙事记忆')
-
-  onProgress?.(`正在从「${chapter.title}」已通过质量与情绪门禁的正文提取候选记忆`)
-  try {
-    const prepared = await prepareNarrativeMemoryAfterGeneration(
-      workId,
-      chapterId,
-      chapter.content,
-      signal,
-      { requirePatternFingerprint: true, dropInvalidStateFactsAfterRetries: true }
-    )
-    const committed = commitPreparedNarrativeMemory(workId, chapterId, prepared, {
-      markChapterCompleted: true,
-      validate: () => novelMemoryCommitBlockers(workId, chapterId)
-    })
-    onProgress?.(`「${chapter.title}」候选记忆及依赖门禁已原子提交`)
-    return committed
-  } catch (error) {
-    // 候选正文仍保留，但任何不完整或过期的派生记忆都不得对后续章节可见。
-    clearChapterNarrativeMemory(workId, chapterId)
-    volumeChapterDAO.updateChapter(chapterId, {
-      status: 'draft',
-      emotion_assessment_json: null,
-      quality_assessment_json: null
-    })
-    throw error
-  }
-}
-
-export function novelMemoryCommitBlockers(workId: number, chapterId: number): string[] {
-  const latest = volumeChapterDAO.getChapter(chapterId)
-  const consistency = runConsistencyGate(workId, chapterId, latest?.content ?? '')
-  const resource = runResourceConstraintGate(workId, chapterId)
-  const fingerprintReady = storyStateDAO.listFingerprintsByWork(workId)
-    .some(row => row.chapter_id === chapterId)
-  const systemic = assessNovelSystemics(workId, {
-    requireFingerprints: false,
-    includeProseScan: false
-  }).issues.filter(issue => issue.severity === 'blocker' && issue.chapterIds.includes(chapterId))
-  return [
-    ...consistency.blockers.map(item => `一致性：${item}`),
-    ...resource.blockers.map(item => `资源约束：${item}`),
-    ...(!fingerprintReady ? ['模式指纹：章节模式指纹缺失'] : []),
-    ...systemic.map(issue => `跨章状态/模式：${issue.message}`)
-  ]
-}
-
-function buildNovelRepairPlan(workId: number, check: GoalCheckResult, config: StoryGoalConfig): RepairPlan {
-  const chapters = volumeChapterDAO.listChaptersByWork(workId)
-  const emptyChapters = chapters.filter(c => !c.content?.trim())
-  if (emptyChapters.length > 0) {
-    return { action: 'draft_missing', scope: 'chapter', targetChapterIds: emptyChapters.map(c => c.id), hint: '先生成缺失章节正文' }
-  }
-
-  const systemicBlockers = (check.systemicIssues ?? []).filter(issue => issue.severity === 'blocker')
-  if (systemicBlockers.length > 0) {
-    const priority = [...systemicBlockers].sort((a, b) => {
-      const weight = { volume: 4, cluster: 3, chapter: 2, sentence: 1 }
-      return weight[b.scope] - weight[a.scope]
-    })[0]
-    const ids = [...new Set(systemicBlockers
-      .filter(issue => issue.scope === priority.scope)
-      .flatMap(issue => issue.chapterIds))]
-    const scope = priority.scope === 'sentence' ? 'sentence' : priority.scope
-    return {
-      action: scope === 'volume' ? 'volume' : scope === 'cluster' ? 'cluster' : 'systemic',
-      scope,
-      targetChapterIds: ids.slice(0, MAX_AUTO_NOVEL_REPAIR_CHAPTERS),
-      hint: systemicBlockers.map(issue => `${issue.code}：${issue.message}；${issue.recommendedAction}`).join('\n'),
-      issueCodes: [...new Set(systemicBlockers.map(issue => issue.code))],
-      evidenceFingerprint: systemicBlockers.map(issue => `${issue.code}:${issue.chapterIds.join(',')}:${issue.evidence.join('|')}`).sort().join('\n')
-    }
-  }
-
-  const lowQuality = check.chapterDiagnostics.filter(d => d.qualityScore >= 0 && (d.qualityHardFail || d.qualityScore < config.qualityMin))
-  if (lowQuality.length > 0) {
-    return { action: 'quality', scope: 'chapter', targetChapterIds: lowQuality.slice(0, 3).map(d => d.chapterId), hint: '提升低质量章节' }
-  }
-
-  const emotionFailures = check.chapterDiagnostics.filter(d => d.emotionScore >= 0 && !d.emotionPassed)
-  if (emotionFailures.length > 0) {
-    return {
-      action: 'emotion',
-      scope: 'chapter',
-      targetChapterIds: emotionFailures.slice(0, 3).map(d => d.chapterId),
-      hint: '按情绪盲读报告定向修复失败章节'
-    }
-  }
-
-  const gateFailures = check.chapterDiagnostics.filter(d => d.gateBlockers > 0 || d.antiAiViolations > 0)
-  if (gateFailures.length > 0) {
-    return { action: 'deai', scope: 'sentence', targetChapterIds: gateFailures.slice(0, 6).map(d => d.chapterId), hint: '修复一致性门禁与去AI问题' }
-  }
-
-  const perChapterTarget = loadWritingPlan(workId).wordsPerChapter || 4000
-  const bounds = bodyWordCountBounds(perChapterTarget)
-  const shortChapters = chapters.filter(chapter => (chapter.word_count ?? 0) < bounds.min)
-  if (shortChapters.length > 0 || check.totalWords < check.targetWords * 0.9) {
-    const targets = (shortChapters.length > 0 ? shortChapters : chapters).slice(0, 3)
-    return {
-      action: 'expand',
-      scope: 'chapter',
-      targetChapterIds: targets.map(chapter => chapter.id),
-      hint: `扩写至每章 ${bounds.min}-${bounds.max} 字，增加有效冲突和因果细节，禁止注水`
-    }
-  }
-
-  const longChapters = chapters.filter(chapter => (chapter.word_count ?? 0) > bounds.max)
-  if (longChapters.length > 0 || check.totalWords > check.targetWords * 1.1) {
-    const targets = longChapters.length > 0 ? longChapters.slice(0, 3) : chapters.slice(-3)
-    return {
-      action: 'compress',
-      scope: 'chapter',
-      targetChapterIds: targets.map(chapter => chapter.id),
-      hint: `压缩至每章 ${bounds.min}-${bounds.max} 字，只删除重复解释和无推进段落`
-    }
-  }
-
-  const systemicWarnings = (check.systemicIssues ?? []).filter(issue => issue.severity === 'warning')
-  if (systemicWarnings.length > 0) {
-    const sentenceWarnings = systemicWarnings.filter(issue => issue.scope === 'sentence')
-    const selected = sentenceWarnings.length > 0 ? sentenceWarnings : systemicWarnings
-    return {
-      action: sentenceWarnings.length > 0 ? 'deai' : 'cluster',
-      scope: sentenceWarnings.length > 0 ? 'sentence' : 'cluster',
-      targetChapterIds: [...new Set(selected.flatMap(issue => issue.chapterIds))].slice(0, 8),
-      hint: selected.map(issue => `${issue.code}：${issue.message}；证据：${issue.evidence.join('；')}`).join('\n'),
-      issueCodes: selected.map(issue => issue.code),
-      evidenceFingerprint: selected.map(issue => `${issue.code}:${issue.chapterIds.join(',')}`).join('|')
-    }
-  }
-
-  const weakIds = check.weakChapterTitles
-    .map(title => chapters.find(chapter => chapter.title === title
-      || chapter.title.includes(title)
-      || title.includes(chapter.title))?.id)
-    .filter((id): id is number => id != null)
-  const targetChapterIds = weakIds.length > 0
-    ? weakIds.slice(0, 3)
-    : chapters
-      .filter((_, index) => index === 0 || index === Math.floor(chapters.length / 2) || index === chapters.length - 1)
-      .map(chapter => chapter.id)
-  return {
-    action: 'goal_align',
-    scope: 'chapter',
-    targetChapterIds,
-    hint: `修复整书目标与结构问题：${check.storyIssues.slice(0, 3).join('；') || check.goalMatchReason || check.overallStoryReason}`
-  }
-}
-
-async function reviseNovelStructuralCluster(
-  workId: number,
-  plan: RepairPlan,
-  goal: string,
-  signal?: AbortSignal
-): Promise<{ outlines: number; invalidatedBodies: number }> {
-  const allChapters = volumeChapterDAO.listChaptersByWork(workId)
-  const targets = allChapters.filter(chapter => plan.targetChapterIds.includes(chapter.id))
-  if (targets.length === 0) throw new Error('结构修复没有可匹配的目标章节')
-  const targetVolumes = [...new Set(targets.map(chapter => chapter.volume_id))]
-  const contextIds = new Set<number>()
-  for (const target of targets) {
-    const index = allChapters.findIndex(chapter => chapter.id === target.id)
-    for (let offset = -1; offset <= 1; offset++) {
-      const chapter = allChapters[index + offset]
-      if (chapter) contextIds.add(chapter.id)
-    }
-  }
-  const context = allChapters.filter(chapter => contextIds.has(chapter.id))
-  const response = await modelService.chat(
-    withGoalLoopModelOptions(workId, {
-      workId,
-      step: 'story_repair_blueprint',
-      enrichWorkContext: true,
-      enrichNarrativeMemory: false,
-      temperature: 0.2,
-      maxTokens: 8000,
-      systemPrompt: [
-        '你是长篇小说结构修复编辑。只输出合法JSON，不要markdown或解释。',
-        '只修改target=true的章节；id和title必须原样返回。不得修改章节数量、人物既有不可逆事实或资源预算。',
-        '这是章节簇/整卷结构修复，必须从因果、解法、对手学习、阶段兑现、关系变化和卷级闭环上消除给定证据，不能只换措辞。',
-        '每项返回完整outline、next_hook和pattern_contract；payoff_type只允许debt/partial/major/aftertaste，tension_level为1-10。',
-        '格式：{"chapters":[{"id":1,"title":"原题","outline":"完整新大纲","next_hook":"新钩子","tension_level":7,"payoff_type":"partial","pattern_contract":{"conflict_type":"","protagonist_method":"","antagonist_tactic":"","anticipated_opponent_adjustment":"","location_type":"","hook_type":"","cost_type":"","relationship_delta":"","volume_objective_delta":""}}]}'
-      ].join('\n'),
-      prompt: [
-        `【用户目标】\n${goal.trim() || '完成一部长篇小说'}`,
-        `【结构问题与确定性证据】\n${plan.hint}`,
-        `【目标与相邻章节】\n${JSON.stringify(context.map(chapter => ({
-          id: chapter.id,
-          target: plan.targetChapterIds.includes(chapter.id),
-          title: chapter.title,
-          volume: chapter.volume_name,
-          outline: chapter.outline,
-          next_hook: chapter.next_hook,
-          outline_diagnosis: chapter.outline_diagnosis
-        })), null, 2)}`
-      ].join('\n\n')
-    }),
-    { stream: false, signal }
-  )
-  if (!response.success || !response.content?.trim()) throw new Error(response.error || '章节簇结构修复失败')
-  const json = extractJsonText(response.content.trim()) ?? response.content.trim()
-  let parsed: { chapters?: Array<Record<string, unknown>> }
-  try { parsed = JSON.parse(json) as typeof parsed } catch (error) {
-    throw new Error(`章节簇结构修复解析失败：${error instanceof Error ? error.message : String(error)}`)
-  }
-  if (!Array.isArray(parsed.chapters)) throw new Error('章节簇结构修复缺少chapters数组')
-
-  let outlines = 0
-  for (const row of parsed.chapters) {
-    const id = Number(row.id)
-    const target = targets.find(chapter => chapter.id === id)
-    if (!target || String(row.title ?? '').trim() !== target.title) continue
-    const outline = String(row.outline ?? '').trim()
-    const nextHook = String(row.next_hook ?? '').trim()
-    const tensionLevel = Math.max(1, Math.min(10, Math.round(Number(row.tension_level) || 0)))
-    const payoffType = String(row.payoff_type ?? '')
-    const pattern = row.pattern_contract
-    if (!outline || !nextHook || !pattern || typeof pattern !== 'object' || Array.isArray(pattern)
-      || !['debt', 'partial', 'major', 'aftertaste'].includes(payoffType) || tensionLevel <= 0) continue
-    let diagnosis: Record<string, unknown> = {}
-    try { diagnosis = JSON.parse(target.outline_diagnosis ?? '{}') as Record<string, unknown> } catch { /* 重建 */ }
-    diagnosis.pattern_contract = pattern
-    diagnosis.tension_plan = { level: tensionLevel, payoff_type: payoffType }
-    volumeChapterDAO.updateChapterWithVersion(id, {
-      outline,
-      next_hook: nextHook,
-      outline_diagnosis: JSON.stringify(diagnosis)
-    })
-    outlines++
-  }
-  if (outlines !== targets.length) throw new Error(`章节簇结构修复仅返回 ${outlines}/${targets.length} 个有效目标`)
-
-  // 结构变化会污染后续记忆；从每个受影响卷最早修改章起级联失效正文，交回draft_body顺序重生。
-  let invalidatedBodies = 0
-  const invalidatedVolumeNames = new Set<string>()
-  for (const volumeId of targetVolumes) {
-    const volumeChapters = allChapters.filter(chapter => chapter.volume_id === volumeId)
-    if (volumeChapters[0]?.volume_name) invalidatedVolumeNames.add(volumeChapters[0].volume_name)
-    const firstTargetIndex = volumeChapters.findIndex(chapter => plan.targetChapterIds.includes(chapter.id))
-    if (firstTargetIndex < 0) continue
-    for (const chapter of volumeChapters.slice(firstTargetIndex)) {
-      clearChapterNarrativeMemory(workId, chapter.id)
-      if (chapter.content?.trim()) invalidatedBodies++
-      volumeChapterDAO.updateChapterWithVersion(chapter.id, {
-        content: '', word_count: 0, status: 'draft', emotion_assessment_json: null
-      })
-    }
-  }
-  const state = readNovelGoalState(workId)
-  updateNovelGoalState(workId, {
-    checkedBodyVolumes: (state.checkedBodyVolumes ?? []).filter(name => !invalidatedVolumeNames.has(name))
-  })
-  return { outlines, invalidatedBodies }
-}
-
-async function executeNovelRepairPlan(
-  workId: number,
-  plan: RepairPlan,
-  goal: string,
-  config: StoryGoalConfig,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<string> {
-  const boundedTargets = capNovelAutomaticRepairTargets(
-    plan.targetChapterIds,
-    volumeChapterDAO.listChaptersByWork(workId)
-  )
-  if (plan.targetChapterIds.length > 0 && boundedTargets.length === 0) {
-    throw new NovelPipelineError(
-      'REPAIR_BOUNDARY',
-      `修复目标超出全书尾部 ${MAX_AUTO_NOVEL_REPAIR_CHAPTERS} 章安全窗口，拒绝自动改写已冻结正文`
-    )
-  }
-  plan = { ...plan, targetChapterIds: boundedTargets }
-
-  if (plan.action === 'draft_missing') {
-    const summaries: string[] = []
-    for (const chapterId of plan.targetChapterIds) {
-      assertNotAborted(signal)
-      const ch = volumeChapterDAO.getChapter(chapterId)
-      onProgress?.(`正在生成缺失章节「${ch?.title ?? chapterId}」`)
-      clearChapterNarrativeMemory(workId, chapterId)
-      const gen = await generateBeatBody(workId, chapterId, {
-        signal,
-        goalDescription: goal,
-        workType: 'novel',
-        deferNarrativeMemory: true
-      })
-      if (!gen.success) throw new Error(gen.error || '生成失败')
-      const gate = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
-      if (!gate.passed) {
-        throw new Error(`「${ch?.title ?? chapterId}」补写后未通过质量与情绪门禁：${gate.failedMetrics.join('、')}`)
-      }
-      await finalizeNovelChapterMemory(workId, chapterId, signal, onProgress)
-      summaries.push(`${ch?.title ?? chapterId} ${gen.wordCount}字，质量与情绪门禁通过`)
-    }
-    return summaries.join('；')
-  }
-
-  if (plan.scope === 'cluster' || plan.scope === 'volume') {
-    onProgress?.(`正在执行${plan.scope === 'volume' ? '整卷' : '章节簇'}结构修复`)
-    const result = await reviseNovelStructuralCluster(workId, plan, goal, signal)
-    return `重构 ${result.outlines} 章大纲，级联失效 ${result.invalidatedBodies} 章正文，将按新状态顺序重生`
-  }
-
-  const summaries: string[] = []
-  for (const chapterId of plan.targetChapterIds) {
-    assertNotAborted(signal)
-    const ch = volumeChapterDAO.getChapter(chapterId)
-    if (!ch) continue
-    clearChapterNarrativeMemory(workId, chapterId)
-    let summary = ''
-    let bodyChanged = false
-
-    if (plan.issueCodes?.includes('MISSING_PATTERN_FINGERPRINT') && ch.content?.trim()) {
-      onProgress?.(`「${ch.title}」将在复验后重新提取状态与模式指纹`)
-      summary = `${ch.title} 等待复验后补抽取状态与模式指纹`
-    } else if (plan.action === 'systemic') {
-      onProgress?.(`正在修复承重状态「${ch.title}」`)
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal,
-        workType: 'novel',
-        deferNarrativeMemory: true,
-        instruction: `${plan.hint}\n只修改与确定性证据冲突的事实；既有不可逆状态优先，不得用模糊措辞掩盖冲突。`
-      })
-      if (!gen.success) throw new Error(gen.error || '承重状态修复失败')
-      bodyChanged = true
-      summary = `${ch.title} 已修复承重状态冲突`
-
-    } else if (plan.action === 'expand' || plan.action === 'compress') {
-      onProgress?.(`正在${plan.action === 'expand' ? '扩写' : '压缩'}「${ch.title}」`)
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal, instruction: plan.hint, workType: 'novel', deferNarrativeMemory: true
-      })
-      if (!gen.success) throw new Error(gen.error || '字数修订失败')
-      bodyChanged = true
-      summary = `${ch.title} ${gen.wordCount}字`
-    } else if (plan.action === 'quality') {
-      onProgress?.(`正在定向精修「${ch.title}」`)
-      const diagnosis = await diagnoseChapterQualityAi(workId, chapterId, ch.content ?? '', {
-        thinkingEnabled: getGoalLoopModelOpts(workId).thinkingEnabled
-      })
-      if (!diagnosis.success || !diagnosis.report) throw new Error(diagnosis.error || '质量诊断失败')
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal,
-        workType: 'novel',
-        deferNarrativeMemory: true,
-        instruction: `根据以下质量诊断逐项修复，优先处理硬失败、因果、人设、设定、大纲覆盖和章末钩子：\n${diagnosis.report}`
-      })
-      if (!gen.success) throw new Error(gen.error || '质量修复失败')
-      bodyChanged = true
-      summary = `${ch.title} 已按诊断定向精修`
-    } else if (plan.action === 'emotion') {
-      onProgress?.(`正在定向修复情绪门禁「${ch.title}」`)
-      let instruction = plan.hint
-      try {
-        const assessment = ch.emotion_assessment_json
-          ? JSON.parse(ch.emotion_assessment_json)
-          : null
-        if (assessment) instruction = emotionRepairHint(assessment)
-      } catch { /* 使用通用情绪修复提示 */ }
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal, instruction, workType: 'novel', deferNarrativeMemory: true
-      })
-      if (!gen.success) throw new Error(gen.error || '情绪修复失败')
-      bodyChanged = true
-      summary = `${ch.title} 已按情绪盲读报告定向精修`
-    } else if (plan.action === 'deai') {
-      onProgress?.(`正在去AI/修复一致性「${ch.title}」`)
-      const gate = runConsistencyGate(workId, chapterId, ch.content ?? '', { requireTimeline: false })
-      const violations = gate.blockers.join('；')
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal,
-        instruction: `请修复以下问题：${[violations, plan.hint].filter(Boolean).join('；') || '去除AI腔、提升叙事自然度'}`,
-        workType: 'novel',
-        deferNarrativeMemory: true
-      })
-      if (!gen.success) throw new Error(gen.error || '修复失败')
-      bodyChanged = true
-      summary = `${ch.title} 已修复`
-    } else {
-      onProgress?.(`正在优化目标匹配「${ch.title}」`)
-      const gen = await reviseBeatBody(workId, chapterId, {
-        signal,
-        deferNarrativeMemory: true,
-        instruction: `${plan.hint || '强化创作目标匹配度'}\n用户目标：${goal}`,
-        workType: 'novel'
-      })
-      if (!gen.success) throw new Error(gen.error || '优化失败')
-      bodyChanged = true
-      summary = `${ch.title} 已优化`
-    }
-
-    const acceptance = await runChapterAcceptanceGate(workId, chapterId, config, signal, onProgress)
-    if (!acceptance.passed) {
-      throw new Error(`「${ch.title}」修订后未通过质量与情绪门禁：${acceptance.failedMetrics.join('、')}`)
-    }
-    await finalizeNovelChapterMemory(workId, chapterId, signal, onProgress)
-    if (bodyChanged) {
-      const state = readNovelGoalState(workId)
-      const volumeName = volumeChapterDAO.listVolumes(workId).find(volume => volume.id === ch.volume_id)?.name
-      updateNovelGoalState(workId, {
-        checkedBodyVolumes: (state.checkedBodyVolumes ?? []).filter(name => name !== volumeName)
-      })
-    }
-    summaries.push(`${summary}，复验通过`)
-  }
-  return summaries.join('；') || '无需修复'
-}
-
-async function runVolumeBodyCheckpoint(
-  workId: number,
-  chapterId: number,
-  goal: string,
-  signal?: AbortSignal,
-  onProgress?: (message: string) => void
-): Promise<{ passed: boolean; summary: string }> {
-  const all = volumeChapterDAO.listChaptersByWork(workId)
-  const current = all.find(chapter => chapter.id === chapterId)
-  if (!current) return { passed: true, summary: '' }
-  const volumeChapters = all.filter(chapter => chapter.volume_id === current.volume_id)
-  if (volumeChapters.at(-1)?.id !== chapterId || volumeChapters.some(chapter => !chapter.content?.trim())) {
-    return { passed: true, summary: '' }
-  }
-  const state = readNovelGoalState(workId)
-  if (state.checkedBodyVolumes?.includes(current.volume_name)) return { passed: true, summary: '' }
-
-  onProgress?.(`正在执行「${current.volume_name}」全覆盖分卷正文检查点`)
-  const assessment = await assessNovelVolume(workId, current.volume_name, volumeChapters, signal)
-  const scoresPassed = assessment.structureScore >= 80
-    && assessment.escalationScore >= 78
-    && assessment.payoffScore >= 80
-    && assessment.continuityScore >= 85
-    && assessment.repetitionScore >= 80
-  const passed = scoresPassed && assessment.evidenceIssues.length === 0 && assessment.issues.length === 0
-  if (passed) {
-    updateNovelGoalState(workId, {
-      checkedBodyVolumes: [...new Set([...(state.checkedBodyVolumes ?? []), current.volume_name])]
-    })
-    return {
-      passed: true,
-      summary: `结构${assessment.structureScore}/升级${assessment.escalationScore}/兑现${assessment.payoffScore}/连续${assessment.continuityScore}/反重复${assessment.repetitionScore}`
-    }
-  }
-
-  if (assessment.evidenceIssues.length === 0) {
-    throw new Error(
-      `分卷评估器给出低分或问题但没有“章节标题 + 原文证据”，禁止据此自动重写「${current.volume_name}」`
-    )
-  }
-
-  const weakIds = assessment.weakChapters
-    .map(title => volumeChapters.find(chapter => chapter.title === title
-      || chapter.title.includes(title)
-      || title.includes(chapter.title))?.id)
-    .filter((id): id is number => id != null)
-  const targetIds = capNovelAutomaticRepairTargets(
-    weakIds,
-    volumeChapterDAO.listChaptersByWork(workId)
-  )
-  if (targetIds.length === 0) {
-    throw new NovelPipelineError(
-      'REPAIR_BOUNDARY',
-      `「${current.volume_name}」的问题证据位于已冻结窗口之外，超出尾部 ${MAX_AUTO_NOVEL_REPAIR_CHAPTERS} 章自动修复范围`
-    )
-  }
-  const plan: RepairPlan = {
-    action: 'volume',
-    scope: 'volume',
-    targetChapterIds: targetIds,
-    hint: [
-      `分卷正文检查点未通过：结构${assessment.structureScore}/升级${assessment.escalationScore}/兑现${assessment.payoffScore}/连续${assessment.continuityScore}/反重复${assessment.repetitionScore}`,
-      ...assessment.issues
-    ].join('\n')
-  }
-  const repaired = await reviseNovelStructuralCluster(workId, plan, goal, signal)
-  return {
-    passed: false,
-    summary: `已重构 ${repaired.outlines} 章并级联失效 ${repaired.invalidatedBodies} 章正文`
-  }
-}
-
+export { cancelAllNovelGoalLoops, cancelNovelGoalLoop, isNovelGoalLoopRunning }
 const VALID_PHASES: Phase[] = NOVEL_GOAL_ROUTINE_PHASE_ORDER
-
-function isResumable(status: string | null | undefined): boolean {
-  return status === 'paused' || status === 'running' || status === 'cancelled' || status === 'timeout'
-}
-
-export function shouldResumeNovelGoalLoop(workId: number): boolean {
-  const existing = goalRoutineDAO.getByWork(workId)
-  if (!existing || existing.goal_met) return false
-  if (!isResumable(existing.status)) return false
-  if (existing.status === 'timeout') return true
-  if (existing.status === 'paused' || existing.status === 'cancelled') {
-    return (existing.turn_count ?? 0) > 0 || Boolean(existing.current_phase)
-  }
-  return false
-}
 
 export async function runNovelGoalLoop(
   workId: number,
@@ -1580,7 +162,7 @@ export async function runNovelGoalLoop(
   resume = false,
   forcePhase?: Phase
 ): Promise<void> {
-  if (activeLoops.has(workId)) {
+  if (isNovelGoalLoopRunning(workId)) {
     throw new Error('该作品已有目标循环在运行')
   }
 
@@ -1590,7 +172,7 @@ export async function runNovelGoalLoop(
   let phase: Phase
   const explicitPhase = forcePhase && isGoalRoutinePhase(forcePhase) ? forcePhase : undefined
 
-  if (resume && existing && isResumable(existing.status)) {
+  if (resume && existing && isResumableNovelGoalStatus(existing.status)) {
     const saved = existing.goal_config_json
       ? { ...DEFAULT_STORY_GOAL_CONFIG, ...JSON.parse(existing.goal_config_json) as Partial<StoryGoalConfig> }
       : { ...DEFAULT_STORY_GOAL_CONFIG }
@@ -1617,18 +199,125 @@ export async function runNovelGoalLoop(
 
   fullConfig.maxTurns = requireGoalTurnLimit(fullConfig.maxTurns)
 
+  const authorityState = ensureNovelAuthorityState(workId)
+  const savedWorkflowDefinitionVersion = readNovelGoalState(workId).workflowDefinitionVersion
+  const run = goalRoutineDAO.beginRun({
+    workId,
+    workflowType: 'novel',
+    resume,
+    maxTurns: fullConfig.maxTurns,
+    currentPhase: phase,
+    goalConfigJson: JSON.stringify(fullConfig),
+    resetTurnCount: resume && Boolean(existing && (
+      existing.status === 'timeout' || existing.turn_count >= fullConfig.maxTurns
+    ))
+  })
+  turn = run.turn_count
+  phase = (run.current_phase as Phase) || phase
+  if (resume) {
+    const narrativeMemoryPlan = recoverInterruptedNarrativeMemoryGateOnResume(workId)
+    if (narrativeMemoryPlan) {
+      updateNovelGoalState(workId, {
+        repairPlan: narrativeMemoryPlan,
+        repairCommitPending: undefined,
+        failure: undefined,
+        autonomousTerminal: undefined
+      })
+      goalRoutineDAO.update(workId, { status: 'running', current_phase: 'repair_execute' })
+      goalRoutineDAO.appendTurn({
+        work_id: workId,
+        turn_no: turn,
+        phase: 'repair_execute',
+        action: 'narrative_memory_outline_replan_resume',
+        target_chapter_id: narrativeMemoryPlan.targetChapterIds[0],
+        summary: '断点账本显示章节提交的跨章记忆门禁被误路由；已回到当前未提交章节的结构重规划'
+      })
+      phase = 'repair_execute'
+    }
+  }
+  if (resume && phase === 'repair_execute') {
+    const structuralReplan = recoverInterruptedExecutionContractRepairOnResume(workId)
+    if (structuralReplan) {
+      updateNovelGoalState(workId, {
+        repairPlan: structuralReplan,
+        failure: undefined,
+        autonomousTerminal: undefined
+      })
+      goalRoutineDAO.update(workId, { status: 'running', current_phase: 'repair_execute' })
+      goalRoutineDAO.appendTurn({
+        work_id: workId,
+        turn_no: turn,
+        phase: 'repair_execute',
+        action: 'execution_contract_structural_replan_resume',
+        target_chapter_id: structuralReplan.targetChapterIds[0],
+        summary: '断点恢复发现章节合同正文补丁已耗尽，恢复一次性当前章节结构重规划而非重复修订正文'
+      })
+      phase = 'repair_execute'
+    }
+  }
+  if (authorityState.created) {
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase,
+      action: 'authority_state_materialized',
+      summary: authorityState.sourceRunId == null
+        ? '已建立作品级小说权威状态'
+        : `已从历史运行 #${authorityState.sourceRunId} 迁移作品级小说权威状态`
+    })
+  }
+
+  try {
+    const frozen = ensureWorkflowModelContract(
+      run.id,
+      storyGoalModelOpts(fullConfig)
+    )
+    if (frozen.created) {
+      goalRoutineDAO.appendTurn({
+        work_id: workId,
+        turn_no: turn,
+        phase,
+        action: 'model_contract_frozen',
+        summary: `已冻结本次运行的模型、协议与生成参数合同 ${frozen.hash.slice(0, 12)}`
+      })
+    }
+  } catch (error) {
+    markNovelAutonomousTerminal({
+      workId,
+      phase,
+      code: 'MODEL_CONTRACT_PREFLIGHT',
+      message: error instanceof Error ? error.message : String(error)
+    })
+    goalRoutineDAO.appendTurn({
+      work_id: workId,
+      turn_no: turn,
+      phase,
+      action: 'model_contract_preflight_failed',
+      summary: error instanceof Error ? error.message : String(error)
+    })
+    throw error
+  }
+
   const controller = new AbortController()
-  activeLoops.set(workId, controller)
+  registerNovelGoalLoop(workId, controller)
   bindGoalLoopModelOpts(workId, fullConfig)
 
-  goalRoutineDAO.ensure(workId)
+  const workflowUpgrade = reconcileNovelWorkflowDefinition({
+    workId,
+    resume,
+    phase,
+    savedVersion: savedWorkflowDefinitionVersion,
+    turn
+  })
+  phase = workflowUpgrade.phase
+
   if (resume && phase === 'generate_beats' && reopenStalledNovelVolumeGate(workId)) {
     goalRoutineDAO.appendTurn({
       work_id: workId,
       turn_no: turn,
       phase,
       action: 'repair_stall_resume',
-      summary: '用户显式断点续跑：保留章节、候选版本和累计改写预算，重新执行只读分卷诊断'
+      summary: '自治恢复：保留章节、候选版本和累计改写预算，重新执行只读分卷诊断'
     })
   }
   const hasNoNovelStructure = volumeChapterDAO.listVolumes(workId).length === 0
@@ -1636,9 +325,10 @@ export async function runNovelGoalLoop(
   if (!resume && explicitPhase === 'generate_volumes' && hasNoNovelStructure) {
     resetNovelGoalStateFromVolumePlan(workId)
   }
-  const savedExecutionProtocolVersion = readNovelGoalState(workId).chapterExecutionProtocolVersion
+  reconcileNovelChapterExecutionProtocol({ workId, resume, phase, turn })
   updateNovelGoalState(workId, {
     chapterExecutionProtocolVersion: CHAPTER_EXECUTION_CONTRACT_VERSION,
+    autonomousTerminal: undefined,
     ...(!resume && !explicitPhase
       ? {
           titleHookCandidates: undefined,
@@ -1648,27 +338,19 @@ export async function runNovelGoalLoop(
         }
       : {}),
     ...(!resume ? {
+      autonomousEpoch: 1,
+      autonomousChapterEscalations: {},
+      chapterTransactionBudgets: {},
       failure: undefined,
       repairStall: undefined
     } : {})
   })
-  if (shouldRecoverNovelChapterExecutionProtocol({
-    resume,
-    phase,
-    savedVersion: savedExecutionProtocolVersion,
-    currentVersion: CHAPTER_EXECUTION_CONTRACT_VERSION
-  })) {
-    updateNovelGoalState(workId, {
-      chapterExecutionProtocolVersion: CHAPTER_EXECUTION_CONTRACT_VERSION,
-      failure: undefined
-    })
-    goalRoutineDAO.appendTurn({
-      work_id: workId,
-      turn_no: turn,
-      phase,
-      action: 'harness_recovery',
-      summary: `章节执行协议升级到 v${CHAPTER_EXECUTION_CONTRACT_VERSION}：保留正式正文与候选版本，清除旧版证据协议失败计数并按结构化验收项重新验收`
-    })
+  const persistedRepairTarget = readNovelGoalState(workId).repairPlan?.targetChapterIds[0]
+  if (persistedRepairTarget != null) {
+    const acceptance = getNovelChapterAcceptanceSummary(workId)
+    if (acceptance) {
+      reconcileAutonomousRepairFromAcceptance(workId, persistedRepairTarget, acceptance)
+    }
   }
   if (!resume && !explicitPhase && volumeChapterDAO.listChaptersByWork(workId).length === 0) {
     updateNovelGoalState(workId, {
@@ -1704,8 +386,20 @@ export async function runNovelGoalLoop(
     const ev: GoalProgressEvent = {
       workId, turn, maxTurns: fullConfig.maxTurns, phase, status, check: lastCheck, message
     }
-    broadcastProgress('goal:progress', ev)
+    broadcastNovelGoalProgress('goal:progress', ev)
   }
+
+  // 单次模型调用可能超过租约时长；没有后台心跳时，运行会在仍有请求
+  // 进行的情况下失去租约，界面看起来像卡在“1 / 600”，并允许其他执行器
+  // 错误接管同一个检查点。心跳只续期仍由本执行器持有且用户未取消的运行。
+  const heartbeat = setInterval(() => {
+    if (controller.signal.aborted) return
+    const current = goalRoutineDAO.getByWork(workId)
+    if (!current || current.status !== 'running' || current.desired_state !== 'running') return
+    if (goalRoutineDAO.heartbeat(workId, phase)) {
+      emit(`正在执行「${phase}」，后台仍在处理`, 'running')
+    }
+  }, 15_000)
 
   try {
     while (true) {
@@ -1716,7 +410,13 @@ export async function runNovelGoalLoop(
       }
 
       const requestedPhase = phase
-      const prerequisitePhase = safeNovelPreparationPhase(workId, requestedPhase, fullConfig.goalDescription)
+      const prerequisitePhase = safeNovelPreparationPhase(
+        workId,
+        requestedPhase,
+        fullConfig.goalDescription,
+        fullConfig.goldenFingerRequired,
+        fullConfig.checkEmotionContract
+      )
       if (prerequisitePhase !== requestedPhase) {
         phase = prerequisitePhase
         updateNovelGoalState(workId, { failure: undefined })
@@ -1732,51 +432,183 @@ export async function runNovelGoalLoop(
         continue
       }
 
-      const expectedChapters = loadWritingPlan(workId).targetChapters
-      const constructionChapters = volumeChapterDAO.listChaptersByWork(workId)
-      const completedBodies = constructionChapters.filter(chapter => Boolean(chapter.content?.trim())).length
-      if (shouldExtendNovelConstructionBudget({
-        turn,
-        maxTurns: fullConfig.maxTurns,
-        expectedChapters,
-        outlinedChapters: constructionChapters.length,
-        completedBodies
-      })) {
-        const previousLimit = fullConfig.maxTurns
-        fullConfig.maxTurns += Math.max(100, expectedChapters)
-        goalRoutineDAO.update(workId, {
-          max_turns: fullConfig.maxTurns,
-          goal_config_json: JSON.stringify(fullConfig)
-        })
-        goalRoutineDAO.appendTurn({
-          work_id: workId,
-          turn_no: turn,
-          phase,
-          action: 'construction_budget_extended',
-          summary: `整本尚未生成完成，施工预算从 ${previousLimit} 自动续展到 ${fullConfig.maxTurns} 轮（大纲 ${constructionChapters.length}/${expectedChapters}，正文 ${completedBodies}/${expectedChapters}）`
-        })
-        emit(`整本尚未完成，已自动续展施工预算至 ${fullConfig.maxTurns} 轮`, 'running')
-        continue
-      }
-
-      if (turn >= fullConfig.maxTurns) {
+      if (isNovelHardBudgetExhausted(turn, fullConfig.maxTurns)) {
+        const runtime = readNovelGoalState(workId)
+        const epoch = runtime.autonomousEpoch ?? 1
+        const maxEpochs = normalizeAutonomousMaxEpochs(fullConfig.autonomousMaxEpochs)
+        if (epoch < maxEpochs) {
+          turn = 0
+          updateNovelGoalState(workId, {
+            autonomousEpoch: epoch + 1,
+            failure: undefined
+          })
+          goalRoutineDAO.update(workId, {
+            status: 'running',
+            turn_count: 0,
+            current_phase: phase
+          })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: 0,
+            phase,
+            action: 'autonomous_epoch_rollover',
+            summary: `自治执行周期 ${epoch}/${maxEpochs} 已完成；从持久化检查点自动开启周期 ${epoch + 1}`
+          })
+          emit(`自治周期 ${epoch + 1}/${maxEpochs} 已自动开始，无需人工续跑`, 'running')
+          continue
+        }
         goalRoutineDAO.appendTurn({
           work_id: workId,
           turn_no: turn,
           phase,
           action: 'budget_exhausted',
-          summary: `已使用 ${fullConfig.maxTurns} 轮硬预算，保存断点并暂停，继续运行需显式恢复`
+          summary: `已用完 ${maxEpochs} 个自治周期，保存全部正文、候选、检查点和权威状态`
         })
         goalRoutineDAO.setStatus(workId, 'timeout')
-        emit('本轮调用预算已用完，已保存断点；请显式继续运行', 'timeout')
+        emit(`自治总预算已用完（${maxEpochs} 周期），运行进入明确预算终态`, 'timeout')
         return
       }
 
       turn++
       goalRoutineDAO.update(workId, { turn_count: turn, current_phase: phase })
       const attemptedPhase = phase
-
+      goalRoutineDAO.appendTurn({
+        work_id: workId,
+        turn_no: turn,
+        phase: attemptedPhase,
+        action: 'phase_start',
+        summary: `开始执行「${attemptedPhase}」阶段`
+      })
+      const runtimeBeforeStep = readNovelGoalState(workId)
+      const scopedChapter = attemptedPhase === 'draft_body'
+        ? nextPendingDraftChapter(workId, fullConfig)
+        : null
+      const scopedChapterId = scopedChapter?.id
+        ?? (attemptedPhase === 'repair_execute'
+          ? runtimeBeforeStep.repairPlan?.targetChapterIds?.[0]
+          : undefined)
+      const attemptedStepKey = attemptedPhase === 'draft_body' && scopedChapter
+        ? resolveNovelDraftWorkflowStep({
+            hasCausalState: Boolean(causalNovelDAO.getState(workId)),
+            decisionReady: isUnifiedNovelDecisionReady(workId, scopedChapter.id),
+            needsGeneration: scopedChapter.needsGeneration,
+            needsAcceptance: scopedChapter.needsAcceptance,
+            precommitReady: hasUnifiedNovelPrecommitArtifacts(workId, scopedChapter.id)
+          })
+        : attemptedPhase === 'repair_execute'
+          ? 'repair_execute'
+          : attemptedPhase
+      const acceptanceIdentity = attemptedStepKey === 'body_acceptance' && scopedChapter
+        ? resolveNovelChapterAcceptanceIdentity(workId, scopedChapter.id, fullConfig)
+        : null
+      const stepInstance = goalRoutineDAO.beginStep({
+        workId,
+        stepKey: attemptedStepKey,
+        phaseKey: attemptedPhase,
+        scopeKey: attemptedStepKey === 'causal_state_init'
+          ? `work:${workId}`
+          : scopedChapterId ? `chapter:${scopedChapterId}` : `work:${workId}`,
+        input: acceptanceIdentity
+          ? {
+              phase: attemptedPhase,
+              operation: attemptedStepKey,
+              chapterId: scopedChapterId,
+              episodeKey: acceptanceIdentity.episodeKey,
+              baseContentHash: acceptanceIdentity.baseContentHash,
+              contractHash: acceptanceIdentity.contractHash,
+              protocolVersion: acceptanceIdentity.protocolVersion
+            }
+          : buildNovelWorkflowStepInput({
+              phase: attemptedPhase,
+              operation: attemptedStepKey,
+              stateRevision: causalNovelDAO.getState(workId)?.revision ?? null,
+              pendingReplayJobId: causalNovelDAO.getPendingReplay(workId)?.id ?? null,
+              repairPlan: runtimeBeforeStep.repairPlan ?? null,
+              chapters: volumeChapterDAO.listChaptersByWork(workId),
+              scopedChapterId
+            }),
+        protocolVersion: acceptanceIdentity
+          ? CHAPTER_ACCEPTANCE_PROTOCOL_VERSION
+          : novelWorkflowStepProtocolVersion(attemptedStepKey)
+      })
+      const attemptedStepLabel = attemptedStepKey === attemptedPhase
+        ? attemptedPhase
+        : novelDraftWorkflowStepLabel(attemptedStepKey as NovelDraftWorkflowStep)
+      if (attemptedStepKey !== attemptedPhase) {
+        goalRoutineDAO.appendTurn({
+          work_id: workId,
+          turn_no: turn,
+          phase: attemptedPhase,
+          action: 'substep_start',
+          target_chapter_id: scopedChapterId ?? null,
+          summary: `开始执行可恢复子步骤「${attemptedStepLabel}」`
+        })
+      }
+      setWorkflowExecutionContext({
+        runId: stepInstance.run_id,
+        stepInstanceId: stepInstance.id,
+        workId,
+        stepKey: attemptedStepKey
+      })
+      let workflowStepFailure: ClassifiedWorkflowError | undefined
+      let workflowStepDisposition: 'completed' | 'needs_repair' = 'completed'
       try {
+        const pendingReplay = causalNovelDAO.getPendingReplay(workId)
+        if (pendingReplay?.status === 'blocked') {
+          const replayTargets = [...new Set([
+            pendingReplay.chapterId,
+            ...pendingReplay.affectedChapterIds
+          ])]
+          causalNovelDAO.cancelReplay(pendingReplay.id)
+          updateNovelGoalState(workId, {
+            repairPlan: {
+              action: 'cluster',
+              scope: 'cluster',
+              targetChapterIds: replayTargets,
+              hint: [
+                '因果重放冲突已自动升级为依赖闭包结构重规划。',
+                pendingReplay.errorMessage ?? '重放前置状态与后续章节不再蕴含'
+              ].join('\n'),
+              issueCodes: ['CAUSAL_REPLAY_CONFLICT']
+            } satisfies RepairPlan,
+            failure: undefined
+          })
+          phase = 'repair_execute'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'causal_replay_autonomous_replan',
+            target_chapter_id: pendingReplay.chapterId,
+            summary: `因果重放冲突已原子恢复到源版本，自动重规划 ${replayTargets.length} 章依赖闭包`
+          })
+          emit(
+            `因果重放冲突已升级为 ${replayTargets.length} 章依赖闭包重规划`,
+            'running'
+          )
+          continue
+        }
+        if (pendingReplay) {
+          const replayed = await processPendingCausalReplay(
+            workId,
+            fullConfig,
+            controller.signal,
+            message => emit(message, 'running')
+          )
+          if (!replayed) throw new Error('待处理因果重放任务没有产生重放结果')
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'causal_replay_complete',
+            target_chapter_id: pendingReplay.chapterId,
+            summary: `因果重放 #${replayed.replayJobId} 完成，`
+              + `${replayed.replayedChapters} 章已提交到 r${replayed.finalRevision}`
+          })
+          emit(`因果重放完成，下一轮恢复「${attemptedPhase}」`, 'running')
+          continue
+        }
         if (phase === 'incubate_outline') {
           const count = await incubateStoryline(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
           goalRoutineDAO.appendTurn({
@@ -1812,7 +644,13 @@ export async function runNovelGoalLoop(
           emit(`冻结孵化版本 #${versionId}`, 'running')
           phase = 'materialize_settings'
         } else if (phase === 'materialize_settings') {
-          const count = await materializeNovelSettings(workId, fullConfig.goalDescription, controller.signal, msg => emit(msg, 'running'))
+          const count = await materializeNovelSettings(
+            workId,
+            fullConfig.goalDescription,
+            fullConfig.goldenFingerRequired,
+            controller.signal,
+            msg => emit(msg, 'running')
+          )
           emit('正在抽取资源约束账本', 'running')
           const resourceCount = await refreshResourceConstraints(workId, controller.signal)
           goalRoutineDAO.appendTurn({
@@ -1827,17 +665,16 @@ export async function runNovelGoalLoop(
             work_id: workId, turn_no: turn, phase, action: 'character_cards', summary: `生成 ${count} 张主角人设卡片`
           })
           emit(`生成 ${count} 张主角人设卡片`, 'running')
-          phase = 'emotion_engine_gate'
+          phase = fullConfig.checkEmotionContract ? 'emotion_engine_gate' : 'overall_self_check'
         } else if (phase === 'emotion_engine_gate') {
-          const result = await ensureEmotionEngine(
-            workId, fullConfig.goalDescription, 'novel', controller.signal,
-            message => emit(message, 'running')
-          )
-          goalRoutineDAO.appendTurn({
-            work_id: workId, turn_no: turn, phase, action: 'emotion_engine_gate',
-            score: result.score, summary: `情绪发动机通过（${result.score}分，${result.rounds}轮）`
+          await runNovelEmotionEnginePreparation({
+            workId,
+            turn,
+            enabled: fullConfig.checkEmotionContract,
+            goal: fullConfig.goalDescription,
+            signal: controller.signal,
+            emit
           })
-          emit(`情绪发动机通过（${result.score}分）`, 'running')
           phase = 'overall_self_check'
         } else if (phase === 'generate_title_hook') {
           emit('正在生成书名和导语', 'running')
@@ -1867,6 +704,11 @@ export async function runNovelGoalLoop(
           })
           const qualityStatus = getSettingsQualityStatus(workId)
           if (!qualityStatus.canProceed) {
+            if (qualityStatus.blockingCount === 0) {
+              throw new Error(
+                `SETTINGS_QUALITY_REVIEW_REQUIRED: 整体自检无 blocking 项，但总分 ${qualityStatus.overallScore ?? '-'} 未达到放行条件；停止自动重写，等待复核自检协议或人工审阅`
+              )
+            }
             const runtime = readNovelGoalState(workId)
             const repairRound = runtime.overallRepairRounds ?? 0
             const revised = await repairNovelSettingsFromOverallCheck(
@@ -1934,6 +776,7 @@ export async function runNovelGoalLoop(
               workId,
               lastVolumeChapter.id,
               fullConfig.goalDescription,
+              fullConfig,
               controller.signal,
               msg => emit(msg, 'running')
             )
@@ -2035,30 +878,67 @@ export async function runNovelGoalLoop(
                 `正文目标章节不属于当前已冻结分卷「${workflow?.kind === 'draft_body' ? workflow.volume.name : '未知'}」`
               )
             }
-            const previouslyAcceptedContent = chapterRow.status === 'completed'
-              ? chapterRow.content?.trim() ?? ''
-              : ''
-            // 只有需要重新生成或重新验收正文时才失效派生记忆。
-            // 若质量/情绪已通过、只缺记忆指纹，则保留验收结果并从记忆检查点恢复。
-            if (chapter.needsGeneration || chapter.needsAcceptance) {
+            if (attemptedStepKey === 'causal_state_init') {
+              await initializeCausalNovelState(
+                workId,
+                fullConfig.goalDescription,
+                controller.signal,
+                msg => emit(msg, 'running'),
+                fullConfig.checkEmotionContract
+              )
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'causal_state_initialized',
+                summary: '已从卷级阶段、当前章节窗口与当前事实投影建立权威因果状态'
+              })
+              emit('权威因果状态初始化完成，下一轮生成当前章因果决策', 'running')
+              phase = 'draft_body'
+              continue
+            }
+            if (attemptedStepKey === 'chapter_decision') {
+              await ensureUnifiedNovelDecision(
+                workId,
+                chapter.id,
+                fullConfig.goalDescription,
+                controller.signal,
+                msg => emit(msg, 'running'),
+                fullConfig.checkEmotionContract
+              )
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'chapter_decision_planned',
+                target_chapter_id: chapter.id,
+                summary: `「${chapter.title}」权威因果决策已独立持久化`
+              })
+              emit(`「${chapter.title}」因果决策已建立，下一轮生成正文`, 'running')
+              phase = 'draft_body'
+              continue
+            }
+            await ensureUnifiedNovelDecision(
+              workId,
+              chapter.id,
+              fullConfig.goalDescription,
+              controller.signal,
+              msg => emit(msg, 'running'),
+              fullConfig.checkEmotionContract
+            )
+
+            if (attemptedStepKey === 'body_generation') {
               clearChapterNarrativeMemory(workId, chapter.id)
               volumeChapterDAO.updateChapter(chapter.id, { status: 'draft' })
-            }
-            if (chapter.needsGeneration) {
               emit(`正在生成正文「${chapter.title}」`, 'running')
               const gen = await generateBeatBody(workId, chapter.id, {
                 signal: controller.signal,
                 goalDescription: fullConfig.goalDescription,
                 workType: 'novel',
-                deferNarrativeMemory: true
+                deferNarrativeMemory: true,
+                checkEmotionContract: fullConfig.checkEmotionContract
               })
               if (!gen.success) {
-                if (gen.failureKind === 'evaluator_protocol') {
-                  throw new NovelPipelineError(
-                    'EVALUATOR_PROTOCOL',
-                    gen.error || '章节执行评估器证据协议异常'
-                  )
-                }
                 throw new Error(gen.error || '正文生成失败')
               }
               goalRoutineDAO.appendTurn({
@@ -2066,29 +946,21 @@ export async function runNovelGoalLoop(
                 target_chapter_id: chapter.id,
                 summary: `生成候选正文「${chapter.title}」${gen.wordCount}字，叙事记忆尚未提交`
               })
-              emit(`生成候选正文「${chapter.title}」${gen.wordCount}字，开始执行质量与情绪门禁`, 'running')
-            } else if (chapter.needsAcceptance) {
+              emit(`生成候选正文「${chapter.title}」${gen.wordCount}字；下一轮执行章节硬合同验收`, 'running')
+              phase = 'draft_body'
+              continue
+            }
+
+            if (attemptedStepKey === 'body_acceptance') {
+              clearChapterNarrativeMemory(workId, chapter.id)
+              volumeChapterDAO.updateChapter(chapter.id, { status: 'draft' })
               goalRoutineDAO.appendTurn({
                 work_id: workId, turn_no: turn, phase, action: 'diagnose_resume',
                 target_chapter_id: chapter.id,
-                summary: `检测到「${chapter.title}」已有正文但缺少完整验收，恢复质量与情绪门禁`
+                summary: `检测到「${chapter.title}」已有正文但缺少完整验收，恢复章节硬合同验收`
               })
-              emit(`「${chapter.title}」正文已存在但尚未完整验收，正在补跑质量与情绪门禁`, 'running')
-            } else {
-              goalRoutineDAO.appendTurn({
-                work_id: workId,
-                turn_no: turn,
-                phase,
-                action: 'memory_resume',
-                target_chapter_id: chapter.id,
-                summary: `「${chapter.title}」质量与情绪验收已完成，仅恢复缺失的章级记忆检查点`
-              })
-              emit(`「${chapter.title}」验收结果完整，正在恢复章级记忆检查点`, 'running')
-            }
-
-            let acceptance: Awaited<ReturnType<typeof runChapterAcceptanceGate>>
-            if (chapter.needsAcceptance) {
-              acceptance = await runChapterConvergenceGate(
+              emit(`「${chapter.title}」正文已存在但尚未完整验收，正在补跑章节硬合同验收`, 'running')
+              const acceptance = await runChapterConvergenceGate(
                 workId,
                 chapter.id,
                 fullConfig,
@@ -2100,36 +972,80 @@ export async function runNovelGoalLoop(
                 target_chapter_id: chapter.id,
                 score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
                 summary: acceptance.passed
-                  ? `「${chapter.title}」质量与情绪门禁通过（质量 ${acceptance.qualityScore} 分，累计诊断 ${acceptance.rounds} 轮）`
-                  : `「${chapter.title}」质量与情绪门禁未通过：${acceptance.failedMetrics.join('、')}`
+                  ? `「${chapter.title}」章节硬合同通过；质量与情绪已进入卷级编辑债务`
+                  : `「${chapter.title}」章节硬合同未通过：${acceptance.failedMetrics.join('、')}`
               })
               if (!acceptance.passed) {
+                workflowStepDisposition = 'needs_repair'
                 clearChapterNarrativeMemory(workId, chapter.id)
                 volumeChapterDAO.updateChapter(chapter.id, {
                   status: 'draft', emotion_assessment_json: null
                 })
-                throw new Error(
-                  `「${chapter.title}」累计诊断 ${acceptance.rounds} 轮仍未通过章节联合门禁，已保留最佳正文并禁止进入下一章`
-                  + `；${acceptance.failedMetrics.join('、') || '综合质量未达标'}`
+                const escalation = buildAutonomousChapterRepairPlan({
+                  workId,
+                  chapterId: chapter.id,
+                  gateType: acceptance.blockedGate,
+                  failureCode: acceptance.failureCode,
+                  wordRange: acceptance.wordRange,
+                  failedMetrics: acceptance.failedMetrics
+                })
+                updateNovelGoalState(workId, {
+                  repairPlan: escalation.plan,
+                  failure: undefined
+                })
+                goalRoutineDAO.appendTurn({
+                  work_id: workId,
+                  turn_no: turn,
+                  phase,
+                  action: 'autonomous_gate_escalation',
+                  target_chapter_id: chapter.id,
+                  summary: `「${chapter.title}」门禁未通过，自动升级到 L${escalation.level} ${escalation.plan.scope} 修复`
+                })
+                emit(
+                  `「${chapter.title}」门禁未收敛，正在自动执行 L${escalation.level} ${escalation.plan.scope} 修复`,
+                  'running'
                 )
+                phase = 'repair_execute'
+                continue
               }
-            } else {
-              const resumed = volumeChapterDAO.getChapter(chapter.id)
-              const cachedQuality = parseCachedQualityAssessment(
-                resumed?.quality_assessment_json,
-                resumed?.content ?? ''
+              emit(`「${chapter.title}」章节硬合同通过；下一轮生成一次携证状态事务并原子提交`, 'running')
+              phase = 'draft_body'
+              continue
+            }
+
+            if (attemptedStepKey === 'precommit_artifacts') {
+              emit(`「${chapter.title}」正文已冻结，正在准备哈希绑定的叙事记忆与因果结果`, 'running')
+              await prepareUnifiedNovelChapterCommit(
+                workId, chapter.id, fullConfig, controller.signal, msg => emit(msg, 'running')
               )
-              const cachedEmotion = parseStoredEmotionAssessment(resumed?.emotion_assessment_json)
-              acceptance = {
-                passed: isStrictCachedQualityReady(cachedQuality)
-                  && cachedEmotion?.passed === true
-                  && cachedEmotion.outcome_meta?.accepted_deferred !== true,
-                deferred: false,
-                qualityScore: cachedQuality?.scoreTotal ?? -1,
-                emotionScore: cachedEmotion?.score,
-                rounds: 0,
-                failedMetrics: []
-              }
+              phase = 'draft_body'
+              continue
+            }
+
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'memory_resume',
+              target_chapter_id: chapter.id,
+              summary: `「${chapter.title}」章节硬合同已完成，仅执行携证状态事务和原子提交`
+            })
+            emit(`「${chapter.title}」验收结果完整，正在提交章级记忆与因果后果`, 'running')
+            const resumed = volumeChapterDAO.getChapter(chapter.id)
+            const cachedQuality = parseCachedQualityAssessment(
+              resumed?.quality_assessment_json,
+              resumed?.content ?? ''
+            )
+            const cachedEmotion = parseStoredEmotionAssessment(resumed?.emotion_assessment_json)
+            const acceptance: Awaited<ReturnType<typeof runChapterAcceptanceGate>> = {
+              passed: isStrictCachedQualityReady(cachedQuality)
+                && cachedEmotion?.passed === true
+                && cachedEmotion.outcome_meta?.accepted_deferred !== true,
+              deferred: false,
+              qualityScore: cachedQuality?.scoreTotal ?? -1,
+              emotionScore: cachedEmotion?.score,
+              rounds: 0,
+              failedMetrics: []
             }
 
             const transitionBlockers = strictChapterTransitionBlockers(
@@ -2147,6 +1063,10 @@ export async function runNovelGoalLoop(
                 `「${chapter.title}」最终提交前确定性复核未通过，禁止进入下一章：${transitionBlockers.join('；')}`
               )
             }
+            const previousBinding = causalNovelDAO.getChapterBinding(chapter.id)
+            const previousBoundContent = previousBinding
+              ? causalNovelDAO.getContentVersion(previousBinding.contentVersionId)?.content.trim() ?? ''
+              : ''
             const acceptedChapter = volumeChapterDAO.getChapter(chapter.id)
             if (acceptedChapter && acceptedChapter.word_count !== countWords(acceptedChapter.content ?? '')) {
               volumeChapterDAO.updateChapter(chapter.id, {
@@ -2154,9 +1074,9 @@ export async function runNovelGoalLoop(
               })
             }
             if (
-              previouslyAcceptedContent
+              previousBoundContent
               && acceptedChapter?.content?.trim()
-              && acceptedChapter.content.trim() !== previouslyAcceptedContent
+              && acceptedChapter.content.trim() !== previousBoundContent
             ) {
               const invalidated = invalidateDownstreamBodiesAfterAcceptedChapterRewrite(
                 workId,
@@ -2175,22 +1095,24 @@ export async function runNovelGoalLoop(
               }
             }
 
-            const finalMemory = await finalizeNovelChapterMemory(
+            const committed = await commitUnifiedNovelChapter(
               workId,
               chapter.id,
+              fullConfig,
               controller.signal,
               msg => emit(msg, 'running')
             )
             goalRoutineDAO.appendTurn({
-              work_id: workId, turn_no: turn, phase, action: 'memory_sync',
+              work_id: workId, turn_no: turn, phase, action: 'unified_chapter_commit',
               target_chapter_id: chapter.id,
-              summary: `章级门禁完成后原子提交「${chapter.title}」记忆体：+${finalMemory.planted}伏笔/${finalMemory.snapshots}快照/${finalMemory.foreshadowingResolved}回收`
+              summary: `「${chapter.title}」正文哈希、记忆、资源后果与权威状态已原子提交到 r${committed.revision}：${committed.summary}`
             })
 
             const volumeCheckpoint = await runVolumeBodyCheckpoint(
               workId,
               chapter.id,
               fullConfig.goalDescription,
+              fullConfig,
               controller.signal,
               msg => emit(msg, 'running')
             )
@@ -2221,31 +1143,32 @@ export async function runNovelGoalLoop(
               score: acceptance.qualityScore >= 0 ? acceptance.qualityScore : null,
               summary: `「${chapter.title}」全部门禁完成，可进入下一章`
             })
-            phase = nextChapter
-              ? 'draft_body'
-              : phaseAfterCurrentDraftWindow(workId)
+            clearAutonomousChapterEscalation(workId, chapter.id)
+            phase = resolvePendingNovelReleaseWindow(workId)
+              ? 'release_window_audit'
+              : nextChapter
+                ? 'draft_body'
+                : phaseAfterCurrentDraftWindow(workId)
           }
+        } else if (phase === 'release_window_audit') {
+          const releaseWindow = await runNovelReleaseWindowAuditPhase({
+            workId,
+            turn,
+            config: fullConfig,
+            signal: controller.signal,
+            emit
+          })
+          phase = releaseWindow.phase
+          if (releaseWindow.stop) return
         } else if (phase === 'goal_check') {
-          emit('正在进行目标验收（质量/字数/门禁/目标匹配）', 'running')
+          emit('正在进行完整性、权威状态与一次性整书编辑审读', 'running')
           lastCheck = await checkStoryGoal(
             workId,
             fullConfig,
             controller.signal,
             msg => emit(msg, 'running')
           )
-          const deferredVolumeIssues = readNovelGoalState(workId).volumeGateDeferredIssues ?? []
-          const deferredIssueCount = deferredVolumeIssues.reduce((sum, item) => sum + item.issues.length, 0)
-          if (deferredIssueCount > 0) {
-            lastCheck = {
-              ...lastCheck,
-              met: false,
-              gateBlockers: lastCheck.gateBlockers + deferredIssueCount,
-              reasons: [
-                ...lastCheck.reasons,
-                `分卷质量债务待终审：${deferredVolumeIssues.length} 卷 / ${deferredIssueCount} 项`
-              ]
-            }
-          }
+          lastCheck = requireUnifiedNovelAuthorityCompletion(workId, lastCheck)
           updateNovelGoalState(workId, { lastCheck })
           goalRoutineDAO.update(workId, {
             last_quality_score: lastCheck.qualityScore >= 0 ? lastCheck.qualityScore : null,
@@ -2270,21 +1193,30 @@ export async function runNovelGoalLoop(
           }
 
           if (lastCheck.met) {
+            const release = freezeUnifiedNovelRelease(workId, lastCheck)
+            if (release) {
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'unified_release',
+                summary: `独立整书终审与因果终止条件同时通过，冻结发布快照 #${release.snapshotId}（状态 r${release.revision}）`
+              })
+            }
             updateNovelGoalState(workId, {
               repairPlan: undefined,
               repairStall: undefined,
               finalAudit: { passed: true, auditedAt: new Date().toISOString(), reasons: [] }
             })
             goalRoutineDAO.setStatus(workId, 'goal_met')
-            emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}`, 'goal_met')
+            emit(`目标达成：质量${lastCheck.qualityScore} · 情绪盲读${lastCheck.emotionScore} · 目标匹配${lastCheck.goalMatchScore} · 章节${lastCheck.contentBeats}/${lastCheck.totalBeats} · 字数${lastCheck.totalWords}${release ? ` · 发布快照#${release.snapshotId}` : ''}`, 'goal_met')
             return
           }
 
-          if (shouldPauseForReadOnlyNovelAudit({
-            planComplete: expectedChapters <= 0 || lastCheck.totalBeats === expectedChapters,
-            contentComplete: lastCheck.contentBeats === lastCheck.totalBeats,
-            met: lastCheck.met
-          })) {
+          if (
+            (expectedChapters <= 0 || lastCheck.totalBeats === expectedChapters)
+            && lastCheck.contentBeats === lastCheck.totalBeats
+          ) {
             updateNovelGoalState(workId, {
               finalAudit: {
                 passed: false,
@@ -2292,16 +1224,16 @@ export async function runNovelGoalLoop(
                 reasons: lastCheck.reasons
               }
             })
-            goalRoutineDAO.update(workId, { status: 'paused', current_phase: 'goal_check', goal_met: false })
             goalRoutineDAO.appendTurn({
               work_id: workId,
               turn_no: turn,
               phase,
-              action: 'audit_pause',
-              summary: `整书终审未通过但正文已冻结；需显式选择继续修复：${lastCheck.reasons.join('；')}`
+              action: 'audit_autonomous_repair',
+              summary: `整书终审未通过，自动进入证据修复：${lastCheck.reasons.join('；')}`
             })
-            emit(`整书终审未通过，已冻结全部正文并暂停：${lastCheck.reasons.join('；')}`, 'paused')
-            return
+            emit(`整书终审未通过，正在自动制定依赖修复计划`, 'running')
+            phase = 'repair_plan'
+            continue
           }
 
           emit(`未达标：${lastCheck.reasons.join('；')}`, 'running')
@@ -2326,35 +1258,21 @@ export async function runNovelGoalLoop(
             }
           })
           const basePlan = buildNovelRepairPlan(workId, lastCheck!, fullConfig)
-          const boundedTargets = capNovelAutomaticRepairTargets(
-            basePlan.targetChapterIds,
-            volumeChapterDAO.listChaptersByWork(workId)
+          const existingIds = new Set(
+            volumeChapterDAO.listChaptersByWork(workId).map(chapter => chapter.id)
           )
+          const boundedTargets = [...new Set(basePlan.targetChapterIds)]
+            .filter(chapterId => existingIds.has(chapterId))
           if (boundedTargets.length === 0) {
-            throw new NovelPipelineError(
-              'REPAIR_BOUNDARY',
-              `终审问题位于已冻结正文，超出尾部 ${MAX_AUTO_NOVEL_REPAIR_CHAPTERS} 章自动修复窗口`
-            )
-          }
-          if (stallCount >= MAX_NOVEL_REPAIR_STALLS) {
-            goalRoutineDAO.update(workId, { status: 'paused', current_phase: 'repair_plan' })
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase,
-              action: 'repair_stalled',
-              summary: `同一证据连续 ${stallCount} 轮未改善，已熔断并保留当前版本`
-            })
-            emit(`同一修复证据连续 ${stallCount} 轮没有改善，已熔断并暂停`, 'paused')
-            return
+            throw new NovelPipelineError('CONTRACT_INVALID', '终审证据没有可解析的章节修复目标')
           }
           const plan: RepairPlan = stallCount >= MAX_REPAIR_STALL_ROUNDS
             ? {
-                action: 'cluster',
-                scope: 'cluster',
+                action: stallCount >= MAX_NOVEL_REPAIR_STALLS ? 'volume' : 'cluster',
+                scope: stallCount >= MAX_NOVEL_REPAIR_STALLS ? 'volume' : 'cluster',
                 targetChapterIds: boundedTargets,
                 hint: [
-                  `同一验收证据连续 ${stallCount} 轮未改善，只升级为尾部 ${boundedTargets.length} 章结构修复。`,
+                  `同一验收证据连续 ${stallCount} 轮未改善，自动升级为${stallCount >= MAX_NOVEL_REPAIR_STALLS ? '卷级依赖' : '章节簇'}结构修复。`,
                   basePlan.hint,
                   ...lastCheck!.reasons
                 ].join('\n'),
@@ -2398,13 +1316,31 @@ export async function runNovelGoalLoop(
             target_chapter_id: plan.targetChapterIds[0] ?? null,
             summary
           })
+          for (const chapterId of plan.targetChapterIds) {
+            clearAutonomousChapterEscalation(workId, chapterId)
+          }
+          // repairPlan 是一次性命令，不是长期状态。尤其结构重规划会主动
+          // 失效正文；若成功后保留旧命令，后续恢复会把空正文重新送入修订。
+          updateNovelGoalState(workId, { repairPlan: undefined, failure: undefined })
           emit(`执行修复：${summary}`, 'running')
-          phase = 'goal_check'
+          phase = resolvePendingNovelReleaseWindow(workId) ? 'release_window_audit' : 'draft_body'
         } else {
           phase = 'materialize_settings'
         }
         updateNovelGoalState(workId, { failure: undefined })
       } catch (e) {
+        const protocolAttemptNo = goalRoutineDAO.getProtocolStepAttemptCount(stepInstance)
+        workflowStepFailure = classifyWorkflowError(e, protocolAttemptNo)
+        goalRoutineDAO.failStep(stepInstance.id, {
+          errorClass: workflowStepFailure.errorClass,
+          errorCode: workflowStepFailure.code,
+          message: workflowStepFailure.message
+        })
+        const classifiedFailureCount = goalRoutineDAO.getConsecutiveWorkflowFailureCount(
+          stepInstance,
+          workflowStepFailure.errorClass,
+          workflowStepFailure.code
+        )
         if (controller.signal.aborted) {
           goalRoutineDAO.setStatus(workId, 'cancelled')
           emit('已取消', 'cancelled')
@@ -2416,30 +1352,497 @@ export async function runNovelGoalLoop(
           work_id: workId, turn_no: turn, phase, action: 'error', summary: msg
         })
         emit(`轮次异常：${msg}`, 'running')
+        const planningRecovery = await recoverCausalPlanningAuthorityMismatch({
+          workId, turn, error: e, classified: workflowStepFailure,
+          goal: fullConfig.goalDescription, signal: controller.signal,
+          onProgress: message => emit(message, 'running')
+        })
+        if (planningRecovery === 'terminal') return
+        if (planningRecovery) {
+          phase = planningRecovery === 'contract_replan' ? 'repair_execute' : 'draft_body'
+          continue
+        }
         const currentFailure = readNovelGoalState(workId).failure
-        const errorCode = attemptedPhase === 'draft_body' && msg.includes('AI 诊断未达到')
-          ? 'QUALITY_GATE_NOT_MET'
-          : e instanceof NovelPipelineError
-            ? e.code
-            : e instanceof Error ? e.name : 'unknown'
-        const expectedConstructionChapters = loadWritingPlan(workId).targetChapters
-        const constructionRows = volumeChapterDAO.listChaptersByWork(workId)
-        const completedConstructionBodies = constructionRows.filter(chapter => Boolean(chapter.content?.trim())).length
-        const keepConstructionRunning = expectedConstructionChapters > 0
-          && (constructionRows.length < expectedConstructionChapters || completedConstructionBodies < expectedConstructionChapters)
-          && !['goal_check', 'repair_plan', 'repair_execute'].includes(attemptedPhase)
-        const signature = novelPhaseFailureSignature(attemptedPhase, errorCode, msg)
-        const failureCount = currentFailure?.phase === attemptedPhase && currentFailure.signature === signature
+        const causalProgressCode = [
+          'MACRO_ARC_STAGNATION',
+          'CHAPTER_NO_MATERIAL_PROGRESS',
+          'REPEATED_EVENT_SIGNATURE'
+        ].find(code => msg.includes(code))
+        const errorCode = causalProgressCode
+          ?? (attemptedPhase === 'draft_body' && msg.includes('AI 诊断未达到')
+            ? 'QUALITY_GATE_NOT_MET'
+            : e instanceof NovelPipelineError
+              ? e.code
+              : workflowStepFailure.code)
+        if (
+          scopedChapterId != null
+          && ['MACRO_ARC_STAGNATION', 'CHAPTER_NO_MATERIAL_PROGRESS', 'REPEATED_EVENT_SIGNATURE']
+            .some(code => errorCode === code || msg.includes(code))
+        ) {
+          const structuralPlan = buildExecutionContractStructuralReplan({
+            workId,
+            chapterId: scopedChapterId,
+            failedMetrics: [errorCode, msg]
+          })
+          updateNovelGoalState(workId, {
+            repairPlan: structuralPlan,
+            repairCommitPending: undefined,
+            failure: undefined,
+            autonomousTerminal: undefined
+          })
+          phase = 'repair_execute'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'causal_progress_structural_replan',
+            target_chapter_id: scopedChapterId,
+            summary: `${errorCode} 已识别为结构合同阻断，转入当前章节结构重规划，不再重试同一因果提交`
+          })
+          emit('检测到宏观因果推进停滞，正在重规划当前章节的阶段推进合同', 'running')
+          continue
+        }
+        if (
+          workflowStepFailure.errorClass === 'transient_transport'
+          || workflowStepFailure.errorClass === 'provider_rate_limit'
+        ) {
+          if (classifiedFailureCount === 1) {
+            turn = Math.max(0, turn - 1)
+            goalRoutineDAO.update(workId, { turn_count: turn, status: 'running' })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase: attemptedPhase,
+              action: 'transport_retry',
+              summary: `${workflowStepFailure.code}：${msg}；`
+                + `${workflowStepFailure.retryDelayMs}ms 后执行唯一一次网络重试，不消耗内容轮次`
+            })
+            emit(
+              `模型服务暂时不可用，`
+              + `${Math.ceil(workflowStepFailure.retryDelayMs / 1000)} 秒后执行唯一一次网络重试`,
+              'running'
+            )
+            await waitForWorkflowRetry(workflowStepFailure.retryDelayMs, controller.signal)
+            continue
+          }
+          const continuationDelay = leafFailureContinuationDelay(workflowStepFailure)
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'transport_supervisor_continue',
+            summary: `模型服务仍不可用；运行监督器保留同一检查点，${continuationDelay}ms 后继续，不升级整轮终态：${msg}`
+          })
+          emit(`模型服务暂时不可用，已保留检查点并由运行监督器继续等待`, 'running')
+          await waitForWorkflowRetry(continuationDelay, controller.signal)
+          continue
+        }
+        if (shouldPauseForNovelConstructionOutputFailure({
+          phase: attemptedPhase,
+          errorCode,
+          message: msg
+        })) {
+          const terminal = classifyNovelConstructionOutputTerminal({ errorCode, message: msg })
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
+          })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: terminal.action,
+            summary: msg
+          })
+          emit(`${terminal.progress}：${msg}`, 'error')
+          return
+        }
+        if (workflowStepFailure.errorClass === 'response_protocol') {
+          updateNovelGoalState(workId, { autonomousTerminal: undefined })
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'response_protocol_supervisor_continue',
+            target_chapter_id: scopedChapterId ?? null,
+            summary: `叶子步骤结构化响应不满足合同，已拒绝候选并保留原始制品；运行监督器继续同一持久化阶段：${msg}`
+          })
+          emit(`结构化候选已拒绝并保存证据，整轮运行继续`, 'running')
+          continue
+        }
+        if (e instanceof NovelRepairRevalidationRequiredError) {
+          phase = 'draft_body'
+          recoverNovelBodyContractRevalidation({
+            workId, turn, chapterId: e.chapterId, emit
+          })
+          continue
+        }
+        if (
+          e instanceof NovelRepairGenerationRequiredError
+          || (
+            e instanceof NovelRepairGateError
+            && e.failedMetrics.some(metric => /最终正文为空/.test(metric))
+          )
+        ) {
+          const chapterId = e.chapterId
+          updateNovelGoalState(workId, {
+            repairPlan: undefined,
+            repairCommitPending: undefined,
+            failure: undefined,
+            autonomousTerminal: undefined
+          })
+          phase = 'draft_body'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'empty_body_regeneration_required',
+            target_chapter_id: chapterId,
+            summary: `章节 ${chapterId} 的旧修订命令已失效：正文为空，已清除命令并按冻结章节合同重新生成`
+          })
+          emit(`章节 ${chapterId} 的旧正文已失效，正在按新合同重新生成`, 'running')
+          continue
+        }
+        if (
+          workflowStepFailure.code === 'NARRATIVE_MEMORY_GATE_REPAIR_REQUIRED'
+          && e instanceof NarrativeMemoryCommitGateError
+        ) {
+          const acceptedSummary = getNovelChapterAcceptanceSummary(workId)
+          if (!acceptedSummary || acceptedSummary.chapterId !== e.chapterId || acceptedSummary.status !== 'accepted') {
+            const resourceBlocker = e.blockers.some(blocker => /资源|resource_budget/i.test(blocker))
+            if (resourceBlocker) {
+              const structuralPlan = buildExecutionContractStructuralReplan({
+                workId,
+                chapterId: e.chapterId,
+                failedMetrics: [
+                  workflowStepFailure.code,
+                  ...e.blockers,
+                  'NARRATIVE_MEMORY_REACCEPT_REQUIRES_RESOURCE_STRUCTURAL_REPLAN'
+                ]
+              })
+              updateNovelGoalState(workId, {
+                repairPlan: structuralPlan,
+                repairCommitPending: undefined,
+                failure: undefined,
+                autonomousTerminal: undefined
+              })
+              phase = 'repair_execute'
+              goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+              goalRoutineDAO.appendTurn({
+                work_id: workId,
+                turn_no: turn,
+                phase,
+                action: 'narrative_memory_resource_structural_replan',
+                target_chapter_id: e.chapterId,
+                summary: `章节 ${e.chapterId} 尚无可绑定验收事件且资源合同阻断，已转入结构重规划，不再重复完整验收`
+              })
+              emit(`章节 ${e.chapterId} 的资源合同未建立，先重规划资源预算再重新生成`, 'running')
+              continue
+            }
+            updateNovelGoalState(workId, {
+              repairPlan: undefined,
+              repairCommitPending: undefined,
+              failure: undefined,
+              autonomousTerminal: undefined
+            })
+            phase = 'draft_body'
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'narrative_memory_reaccept_required',
+              target_chapter_id: e.chapterId,
+              summary: `章节 ${e.chapterId} 没有可绑定的已接受验收事件，已清除旧提交恢复计划并返回完整章节验收`
+            })
+            emit(`章节 ${e.chapterId} 缺少有效验收事件，先重新执行完整章节验收`, 'running')
+            continue
+          }
+          phase = 'repair_execute'
+          if (!handleNarrativeMemoryCommitGate({
+            workId, turn, chapterId: e.chapterId, blockers: e.blockers, emit
+          })) return
+          continue
+        }
+        if (
+          workflowStepFailure.code === 'CHAPTER_TRANSACTION_PATCH_EXHAUSTED'
+          && attemptedPhase === 'repair_execute'
+          && scopedChapterId != null
+        ) {
+          const runtime = readNovelGoalState(workId)
+          const exhaustedPlan = runtime.repairPlan as RepairPlan | undefined
+          const retryMarker = `STRUCTURAL_REPLAN_RETRY_TURN_${turn}`
+          const structuralPlan = buildExecutionContractStructuralReplan({
+            workId,
+            chapterId: scopedChapterId,
+            failedMetrics: [
+              ...(exhaustedPlan?.issueCodes ?? []),
+              workflowStepFailure.code,
+              msg,
+              retryMarker
+            ]
+          })
+          updateNovelGoalState(workId, {
+            repairPlan: structuralPlan,
+            repairCommitPending: undefined,
+            failure: undefined,
+            autonomousTerminal: undefined
+          })
+          phase = 'repair_execute'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'leaf_failure_reroute_structural_replan',
+            target_chapter_id: scopedChapterId,
+            summary: `章节 ${scopedChapterId} 修复车道已耗尽，已转入第 ${turn} 轮独立结构重规划，不再把同一章节放回普通正文队列`
+          })
+          emit(`章节 ${scopedChapterId} 修复车道已耗尽，转入独立结构重规划`, 'running')
+          continue
+        }
+        const attemptedRepairPlan = readNovelGoalState(workId).repairPlan as RepairPlan | undefined
+        const previousEscalation = scopedChapterId == null
+          ? undefined
+          : readNovelGoalState(workId).autonomousChapterEscalations?.[String(scopedChapterId)]
+        if (
+          e instanceof NovelRepairGateError
+          && shouldRouteExecutionContractRepairToStructuralReplan({
+            attemptedPhase,
+            attemptedAction: attemptedRepairPlan?.action,
+            blockedGate: e.blockedGate,
+            previousEvidenceFingerprint: previousEscalation?.evidenceFingerprint,
+            failedMetrics: e.failedMetrics
+          })
+        ) {
+          const replan = buildExecutionContractStructuralReplan({
+            workId,
+            chapterId: e.chapterId,
+            failedMetrics: e.failedMetrics
+          })
+          updateNovelGoalState(workId, {
+            repairPlan: replan,
+            failure: undefined,
+            autonomousTerminal: undefined
+          })
+          phase = 'repair_execute'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'execution_contract_structural_replan',
+            target_chapter_id: e.chapterId,
+            summary: '章节合同定点补丁后出现新的边界证据，已转入一次性当前章节结构重规划'
+          })
+          emit('章节合同补丁未重试正文；正在重规划当前未提交章节的执行合同', 'running')
+          continue
+        }
+        if (
+          e instanceof NovelRepairGateError
+          && shouldRouteLengthNormalizationToSemanticRepair({
+            attemptedPhase,
+            attemptedAction: attemptedRepairPlan?.action,
+            blockedGate: e.blockedGate
+          })
+        ) {
+          const escalation = buildAutonomousChapterRepairPlan({
+            workId,
+            chapterId: e.chapterId,
+            gateType: 'execution_contract',
+            failureCode: e.code,
+            failedMetrics: e.failedMetrics
+          })
+          updateNovelGoalState(workId, {
+            repairPlan: escalation.plan,
+            failure: undefined
+          })
+          phase = 'repair_execute'
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase,
+            action: 'orthogonal_semantic_repair',
+            target_chapter_id: e.chapterId,
+            summary: '字数归一化完成后首次暴露执行合同阻断，转入独立语义修复车道'
+          })
+          emit('字数补丁已完成；执行合同阻断正在使用独立的唯一语义补丁修复', 'running')
+          continue
+        }
+        if (
+          (workflowStepFailure.route === 'repair_upstream'
+            || workflowStepFailure.route === 'replan_upstream')
+          && (
+            e instanceof NovelRepairGateError
+            || scopedChapterId != null
+            || readNovelGoalState(workId).repairPlan
+          )
+        ) {
+          const runtime = readNovelGoalState(workId)
+          const existingPlan = runtime.repairPlan as RepairPlan | undefined
+          const targetChapterId = e instanceof NovelRepairGateError
+            ? e.chapterId
+            : scopedChapterId ?? existingPlan?.targetChapterIds?.[0]
+          if (targetChapterId != null) {
+            const escalation = buildAutonomousChapterRepairPlan({
+              workId,
+              chapterId: targetChapterId,
+              gateType: e instanceof NovelRepairGateError
+                ? e.blockedGate
+                : workflowStepFailure.route === 'replan_upstream'
+                  ? 'execution_contract'
+                  : undefined,
+              failedMetrics: e instanceof NovelRepairGateError
+                ? e.failedMetrics
+                : [workflowStepFailure.code, msg]
+            })
+            updateNovelGoalState(workId, {
+              repairPlan: escalation.plan,
+              failure: undefined
+            })
+            phase = 'repair_execute'
+            goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
+            goalRoutineDAO.appendTurn({
+              work_id: workId,
+              turn_no: turn,
+              phase,
+              action: 'autonomous_failure_escalation',
+              target_chapter_id: targetChapterId,
+              summary: `${workflowStepFailure.code} 已自动升级到 L${escalation.level} ${escalation.plan.scope} 修复`
+            })
+            emit(
+              `「${attemptedStepLabel}」失败已自动升级到 L${escalation.level} ${escalation.plan.scope} 修复`,
+              'running'
+            )
+            continue
+          }
+        }
+        if (shouldContinueNovelRunAfterLeafFailure({
+          failure: workflowStepFailure,
+          chapterId: scopedChapterId,
+          phase: attemptedPhase
+        })) {
+          const continuationDelay = leafFailureContinuationDelay(workflowStepFailure)
+          updateNovelGoalState(workId, { autonomousTerminal: undefined })
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'leaf_failure_supervisor_continue',
+            target_chapter_id: scopedChapterId ?? null,
+            summary: `${workflowStepFailure.errorClass}/${workflowStepFailure.code} 仅拒绝当前叶子事务，整轮继续：${msg}`
+          })
+          emit(`「${attemptedStepLabel}」候选失败已隔离，整轮运行继续`, 'running')
+          if (continuationDelay > 0) {
+            await waitForWorkflowRetry(continuationDelay, controller.signal)
+          }
+          continue
+        }
+        if (workflowStepFailure.errorClass === 'user_action_required') {
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: workflowStepFailure.code,
+            message: msg
+          })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: [
+              'QUALITY_NON_CONVERGENT',
+              'EMOTION_NON_CONVERGENT',
+              'EXECUTION_CONTRACT_NON_CONVERGENT'
+            ].includes(workflowStepFailure.code)
+              ? 'quality_non_convergent'
+              : 'autonomous_external_terminal',
+            summary: `需要用户提供新的外部事实或权限：${workflowStepFailure.errorClass}/${workflowStepFailure.code}：${msg}`
+          })
+          emit(`运行需要新的用户输入或授权，已安全停在当前检查点：${msg}`, 'error')
+          return
+        }
+        if (attemptedPhase === 'release_window_audit') {
+          markNovelAutonomousTerminal({
+            workId,
+            phase: attemptedPhase,
+            code: workflowStepFailure.code,
+            message: msg
+          })
+          goalRoutineDAO.setStatus(workId, 'paused')
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'release_window_audit_terminal',
+            target_chapter_id: null,
+            summary: `首发窗口审读失败，已冻结同一正文哈希并暂停：${workflowStepFailure.errorClass}/${workflowStepFailure.code}：${msg}`
+          })
+          emit(`首发窗口审读失败，已冻结正文并暂停：${msg}`, 'error')
+          return
+        }
+        if (
+          scopedChapterId == null
+          && (
+            workflowStepFailure.errorClass === 'budget_exhausted'
+            || workflowStepFailure.errorClass === 'response_protocol'
+            || workflowStepFailure.errorClass === 'deterministic_invariant'
+          )
+        ) {
+          markNovelAutonomousTerminal({
+            workId,
+            phase: attemptedPhase,
+            code: workflowStepFailure.code,
+            message: msg
+          })
+          goalRoutineDAO.setStatus(workId, 'paused')
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'work_level_protocol_terminal',
+            target_chapter_id: null,
+            summary: `工作级阶段失败，已保留检查点并暂停：${workflowStepFailure.errorClass}/${workflowStepFailure.code}：${msg}`
+          })
+          emit(`工作级阶段失败，已保留检查点并暂停：${msg}`, 'error')
+          return
+        }
+        const signature = novelPhaseFailureSignature(
+          attemptedPhase,
+          errorCode,
+          msg,
+          attemptedStepKey === attemptedPhase ? undefined : attemptedStepKey
+        )
+        const failureCount = currentFailure?.phase === attemptedPhase
+          && currentFailure.step === attemptedStepKey
+          && currentFailure.signature === signature
           ? currentFailure.count + 1
           : 1
         updateNovelGoalState(workId, {
-          failure: { phase: attemptedPhase, signature, count: failureCount, message: msg }
+          failure: {
+            phase: attemptedPhase,
+            step: attemptedStepKey,
+            signature,
+            count: failureCount,
+            message: msg
+          }
         })
         const pendingChapterGate = attemptedPhase === 'generate_beats'
           ? readNovelGoalState(workId).pendingChapterVolumeGate
           : undefined
         if (errorCode === 'PREREQUISITE_MISSING') {
-          const prerequisitePhase = safeNovelPreparationPhase(workId, attemptedPhase, fullConfig.goalDescription)
+          const prerequisitePhase = safeNovelPreparationPhase(
+            workId,
+            attemptedPhase,
+            fullConfig.goalDescription,
+            fullConfig.goldenFingerRequired,
+            fullConfig.checkEmotionContract
+          )
           if (prerequisitePhase !== attemptedPhase) {
             phase = prerequisitePhase
             updateNovelGoalState(workId, { failure: undefined })
@@ -2454,163 +1857,157 @@ export async function runNovelGoalLoop(
             emit(`前置条件缺失，已回退到「${phase}」继续：${msg}`, 'running')
             continue
           }
-          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
+          })
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
             phase: attemptedPhase,
-            action: 'prerequisite_pause',
-            summary: `前置条件缺失，已暂停且不重复空转：${msg}`
+            action: 'prerequisite_terminal',
+            summary: `前置条件无法由自治规划恢复，运行终止：${msg}`
           })
-          emit(`前置条件缺失，已保存断点并暂停：${msg}`, 'paused')
+          emit(`前置条件无法由自治规划恢复，已进入明确失败终态：${msg}`, 'error')
           return
         }
         if (errorCode === 'EVALUATOR_PROTOCOL') {
-          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
+          })
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
             phase: attemptedPhase,
-            action: 'evaluator_protocol_pause',
+            action: 'evaluator_protocol_terminal',
             summary: msg
           })
-          emit(`章节候选已保留；评估器证据协议连续 3 次失败，已保存断点并暂停，不会重复改写或空转：${msg}`, 'paused')
+          emit(`章节候选已保留；评估器协议重试耗尽，已进入外部故障终态：${msg}`, 'error')
           return
         }
-        if (shouldPauseForNovelConstructionOutputFailure({
-          phase: attemptedPhase,
-          errorCode
-        })) {
-          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
-          goalRoutineDAO.appendTurn({
-            work_id: workId,
-            turn_no: turn,
-            phase: attemptedPhase,
-            action: 'output_truncation_pause',
-            summary: msg
+        if (
+          isNovelChapterCheckpointFailure(errorCode)
+          && errorCode.startsWith('EMOTION_LEDGER_')
+        ) {
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
           })
-          emit(`结构合同已动态扩容重试但仍被截断；已保留前序章节检查点并暂停，禁止跨轮空转：${msg}`, 'paused')
-          return
-        }
-        const boundaryState = readNovelGoalState(workId)
-        const boundaryVolumeName = boundaryState.pendingChapterVolumeGate ?? boundaryState.chapterVolumeGateCheckpoint?.volume
-        if (shouldContinueNovelAfterVolumeRepairBoundary({
-          phase: attemptedPhase,
-          errorCode,
-          hasVolumeCheckpoint: Boolean(boundaryVolumeName)
-        })) {
-          const runtime = boundaryState
-          const checkpoint = runtime.chapterVolumeGateCheckpoint
-          const volumeName = boundaryVolumeName
-          if (volumeName) {
-            const issues = [
-              ...(checkpoint?.assessments.flatMap(item => item.issues) ?? []),
-              ...(checkpoint?.aggregate?.issues ?? []),
-              ...(checkpoint?.repair?.clusters.flatMap(cluster => cluster.issues) ?? [])
-            ]
-            const scores = [
-              ...(checkpoint?.assessments.map(item => item.score) ?? []),
-              ...(checkpoint?.aggregate ? [checkpoint.aggregate.score] : [])
-            ]
-            const score = scores.length > 0
-              ? Math.round(scores.reduce((sum, value) => sum + value, 0) / scores.length)
-              : 0
-            const previousDebt = runtime.volumeGateDeferredIssues ?? []
-            updateNovelGoalState(workId, {
-              failure: undefined,
-              pendingChapterVolumeGate: undefined,
-              chapterVolumeGateCheckpoint: undefined,
-              checkedChapterVolumes: [...new Set([...(runtime.checkedChapterVolumes ?? []), volumeName])],
-              volumeGateDeferredIssues: [
-                ...previousDebt.filter(item => item.volume !== volumeName),
-                {
-                  volume: volumeName,
-                  score,
-                  rounds: checkpoint?.round ?? 0,
-                  reason: msg,
-                  deferredAt: new Date().toISOString(),
-                  issues: issues.map(issue => ({
-                    source: issue.source,
-                    code: issue.code,
-                    problem: issue.problem,
-                    repairChapterNumbers: [...issue.repairChapterNumbers],
-                    requiredFix: issue.requiredFix
-                  }))
-                }
-              ]
-            })
-            phase = 'generate_beats'
-            goalRoutineDAO.update(workId, { status: 'running', current_phase: phase })
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase,
-              action: 'volume_gate_deferred_continue',
-              summary: `分卷「${volumeName}」停止自动改写，质量问题转入延后账本，整本生成继续：${msg}`
-            })
-            emit(`分卷「${volumeName}」已停止自动改写并记录质量债务，继续生成下一阶段`, 'running')
-            continue
-          }
-        }
-        if (isTerminalNovelRepairError(errorCode)) {
-          if (keepConstructionRunning) {
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase: attemptedPhase,
-              action: 'construction_boundary_retry',
-              summary: `自动改写已停止但整本施工未完成，保留正文与版本并继续：${msg}`
-            })
-            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
-            emit(`已停止本次越界改写并保留版本，整本施工继续`, 'running')
-            await new Promise(resolve => setTimeout(resolve, Math.min(30_000, 2_000 * failureCount)))
-            continue
-          }
-          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
             phase: attemptedPhase,
-            action: errorCode === 'REPAIR_STALL' ? 'repair_stall_pause' : 'repair_boundary_pause',
+            action: 'emotion_ledger_terminal',
             summary: msg
           })
           emit(
-            errorCode === 'REPAIR_STALL'
-              ? `自动修复未收敛，已停止改写并保留检查点：${msg}`
-              : `自动修复已越过安全边界，保留现有正文并暂停：${msg}`,
-            'paused'
+            `情绪账本事务失败，已保留正文、质量结果和已完成情绪检查点；不会进入通用施工重试：${msg}`,
+            'error'
           )
           return
         }
-        if (failureCount >= MAX_NOVEL_PHASE_FAILURES) {
-          if (keepConstructionRunning) {
-            updateNovelGoalState(workId, { failure: undefined })
-            goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
-            goalRoutineDAO.appendTurn({
-              work_id: workId,
-              turn_no: turn,
-              phase: attemptedPhase,
-              action: 'construction_failure_retry',
-              summary: `施工阶段连续 ${failureCount} 次失败，已保留检查点、重置重试窗口并继续：${msg}`
-            })
-            emit(`施工阶段连续失败，已保留检查点并退避后继续，不终止整本生成`, 'running')
-            await new Promise(resolve => setTimeout(resolve, 30_000))
-            continue
-          }
-          goalRoutineDAO.update(workId, { status: 'paused', current_phase: attemptedPhase })
+        if (
+          isNovelChapterCheckpointFailure(errorCode)
+          && errorCode.startsWith('MEMORY_EXTRACT_')
+        ) {
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
+          })
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
             phase: attemptedPhase,
-            action: 'failure_circuit_breaker',
-            summary: `相同失败连续 ${failureCount} 次，已熔断：${msg}`
+            action: 'memory_extract_terminal',
+            summary: msg
           })
-          emit(`「${attemptedPhase}」相同失败连续 ${failureCount} 次，已保存断点并暂停`, 'paused')
+          emit(
+            `叙事记忆事务失败，已保留正文及全部前序验收检查点；恢复时只重试记忆阶段：${msg}`,
+            'error'
+          )
           return
         }
+        if (
+          errorCode === 'QUALITY_EVALUATOR_UNAVAILABLE'
+          || errorCode === 'QUALITY_EVALUATOR_PROTOCOL'
+        ) {
+          markNovelAutonomousTerminal({
+            workId, phase: attemptedPhase,
+            code: errorCode,
+            message: msg
+          })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: errorCode === 'QUALITY_EVALUATOR_PROTOCOL'
+              ? 'quality_evaluator_protocol_terminal'
+              : 'quality_evaluator_unavailable_terminal',
+            summary: msg
+          })
+          emit(
+            errorCode === 'QUALITY_EVALUATOR_PROTOCOL'
+              ? `质量评估器响应协议失败，已保留正文并进入外部协议故障终态；不会计入质量轮次或触发正文改写：${msg}`
+              : `质量评估器连续调用失败，已保留正文并进入外部服务故障终态；不会计入质量轮次或触发正文改写：${msg}`,
+            'error'
+          )
+          return
+        }
+        if (
+          errorCode === 'VOLUME_HARD_GATE_BLOCKED'
+          || errorCode === 'CAUSAL_PROGRESS_GATE_BLOCKED'
+        ) {
+          stopNovelOnHardGate({
+            workId,
+            phase: attemptedPhase,
+            errorCode,
+            message: msg,
+            turn,
+            emit
+          })
+          return
+        }
+        if (isTerminalNovelRepairError(errorCode)) {
+          updateNovelGoalState(workId, {
+            autonomousTerminal: undefined,
+            failure: undefined
+          })
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'repair_supervisor_continue',
+            target_chapter_id: scopedChapterId ?? null,
+            summary: `当前修复层级未收敛；拒绝当前候选并保留检查点，整轮监督器继续下一内容轮次：${msg}`
+          })
+          emit(`当前修复候选未收敛，已隔离候选并继续整轮运行`, 'running')
+          continue
+        }
+        if (failureCount >= MAX_NOVEL_PHASE_FAILURES) {
+          updateNovelGoalState(workId, {
+            failure: undefined,
+            autonomousTerminal: undefined
+          })
+          goalRoutineDAO.update(workId, { status: 'running', current_phase: attemptedPhase })
+          goalRoutineDAO.appendTurn({
+            work_id: workId,
+            turn_no: turn,
+            phase: attemptedPhase,
+            action: 'phase_failure_supervisor_continue',
+            target_chapter_id: scopedChapterId ?? null,
+            summary: `相同叶子失败连续 ${failureCount} 次；已清空失败窗口但保留阶段检查点，整轮继续：${msg}`
+          })
+          emit(`「${attemptedStepLabel}」失败窗口已隔离，整轮继续`, 'running')
+          continue
+        }
         if (failureCount >= MAX_REPAIR_STALL_ROUNDS) {
-          // 分卷生成会保存逐卷检查点；保留失败详情，让下一轮按超时/截断分别降级，
-          // 成功进入下一阶段后由轮次末尾统一清除。
+          // 分卷生成保存逐卷检查点；保留失败详情，成功进入下一阶段后统一清除。
           goalRoutineDAO.appendTurn({
             work_id: workId,
             turn_no: turn,
@@ -2624,7 +2021,7 @@ export async function runNovelGoalLoop(
               ? /VOLUME_OUTPUT_TRUNCATED|Unterminated string|Unexpected end of JSON/i.test(msg)
                 ? `分卷生成连续 ${failureCount} 次发生输出截断，下一轮将从已保存分卷继续，提高输出预算并强制精简字段：${msg}`
                 : `分卷生成连续 ${failureCount} 次失败，下一轮将从已保存分卷继续；若为超时则仅压缩输入上下文：${msg}`
-              : `「${attemptedPhase}」连续 ${failureCount} 次执行失败，将保留检查点继续重试：${msg}`
+              : `「${attemptedStepLabel}」连续 ${failureCount} 次执行失败，将保留检查点继续重试：${msg}`
           })
           emit(
             attemptedPhase === 'generate_beats'
@@ -2635,16 +2032,27 @@ export async function runNovelGoalLoop(
               ? /VOLUME_OUTPUT_TRUNCATED|Unterminated string|Unexpected end of JSON/i.test(msg)
                 ? '分卷输出被截断，已提高输出预算并从当前卷继续'
                 : '分卷生成连续失败，已按错误类型调整请求并从断点继续'
-              : `「${attemptedPhase}」连续失败，已保留检查点并继续重试`,
+              : `「${attemptedStepLabel}」连续失败，已保留检查点并继续重试`,
             'running'
           )
         } else {
-          emit(`「${attemptedPhase}」第 ${failureCount} 次执行失败，将在下一轮继续自动重试：${msg}`, 'running')
+          emit(`「${attemptedStepLabel}」第 ${failureCount} 次执行失败，将在下一轮继续自动重试：${msg}`, 'running')
         }
+      } finally {
+        if (!workflowStepFailure) {
+          goalRoutineDAO.completeStep(stepInstance.id, phase, {
+            turn,
+            nextPhase: phase,
+            authorityRevision: causalNovelDAO.getState(workId)?.revision ?? null,
+            runStatus: goalRoutineDAO.getByWork(workId)?.status
+          }, workflowStepDisposition)
+        }
+        clearWorkflowExecutionContext(workId, stepInstance.id)
       }
     }
   } finally {
+    clearInterval(heartbeat)
     clearGoalLoopModelOpts(workId)
-    activeLoops.delete(workId)
+    unregisterNovelGoalLoop(workId)
   }
 }

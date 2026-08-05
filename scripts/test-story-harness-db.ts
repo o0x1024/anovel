@@ -7,8 +7,12 @@ const db = new Database(':memory:')
 db.pragma('foreign_keys = ON')
 db.exec(`
   CREATE TABLE works (
-    id INTEGER PRIMARY KEY, title TEXT, description TEXT,
+    id INTEGER PRIMARY KEY, title TEXT, description TEXT, genre TEXT, tags TEXT,
     update_time TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE core_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL,
+    type TEXT NOT NULL, content TEXT, structured_content TEXT
   );
   CREATE TABLE volumes (id INTEGER PRIMARY KEY, work_id INTEGER NOT NULL, name TEXT, sort INTEGER);
   CREATE TABLE chapters (
@@ -25,6 +29,22 @@ db.exec(`
     generation_round INTEGER, snapshot_json TEXT
   );
   CREATE TABLE emotional_state_ledger (id INTEGER PRIMARY KEY, chapter_id INTEGER);
+  CREATE TABLE chapter_emotion_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_id INTEGER NOT NULL,
+    chapter_id INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    batch_key TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    payload_json TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_code TEXT,
+    failure_message TEXT,
+    create_time TEXT DEFAULT CURRENT_TIMESTAMP,
+    update_time TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chapter_id, content_hash, stage, batch_key)
+  );
   CREATE TABLE story_generation_candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL, chapter_id INTEGER NOT NULL,
     base_content_hash TEXT, content TEXT NOT NULL, word_count INTEGER NOT NULL DEFAULT 0,
@@ -44,6 +64,16 @@ db.exec(`
   CREATE TABLE story_release_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL, label TEXT NOT NULL,
     content_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL, is_frozen INTEGER NOT NULL DEFAULT 1,
+    create_time TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE story_reader_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, work_id INTEGER NOT NULL,
+    release_snapshot_id INTEGER NOT NULL, source TEXT NOT NULL,
+    impressions INTEGER NOT NULL, opened_reads INTEGER NOT NULL,
+    preview_completions INTEGER NOT NULL, completions INTEGER NOT NULL,
+    likes INTEGER NOT NULL DEFAULT 0, comments INTEGER NOT NULL DEFAULT 0,
+    shares INTEGER NOT NULL DEFAULT 0, follows INTEGER NOT NULL DEFAULT 0,
+    avg_read_seconds REAL, notes TEXT, collected_at TEXT NOT NULL,
     create_time TEXT DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE story_lead_versions (
@@ -108,7 +138,12 @@ assert.equal(dao.listIssues(1)[0].status, 'stalled')
 dao.syncIssues(1, [])
 assert.equal(dao.listIssues(1)[0].status, 'stalled')
 assert.equal(dao.listIssues(1)[0].clean_confirmations, 1)
-assert.throws(() => dao.createReleaseSnapshot(1), /未关闭/)
+const passedReleaseGate = () => ({
+  promise: { passed: true, titlePromise: '标题结果真实发生', hookPromise: '导语悬念完整回收' },
+  compliance: { passed: true, issues: [] },
+  sourceHash: dao.releaseSourceHash(1)
+})
+assert.throws(() => dao.createReleaseSnapshot(1, passedReleaseGate()), /未关闭/)
 db.prepare("UPDATE chapters SET content = '第二拍发生无关变化' WHERE id = 2").run()
 dao.syncIssues(1, [])
 assert.equal(dao.listIssues(1)[0].status, 'resolved')
@@ -121,9 +156,47 @@ assert.equal(
 )
 assert.equal(dao.listLeadVersions(1)[0].description, '旧导语完整复述第一拍')
 
-const snapshotId = dao.createReleaseSnapshot(1)
+assert.throws(() => dao.createReleaseSnapshot(1, {
+  promise: { passed: false, titlePromise: '', hookPromise: '' },
+  compliance: { passed: true, issues: [] },
+  sourceHash: dao.releaseSourceHash(1)
+}), /发布承诺/)
+const staleReleaseGate = passedReleaseGate()
+db.prepare("UPDATE chapters SET content = '第二拍在发布前再次变化' WHERE id = 2").run()
+assert.throws(() => dao.createReleaseSnapshot(1, staleReleaseGate), /正文版本已变化/)
+const snapshotId = dao.createReleaseSnapshot(1, passedReleaseGate())
 assert.ok(snapshotId > 0)
 assert.equal(db.prepare('SELECT is_frozen FROM story_release_snapshots WHERE id = ?').get(snapshotId).is_frozen, 1)
+assert.throws(() => dao.recordReaderFeedback({
+  workId: 1,
+  releaseSnapshotId: snapshotId,
+  source: '番茄小说',
+  impressions: 100,
+  openedReads: 80,
+  previewCompletions: 90,
+  completions: 30,
+  collectedAt: new Date().toISOString()
+}), /曝光 ≥ 打开阅读 ≥ 试读完成 ≥ 全文完成/)
+dao.recordReaderFeedback({
+  workId: 1,
+  releaseSnapshotId: snapshotId,
+  source: '番茄小说',
+  impressions: 10_000,
+  openedReads: 4_000,
+  previewCompletions: 2_800,
+  completions: 2_000,
+  likes: 400,
+  comments: 100,
+  shares: 100,
+  follows: 200,
+  collectedAt: new Date().toISOString()
+})
+const calibration = dao.getReaderCalibration(1)
+assert.equal(calibration.openRate, 0.4)
+assert.equal(calibration.previewCompletionRate, 0.7)
+assert.equal(calibration.completionRate, 0.5)
+assert.equal(calibration.confidence, 'directional')
+assert.ok((calibration.suggestedPreviewHookMin ?? 0) > 0)
 
 const chapterDAO = new VolumeChapterDAO(db)
 chapterDAO.rewriteStoryBeatsPreservingVersions([{

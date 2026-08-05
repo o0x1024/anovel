@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
-import { coreSettingDAO, volumeChapterDAO } from '../db'
+import { coreSettingDAO, goalRoutineDAO, volumeChapterDAO } from '../db'
 import { loadWritingPlan } from './writing-plan'
 import { loadCharacterCards, resolveChapterCharacterNames } from './character-cards'
 import {
   buildChapterExecutionContract,
   type ChapterExecutionContract
 } from '../../shared/chapter-execution-contract'
+import { clampWordCountTolerance } from '../../shared/body-word-target'
 
 const SETTING_CHAR_BUDGETS: Record<string, number> = {
   golden_finger: 1400,
@@ -23,7 +24,7 @@ const SETTING_LABELS: Record<string, string> = {
   main_plotline: '本章相关主线阶段'
 }
 
-const EXECUTION_ACCEPTANCE_KEY = 'execution_acceptance_v4'
+const EXECUTION_ACCEPTANCE_KEY = 'execution_acceptance_v6'
 
 function chapterContentHash(content: string): string {
   return createHash('sha256').update(content).digest('hex')
@@ -105,10 +106,34 @@ export function selectRelevantSettingExcerpts(
   return selected.sort((a, b) => a.index - b.index).map(item => item.text).join('\n\n').slice(0, maxChars)
 }
 
+function resolveGoalWordSettings(workId: number): {
+  wordsPerChapter?: number
+  wordCountTolerance?: number
+} {
+  const routine = goalRoutineDAO.getByWork(workId)
+  if (!routine?.goal_config_json) return {}
+  try {
+    const config = JSON.parse(routine.goal_config_json) as {
+      wordsPerChapter?: unknown
+      wordCountTolerance?: unknown
+    }
+    const wordsPerChapter = typeof config.wordsPerChapter === 'number' && config.wordsPerChapter > 0
+      ? Math.round(config.wordsPerChapter)
+      : undefined
+    const wordCountTolerance = typeof config.wordCountTolerance === 'number'
+      ? clampWordCountTolerance(config.wordCountTolerance)
+      : undefined
+    return { wordsPerChapter, wordCountTolerance }
+  } catch {
+    return {}
+  }
+}
+
 export function compileChapterExecutionContract(
   workId: number,
   chapterId: number,
-  wordTargetOverride?: number
+  wordTargetOverride?: number,
+  wordCountToleranceOverride?: number
 ): ChapterExecutionContract | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const chapter = chapters.find(item => item.id === chapterId)
@@ -116,7 +141,11 @@ export function compileChapterExecutionContract(
   const volume = volumeChapterDAO.listVolumes(workId).find(item => item.id === chapter.volume_id)
   const characterNames = resolveChapterCharacterNames(workId, chapter)
   const cards = loadCharacterCards(workId).filter(card => characterNames.includes(card.name))
-  const wordTarget = wordTargetOverride ?? loadWritingPlan(workId).wordsPerChapter
+  const goalWords = resolveGoalWordSettings(workId)
+  const wordTarget = wordTargetOverride
+    ?? goalWords.wordsPerChapter
+    ?? loadWritingPlan(workId).wordsPerChapter
+  const wordCountTolerance = wordCountToleranceOverride ?? goalWords.wordCountTolerance
   return buildChapterExecutionContract({
     chapterId,
     chapterTitle: chapter.title,
@@ -127,16 +156,23 @@ export function compileChapterExecutionContract(
     outlineDiagnosis: chapter.outline_diagnosis,
     characterNames,
     characterSpeechStyles: cards.map(card => card.speechStyle ?? ''),
-    wordTarget
+    wordTarget,
+    wordCountTolerance
   })
 }
 
 export function persistChapterExecutionContract(
   workId: number,
   chapterId: number,
-  wordTargetOverride?: number
+  wordTargetOverride?: number,
+  wordCountToleranceOverride?: number
 ): ChapterExecutionContract | null {
-  const contract = compileChapterExecutionContract(workId, chapterId, wordTargetOverride)
+  const contract = compileChapterExecutionContract(
+    workId,
+    chapterId,
+    wordTargetOverride,
+    wordCountToleranceOverride
+  )
   if (!contract) return null
   const chapter = volumeChapterDAO.getChapter(chapterId)
   let diagnosis: Record<string, unknown> = {}
@@ -150,16 +186,25 @@ export function persistChapterExecutionContract(
     }
   } catch { diagnosisReadable = false }
   if (!diagnosisReadable) return contract
-  const current = diagnosis.execution_contract_v4 as {
+  const current = diagnosis.execution_contract_v5 as {
     sourceOutlineHash?: unknown
     wordTarget?: unknown
+    wordMin?: unknown
+    wordMax?: unknown
   } | undefined
-  if (current?.sourceOutlineHash !== contract.sourceOutlineHash || current?.wordTarget !== contract.wordTarget) {
+  if (
+    current?.sourceOutlineHash !== contract.sourceOutlineHash
+    || current?.wordTarget !== contract.wordTarget
+    || current?.wordMin !== contract.wordMin
+    || current?.wordMax !== contract.wordMax
+  ) {
     const currentDiagnosis = { ...diagnosis }
     delete currentDiagnosis.execution_contract_v3
+    delete currentDiagnosis.execution_contract_v4
+    delete currentDiagnosis.execution_acceptance_v4
     delete currentDiagnosis[EXECUTION_ACCEPTANCE_KEY]
     volumeChapterDAO.updateChapter(chapterId, {
-      outline_diagnosis: JSON.stringify({ ...currentDiagnosis, execution_contract_v4: contract }),
+      outline_diagnosis: JSON.stringify({ ...currentDiagnosis, execution_contract_v5: contract }),
       quality_assessment_json: null
     })
   }

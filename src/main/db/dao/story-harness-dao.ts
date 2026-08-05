@@ -67,6 +67,37 @@ export interface StoryLeadVersionRow {
   create_time: string
 }
 
+export interface StoryReaderFeedbackRow {
+  id: number
+  work_id: number
+  release_snapshot_id: number
+  source: string
+  impressions: number
+  opened_reads: number
+  preview_completions: number
+  completions: number
+  likes: number
+  comments: number
+  shares: number
+  follows: number
+  avg_read_seconds: number | null
+  notes: string | null
+  collected_at: string
+  create_time: string
+}
+
+export interface StoryReaderCalibration {
+  sampleSize: number
+  impressions: number
+  openRate: number
+  previewCompletionRate: number
+  completionRate: number
+  engagementRate: number
+  suggestedPreviewHookMin: number | null
+  suggestedOverallStoryMin: number | null
+  confidence: 'insufficient' | 'directional' | 'stable'
+}
+
 interface ChapterSnapshotRow {
   id: number
   volume_id: number
@@ -242,6 +273,7 @@ export class StoryHarnessDAO extends BaseDAO {
         [content, candidate.word_count, chapter.id]
       )
       this.run('DELETE FROM emotional_state_ledger WHERE chapter_id = ?', [chapter.id])
+      this.run('DELETE FROM chapter_emotion_checkpoints WHERE chapter_id = ?', [chapter.id])
       this.run(
         `UPDATE story_generation_candidates
          SET status = CASE WHEN id = ? THEN 'accepted'
@@ -418,17 +450,39 @@ export class StoryHarnessDAO extends BaseDAO {
     )
   }
 
-  private currentStoryContentHash(workId: number): string {
-    const work = this.get<{ description: string | null }>('SELECT description FROM works WHERE id = ?', [workId])
+  releaseSourceHash(workId: number): string {
+    const work = this.get<{
+      title: string
+      description: string | null
+      genre: string | null
+      tags: string | null
+    }>('SELECT title, description, genre, tags FROM works WHERE id = ?', [workId])
     const chapters = this.all<{ id: number; content: string | null }>(
       `SELECT c.id, c.content FROM chapters c
        JOIN volumes v ON v.id = c.volume_id
        WHERE v.work_id = ? ORDER BY v.sort, c.sort`,
       [workId]
     )
+    const settings = this.all<{
+      type: string
+      content: string | null
+      structured_content: string | null
+    }>(
+      `SELECT type, content, structured_content FROM core_settings
+       WHERE work_id = ? ORDER BY type, id`,
+      [workId]
+    )
     return stableStoryHash(JSON.stringify({
+      title: work?.title?.trim() ?? '',
       description: work?.description?.trim() ?? '',
-      chapters: chapters.map(chapter => ({ id: chapter.id, content: chapter.content?.trim() ?? '' }))
+      genre: work?.genre?.trim() ?? '',
+      tags: work?.tags?.trim() ?? '',
+      chapters: chapters.map(chapter => ({ id: chapter.id, content: chapter.content?.trim() ?? '' })),
+      settings: settings.map(setting => ({
+        type: setting.type,
+        content: setting.content?.trim() ?? '',
+        structuredContent: setting.structured_content?.trim() ?? ''
+      }))
     }))
   }
 
@@ -460,8 +514,26 @@ export class StoryHarnessDAO extends BaseDAO {
         )
   }
 
-  createReleaseSnapshot(workId: number, label = 'release_ready'): number {
+  createReleaseSnapshot(
+    workId: number,
+    releaseGate: {
+      promise: { passed: boolean; titlePromise: string; hookPromise: string }
+      compliance: { passed: boolean; issues: unknown[] }
+      sourceHash: string
+    },
+    label = 'release_ready'
+  ): number {
     return this.transaction(() => {
+      const currentSourceHash = this.releaseSourceHash(workId)
+      if (!releaseGate.sourceHash || releaseGate.sourceHash !== currentSourceHash) {
+        throw new Error('发布验收证据对应的正文版本已变化，禁止创建发布快照')
+      }
+      if (!releaseGate.promise.passed || !releaseGate.promise.titlePromise.trim() || !releaseGate.promise.hookPromise.trim()) {
+        throw new Error('标题与导语发布承诺尚未形成完整兑现证据，禁止创建发布快照')
+      }
+      if (!releaseGate.compliance.passed || releaseGate.compliance.issues.length > 0) {
+        throw new Error('题材事实或平台合规门禁未通过，禁止创建发布快照')
+      }
       const unresolved = this.get<{ n: number }>(
         "SELECT COUNT(*) AS n FROM story_issue_ledger WHERE work_id = ? AND status IN ('open', 'stalled')",
         [workId]
@@ -479,7 +551,7 @@ export class StoryHarnessDAO extends BaseDAO {
       if (chapters.length === 0 || chapters.some(chapter => !chapter.content?.trim())) {
         throw new Error('仍有空章节，禁止创建发布快照')
       }
-      const snapshot = JSON.stringify({ work, chapters })
+      const snapshot = JSON.stringify({ work, chapters, releaseGate })
       return this.insert(
         `INSERT INTO story_release_snapshots (work_id, label, content_hash, snapshot_json, is_frozen)
          VALUES (?, ?, ?, ?, 1)`,
@@ -495,6 +567,117 @@ export class StoryHarnessDAO extends BaseDAO {
        FROM story_release_snapshots WHERE work_id = ? ORDER BY id DESC`,
       [workId]
     )
+  }
+
+  recordReaderFeedback(input: {
+    workId: number
+    releaseSnapshotId: number
+    source: string
+    impressions: number
+    openedReads: number
+    previewCompletions: number
+    completions: number
+    likes?: number
+    comments?: number
+    shares?: number
+    follows?: number
+    avgReadSeconds?: number | null
+    notes?: string | null
+    collectedAt: string
+  }): number {
+    const counts = [
+      input.impressions,
+      input.openedReads,
+      input.previewCompletions,
+      input.completions,
+      input.likes ?? 0,
+      input.comments ?? 0,
+      input.shares ?? 0,
+      input.follows ?? 0
+    ]
+    if (counts.some(value => !Number.isInteger(value) || value < 0)) {
+      throw new Error('读者数据必须是非负整数')
+    }
+    if (input.impressions < input.openedReads
+      || input.openedReads < input.previewCompletions
+      || input.previewCompletions < input.completions) {
+      throw new Error('读者漏斗必须满足：曝光 ≥ 打开阅读 ≥ 试读完成 ≥ 全文完成')
+    }
+    const source = input.source.trim()
+    if (!source) throw new Error('读者数据来源不能为空')
+    const snapshot = this.get<{ work_id: number }>(
+      'SELECT work_id FROM story_release_snapshots WHERE id = ?',
+      [input.releaseSnapshotId]
+    )
+    if (!snapshot || snapshot.work_id !== input.workId) {
+      throw new Error('发布快照不存在或不属于当前作品')
+    }
+    return this.insert(
+      `INSERT INTO story_reader_feedback (
+        work_id, release_snapshot_id, source, impressions, opened_reads,
+        preview_completions, completions, likes, comments, shares, follows,
+        avg_read_seconds, notes, collected_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        input.workId,
+        input.releaseSnapshotId,
+        source,
+        input.impressions,
+        input.openedReads,
+        input.previewCompletions,
+        input.completions,
+        input.likes ?? 0,
+        input.comments ?? 0,
+        input.shares ?? 0,
+        input.follows ?? 0,
+        input.avgReadSeconds ?? null,
+        input.notes?.trim() || null,
+        input.collectedAt
+      ]
+    )
+  }
+
+  listReaderFeedback(workId: number): StoryReaderFeedbackRow[] {
+    return this.all<StoryReaderFeedbackRow>(
+      'SELECT * FROM story_reader_feedback WHERE work_id = ? ORDER BY collected_at DESC, id DESC',
+      [workId]
+    )
+  }
+
+  getReaderCalibration(workId: number): StoryReaderCalibration {
+    const rows = this.listReaderFeedback(workId)
+    const totals = rows.reduce((sum, row) => ({
+      impressions: sum.impressions + row.impressions,
+      opened: sum.opened + row.opened_reads,
+      preview: sum.preview + row.preview_completions,
+      completions: sum.completions + row.completions,
+      engagement: sum.engagement + row.likes + row.comments + row.shares + row.follows
+    }), { impressions: 0, opened: 0, preview: 0, completions: 0, engagement: 0 })
+    const ratio = (value: number, base: number) => base > 0 ? Number((value / base).toFixed(4)) : 0
+    const openRate = ratio(totals.opened, totals.impressions)
+    const previewCompletionRate = ratio(totals.preview, totals.opened)
+    const completionRate = ratio(totals.completions, totals.opened)
+    const engagementRate = ratio(totals.engagement, totals.opened)
+    const confidence: StoryReaderCalibration['confidence'] = totals.opened >= 5000 && rows.length >= 3
+      ? 'stable'
+      : totals.opened >= 500
+        ? 'directional'
+        : 'insufficient'
+    return {
+      sampleSize: rows.length,
+      impressions: totals.impressions,
+      openRate,
+      previewCompletionRate,
+      completionRate,
+      engagementRate,
+      suggestedPreviewHookMin: confidence === 'insufficient'
+        ? null
+        : Math.max(65, Math.min(90, Math.round(65 + previewCompletionRate * 25))),
+      suggestedOverallStoryMin: confidence === 'insufficient'
+        ? null
+        : Math.max(70, Math.min(92, Math.round(70 + completionRate * 25))),
+      confidence
+    }
   }
 }
 

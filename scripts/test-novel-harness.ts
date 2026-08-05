@@ -194,7 +194,7 @@ import {
 } from '../src/main/context/anti-ai-rules'
 
 assert(TARGET_WORD_PRESETS.includes(4_000_000))
-for (const step of ['body_generation_scene', 'novel_execution_repair', 'goal_diagnose_fix', 'story_continuity_repair']) {
+for (const step of ['novel_execution_repair', 'goal_diagnose_fix', 'story_continuity_repair']) {
   assert.equal(isFullProseOutputStep(step), true)
   assert.equal(isBodyGenerationStep(step), true)
   assert.equal(shouldInjectWritingStyle(step), true)
@@ -497,6 +497,27 @@ assert.deepEqual(normalizedCovered.coverage[0].evidenceIds, ['C001'])
 assert(normalizedCovered.warnings.some(item => item.includes('C999')))
 assert(normalizedCovered.warnings.some(item => item.includes('顶层 passed')))
 
+const overCitedBody = Array.from(
+  { length: 12 },
+  (_, index) => `第${index + 1}个连续动作已经在正文中发生。`
+).join('\n')
+const overCitedLedger = buildNovelEvidenceLedger(overCitedBody)
+const overCitedAssessment = normalizeNovelExecutionAssessment({
+  passed: true,
+  coverage: legacyColonContract.requirements.map(requirement => ({
+    requirement_id: requirement.id,
+    verdict: 'covered',
+    evidence_ids: overCitedLedger.slice(0, 10).map(item => item.id),
+    reason: '多个连续动作共同完成该验收项'
+  })),
+  forbidden_violations: [],
+  continuity_blockers: [],
+  warnings: []
+}, legacyColonContract, overCitedLedger, 2000)
+assert.equal(overCitedAssessment.passed, true)
+assert.equal(overCitedAssessment.evaluatorProtocolErrors, undefined)
+assert.equal(overCitedAssessment.coverage[0].evidenceIds.length, 6)
+
 const previousOnlyEvidence = normalizeNovelExecutionAssessment({
   passed: true,
   coverage: legacyColonContract.requirements.map(requirement => ({
@@ -595,7 +616,7 @@ const severeShort = evaluateNovelQualityAcceptance({
   contract: muteContract
 })
 assert.equal(severeShort.passed, false)
-assert(severeShort.blockingFailures.some(item => item.includes('字数严重越界')))
+assert(severeShort.blockingFailures.some(item => item.includes('字数越界')))
 assert.equal(isRecognizedNovelHardFail(true, ['AI句式超过建议比例']), false)
 assert.equal(isRecognizedNovelHardFail(true, ['严重违反金手指能力限制']), true)
 assert.equal(isRecognizedNovelHardFail(false, ['违反系统设定：出现了不符合规则的外在实体面板']), true)

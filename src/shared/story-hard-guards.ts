@@ -10,6 +10,8 @@ export function detectStoryMetaResidues(text: string): string[] {
 }
 
 interface ContinuityShape {
+  entry_boundary?: string
+  exit_boundary?: string
   time_anchor?: string
   elapsed_from_previous?: string
   start_location?: string
@@ -20,6 +22,45 @@ interface ContinuityShape {
   opponent_reasoning?: string
   damage_to_protagonist?: string
   protagonist_adjustment?: string
+}
+
+export interface StoryBoundaryContractIssue {
+  leftIndex: number
+  rightIndex: number
+  leftExit: string
+  rightEntry: string
+  message: string
+}
+
+function normalizeBoundaryKey(value?: string): string {
+  return value?.trim().replace(/\s+/g, ' ') ?? ''
+}
+
+/**
+ * 相邻拍的权威状态交接必须能做字面等值比较。
+ * 语义猜测只用于给编辑建议，不能代替发布前的确定性合同。
+ */
+export function validateStoryBoundaryContracts(
+  chapters: StoryBeatGuardInput[]
+): StoryBoundaryContractIssue[] {
+  const issues: StoryBoundaryContractIssue[] = []
+  for (let index = 0; index < chapters.length - 1; index++) {
+    const current = chapters[index].continuity_contract
+    const next = chapters[index + 1].continuity_contract
+    const leftExit = normalizeBoundaryKey(current?.exit_boundary)
+    const rightEntry = normalizeBoundaryKey(next?.entry_boundary)
+    if (leftExit && rightEntry && leftExit === rightEntry) continue
+    issues.push({
+      leftIndex: index,
+      rightIndex: index + 1,
+      leftExit,
+      rightEntry,
+      message: !leftExit || !rightEntry
+        ? `第${index + 1}拍 exit_boundary 与第${index + 2}拍 entry_boundary 必须同时存在`
+        : `第${index + 1}拍 exit_boundary 与第${index + 2}拍 entry_boundary 不相等`
+    })
+  }
+  return issues
 }
 
 interface StoryBeatGuardInput {
@@ -61,7 +102,9 @@ function adjacentContractIssues(
 }
 
 export function validateStoryContinuityContracts(chapters: StoryBeatGuardInput[]): string[] {
-  const issues: string[] = []
+  const issues: string[] = validateStoryBoundaryContracts(chapters).map(issue =>
+    `${issue.message}：左值“${issue.leftExit || '缺失'}”，右值“${issue.rightEntry || '缺失'}”`
+  )
   chapters.forEach((chapter, index) => {
     const contract = chapter.continuity_contract
     if (!contract) {

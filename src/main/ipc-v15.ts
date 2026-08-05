@@ -1,4 +1,5 @@
 import { ipcMain } from 'electron'
+import { aiSessionManager } from './ai/ai-session-manager'
 import { foreshadowingDAO, characterSnapshotDAO, timelineDAO, anchorAlignmentDAO, anchorDAO, volumeChapterDAO, coreSettingDAO, appPreferenceDAO } from './db'
 import type { AnchorRow, TimelineEventRow } from './db'
 import { filterAnchorsForChapter } from './context/anchor-scope'
@@ -95,6 +96,10 @@ import {
 } from './context/chapter-execution-context'
 import { incubatorVersionDAO } from './db/dao/incubator'
 import { buildFrozenStorylineContext } from './context/incubator/build-storyline-context'
+import {
+  classifyQualityDiagnosisFailure,
+  type QualityDiagnosisFailureKind
+} from './context/goal-routine/quality-evaluator-policy'
 
 interface QualityGateSnapshot {
   fatalCount: number
@@ -302,13 +307,38 @@ function buildContentLogicContext(workId: number, chapterId: number): string | n
  * 章节 AI 质量诊断（主进程函数）。
  * 从 quality:diagnoseAI IPC 下沉而来，sender 可选：不传则 headless 运行（供目标循环 checker 调用）。
  */
+export type ChapterQualityDiagnosisResult =
+  | {
+      success: true
+      report: string
+      scoreTotal: number
+      hardFail: boolean
+      cappedByGate: boolean
+      scoreBreakdown: unknown
+      preprocessedContent?: string
+      goldenOpening?: { label: string; passed: boolean; issues: string[] }
+    }
+  | {
+      success: false
+      error: string
+      failureKind: QualityDiagnosisFailureKind
+      durationMs?: number
+      finishReason?: 'stop' | 'length' | 'content_filter' | 'tool' | 'unknown'
+    }
+
 export async function diagnoseChapterQualityAi(
   workId: number,
   chapterId: number,
   content: string,
-  modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean; wordTarget?: number },
+  modelOpts?: {
+    modelType?: string
+    modelName?: string
+    thinkingEnabled?: boolean
+    wordTarget?: number
+    signal?: AbortSignal
+  },
   sender?: import('electron').WebContents
-): Promise<{ success: boolean; error?: string; report?: string; scoreTotal?: number; hardFail?: boolean; cappedByGate?: boolean; scoreBreakdown?: unknown; preprocessedContent?: string; goldenOpening?: { label: string; passed: boolean; issues: string[] } }> {
+): Promise<ChapterQualityDiagnosisResult> {
   const gate = diagnoseChapterQuality(workId, chapterId, content)
   const styleCtx = buildStyleDiagnosisContext(workId)
   const workInfo = workDAO.getById(workId)
@@ -335,10 +365,15 @@ export async function diagnoseChapterQualityAi(
     const { min, max } = bodyWordCountBounds(resolvedWordTarget)
     const actualChars = countWords(diagnosisContent)
     const deviation = Math.round(((actualChars - resolvedWordTarget) / resolvedWordTarget) * 100)
-    const deviationLabel = deviation > 25 ? '严重超标' : deviation > 10 ? '轻微超标' : deviation < -25 ? '严重不足' : deviation < -10 ? '轻微不足' : '达标'
+    const softPct = Math.round(((max - resolvedWordTarget) / Math.max(1, resolvedWordTarget)) * 100)
+    const deviationLabel = Math.abs(deviation) > softPct + 15
+      ? (deviation > 0 ? '严重超标' : '严重不足')
+      : Math.abs(deviation) > softPct
+        ? (deviation > 0 ? '轻微超标' : '轻微不足')
+        : '达标'
     sections.push(
       `\n【目标字数诊断数据 - 已由系统预计算，直接使用，禁止自行重新计数】`,
-      `目标：约 ${resolvedWordTarget} 字（允许 ±10%，即 ${min}–${max} 字）`,
+      `目标：约 ${resolvedWordTarget} 字（允许 ${min}–${max} 字）`,
       `实际字数（含标点，不含空白）：${actualChars} 字`,
       `偏差：${deviation > 0 ? '+' : ''}${deviation}%（${deviationLabel}）`
     )
@@ -374,9 +409,24 @@ export async function diagnoseChapterQualityAi(
     enrichNarrativeMemory: false,
     modelType: modelOpts?.modelType as import('./model/types').ModelType | undefined,
     modelName: modelOpts?.modelName,
-    thinkingEnabled: modelOpts?.thinkingEnabled
-  }, sender ? { webContents: sender } : { stream: false })
-  if (!res.success) return { success: false, error: res.error }
+    // 质量评估需要短而完整的结构化结论；深度思考会占满 completion
+    // 预算并留下空 content，因此该步骤使用独立的无思考执行合同。
+    thinkingEnabled: false,
+    temperature: 0.1,
+    maxTokens: 4096,
+    timeoutMs: 120_000
+  }, sender
+    ? { webContents: sender, signal: modelOpts?.signal }
+    : { stream: false, signal: modelOpts?.signal })
+  if (!res.success) {
+    const error = res.error || '质量诊断模型调用失败'
+    return {
+      success: false,
+      error,
+      failureKind: classifyQualityDiagnosisFailure(error, Boolean(res.cancelled)),
+      durationMs: res.durationMs
+    }
+  }
 
   const reconciled = reconcileQualityAiReport(res.content, {
     fatalCount: gate.fatalCount,
@@ -385,6 +435,15 @@ export async function diagnoseChapterQualityAi(
   const parsed = isStory
     ? parseStoryQualityAiScoreBreakdown(reconciled.report)
     : parseQualityAiScoreReport(reconciled.report)
+  if (!parsed) {
+    return {
+      success: false,
+      error: `质量诊断响应不符合结构化评分协议（finishReason=${res.finishReason ?? 'unknown'}）`,
+      failureKind: 'protocol',
+      durationMs: res.durationMs,
+      finishReason: res.finishReason
+    }
+  }
 
   const overlap = isStory && chapterOrdinal === 1
     ? assessHookBodyOverlap(workInfo?.description ?? '', diagnosisContent)
@@ -633,7 +692,8 @@ function parseTimelineGeneration(content: string): Array<{
   ipcMain.handle('narrative:checkWorldview', (_e, workId: number, content: string) =>
     checkWorldviewConsistency(workId, content))
 
-  ipcMain.handle('memory:extractFromChapter', async (e, workId: number, chapterId: number, content: string, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }) => {
+  ipcMain.handle('memory:extractFromChapter', async (e, workId: number, chapterId: number, content: string, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }, sessionId?: string) => {
+    const session = aiSessionManager.getHandle(sessionId ?? '', e.sender)
     const res = await modelService.chat({
       prompt: content,
       systemPrompt: MEMORY_EXTRACT_SYSTEM_PROMPT,
@@ -645,7 +705,7 @@ function parseTimelineGeneration(content: string): Array<{
       modelType: modelOpts?.modelType as import('./model/types').ModelType | undefined,
       modelName: modelOpts?.modelName,
       thinkingEnabled: modelOpts?.thinkingEnabled
-    }, { webContents: e.sender })
+    }, session ? { stream: false, signal: session.getSignal() } : { webContents: e.sender })
     if (!res.success) return { success: false, error: res.error, planted: 0, resolved: 0, snapshots: 0 }
     const extracted = parseMemoryExtract(res.content)
     const cleared = clearChapterMemoryBeforeExtract(workId, chapterId)
@@ -654,7 +714,8 @@ function parseTimelineGeneration(content: string): Array<{
   })
 
   // ==================== AI 伏笔回收检测（替换硬编码 8 字匹配） ====================
-  ipcMain.handle('foreshadowing:detectResolutions', async (e, workId: number, chapterId: number, content: string, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }) => {
+  ipcMain.handle('foreshadowing:detectResolutions', async (e, workId: number, chapterId: number, content: string, modelOpts?: { modelType?: string; modelName?: string; thinkingEnabled?: boolean }, sessionId?: string) => {
+    const session = aiSessionManager.getHandle(sessionId ?? '', e.sender)
     const pending = foreshadowingDAO.listPending(workId)
     if (!pending.length) return { success: true, resolved: 0, partial: 0, message: '无待回收伏笔' }
 
@@ -681,7 +742,7 @@ function parseTimelineGeneration(content: string): Array<{
       modelType: modelOpts?.modelType as import('./model/types').ModelType | undefined,
       modelName: modelOpts?.modelName,
       thinkingEnabled: modelOpts?.thinkingEnabled
-    }, { webContents: e.sender })
+    }, session ? { stream: false, signal: session.getSignal() } : { webContents: e.sender })
 
     if (!res.success) return { success: false, error: res.error }
 
@@ -728,18 +789,14 @@ function parseTimelineGeneration(content: string): Array<{
     const isStory = workInfo?.work_type === 'story'
 
     if (isStory) {
-      const filteredIssues = (critique.issues || []).filter(issue => issue.evidence?.trim())
-      if (!filteredIssues.length) {
+      const failedDimensions = critique.dimensions.filter(dimension => !dimension.passed)
+      if (!failedDimensions.length) {
         return { success: true, content: content }
       }
-      
-      const issueLines = filteredIssues.map((issue, i) =>
-        `${i + 1}. [${issue.dimension}] evidence: "${issue.evidence}" → fixHint: ${issue.suggestion}`
-      ).join('\n')
 
       const prompt = [
         '【诊断问题列表（只修复以下问题，其余保持原文不变）】',
-        issueLines,
+        formatCritiqueFixReport(critique),
         '',
         '【原文】',
         content
@@ -826,7 +883,7 @@ function parseTimelineGeneration(content: string): Array<{
     const systemPrompt = [QUALITY_APPLY_FIXES_PROMPT, STYLE_REWRITE_INSTRUCTION].join('\n\n')
     const resolvedWordTarget = modelOpts?.wordTarget ?? loadWritingPlan(workId).wordsPerChapter
     const wordTargetSection = resolvedWordTarget > 0
-      ? `\n【目标字数】${resolvedWordTarget} 字（允许 ±10%，即 ${bodyWordCountBounds(resolvedWordTarget).min}–${bodyWordCountBounds(resolvedWordTarget).max} 字）\n`
+      ? `\n【目标字数】${resolvedWordTarget} 字（允许 ${bodyWordCountBounds(resolvedWordTarget).min}–${bodyWordCountBounds(resolvedWordTarget).max} 字）\n`
       : ''
     const prompt = [
       '【诊断报告】',
@@ -857,7 +914,7 @@ function parseTimelineGeneration(content: string): Array<{
     const systemPrompt = action === 'expand' ? ADJUST_WORDS_EXPAND_PROMPT : ADJUST_WORDS_COMPRESS_PROMPT
     const resolvedWordTarget = modelOpts?.wordTarget ?? loadWritingPlan(workId).wordsPerChapter
     const wordTargetSection = resolvedWordTarget > 0
-      ? `\n【目标字数】将字数调整至：约 ${resolvedWordTarget} 字（允许 ±10%，即 ${bodyWordCountBounds(resolvedWordTarget).min}–${bodyWordCountBounds(resolvedWordTarget).max} 字）\n`
+      ? `\n【目标字数】将字数调整至：约 ${resolvedWordTarget} 字（允许 ${bodyWordCountBounds(resolvedWordTarget).min}–${bodyWordCountBounds(resolvedWordTarget).max} 字）\n`
       : ''
 
     const contextSections: string[] = []

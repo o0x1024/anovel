@@ -26,9 +26,6 @@ export function navKeyForPath(path: string): string {
   if (normalized.startsWith('/novel/')) {
     return '/'
   }
-  if (normalized.startsWith('/causal-novel/')) {
-    return '/causal-novels'
-  }
   if (normalized.startsWith('/story/')) {
     return '/stories'
   }

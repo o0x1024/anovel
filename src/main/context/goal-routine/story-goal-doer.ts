@@ -17,7 +17,7 @@ import {
   coreSettingDAO
 } from '../../db'
 import { normalizeModelBodyOutput } from '../../../shared/normalize-body-text'
-import { formatBodyWordTargetLine } from '../../../shared/body-word-target'
+import { countWords, formatBodyWordTargetLine } from '../../../shared/body-word-target'
 import { formatBodyPromptLines } from '../../../shared/work-terminology'
 import {
   NOVEL_GOAL_BODY_GENERATION_SYSTEM,
@@ -56,10 +56,8 @@ import {
   applyBodyReactionReplacementPatches,
   BODY_REACTION_CLICHE_DIRECTIVE,
   detectBodyReactionCliches,
-  removeBodyReactionClichesDeterministically,
   type BodyReactionReplacementPatch
 } from '../anti-ai-rules'
-import { extractJsonText } from '../parse-json-extract'
 import { assessStoryBeatContinuity } from './story-continuity-gate'
 import { formatStoryContractForPrompt } from './story-contract'
 import { assessNovelSystemics } from './novel-systemic-gate'
@@ -67,16 +65,27 @@ import {
   canRepairStoryContinuity,
   isStoryContinuityEvaluatorFailure
 } from './story-continuity-repair-policy'
+import { requestStructuredModelOutput } from './structured-model-output'
 import {
   detectStoryTextIntegrityIssues,
   buildStoryCandidateContextSource,
   derivedMemoryFailureDisposition,
   isStructuralStoryCandidateRejection,
-  repairDeterministicStoryQuotes,
+  repairDeterministicStoryCandidate,
   resolveStoryModelCapability,
   shouldBlockStoryAntiAi,
+  storyCandidateDefectSignature,
   STORY_HARNESS_MAX_CANDIDATES_PER_BEAT
 } from '../../../shared/story-harness'
+import {
+  NARRATIVE_MEMORY_MAX_ATTEMPTS,
+  NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS,
+  NarrativeMemoryPipelineError,
+  classifyNarrativeMemoryFailure,
+  decideNarrativeMemoryRetry,
+  narrativeMemoryTokenBudget,
+  type NarrativeMemoryFailureCode
+} from './narrative-memory-failure'
 import {
   formatChapterExecutionContract,
   type ChapterExecutionContract
@@ -85,17 +94,7 @@ import {
   buildChapterExecutionContext,
   persistChapterExecutionContract
 } from '../chapter-execution-context'
-import {
-  isNovelExecutionEvaluatorFailure,
-  assessNovelExecutionCandidate,
-  convergeNovelExecutionWordRange,
-  repairNovelExecutionCandidate,
-  type NovelExecutionGateResult
-} from './novel-execution-gate'
-import {
-  selectReusableNovelExecutionCandidate,
-  shouldPersistNovelExecutionCandidate
-} from './novel-goal-policy'
+import { recordChapterEditorialDebt } from './novel-chapter-transaction-policy'
 
 function storyCandidateContextSource(
   workId: number,
@@ -124,12 +123,14 @@ export interface BeatGenResult {
   wordCount: number
   antiAiRepairs?: number
   antiAiRepairRounds?: number
+  deterministicRepairs?: number
   continuityRepairRounds?: number
   continuityBlockers?: string[]
   requiresEscalation?: boolean
-  failureKind?: 'contract' | 'body_integrity' | 'continuity' | 'evaluator_protocol' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
+  failureKind?: 'contract' | 'body_integrity' | 'continuity' | 'memory_extract' | 'resource' | 'consistency' | 'candidate_budget' | 'cancelled'
   memoryPending?: boolean
   memoryExtracted?: { planted: number; resolved: number; snapshots: number; timelineEvents: number; stateFacts?: number; patternFingerprint?: boolean; warnings?: string[]; foreshadowingResolved: number; foreshadowingPartial: number }
+  failureSignature?: string
   error?: string
 }
 
@@ -138,11 +139,13 @@ export interface GenerateBeatBodyOptions {
   onProgress?: (message: string) => void
   goalDescription?: string
   extraHint?: string
-  workType?: 'novel' | 'story' | 'causal_novel'
+  workType?: 'novel' | 'story'
   wordTargetOverride?: number
+  wordCountToleranceOverride?: number
   onContinuityEvent?: (event: StoryContinuityRepairEvent) => void
   /** 小说目标循环先稳定正文，再由外层统一提交叙事记忆。 */
   deferNarrativeMemory?: boolean
+  checkEmotionContract?: boolean
 }
 
 export interface ReviseBeatBodyOptions {
@@ -150,8 +153,12 @@ export interface ReviseBeatBodyOptions {
   instruction: string
   workType?: 'novel' | 'story'
   wordTargetOverride?: number
+  requiredWordRange?: { min: number; target: number; max: number }
   /** 修订候选不得提前覆盖已经验收的叙事记忆。 */
   deferNarrativeMemory?: boolean
+  checkEmotionContract?: boolean
+  /** 模型候选形成后、写入章节版本前执行的同步事务门禁。 */
+  beforePersist?: () => void
 }
 
 export interface PreparedNarrativeMemory {
@@ -167,8 +174,21 @@ export interface CommitPreparedNarrativeMemoryOptions {
   markChapterCompleted?: boolean
 }
 
-function countWords(s: string): number {
-  return s.replace(/\s/g, '').length
+export class NarrativeMemoryCommitGateError extends Error {
+  readonly code = 'NARRATIVE_MEMORY_GATE_REPAIR_REQUIRED'
+
+  constructor(
+    readonly chapterId: number,
+    readonly blockers: string[]
+  ) {
+    super(`候选叙事记忆门禁未通过：${blockers.join('；')}`)
+    this.name = 'NarrativeMemoryCommitGateError'
+  }
+}
+
+function compactNarrativeMemoryError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.replace(/\s+/g, ' ').trim().slice(0, 500)
 }
 
 interface BodyReactionRepairResult {
@@ -179,6 +199,28 @@ interface BodyReactionRepairResult {
 }
 
 const MAX_BODY_REACTION_REPAIR_ROUNDS = 2
+
+const BODY_REACTION_REPLACEMENTS_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['replacements'],
+  properties: {
+    replacements: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 64,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['original', 'replacement'],
+        properties: {
+          original: { type: 'string', minLength: 1 },
+          replacement: { type: 'string' }
+        }
+      }
+    }
+  }
+}
 
 /**
  * 只让模型返回命中句子的 replacement，再由程序定点应用。
@@ -202,75 +244,60 @@ async function repairBodyReactionCliches(
     rounds = round
     const sentences = [...new Set(violations.map(item => item.sentence))]
     onProgress?.(`检测到 ${violations.length} 处泛白类模板反应，正在定点修复（${round}/${MAX_BODY_REACTION_REPAIR_ROUNDS}）`)
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        workId,
-        chapterId,
-        step: 'body_style_rewrite',
-        maxTokens: Math.max(1200, sentences.join('').length * 3),
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false,
-        responseSchema: {
-          name: 'body_reaction_replacements',
-          strict: false,
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['replacements'],
-            properties: {
-              replacements: {
-                type: 'array',
-                minItems: 1,
-                maxItems: sentences.length,
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['original', 'replacement'],
-                  properties: {
-                    original: { type: 'string', enum: sentences },
-                    replacement: { type: 'string' }
-                  }
-                }
-              }
-            }
-          }
-        },
-        systemPrompt: [
-          '你是小说正文定点修订器。只处理列出的命中句子，不得改动其他正文。',
-          BODY_REACTION_CLICHE_DIRECTIVE,
-          '无独立剧情信息的命中句子，replacement 返回空字符串。',
-          '如命中句子还承载对话、选择、道具变化或因果信息，只删掉套话并保留这些信息。',
-          '严禁补写呼吸一滞、身体僵住、瞳孔骤缩、颤抖、攥拳、嘴角上扬等替代套话。',
-          '只返回 JSON：{"replacements":[{"original":"必须与输入句子逐字一致","replacement":"修订后完整句子或空字符串"}]}'
-        ].join('\n'),
-        prompt: `【待定点修订的句子】\n${JSON.stringify(sentences, null, 2)}`
-      }),
-      { stream: false, signal }
-    )
-    if (!response.success || !response.content?.trim()) {
-      appLogger.warn('goal_routine', '泛白类身体反应定点修复未返回结果', {
-        workId, chapterId, round, error: response.error
-      })
-      continue
-    }
-
-    let parsed: unknown
-    try {
-      const json = extractJsonText(response.content)
-      parsed = json ? JSON.parse(json) : null
-    } catch {
-      parsed = null
-    }
-    const replacements = Array.isArray(parsed)
-      ? parsed
-      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { replacements?: unknown }).replacements)
-        ? (parsed as { replacements: unknown[] }).replacements
-        : []
+    const replacements = await requestStructuredModelOutput<BodyReactionReplacementPatch[]>({
+      workId,
+      label: `泛白类身体反应定点修复第${round}轮`,
+      attempts: 1,
+      signal,
+      schema: BODY_REACTION_REPLACEMENTS_SCHEMA,
+      request: () => modelService.chat(
+        withGoalLoopModelOptions(workId, {
+          workId,
+          chapterId,
+          step: 'body_style_rewrite',
+          maxTokens: Math.max(1200, sentences.join('').length * 3),
+          enrichWorkContext: false,
+          enrichNarrativeMemory: false,
+          responseSchema: {
+            name: 'body_reaction_replacements',
+            strict: true,
+            schema: BODY_REACTION_REPLACEMENTS_SCHEMA
+          },
+          structuredOutputMode: 'prompt_json',
+          systemPrompt: [
+            '你是小说正文定点修订器。只处理列出的命中句子，不得改动其他正文。',
+            BODY_REACTION_CLICHE_DIRECTIVE,
+            '无独立剧情信息的命中句子，replacement 返回空字符串。',
+            '如命中句子还承载对话、选择、道具变化或因果信息，只删掉套话并保留这些信息。',
+            '严禁补写呼吸一滞、身体僵住、瞳孔骤缩、颤抖、攥拳、嘴角上扬等替代套话。',
+            '只返回 JSON：{"replacements":[{"original":"必须与输入句子逐字一致","replacement":"修订后完整句子或空字符串"}]}'
+          ].join('\n'),
+          prompt: `【待定点修订的句子】\n${JSON.stringify(sentences, null, 2)}`
+        }),
+        { stream: false, signal }
+      ),
+      validate: value => {
+        const rows = Array.isArray(value.replacements)
+          ? value.replacements as unknown as BodyReactionReplacementPatch[]
+          : []
+        const allowed = new Set(sentences)
+        const originals = rows.map(item => typeof item?.original === 'string' ? item.original : '')
+        if (
+          rows.length === 0
+          || rows.some(item => !item || typeof item.original !== 'string' || typeof item.replacement !== 'string')
+          || originals.some(original => !allowed.has(original))
+          || new Set(originals).size !== originals.length
+        ) {
+          throw new Error('泛白类身体反应补丁必须且只能引用当前列出的原句，每个原句最多一次')
+        }
+        return rows
+      }
+    })
 
     const patchResult = applyBodyReactionReplacementPatches(
       content,
       sentences,
-      replacements as BodyReactionReplacementPatch[]
+      replacements
     )
     content = patchResult.content
     const appliedThisRound = patchResult.applied
@@ -284,21 +311,6 @@ async function repairBodyReactionCliches(
       applied: appliedThisRound,
       rejected: patchResult.rejected,
       remaining: detectBodyReactionCliches(content).length
-    })
-  }
-
-  const beforeFallback = detectBodyReactionCliches(content).length
-  if (!signal?.aborted && beforeFallback > 0) {
-    const fallback = removeBodyReactionClichesDeterministically(content)
-    content = fallback.content
-    repairs += fallback.removedClauses
-    onProgress?.(`模型定点补丁未收敛，已只删除 ${fallback.removedClauses} 个命中分句，剩余 ${fallback.remaining} 处`)
-    appLogger.warn('goal_routine', '泛白类身体反应使用确定性删除兜底', {
-      workId,
-      chapterId,
-      detected: beforeFallback,
-      removedClauses: fallback.removedClauses,
-      remaining: fallback.remaining
     })
   }
 
@@ -386,7 +398,8 @@ function buildBodyPrompt(
   extraHint?: string,
   workType: 'novel' | 'story' = 'story',
   executionContract?: ChapterExecutionContract,
-  executionContext = ''
+  executionContext = '',
+  checkEmotionContract = true
 ): string | null {
   const chapters = volumeChapterDAO.listChaptersByWork(workId)
   const ch = chapters.find(c => c.id === chapterId)
@@ -405,13 +418,19 @@ function buildBodyPrompt(
     'proseRules'
   )
   const resourceBudget = formatChapterResourceBudgetsForPrompt(workId, chapterId)
-  const emotionCard = emotionExecutionCard(chapterId)
+  const emotionCard = checkEmotionContract ? emotionExecutionCard(chapterId) : ''
+  const wordToleranceHint = executionContract
+    ? Math.max(
+      (executionContract.wordTarget - executionContract.wordMin) / Math.max(1, executionContract.wordTarget),
+      (executionContract.wordMax - executionContract.wordTarget) / Math.max(1, executionContract.wordTarget)
+    )
+    : undefined
   const taskPrompt = formatBodyPromptLines(workType, {
     volName: vol?.name,
     volDescription: workType === 'novel' && executionContract ? undefined : vol?.description,
     chapterTitle: ch.title,
     outline: ch.outline,
-    wordTargetLine: formatBodyWordTargetLine(wordTarget)
+    wordTargetLine: formatBodyWordTargetLine(wordTarget, wordToleranceHint)
   }).concat(
     [
       goalDescription?.trim()
@@ -435,62 +454,6 @@ function buildBodyPrompt(
   ].filter(Boolean).join('\n\n')
 }
 
-async function generateNovelBodyByScenes(input: {
-  workId: number
-  chapterId: number
-  contract: ChapterExecutionContract
-  basePrompt: string
-  systemPrompt: string
-  signal?: AbortSignal
-  onProgress?: (message: string) => void
-  startIndex?: number
-  initialContent?: string
-}): Promise<{ success: boolean; content: string; completedSceneCount: number; error?: string }> {
-  const completed: string[] = input.initialContent?.trim() ? [input.initialContent.trim()] : []
-  const startIndex = Math.max(0, Math.min(input.startIndex ?? 0, input.contract.scenes.length))
-  for (let index = startIndex; index < input.contract.scenes.length; index++) {
-    if (input.signal?.aborted) {
-      return { success: false, content: completed.join('\n\n'), completedSceneCount: index, error: '已取消' }
-    }
-    const scene = input.contract.scenes[index]
-    input.onProgress?.(`正在生成${scene.label}（${index + 1}/${input.contract.scenes.length}）`)
-    const priorTail = completed.join('\n\n').slice(-1800)
-    const response = await modelService.chat(
-      withGoalLoopModelOptions(input.workId, {
-        workId: input.workId,
-        chapterId: input.chapterId,
-        step: 'body_generation_scene',
-        maxTokens: Math.max(1800, Math.min(5000, scene.targetWords * 2)),
-        temperature: 0.65,
-        enrichWorkContext: false,
-        enrichNarrativeMemory: index === 0,
-        systemPrompt: [
-          input.systemPrompt,
-          '你正在分场景完成同一章节。只输出当前场景正文，不输出场景标题、编号、自检或后续场景。',
-          '当前场景必须从已完成正文末尾之后继续，禁止复述。完成本场 mustCover 并停在 exitFacts，不得提前写后续场景。'
-        ].join('\n\n'),
-        prompt: [
-          input.basePrompt,
-          `【当前只写这一场】\n${JSON.stringify(scene, null, 2)}`,
-          priorTail ? `【本章已完成正文尾部】\n${priorTail}` : '',
-          `当前场景目标约 ${scene.targetWords} 字，只写正文。`
-        ].filter(Boolean).join('\n\n')
-      }),
-      { stream: false, signal: input.signal }
-    )
-    if (!response.success || !response.content?.trim()) {
-      return {
-        success: false,
-        content: completed.join('\n\n'),
-        completedSceneCount: index,
-        error: response.error || `${scene.label}生成失败`
-      }
-    }
-    completed.push(normalizeModelBodyOutput(response.content.trim(), 'body_generation'))
-  }
-  return { success: true, content: completed.join('\n\n'), completedSceneCount: input.contract.scenes.length }
-}
-
 /**
  * 为指定节拍/章节生成正文：headless 生成 → humanize（仅轻量）→ 写库（带版本快照）。
  * 不掺 autoRewrite；去AI 由 checker 判定、fix 阶段针对性处理。
@@ -502,9 +465,10 @@ export async function generateBeatBody(
 ): Promise<BeatGenResult> {
   const {
     signal, onProgress, goalDescription, extraHint, workType = 'story', wordTargetOverride,
-    deferNarrativeMemory = false
+    wordCountToleranceOverride, deferNarrativeMemory = false,
+    checkEmotionContract = true
   } = options
-  const proseWorkType: 'novel' | 'story' = workType === 'causal_novel' ? 'novel' : workType
+  const proseWorkType: 'novel' | 'story' = workType
   const existingChapter = volumeChapterDAO.getChapter(chapterId)
   const generationContext = storyCandidateContextSource(workId, existingChapter)
   if (workType === 'story') {
@@ -530,11 +494,15 @@ export async function generateBeatBody(
       }
     }
   }
-  await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
+  if (proseWorkType === 'story' || checkEmotionContract) {
+    await ensureChapterEmotionContract(workId, chapterId, goalDescription, signal)
+  }
   const plan = loadWritingPlan(workId)
-  const wordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
+  const requestedWordTarget = wordTargetOverride ?? (plan.wordsPerChapter || 4000)
   const executionContract = proseWorkType === 'novel'
-    ? persistChapterExecutionContract(workId, chapterId, wordTarget)
+    // 长篇正文的唯一字数权威是章节执行合同：默认值必须来自目标循环配置，
+    // 不能把写作计划的展示默认值覆盖到合同，再由验收按目标配置重新编译。
+    ? persistChapterExecutionContract(workId, chapterId, wordTargetOverride, wordCountToleranceOverride)
     : null
   if (proseWorkType === 'novel' && !executionContract) {
     return { success: false, content: '', wordCount: 0, failureKind: 'contract', error: '章节不存在，无法编译正文执行合同' }
@@ -548,37 +516,7 @@ export async function generateBeatBody(
       error: `章节执行合同冲突：${executionContract.errors.join('；')}`
     }
   }
-  const reusableEvaluatorCandidate = proseWorkType === 'novel' && executionContract && !existingChapter?.content?.trim()
-    ? selectReusableNovelExecutionCandidate(volumeChapterDAO.listVersions(chapterId), {
-        outline: existingChapter?.outline,
-        wordTarget: executionContract.wordTarget,
-        wordMin: executionContract.wordMin,
-        wordMax: executionContract.wordMax,
-        contractHash: executionContract.sourceOutlineHash
-      })
-    : undefined
-  if (reusableEvaluatorCandidate?.content?.trim()) {
-    onProgress?.(`复用已保留的章节候选版本 v${reusableEvaluatorCandidate.version_number}，按新版证据协议重新验收`)
-    appLogger.info('goal_routine', '复用评估器证据协议失败时保留的最佳章节候选', {
-      workId,
-      chapterId,
-      versionNumber: reusableEvaluatorCandidate.version_number,
-      modelType: reusableEvaluatorCandidate.model_type,
-      wordCount: reusableEvaluatorCandidate.word_count,
-      wordTarget: executionContract.wordTarget,
-      wordRange: [executionContract.wordMin, executionContract.wordMax]
-    })
-    return persistGeneratedBody(
-      workId,
-      chapterId,
-      reusableEvaluatorCandidate.content,
-      proseWorkType,
-      signal,
-      onProgress,
-      options.onContinuityEvent,
-      deferNarrativeMemory
-    )
-  }
+  const wordTarget = executionContract?.wordTarget ?? requestedWordTarget
   const compactContext = executionContract
     ? buildChapterExecutionContext(workId, chapterId, executionContract)
     : { text: '', sectionChars: {} }
@@ -590,7 +528,8 @@ export async function generateBeatBody(
     extraHint,
     proseWorkType,
     executionContract ?? undefined,
-    compactContext.text
+    compactContext.text,
+    checkEmotionContract
   )
   if (!prompt) return { success: false, content: '', wordCount: 0, error: `${proseWorkType === 'story' ? '节拍' : '章节'}不存在` }
 
@@ -617,59 +556,24 @@ export async function generateBeatBody(
     })
   }
 
-  let sceneResume: { startIndex: number; initialContent: string } | undefined
-  if (proseWorkType === 'novel' && executionContract?.scenes.length) {
-    const latestVersion = volumeChapterDAO.listVersions(chapterId)[0]
-    const partial = latestVersion?.model_type === 'novel_scene_partial' && latestVersion.content?.trim()
-      ? latestVersion
-      : undefined
-    if (partial?.snapshot_json) {
-      try {
-        const snapshot = JSON.parse(partial.snapshot_json) as {
-          contractHash?: unknown
-          completedSceneCount?: unknown
-        }
-        const completedSceneCount = Number(snapshot.completedSceneCount)
-        if (
-          snapshot.contractHash === executionContract.sourceOutlineHash
-          && Number.isInteger(completedSceneCount)
-          && completedSceneCount > 0
-          && completedSceneCount < executionContract.scenes.length
-        ) {
-          sceneResume = { startIndex: completedSceneCount, initialContent: partial.content ?? '' }
-          onProgress?.(`检测到同一章节合同的分场景断点，从第 ${completedSceneCount + 1} 场继续`)
-        }
-      } catch { /* 旧版本快照不是断点元数据 */ }
-    }
-  }
-
-  const response = proseWorkType === 'novel' && executionContract?.scenes.length
-    ? await generateNovelBodyByScenes({
-        workId,
-        chapterId,
-        contract: executionContract,
-        basePrompt: prompt,
-        systemPrompt,
-        signal,
-        onProgress,
-        startIndex: sceneResume?.startIndex,
-        initialContent: sceneResume?.initialContent
-      })
-    : await modelService.chat(
-        withGoalLoopModelOptions(workId, {
-          prompt,
-          systemPrompt,
-          step: 'body_generation',
-          workId,
-          maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
-          temperature: proseWorkType === 'novel' ? 0.75 : undefined,
-          enrichWorkContext: proseWorkType !== 'novel',
-          chapterId,
-          volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
-          enrichNarrativeMemory: true
-        }),
-        { stream: false, signal }
-      )
+  onProgress?.(proseWorkType === 'novel'
+    ? '正在一次性生成完整章节正文'
+    : '正在生成正文')
+  const response = await modelService.chat(
+    withGoalLoopModelOptions(workId, {
+      prompt,
+      systemPrompt,
+      step: 'body_generation',
+      workId,
+      maxTokens: Math.max(6000, Math.min(12000, wordTarget * 2)),
+      temperature: proseWorkType === 'novel' ? 0.75 : undefined,
+      enrichWorkContext: proseWorkType !== 'novel',
+      chapterId,
+      volumeId: volumeChapterDAO.listChaptersByWork(workId).find(c => c.id === chapterId)?.volume_id,
+      enrichNarrativeMemory: proseWorkType !== 'novel'
+    }),
+    { stream: false, signal }
+  )
 
   if (!response.success || !response.content?.trim()) {
     if (proseWorkType === 'novel' && response.content?.trim() && executionContract) {
@@ -677,29 +581,15 @@ export async function generateBeatBody(
         outline: existingChapter?.outline ?? undefined,
         content: response.content,
         word_count: countWords(response.content),
-        model_type: 'novel_scene_partial',
+        model_type: 'novel_body_incomplete',
         snapshot_json: JSON.stringify({
           contractHash: executionContract.sourceOutlineHash,
-          completedSceneCount: 'completedSceneCount' in response ? response.completedSceneCount : 0,
           partialChars: response.content.length,
-          error: response.error || '分场景生成中断'
+          error: response.error || '完整章节生成中断'
         })
       })
     }
     return { success: false, content: response.content ?? '', wordCount: 0, error: response.error || '生成失败' }
-  }
-
-  if (proseWorkType === 'novel' && executionContract?.scenes.length && 'completedSceneCount' in response) {
-    volumeChapterDAO.createVersion(chapterId, {
-      outline: existingChapter?.outline ?? undefined,
-      content: response.content,
-      word_count: countWords(response.content),
-      model_type: 'novel_scene_complete',
-      snapshot_json: JSON.stringify({
-        contractHash: executionContract.sourceOutlineHash,
-        completedSceneCount: response.completedSceneCount
-      })
-    })
   }
 
   return persistGeneratedBody(
@@ -770,12 +660,15 @@ async function persistGeneratedBody(
   signal?: AbortSignal,
   onProgress?: (message: string) => void,
   onContinuityEvent?: (event: StoryContinuityRepairEvent) => void,
-  deferNarrativeMemory = false
+  deferNarrativeMemory = false,
+  requiredWordRange?: { min: number; target: number; max: number },
+  beforePersist?: () => void
 ): Promise<BeatGenResult> {
   let content = normalizeModelBodyOutput(rawContent.trim(), 'body_generation')
   const currentChapter = volumeChapterDAO.getChapter(chapterId)
   const generationContext = storyCandidateContextSource(workId, currentChapter)
   let candidateId: number | undefined
+  let deterministicRepairs = 0
 
   const rejectStoryCandidate = (reason: string, checks?: unknown): void => {
     if (candidateId != null) {
@@ -795,6 +688,18 @@ async function persistGeneratedBody(
     })
   }
 
+  const normalizeStoryCandidate = (): void => {
+    if (workType !== 'story') return
+    const repaired = repairDeterministicStoryCandidate(content)
+    content = repaired.content
+    deterministicRepairs += repaired.repairCount
+    if (repaired.repairCount > 0) {
+      onProgress?.(
+        `候选入库前完成 ${repaired.repairCount} 处无歧义原位修复`
+      )
+    }
+  }
+
   const { cleanedContent } = extractEmotionIntensity(content)
   content = cleanedContent
 
@@ -803,15 +708,22 @@ async function persistGeneratedBody(
     content = humanizeText(content)
   } catch { /* humanize 失败不阻断 */ }
 
-  // 在写库和提取叙事记忆之前定点清理，避免模板反应污染伏笔/角色快照。
-  let antiAiRepair = await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
+  // 短故事仍使用候选式定点修订；长篇的风格问题只登记编辑债务，
+  // 不允许在章节事务内部触发第二条模型改写链。
+  let antiAiRepair = workType === 'story'
+    ? await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
+    : {
+        content,
+        repairs: 0,
+        rounds: 0,
+        remaining: detectBodyReactionCliches(content).length
+      }
   content = antiAiRepair.content
-  if (workType === 'story') content = repairDeterministicStoryQuotes(content)
+  normalizeStoryCandidate()
   createStoryCandidate('body_generation')
 
   const antiAiBlocked = workType === 'story'
-    ? shouldBlockStoryAntiAi(antiAiRepair.remaining, content.length)
-    : antiAiRepair.remaining > 0
+    && shouldBlockStoryAntiAi(antiAiRepair.remaining, content.length)
   if (antiAiBlocked) {
     const error = `泛白类身体反应经 ${antiAiRepair.rounds} 轮定点修复仍剩 ${antiAiRepair.remaining} 处，已否决当前候选`
     rejectStoryCandidate(error, { antiAiRemaining: antiAiRepair.remaining })
@@ -834,171 +746,19 @@ async function persistGeneratedBody(
   let antiAiRepairs = antiAiRepair.repairs
   let antiAiRepairRounds = antiAiRepair.rounds
   let wordCount = countWords(content)
-  let continuityRepairRounds = 0
-
-  if (workType === 'novel') {
-    const contract = persistChapterExecutionContract(workId, chapterId)
-    if (!contract) {
-      return { success: false, content, wordCount, failureKind: 'contract', error: '无法编译长篇章节执行合同' }
-    }
-    if (wordCount < contract.wordMin || wordCount > contract.wordMax) {
-      onProgress?.(
-        `章节字数 ${wordCount} 超出合同 ${contract.wordMin}-${contract.wordMax}，正在先收敛长度再执行语义门禁`
-      )
-      const lengthConvergence = await convergeNovelExecutionWordRange(
-        workId,
-        chapterId,
-        content,
-        contract,
-        signal
-      )
-      content = lengthConvergence.content
-      wordCount = countWords(content)
-      if (!lengthConvergence.success) {
-        volumeChapterDAO.createVersion(chapterId, {
-          outline: currentChapter?.outline ?? undefined,
-          content,
-          word_count: wordCount,
-          model_type: 'novel_execution_candidate',
-          generation_round: lengthConvergence.attempts,
-          snapshot_json: JSON.stringify({
-            contractHash: contract.sourceOutlineHash,
-            lengthConvergence,
-            wordRangeFailure: true
-          })
-        })
-        return {
-          success: false,
-          content,
-          wordCount,
-          continuityRepairRounds: lengthConvergence.attempts,
-          continuityBlockers: [
-            lengthConvergence.error
-              || `章节字数 ${wordCount} 不在合同范围 ${contract.wordMin}-${contract.wordMax}`
-          ],
-          requiresEscalation: true,
-          failureKind: 'continuity',
-          error: `${lengthConvergence.error || '章节字数预收敛失败'}，候选已存入版本历史且禁止进入下一章`
-        }
-      }
-      onProgress?.(`章节字数已收敛到 ${wordCount}，开始执行情节点与连续性门禁`)
-    }
-    for (let round = 0; round <= 2; round++) {
-      onProgress?.(`正在核验章节情节点覆盖与章际衔接（${round + 1}/3）`)
-      const evaluatorAttempts: NovelExecutionGateResult[] = []
-      let gate = await assessNovelExecutionCandidate(workId, chapterId, content, contract, signal)
-      evaluatorAttempts.push(gate)
-      for (let evaluatorRetry = 1; isNovelExecutionEvaluatorFailure(gate.blockers) && evaluatorRetry <= 2; evaluatorRetry++) {
-        onProgress?.(`章节执行门禁证据格式无效，正在重新取证（${evaluatorRetry}/2）`)
-        gate = await assessNovelExecutionCandidate(
-          workId,
-          chapterId,
-          content,
-          contract,
-          signal,
-          gate.evaluatorProtocolErrors ?? gate.blockers
-        )
-        evaluatorAttempts.push(gate)
-      }
-      if (gate.passed) break
-      if (isNovelExecutionEvaluatorFailure(gate.blockers)) {
-        const candidateWordCount = countWords(content)
-        volumeChapterDAO.createVersion(chapterId, {
-          outline: currentChapter?.outline ?? undefined,
-          content,
-          word_count: candidateWordCount,
-          model_type: 'novel_gate_evidence',
-          generation_round: round + 1,
-          snapshot_json: JSON.stringify({
-            contractHash: contract.sourceOutlineHash,
-            gate,
-            evaluatorAttempts,
-            evaluatorFailure: true
-          })
-        })
-        return {
-          success: false,
-          content,
-          wordCount: candidateWordCount,
-          continuityRepairRounds: round,
-          continuityBlockers: gate.blockers,
-          requiresEscalation: true,
-          failureKind: 'evaluator_protocol',
-          error: '章节执行评估器连续 3 次未返回可逐项验证的精确证据，候选已存入版本历史且不触发正文改写'
-        }
-      }
-      wordCount = countWords(content)
-      if (shouldPersistNovelExecutionCandidate(volumeChapterDAO.listVersions(chapterId), {
-        contractHash: contract.sourceOutlineHash,
-        content,
-        wordCount,
-        wordMin: contract.wordMin,
-        wordMax: contract.wordMax,
-        coverageVerdicts: gate.coverage.map(item => item.verdict),
-        forbiddenViolationCount: gate.forbiddenViolations.length
-      })) {
-        volumeChapterDAO.createVersion(chapterId, {
-          outline: currentChapter?.outline ?? undefined,
-          content,
-          word_count: wordCount,
-          model_type: 'novel_execution_candidate',
-          generation_round: round + 1,
-          snapshot_json: JSON.stringify({
-            contractHash: contract.sourceOutlineHash,
-            gate,
-            evaluatorAttempts
-          })
-        })
-      }
-      if (round >= 2) {
-        return {
-          success: false,
-          content,
-          wordCount,
-          continuityRepairRounds: round,
-          continuityBlockers: gate.blockers,
-          requiresEscalation: true,
-          failureKind: 'continuity',
-          error: `章节合同硬门禁经过 2 轮定向修复仍未全部 covered，禁止进入下一章：${gate.blockers.join('；')}`
-        }
-      }
-      onProgress?.(`章节执行门禁未通过，正在定向修复（${round + 1}/2）`)
-      const repaired = await repairNovelExecutionCandidate(
-        workId,
-        chapterId,
-        content,
-        contract,
-        gate.blockers,
-        signal
-      )
-      if (!repaired.success) {
-        return {
-          success: false,
-          content,
-          wordCount,
-          continuityBlockers: gate.blockers,
-          requiresEscalation: true,
-          failureKind: 'continuity',
-          error: repaired.error || '章节执行定向修复失败'
-        }
-      }
-      content = normalizeModelBodyOutput(repaired.content, 'body_generation')
-      try { content = humanizeText(content) } catch { /* 保留模型正文 */ }
-      antiAiRepair = await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
-      content = antiAiRepair.content
-      antiAiRepairs += antiAiRepair.repairs
-      antiAiRepairRounds += antiAiRepair.rounds
-      if (antiAiRepair.remaining > 0) {
-        return {
-          success: false,
-          content,
-          wordCount: countWords(content),
-          error: `章节执行修复后仍有 ${antiAiRepair.remaining} 处泛白类模板反应`
-        }
-      }
-      continuityRepairRounds = round + 1
+  if (
+    requiredWordRange
+    && (wordCount < requiredWordRange.min || wordCount > requiredWordRange.max)
+  ) {
+    return {
+      success: false,
+      content,
+      wordCount,
+      failureKind: 'contract',
+      error: `修订候选字数 ${wordCount} 未进入合同范围 ${requiredWordRange.min}-${requiredWordRange.max}，拒绝持久化`
     }
   }
+  let continuityRepairRounds = 0
 
   if (workType === 'story') {
     const chapters = volumeChapterDAO.listChaptersByWork(workId)
@@ -1015,6 +775,7 @@ async function persistGeneratedBody(
     })
     if (integrityIssues.some(issue => issue.severity === 'blocker')) {
       const error = `正文确定性门禁未通过：${integrityIssues.map(issue => issue.message).join('；')}`
+      const failureSignature = storyCandidateDefectSignature(chapterId, content, integrityIssues)
       rejectStoryCandidate(error, { integrityIssues })
       return {
         success: false,
@@ -1022,8 +783,10 @@ async function persistGeneratedBody(
         wordCount,
         antiAiRepairs,
         antiAiRepairRounds,
+        deterministicRepairs,
         error,
-        failureKind: 'body_integrity'
+        failureKind: 'body_integrity',
+        failureSignature
       }
     }
     if (candidateId != null) {
@@ -1031,7 +794,6 @@ async function persistGeneratedBody(
     }
 
     const capability = resolveStoryModelCapability(getGoalLoopModelOpts(workId))
-    let evaluatorRetries = 0
     while (true) {
       const candidateRound = continuityRepairRounds + 1
       onProgress?.(`正在执行跨拍连续性与最终闭环门禁（候选第 ${candidateRound} 轮）`)
@@ -1045,14 +807,6 @@ async function persistGeneratedBody(
         })
         break
       }
-      if (isStoryContinuityEvaluatorFailure(continuity.blockers) && evaluatorRetries < 2) {
-        evaluatorRetries++
-        onContinuityEvent?.({
-          type: 'evaluator_retry', candidateRound, blockers: continuity.blockers, wordCount: countWords(content)
-        })
-        continue
-      }
-      evaluatorRetries = 0
       wordCount = countWords(content)
       // 候选不进入正式正文，但存入章节版本，便于查看每轮修复前后的实际文本。
       volumeChapterDAO.createVersion(chapterId, {
@@ -1077,7 +831,7 @@ async function persistGeneratedBody(
           continuityBlockers: continuity.blockers,
           requiresEscalation: true,
           failureKind: 'continuity',
-          error: '跨拍连续性评估器连续 3 次不可用，已保留候选且不修改正文'
+          error: `跨拍连续性评估器连续 2 次无法完成取证，已保留候选且不修改正文：${continuity.blockers.join('；')}`
         }
       }
       if (!canRepairStoryContinuity(continuityRepairRounds, capability.maxContinuityRepairs)) {
@@ -1118,7 +872,7 @@ async function persistGeneratedBody(
       } catch { /* humanize 失败不阻断 */ }
       antiAiRepair = await repairBodyReactionCliches(workId, chapterId, content, signal, onProgress)
       content = antiAiRepair.content
-      content = repairDeterministicStoryQuotes(content)
+      normalizeStoryCandidate()
       createStoryCandidate('story_continuity_repair')
       if (shouldBlockStoryAntiAi(antiAiRepair.remaining, content.length)) {
         const error = `连续性修复候选仍有 ${antiAiRepair.remaining} 处泛白类模板反应`
@@ -1141,7 +895,7 @@ async function persistGeneratedBody(
     }
   }
 
-  // 小说目标循环的候选正文尚可能被质量/情绪门禁重写，禁止在此提前发布派生记忆。
+  // 小说目标循环先验收硬合同，再原子发布由正文投影出的权威状态。
   const memoryDeferred = workType === 'novel' && deferNarrativeMemory
   let memoryExtracted: BeatGenResult['memoryExtracted']
   let memoryError = ''
@@ -1178,7 +932,7 @@ async function persistGeneratedBody(
 
   if (workType === 'novel' && !memoryDeferred && !memoryError) {
     const fingerprint = storyStateDAO.listFingerprintsByWork(workId).find(row => row.chapter_id === chapterId)
-    const systemic = assessNovelSystemics(workId, { requireFingerprints: false, includeProseScan: false })
+    const systemic = assessNovelSystemics(workId, { requireFingerprints: false, includeProseScan: true })
     const blockers = systemic.issues.filter(issue =>
       issue.severity === 'blocker' && issue.chapterIds.includes(chapterId)
     )
@@ -1253,10 +1007,21 @@ async function persistGeneratedBody(
       status: memoryDeferred ? 'draft' : 'completed',
       emotion_assessment_json: null
     }
-    if (currentChapter?.content?.trim()) {
-      volumeChapterDAO.updateChapterWithVersion(chapterId, persistFields)
-    } else {
-      volumeChapterDAO.updateChapter(chapterId, persistFields)
+    getDatabase().transaction(() => {
+      beforePersist?.()
+      if (currentChapter?.content?.trim()) {
+        volumeChapterDAO.updateChapterWithVersion(chapterId, persistFields)
+      } else {
+        volumeChapterDAO.updateChapter(chapterId, persistFields)
+      }
+    })()
+    if (antiAiRepair.remaining > 0) {
+      recordChapterEditorialDebt({
+        workId,
+        chapterId,
+        kind: 'style',
+        issues: [`检测到 ${antiAiRepair.remaining} 处模板化身体反应，留待卷级编辑审读`]
+      })
     }
   }
 
@@ -1268,6 +1033,7 @@ async function persistGeneratedBody(
     memoryPending: memoryDeferred || Boolean(memoryError),
     antiAiRepairs,
     antiAiRepairRounds,
+    deterministicRepairs,
     continuityRepairRounds,
   }
 }
@@ -1283,6 +1049,32 @@ export async function commitStoryBodyCandidate(
   return persistGeneratedBody(workId, chapterId, content, 'story', signal, onProgress)
 }
 
+/**
+ * 长篇修复候选的唯一入库入口：所有本地补丁完成后仍复用正文规范化、
+ * 一致性检查和版本快照，且必须先通过调用方给出的确定字数合同。
+ */
+export async function commitNovelBodyCandidate(
+  workId: number,
+  chapterId: number,
+  content: string,
+  requiredWordRange: { min: number; target: number; max: number },
+  signal?: AbortSignal,
+  beforePersist?: () => void
+): Promise<BeatGenResult> {
+  return persistGeneratedBody(
+    workId,
+    chapterId,
+    content,
+    'novel',
+    signal,
+    undefined,
+    undefined,
+    true,
+    requiredWordRange,
+    beforePersist
+  )
+}
+
 /** 基于当前正文做定向修订；与首次生成共用同一套记忆、资源和时间线提交门禁。 */
 export async function reviseBeatBody(
   workId: number,
@@ -1292,9 +1084,21 @@ export async function reviseBeatBody(
   const chapter = volumeChapterDAO.getChapter(chapterId)
   if (!chapter?.content?.trim()) return { success: false, content: '', wordCount: 0, error: '当前章节没有可修订正文' }
   const workType = options.workType ?? 'novel'
-  await ensureChapterEmotionContract(workId, chapterId, '', options.signal)
+  if (workType === 'story' || options.checkEmotionContract !== false) {
+    await ensureChapterEmotionContract(workId, chapterId, '', options.signal)
+  }
   const wordTarget = options.wordTargetOverride ?? (loadWritingPlan(workId).wordsPerChapter || 4000)
-  const basePrompt = buildBodyPrompt(workId, chapterId, wordTarget, undefined, options.instruction, workType)
+  const basePrompt = buildBodyPrompt(
+    workId,
+    chapterId,
+    wordTarget,
+    undefined,
+    options.instruction,
+    workType,
+    undefined,
+    '',
+    options.checkEmotionContract !== false
+  )
   if (!basePrompt) return { success: false, content: '', wordCount: 0, error: '章节不存在' }
   const response = await modelService.chat(
     withGoalLoopModelOptions(workId, {
@@ -1307,8 +1111,11 @@ export async function reviseBeatBody(
       systemPrompt: [
         '你是长篇小说结构精修编辑。根据修订要求修改当前章节，只输出修改后的完整正文。',
         '保留未被问题证据涉及的情节、人物状态和有效表达；不得改变后续章节已经依赖的事实。',
-        '修改后仍须严格执行章节大纲、戏剧契约、资源预算和章末钩子。'
-      ].join('\n'),
+        '修改后仍须严格执行章节大纲、戏剧契约、资源预算和章末钩子。',
+        options.requiredWordRange
+          ? `本次修订同时受字数硬合同约束。最终正文按“去空白、保留标点”的口径必须在 ${options.requiredWordRange.min}-${options.requiredWordRange.max} 字，目标 ${options.requiredWordRange.target} 字；只处理修订要求指定的问题。`
+          : ''
+      ].filter(Boolean).join('\n'),
       prompt: `${basePrompt}\n\n【当前正文】\n${chapter.content}\n\n【修订要求】\n${options.instruction}`
     }),
     { stream: false, signal: options.signal }
@@ -1324,7 +1131,9 @@ export async function reviseBeatBody(
     options.signal,
     undefined,
     undefined,
-    options.deferNarrativeMemory ?? false
+    options.deferNarrativeMemory ?? false,
+    options.requiredWordRange,
+    options.beforePersist
   )
 }
 
@@ -1373,31 +1182,113 @@ export async function prepareNarrativeMemoryAfterGeneration(
   // 只生成候选记忆，不修改任何正式账本。结构或证据不合格时只重试提取器。
   let extracted: ReturnType<typeof parseMemoryExtract> | undefined
   let extractError = ''
+  let extractFailureCode: NarrativeMemoryFailureCode = 'MEMORY_EXTRACT_PROTOCOL'
+  const attemptHistory: string[] = []
   const warnings: string[] = []
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  generationLoop:
+  for (let attempt = 1; attempt <= NARRATIVE_MEMORY_MAX_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw new Error('canceled')
-    const memRes = await modelService.chat(
-      withGoalLoopModelOptions(workId, {
-        prompt: extractionPrompt,
-        systemPrompt: [
-          memorySystemPrompt,
-          extractError
-            ? `【上一轮提取错误】${extractError}\n本轮必须修正 JSON 与 evidence；evidence 必须逐字摘自正文。`
-            : ''
-        ].filter(Boolean).join('\n\n'),
-        workId,
-        chapterId,
-        step: 'memory_extract',
-        temperature: 0,
-        maxTokens: 4200,
-        responseSchema: { name: 'narrative_memory_extract', schema: MEMORY_EXTRACT_RESPONSE_SCHEMA, strict: false },
-        enrichWorkContext: false,
-        enrichNarrativeMemory: false
-      }),
-      { stream: false, signal }
-    )
+    const attemptMaxTokens = narrativeMemoryTokenBudget(attempt)
+    let memRes: Awaited<ReturnType<typeof modelService.chat>> | undefined
+    for (
+      let transportAttempt = 1;
+      transportAttempt <= NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS;
+      transportAttempt++
+    ) {
+      try {
+        memRes = await modelService.chat(
+          withGoalLoopModelOptions(workId, {
+            prompt: extractionPrompt,
+            systemPrompt: [
+              memorySystemPrompt,
+              extractError
+                ? `【上一轮提取错误】${extractError}\n本轮必须修正 JSON 与 evidence；evidence 必须逐字摘自正文。`
+                : ''
+            ].filter(Boolean).join('\n\n'),
+            workId,
+            chapterId,
+            step: 'memory_extract',
+            temperature: 0,
+            maxTokens: attemptMaxTokens,
+            timeoutMs: 120_000,
+            forceThinkingDisabled: true,
+            responseSchema: { name: 'narrative_memory_extract', schema: MEMORY_EXTRACT_RESPONSE_SCHEMA, strict: false },
+            structuredOutputMode: 'prompt_json',
+            enrichWorkContext: false,
+            enrichNarrativeMemory: false
+          }),
+          { stream: false, signal }
+        )
+      } catch (error) {
+        if (signal?.aborted) throw error
+        extractError = compactNarrativeMemoryError(error)
+        extractFailureCode = classifyNarrativeMemoryFailure(extractError)
+        if (extractFailureCode !== 'MEMORY_EXTRACT_TRANSPORT') {
+          attemptHistory.push(`生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}：${extractError}`)
+          continue generationLoop
+        }
+        attemptHistory.push(
+          `生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}`
+          + `·传输${transportAttempt}/${NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS}：${extractError}`
+        )
+        if (decideNarrativeMemoryRetry({
+          failureCode: extractFailureCode,
+          generationAttempt: attempt,
+          transportAttempt
+        }) === 'retry_transport') continue
+        throw new NarrativeMemoryPipelineError(
+          extractFailureCode,
+          `叙事记忆传输连续${NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS}次失败，未消耗结构生成轮次`
+          + `；重试轨迹：${attemptHistory.join('；')}`
+        )
+      }
+      if (memRes.success || classifyNarrativeMemoryFailure(
+        memRes.error || '模型未返回内容',
+        memRes.finishReason
+      ) !== 'MEMORY_EXTRACT_TRANSPORT') break
+      extractError = memRes.error || '模型未返回内容'
+      extractFailureCode = 'MEMORY_EXTRACT_TRANSPORT'
+      attemptHistory.push(
+        `生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}`
+        + `·传输${transportAttempt}/${NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS}：${extractError}`
+      )
+      if (decideNarrativeMemoryRetry({
+        failureCode: extractFailureCode,
+        generationAttempt: attempt,
+        transportAttempt
+      }) === 'pause') {
+        throw new NarrativeMemoryPipelineError(
+          extractFailureCode,
+          `叙事记忆传输连续${NARRATIVE_MEMORY_MAX_TRANSPORT_ATTEMPTS}次失败，未消耗结构生成轮次`
+          + `；重试轨迹：${attemptHistory.join('；')}`
+        )
+      }
+    }
+    if (!memRes) throw new Error('叙事记忆请求未产生结果')
     if (!memRes.success || !memRes.content?.trim()) {
       extractError = memRes.error || '模型未返回内容'
+      extractFailureCode = classifyNarrativeMemoryFailure(extractError, memRes.finishReason)
+      attemptHistory.push(
+        `生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}`
+        + `：${extractFailureCode} ${extractError}`
+      )
+      continue
+    }
+    if (memRes.finishReason === 'length') {
+      const nextTokens = attempt < NARRATIVE_MEMORY_MAX_ATTEMPTS
+        ? narrativeMemoryTokenBudget(attempt + 1)
+        : null
+      extractError = `叙事记忆输出达到长度上限（finishReason=length，maxTokens=${attemptMaxTokens}`
+        + `${nextTokens ? `，下一生成轮提升至 ${nextTokens}` : ''}）`
+      extractFailureCode = 'MEMORY_EXTRACT_TRUNCATED'
+      attemptHistory.push(`生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}：输出截断`)
+      appLogger.warn('goal_routine', '叙事记忆候选输出截断，推进结构生成预算', {
+        workId,
+        chapterId,
+        generationAttempt: attempt,
+        maxTokens: attemptMaxTokens,
+        nextMaxTokens: nextTokens
+      })
       continue
     }
     try {
@@ -1432,13 +1323,31 @@ export async function prepareNarrativeMemoryAfterGeneration(
         }
       }
       extracted = candidate
+      attemptHistory.push(`生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}：结构与证据通过`)
       break
     } catch (error) {
-      extractError = error instanceof Error ? error.message : String(error)
+      extractError = compactNarrativeMemoryError(error)
+      extractFailureCode = classifyNarrativeMemoryFailure(extractError, memRes.finishReason)
+      attemptHistory.push(
+        `生成${attempt}/${NARRATIVE_MEMORY_MAX_ATTEMPTS}·${attemptMaxTokens}`
+        + `：${extractFailureCode} ${extractError}`
+      )
+      appLogger.warn('goal_routine', '叙事记忆候选未通过结构或证据校验', {
+        workId,
+        chapterId,
+        generationAttempt: attempt,
+        maxTokens: attemptMaxTokens,
+        errorCode: extractFailureCode,
+        error: extractError
+      })
     }
   }
   if (!extracted) {
-    throw new Error(`叙事记忆提取连续3轮未通过结构与证据门禁：${extractError}`)
+    throw new NarrativeMemoryPipelineError(
+      extractFailureCode,
+      `叙事记忆提取连续${NARRATIVE_MEMORY_MAX_ATTEMPTS}个结构生成轮未通过`
+      + `；最后错误：${extractError}；重试轨迹：${attemptHistory.join('；')}`
+    )
   }
   if (warnings.length > 0) {
     appLogger.warn('goal_routine', '叙事记忆提取已执行弱模型确定性降级', {
@@ -1502,7 +1411,7 @@ export function commitPreparedNarrativeMemory(
     const appliedResolutions = applyForeshadowingResolutions(workId, chapterId, prepared.resolutions)
     const blockers = options.validate?.().filter(Boolean) ?? []
     if (blockers.length > 0) {
-      throw new Error(`候选叙事记忆门禁未通过：${blockers.join('；')}`)
+      throw new NarrativeMemoryCommitGateError(chapterId, blockers)
     }
     if (options.markChapterCompleted) {
       volumeChapterDAO.updateChapter(chapterId, { status: 'completed' })

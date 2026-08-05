@@ -5,10 +5,10 @@ export interface WorkModelOptions {
   thinkingEnabled?: boolean
 }
 
-export function withWorkModelOptions<T extends WorkModelOptions>(
+export function withWorkModelOptions<T extends object>(
   request: T,
   modelOpts?: WorkModelOptions
-): T {
+): T & WorkModelOptions {
   if (!modelOpts) return request
   return {
     ...request,
